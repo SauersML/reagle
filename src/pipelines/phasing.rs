@@ -2031,49 +2031,12 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
                     let fwd = phaser.phase_sample(&condensed, sp, &mut active_pool, &mut injector);
 
-                    // Bidirectional beam: run a backward pass and combine swap posteriors.
-                    if !condensed.call_sites.is_empty() {
-                        let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
-                        th.materialize_at(0, &mut tmp);
-                        for id in tmp.iter().copied() {
-                            let hid = id.as_u32() as usize;
-                            if hid >= n_target_haps {
-                                let ref_id = hid - n_target_haps;
-                                if ref_id < packed_ref.n_ref_haps() {
-                                    active_pool_rev.add(ref_id);
-                                }
-                            }
-                        }
-                        let condensed_rev = condensed.reversed(&hi_freq_gen_positions, &self.params);
-                        let mut injector_rev = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
-                        let mut sp_rev = sp.clone();
-                        let bwd = phaser.phase_sample(&condensed_rev, &mut sp_rev, &mut active_pool_rev, &mut injector_rev);
-                        let mut p_swapped_bwd = bwd.p_swapped;
-                        p_swapped_bwd.reverse();
-                        let mut combined = Vec::with_capacity(fwd.p_swapped.len());
-                        for i in 0..fwd.p_swapped.len() {
-                            let pf = fwd.p_swapped[i].clamp(1e-6, 1.0 - 1e-6);
-                            let pb = p_swapped_bwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
-                            let lf = (pf / (1.0 - pf)).ln();
-                            let lb = (pb / (1.0 - pb)).ln();
-                            let logit = lf + lb;
-                            let p = 1.0 / (1.0 + (-logit).exp());
-                            let p = p.clamp(1e-6, 1.0 - 1e-6);
-                            combined.push(p as f32);
-                        }
-                        for (i, &swapped) in fwd.decisions.iter().enumerate() {
-                            let m = condensed.call_sites[i].marker.as_usize();
-                            let p = combined.get(i).copied().unwrap_or(0.5);
-                            let conf = if swapped { p } else { 1.0 - p };
-                            sp.set_phase_confidence(m, conf);
-                        }
-
-                        if let Ok(mut slot) = beam_confidence[s].lock() {
-                            slot.clear();
-                            for (i, &p) in combined.iter().enumerate() {
-                                let call = &condensed.call_sites[i];
-                                slot.push((call.marker.as_usize(), call.a1, call.a2, p));
-                            }
+                    // Use forward pass posteriors only (avoid heuristic bidirectional combine).
+                    if let Ok(mut slot) = beam_confidence[s].lock() {
+                        slot.clear();
+                        for (i, &p) in fwd.p_swapped.iter().enumerate() {
+                            let call = &condensed.call_sites[i];
+                            slot.push((call.marker.as_usize(), call.a1, call.a2, p));
                         }
                     }
                 });

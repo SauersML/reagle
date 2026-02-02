@@ -561,8 +561,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     score: 0,
                     history: HistoryIdx(0),
                     last_swapped: true,
-                    history_bits: 1,
-                    history_len: 1,
+                    history_bits: 0,
+                    history_len: 0,
                 });
                 if beam.len() >= self.config.beam_width {
                     break;
@@ -730,9 +730,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             for (h2, c2, e2) in scratch.hap2_allele.iter() {
                 let history = trie.push(path.history, swapped);
                 let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
-                let flip_penalty = if swapped != path.last_swapped { call.flip_cost } else { 0 };
+                let flip_penalty = if call_idx == 0 {
+                    0
+                } else if swapped != path.last_swapped {
+                    call.flip_cost
+                } else {
+                    0
+                };
                 let score = score_no_flip + flip_penalty;
-                let logp = -(score_no_flip as f64) / 1_000_000.0;
+                let logp = -(score as f64) / 1_000_000.0;
                 if swapped {
                     logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp);
                 } else {
@@ -773,20 +779,23 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         // For emission at marker m with target allele X:
         //   LLR = log(P(X|donor)) - log(π(X))
         //
-        // As costs (negative log-likelihood), we want:
-        //   match_cost(m) = -log(1-ε) + log(π(X))
-        //   mismatch_cost(m) = -log(ε) + log(π(X))
+        // As costs (negative log-likelihood), we ADD the information content -log(π(X)):
+        //   match_cost(m) = base_match + (-log(π(X)))
+        //   mismatch_cost(m) = base_mismatch + (-log(π(X)))
         //
-        // The log(π(X)) term is the MAF adjustment. When π(X) is small (rare allele):
-        //   - log(π(X)) is negative, reducing cost → rare matches count more
-        //   - This is exactly what coalescent theory predicts
+        // For rare alleles (small π): -log(π(X)) is large and positive, so:
+        //   - Match cost increases slightly, but matches become more valuable relative to mismatches
+        //   - Mismatch cost increases significantly, making rare allele errors very costly
+        //
+        // This is exactly what coalescent theory predicts: rare alleles are more genealogically
+        // informative, so getting them wrong should be penalized more heavily.
         //
         // Use f64 to avoid overflow, then saturate to i32.
-        let freq_adjustment = (targ_freq.max(1e-9) as f64).ln() * 1_000_000.0;
-        let effective_match_cost = ((self.costs.match_cost as f64) + freq_adjustment)
+        let info_content = -(targ_freq.max(1e-9) as f64).ln() * 1_000_000.0;
+        let effective_match_cost = ((self.costs.match_cost as f64) + info_content)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        let effective_mismatch_cost = ((self.costs.mismatch_cost as f64) + freq_adjustment)
+        let effective_mismatch_cost = ((self.costs.mismatch_cost as f64) + info_content)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
 
@@ -989,12 +998,16 @@ fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> 
     for i in 0..logsum_swapped.len() {
         let ls = logsum_swapped[i];
         let lu = logsum_unswapped.get(i).copied().unwrap_or(f64::NEG_INFINITY);
-        if ls.is_infinite() && lu.is_infinite() {
-            out.push(0.5);
+        if ls.is_infinite() && ls.is_sign_negative() {
+            if lu.is_infinite() && lu.is_sign_negative() {
+                out.push(0.5);
+            } else {
+                out.push(0.0);
+            }
             continue;
         }
-        if ls.is_infinite() || lu.is_infinite() {
-            out.push(0.5);
+        if lu.is_infinite() && lu.is_sign_negative() {
+            out.push(1.0);
             continue;
         }
         let m = if ls > lu { ls } else { lu };

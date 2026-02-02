@@ -250,6 +250,8 @@ fn build_segment_mask<RefSpace>(
             // This anchors local consistency across phased hets.
             // For hets, both alleles must be present, so we always constrain.
             if !sample_phase.is_unphased(orig_m) {
+                tmp.fill(0);
+                tmp2.fill(0);
                 let mut ok = false;
                 if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
                     ok = true;
