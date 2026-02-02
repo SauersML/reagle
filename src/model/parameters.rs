@@ -48,7 +48,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Maximum recombination intensity
-    pub const MAX_RECOMB_INTENSITY: f32 = 5.0;
+    pub const MAX_RECOMB_INTENSITY: f32 = 15.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
@@ -74,7 +74,8 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let raw_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = raw_intensity.min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -162,7 +163,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
     }
@@ -240,11 +241,15 @@ impl ParamEstimates {
     /// Returns ratio of expected switches to total genetic distance
     /// λ = Σ(expected_switches) / Σ(genetic_distances)
     /// Returns None if total genetic distance is too small (avoid division by zero or default 1.0)
+    ///
+    /// Note: sum_gen_dist is in cM, so we multiply by 100.0 to convert to Morgan^-1
     pub fn recomb_intensity(&self) -> Option<f32> {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM. Intensity = switches / Morgan.
+        // switches / cM * 100 cM/Morgan = switches / Morgan.
+        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
     /// Estimate mismatch probability
@@ -325,10 +330,11 @@ mod tests {
 
     #[test]
     fn test_recomb_intensity_formula() {
-        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        // Use reduced Ne so we don't hit clamping limit
+        let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
 
@@ -384,4 +390,22 @@ mod tests {
         assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
     }
+}
+
+#[test]
+fn test_param_estimates_recomb_intensity_scaling() {
+    let mut est = ParamEstimates::new();
+    // Add 1 switch over 100 cM (= 1 Morgan)
+    est.add_switch(100.0, 1.0);
+
+    // Intensity should be 1 switch / 1 Morgan = 1.0
+    // If it returns switches/cM, it would be 0.01.
+    // We expect switches/Morgan because p_recomb expects that.
+
+    let intensity = est.recomb_intensity().unwrap();
+    assert!(
+        (intensity - 1.0).abs() < 0.001,
+        "Expected 1.0 (switches/Morgan), got {} (switches/cM?)",
+        intensity
+    );
 }
