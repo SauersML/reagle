@@ -348,15 +348,18 @@ impl PbwtBeamIndex {
             }
             let mut pos_lens: Vec<(u32, usize, f32)> = Vec::new();
             pbwt.collect_positions_and_lens(hi_idx, &union, &mut pos_lens);
-            let mut pos_len_map: std::collections::HashMap<u32, (usize, f32)> =
-                std::collections::HashMap::with_capacity(pos_lens.len());
-            for (h, pos, len) in pos_lens {
-                pos_len_map.insert(h, (pos, len));
-            }
             let mut select_longest = |donors: &mut Vec<u32>| {
                 donors.sort_unstable_by(|a, b| {
-                    let la = pos_len_map.get(a).map(|(_, l)| *l).unwrap_or(0.0);
-                    let lb = pos_len_map.get(b).map(|(_, l)| *l).unwrap_or(0.0);
+                    let la = pos_lens
+                        .iter()
+                        .find(|(h, _, _)| h == a)
+                        .map(|(_, _, l)| *l)
+                        .unwrap_or(0.0);
+                    let lb = pos_lens
+                        .iter()
+                        .find(|(h, _, _)| h == b)
+                        .map(|(_, _, l)| *l)
+                        .unwrap_or(0.0);
                     lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 if donors.len() > k {
@@ -365,8 +368,8 @@ impl PbwtBeamIndex {
             };
             select_longest(&mut d0);
             select_longest(&mut d1);
-            let meta0 = build_donor_meta(&d0, &beams[0], &pos_len_map);
-            let meta1 = build_donor_meta(&d1, &beams[1], &pos_len_map);
+            let meta0 = build_donor_meta(&d0, &beams[0], &pos_lens);
+            let meta1 = build_donor_meta(&d1, &beams[1], &pos_lens);
             donor_meta0.push(Some(meta0));
             donor_meta1.push(Some(meta1));
         }
@@ -407,11 +410,11 @@ fn find_cluster(beam: &RankBeam, pos: usize) -> (u16, f32) {
 fn build_donor_meta(
     donors: &[u32],
     beam: &RankBeam,
-    pos_len_map: &std::collections::HashMap<u32, (usize, f32)>,
+    pos_lens: &[(u32, usize, f32)],
 ) -> Vec<PbwtDonorMeta> {
     let mut out = Vec::with_capacity(donors.len());
     for &hap in donors {
-        if let Some((pos, len)) = pos_len_map.get(&hap).copied() {
+        if let Some((_, pos, len)) = pos_lens.iter().find(|(h, _, _)| *h == hap).copied() {
             let (cluster_id, cluster_size) = find_cluster(beam, pos);
             out.push(PbwtDonorMeta {
                 hap,
