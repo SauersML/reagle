@@ -6756,9 +6756,104 @@ fn sample_dynamic_mcmc(
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
         }
-    } else if let Some(&seed_hap) = neighbors.first() {
-        path1_ref.fill(seed_hap);
-        path2_ref.fill(seed_hap);
+    } else {
+        let mut heuristic_applied = false;
+        // Inline pairwise consistency heuristic for initialization
+        // Iterates over top 16 neighbors to find a constant pair that best explains the genotype.
+        // Used to break symmetry and avoid bad random starts in small windows.
+        if n_markers <= 500 && neighbors.len() >= 2 {
+            let limit = 16.min(neighbors.len());
+            let subset = &neighbors[..limit];
+            let mut best_score = -1.0f32;
+            let mut best_pair = (0u32, 0u32);
+            let mut informative_count = 0;
+
+            for m in 0..n_markers {
+                if seq1[m] != 255 && seq2[m] != 255 {
+                    informative_count += 1;
+                }
+            }
+
+            if informative_count > 0 {
+                let threshold = 0.9 * informative_count as f32;
+                for i in 0..limit {
+                    for j in 0..i {
+                        let h1 = subset[i];
+                        let h2 = subset[j];
+                        let mut score = 0.0f32;
+                        for m in 0..n_markers {
+                            let a1 = seq1[m];
+                            let a2 = seq2[m];
+                            if a1 == 255 && a2 == 255 {
+                                continue;
+                            }
+                            let r1 = phase_ibs.allele(m, h1);
+                            let r2 = phase_ibs.allele(m, h2);
+                            if r1 == 255 || r2 == 255 {
+                                continue;
+                            }
+
+                            if a1 == a2 {
+                                // Hom
+                                if r1 == a1 && r2 == a1 {
+                                    score += 1.0;
+                                } else {
+                                    score -= 1.0;
+                                }
+                            } else {
+                                // Het
+                                if (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1) {
+                                    score += 1.0;
+                                } else {
+                                    score -= 1.0;
+                                }
+                            }
+                        }
+
+                        if score > best_score {
+                            best_score = score;
+                            best_pair = (h1, h2);
+                        }
+                    }
+                }
+
+                if best_score >= threshold {
+                    path1_ref.fill(best_pair.0);
+                    path2_ref.fill(best_pair.1);
+                    heuristic_applied = true;
+
+                    // Initialize alleles from the selected pair to help MCMC start
+                    for m in 0..n_markers {
+                        let a1 = seq1[m];
+                        let a2 = seq2[m];
+                        let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+                        let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+                        if anchor_a1 != 255 || anchor_a2 != 255 {
+                            continue;
+                        }
+
+                        if a1 != 255 && a2 != 255 && a1 != a2 {
+                            let r1 = phase_ibs.allele(m, best_pair.0);
+                            let r2 = phase_ibs.allele(m, best_pair.1);
+                            if r1 == a1 && r2 == a2 {
+                                h1_alleles[m] = a1;
+                                h2_alleles[m] = a2;
+                            } else if r1 == a2 && r2 == a1 {
+                                h1_alleles[m] = a2;
+                                h2_alleles[m] = a1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !heuristic_applied {
+            if let Some(&seed_hap) = neighbors.first() {
+                path1_ref.fill(seed_hap);
+                path2_ref.fill(seed_hap);
+            }
+        }
     }
 
     fn mix_neighbors(
