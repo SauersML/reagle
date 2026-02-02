@@ -85,6 +85,7 @@ const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
