@@ -244,7 +244,7 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        // Multiply by 100 to convert from per-cM to per-Morgan
+        // Multiply by 100.0 to convert from switches/cM to switches/Morgan (Li-Stephens model expects Morgan^-1)
         Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
     }
 
