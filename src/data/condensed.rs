@@ -1,18 +1,25 @@
 //! Condensed target representation for fast phasing.
 //!
-//! Collapses homozygous stretches into segments with reference consistency masks.
+//! Collapses homozygous stretches into segments with compact constraints.
 
 use crate::data::marker::AnyMarkerSpace;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::data::{MarkerIdx};
-use crate::data::ref_packed::{PackedRefView, mask_all_ones, mask_and_inplace};
+use crate::data::ref_packed::PackedRefView;
 use crate::model::parameters::ModelParams;
 
 #[derive(Clone, Debug)]
 pub struct CondensedSegment {
-    pub mask: Vec<u64>,
+    pub constraints: Vec<SegmentConstraint>,
     pub any_constraint: bool,
     pub len_morgans: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SegmentConstraint {
+    pub marker: MarkerIdx<AnyMarkerSpace>,
+    pub alleles: [u8; 2],
+    pub n_alleles: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -61,9 +68,6 @@ impl CondensedTarget {
         packed_ref: &PackedRefView<RefSpace>,
         params: &ModelParams,
     ) -> Self {
-        let n_ref = packed_ref.n_ref_haps();
-        let n_words = (n_ref + 63) / 64;
-
         let mut call_sites: Vec<CallSite> = Vec::new();
         let mut segments: Vec<CondensedSegment> = Vec::new();
 
@@ -184,7 +188,6 @@ impl CondensedTarget {
                 end_hi,
                 hi_freq_gen_positions,
                 packed_ref,
-                n_words,
             );
             segments.push(seg);
             prev_hi = end_hi;
@@ -197,7 +200,6 @@ impl CondensedTarget {
             hi_freq_to_orig.len(),
             hi_freq_gen_positions,
             packed_ref,
-            n_words,
         );
         segments.push(trailing);
 
@@ -278,18 +280,12 @@ impl CondensedTarget {
     }
 }
 
-/// For segment mask constraints, we only hard-constrain on *minor* allele homozygotes.
+/// Segment constraints are stored compactly as per-marker allowed alleles.
 ///
-/// Information-theoretic justification: a homozygous site for allele a provides
-/// information I(a) = -log₂(p(a)) bits about donor compatibility.
-///
-/// - When p(a) > 0.5 (major allele): I(a) < 1 bit. Most reference haplotypes match,
-///   so the constraint provides minimal discrimination and risks over-pruning.
-///
-/// - When p(a) < 0.5 (minor allele): I(a) > 1 bit. Fewer reference haplotypes match,
-///   so the constraint provides meaningful discrimination.
-///
-/// The p = 0.5 boundary is the information-theory neutral point, not a tuned threshold.
+/// We add homozygous constraints for any mapped allele (strong signal), and
+/// add phased heterozygous constraints as an allowed-allele set. This avoids
+/// materializing full reference bitmasks while preserving the same filtering
+/// semantics for candidate haplotypes.
 
 fn build_segment_mask<RefSpace>(
     sample_phase: &SamplePhase,
@@ -298,13 +294,8 @@ fn build_segment_mask<RefSpace>(
     end_hi: usize,
     hi_freq_gen_positions: &[f64],
     packed_ref: &PackedRefView<RefSpace>,
-    n_words: usize,
 ) -> CondensedSegment {
-    let mut mask: Vec<u64> = vec![0u64; n_words];
-    mask_all_ones(&mut mask, packed_ref.n_ref_haps());
-
-    let mut tmp: Vec<u64> = vec![0u64; n_words];
-    let mut tmp2: Vec<u64> = vec![0u64; n_words];
+    let mut constraints: Vec<SegmentConstraint> = Vec::new();
     let mut any_constraint = false;
     let len_morgans = if end_hi > start_hi && hi_freq_gen_positions.len() > 1 {
         let start_pos = hi_freq_gen_positions
@@ -328,43 +319,32 @@ fn build_segment_mask<RefSpace>(
             continue;
         }
         if a1 == a2 {
-            // Only constrain on minor allele homozygotes (p < 0.5).
-            // Major allele homozygotes (p > 0.5) provide < 1 bit of information.
-            if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
-                mask_and_inplace(&mut mask, &tmp);
+            if packed_ref.can_map_targ_allele(orig_m, a1) {
+                constraints.push(SegmentConstraint {
+                    marker: MarkerIdx::new(orig_m as u32),
+                    alleles: [a1, a1],
+                    n_alleles: 1,
+                });
                 any_constraint = true;
             }
         } else if a1 <= 1 && a2 <= 1 {
-            // If heterozygous and phased, constrain segment to match either allele.
-            // This anchors local consistency across phased hets.
-            // For hets, both alleles must be present, so we always constrain.
             if !sample_phase.is_unphased(orig_m) {
-                tmp.fill(0);
-                tmp2.fill(0);
-                let mut ok = false;
-                if packed_ref.fill_match_mask(orig_m, a1, &mut tmp) {
-                    ok = true;
-                }
-                if packed_ref.fill_match_mask(orig_m, a2, &mut tmp2) {
-                    ok = true;
-                }
-                if ok {
-                    for i in 0..mask.len().min(tmp.len()).min(tmp2.len()) {
-                        tmp[i] |= tmp2[i];
-                    }
-                    mask_and_inplace(&mut mask, &tmp);
+                let ok1 = packed_ref.can_map_targ_allele(orig_m, a1);
+                let ok2 = packed_ref.can_map_targ_allele(orig_m, a2);
+                if ok1 || ok2 {
+                    constraints.push(SegmentConstraint {
+                        marker: MarkerIdx::new(orig_m as u32),
+                        alleles: [a1, a2],
+                        n_alleles: 2,
+                    });
                     any_constraint = true;
                 }
             }
         }
     }
 
-    if !any_constraint {
-        mask_all_ones(&mut mask, packed_ref.n_ref_haps());
-    }
-
     CondensedSegment {
-        mask,
+        constraints,
         any_constraint,
         len_morgans,
     }

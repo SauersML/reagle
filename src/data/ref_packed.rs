@@ -36,6 +36,12 @@ impl<RefSpace> PackedRefView<RefSpace> {
         }
     }
 
+    /// Check whether a target allele can be mapped at this marker.
+    #[inline]
+    pub fn can_map_targ_allele(&self, marker: usize, targ_allele: u8) -> bool {
+        self.map_targ_to_ref(marker, targ_allele).is_some()
+    }
+
     /// Map a reference allele to target allele space (for emission checks).
     #[inline]
     fn map_ref_to_targ(&self, marker: usize, ref_allele: u8) -> Option<u8> {
@@ -43,71 +49,6 @@ impl<RefSpace> PackedRefView<RefSpace> {
         mapping.reverse_map_allele(ref_allele)
     }
 
-    /// Fill `out` with a match mask for the given target allele.
-    ///
-    /// Returns false if the marker isn't aligned or the allele can't be mapped.
-    pub fn fill_match_mask(&self, marker: usize, targ_allele: u8, out: &mut [u64]) -> bool {
-        let col = match self.columns.get(marker).and_then(|v| v.as_ref()) {
-            Some(col) => col,
-            None => return false,
-        };
-        let ref_allele = match self.map_targ_to_ref(marker, targ_allele) {
-            Some(a) => a,
-            None => return false,
-        };
-
-        match col {
-            PackedRefColumn::Bits {
-                bits,
-                n_haps,
-                words,
-                missing,
-            } => {
-                if *bits != 1 {
-                    // Non-biallelic: fall back to per-hap scan.
-                    let n = (*n_haps).min(self.n_ref_haps);
-                    out.fill(0);
-                    for h in 0..n {
-                        if col.allele(h) == ref_allele {
-                            let w = h / 64;
-                            let b = h % 64;
-                            out[w] |= 1u64 << b;
-                        }
-                    }
-                    return true;
-                }
-                let n_words = out.len();
-                out[..n_words].fill(0);
-                let miss_words = missing.len().min(n_words);
-                let data_words = words.len().min(n_words);
-                for w in 0..n_words {
-                    let miss = if w < miss_words { missing[w] } else { 0 };
-                    let bits_word = if w < data_words { words[w] } else { 0 };
-                    let match_word = if ref_allele == 1 {
-                        bits_word & !miss
-                    } else if ref_allele == 0 {
-                        (!bits_word) & !miss
-                    } else {
-                        0
-                    };
-                    out[w] = match_word;
-                }
-                true
-            }
-            PackedRefColumn::Bytes { alleles } => {
-                out.fill(0);
-                let n = alleles.len().min(self.n_ref_haps);
-                for h in 0..n {
-                    if alleles[h] == ref_allele {
-                        let w = h / 64;
-                        let b = h % 64;
-                        out[w] |= 1u64 << b;
-                    }
-                }
-                true
-            }
-        }
-    }
 
     /// Get the reference allele (mapped to target allele space) for a given hap at marker.
     pub fn ref_allele_targ(&self, marker: usize, hap: usize) -> Option<u8> {
@@ -149,61 +90,4 @@ impl<RefSpace: Send + Sync> PackedRefView<RefSpace> {
             phantom: std::marker::PhantomData,
         }
     }
-}
-
-/// Utility: mask all bits on for `n` haplotypes.
-#[inline]
-pub fn mask_all_ones(mask: &mut [u64], n_haps: usize) {
-    mask.fill(!0u64);
-    let n_words = mask.len();
-    if n_words == 0 {
-        return;
-    }
-    let rem = n_haps % 64;
-    if rem != 0 {
-        let last = n_words - 1;
-        let keep = (1u64 << rem) - 1;
-        mask[last] = keep;
-    }
-}
-
-#[inline]
-pub fn mask_and_inplace(dst: &mut [u64], src: &[u64]) {
-    let n = dst.len().min(src.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe {
-                use std::arch::x86_64::{__m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_storeu_si256};
-                let chunks = n / 4;
-                let dst_ptr = dst.as_mut_ptr() as *mut u8;
-                let src_ptr = src.as_ptr() as *const u8;
-                for i in 0..chunks {
-                    let offset = i * 32;
-                    let a = _mm256_loadu_si256(dst_ptr.add(offset) as *const __m256i);
-                    let b = _mm256_loadu_si256(src_ptr.add(offset) as *const __m256i);
-                    let c = _mm256_and_si256(a, b);
-                    _mm256_storeu_si256(dst_ptr.add(offset) as *mut __m256i, c);
-                }
-                let start = chunks * 4;
-                for i in start..n {
-                    dst[i] &= src[i];
-                }
-                return;
-            }
-        }
-    }
-    for i in 0..n {
-        dst[i] &= src[i];
-    }
-}
-
-#[inline]
-pub fn mask_bit_is_set(mask: &[u64], hap: usize) -> bool {
-    let w = hap / 64;
-    let b = hap % 64;
-    if w >= mask.len() {
-        return false;
-    }
-    ((mask[w] >> b) & 1) != 0
 }

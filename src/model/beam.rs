@@ -1,7 +1,7 @@
 //! Beam search phaser for condensed targets.
 
 use crate::data::condensed::{CondensedTarget, CallSite};
-use crate::data::ref_packed::{PackedRefView, mask_bit_is_set};
+use crate::data::ref_packed::PackedRefView;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::data::MarkerIdx;
 use crate::model::parameters::ModelParams;
@@ -848,7 +848,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         for path in beam {
             self.repair_hap_into(
                 path.hap1,
-                &segment.mask,
+                &segment.constraints,
                 active_pool,
                 switch_cost,
                 soft_segment,
@@ -857,7 +857,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             );
             self.repair_hap_into(
                 path.hap2,
-                &segment.mask,
+                &segment.constraints,
                 active_pool,
                 switch_cost,
                 soft_segment,
@@ -887,7 +887,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     fn repair_hap_into(
         &self,
         hap: usize,
-        mask: &[u64],
+        constraints: &[crate::data::condensed::SegmentConstraint],
         active_pool: &ActivePool,
         switch_cost: i32,
         soft_segment: bool,
@@ -895,7 +895,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         out: &mut Vec<(usize, i32)>,
     ) {
         out.clear();
-        let hap_ok = mask_bit_is_set(mask, hap);
+        let hap_ok = hap_matches_constraints(self.packed_ref, hap, constraints);
         if hap_ok {
             out.push((hap, 0));
         } else if soft_segment {
@@ -903,7 +903,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
         // switch to most recently injected candidates first
         for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
-            if mask_bit_is_set(mask, h) {
+            if hap_matches_constraints(self.packed_ref, h, constraints) {
                 out.push((h, switch_cost));
             }
             if out.len() >= self.config.switch_candidates {
@@ -913,7 +913,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         if hap_ok && out.len() < 2 {
             // allow a limited exploratory switch even if current hap is consistent
             for &h in active_pool.list().iter().rev().take(2) {
-                if h != hap && mask_bit_is_set(mask, h) {
+                if h != hap && hap_matches_constraints(self.packed_ref, h, constraints) {
                     out.push((h, switch_cost));
                 }
                 if out.len() >= self.config.switch_candidates {
@@ -1414,6 +1414,30 @@ fn push_history_bits(prev_bits: u64, prev_len: u8, swapped: bool) -> (u64, u8) {
     };
     let len = if prev_len < HISTORY_BITS { prev_len + 1 } else { HISTORY_BITS };
     (bits, len)
+}
+
+fn hap_matches_constraints<RefSpace>(
+    packed_ref: &PackedRefView<RefSpace>,
+    hap: usize,
+    constraints: &[crate::data::condensed::SegmentConstraint],
+) -> bool {
+    for c in constraints {
+        let marker = c.marker.as_usize();
+        let ref_al = match packed_ref.ref_allele_targ(marker, hap) {
+            Some(a) => a,
+            None => return false,
+        };
+        if c.n_alleles <= 1 {
+            if ref_al != c.alleles[0] {
+                return false;
+            }
+        } else {
+            if ref_al != c.alleles[0] && ref_al != c.alleles[1] {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[inline]

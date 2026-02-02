@@ -79,25 +79,6 @@ fn fill_ref_alleles(col: &GenotypeColumn, out: &mut [u8]) {
     }
 }
 
-#[inline]
-fn allele_to_posterior(n_alleles: usize, allele: u8) -> AllelePosteriors {
-    if n_alleles <= 2 {
-        let p_alt = if allele == 1 { 1.0 } else if allele == 0 { 0.0 } else { 0.5 };
-        AllelePosteriors::Biallelic(p_alt)
-    } else {
-        let mut probs = vec![0.0f32; n_alleles.max(1)];
-        if (allele as usize) < n_alleles {
-            probs[allele as usize] = 1.0;
-        } else {
-            let uniform = 1.0 / n_alleles.max(1) as f32;
-            for p in &mut probs {
-                *p = uniform;
-            }
-        }
-        AllelePosteriors::Multiallelic(probs)
-    }
-}
-
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
@@ -3800,7 +3781,7 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let n_target_haps = n_target_samples * 2;
-        let mut sm_posts_by_hap: Vec<Vec<AllelePosteriors>> =
+        let mut sm_alt_probs_by_hap: Vec<Vec<f32>> =
             vec![Vec::with_capacity(output_markers); n_target_haps];
         let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
         // Information-weighted confusion: weight donor instability by -log(π(X))
@@ -3966,26 +3947,18 @@ impl crate::pipelines::ImputationPipeline {
                     RefHapId::new(donor as u32),
                 );
                 if store {
-                    let ap = if target_allele == 255 {
-                        // Missing target: blend donor ensemble with ref prior based on information.
-                        let w = (sm_total_info[hap_idx] / min_info_nats).clamp(0.0, 1.0);
-                        if n_alleles <= 2 {
+                    let p_alt = if n_alleles <= 2 {
+                        if target_allele == 255 {
+                            // Missing target: blend donor ensemble with ref prior based on information.
+                            let w = (sm_total_info[hap_idx] / min_info_nats).clamp(0.0, 1.0);
                             let donor_mean = if donor_candidates.is_empty() {
                                 let donor = current_donor[hap_idx];
                                 let allele = col.get(HapIdx::new(donor));
-                                if allele <= 1 {
-                                    allele as f32
-                                } else {
-                                    freq_prior
-                                }
+                                if allele <= 1 { allele as f32 } else { freq_prior }
                             } else if w >= 0.5 {
                                 let donor = current_donor[hap_idx];
                                 let allele = col.get(HapIdx::new(donor));
-                                if allele <= 1 {
-                                    allele as f32
-                                } else {
-                                    freq_prior
-                                }
+                                if allele <= 1 { allele as f32 } else { freq_prior }
                             } else {
                                 let mut alt_sum = 0u32;
                                 for &cand in &donor_candidates {
@@ -3996,70 +3969,16 @@ impl crate::pipelines::ImputationPipeline {
                                 }
                                 alt_sum as f32 / donor_candidates.len() as f32
                             };
-                            let p_alt = (w * donor_mean + (1.0 - w) * freq_prior)
-                                .clamp(1e-6, 1.0 - 1e-6);
-                            AllelePosteriors::Biallelic(p_alt)
+                            (w * donor_mean + (1.0 - w) * freq_prior)
+                                .clamp(1e-6, 1.0 - 1e-6)
                         } else {
-                            let mut donor_probs = vec![0.0f32; n_alleles.max(1)];
-                            if donor_candidates.is_empty() {
-                                let uniform = 1.0 / n_alleles.max(1) as f32;
-                                for p in &mut donor_probs {
-                                    *p = uniform;
-                                }
-                            } else {
-                                for &cand in &donor_candidates {
-                                    let allele = col.get(HapIdx::new(cand));
-                                    if (allele as usize) < n_alleles {
-                                        donor_probs[allele as usize] += 1.0;
-                                    }
-                                }
-                                let denom = donor_candidates.len() as f32;
-                                if denom > 0.0 {
-                                    for p in &mut donor_probs {
-                                        *p /= denom;
-                                    }
-                                }
-                            }
-                            let mut prior_probs = vec![0.0f32; n_alleles.max(1)];
-                            if let Some(freqs) = ref_allele_freqs.get(ref_m) {
-                                let mut sum = 0.0f32;
-                                for (i, p) in prior_probs.iter_mut().enumerate() {
-                                    *p = freqs.get(i).copied().unwrap_or(0.0);
-                                    sum += *p;
-                                }
-                                if sum > 0.0 {
-                                    for p in &mut prior_probs {
-                                        *p /= sum;
-                                    }
-                                } else {
-                                    let uniform = 1.0 / n_alleles.max(1) as f32;
-                                    for p in &mut prior_probs {
-                                        *p = uniform;
-                                    }
-                                }
-                            } else {
-                                let uniform = 1.0 / n_alleles.max(1) as f32;
-                                for p in &mut prior_probs {
-                                    *p = uniform;
-                                }
-                            }
-                            for i in 0..prior_probs.len() {
-                                donor_probs[i] = (w * donor_probs[i] + (1.0 - w) * prior_probs[i])
-                                    .max(0.0);
-                            }
-                            let sum: f32 = donor_probs.iter().sum();
-                            if sum > 0.0 {
-                                for p in &mut donor_probs {
-                                    *p /= sum;
-                                }
-                            }
-                            AllelePosteriors::Multiallelic(donor_probs)
+                            let allele = col.get(HapIdx::new(donor));
+                            if allele == 1 { 1.0 } else { 0.0 }
                         }
                     } else {
-                        let allele = col.get(HapIdx::new(donor));
-                        allele_to_posterior(n_alleles, allele)
+                        0.0
                     };
-                    sm_posts_by_hap[hap_idx].push(ap);
+                    sm_alt_probs_by_hap[hap_idx].push(p_alt);
                 }
             }
         }
@@ -4359,14 +4278,16 @@ impl crate::pipelines::ImputationPipeline {
                     (posteriors, next_priors, stats)
                 };
 
-                let mut hap1_posts = sm_posts_by_hap[h1_idx.as_usize()].clone();
-                let mut hap2_posts = sm_posts_by_hap[h2_idx.as_usize()].clone();
+                let mut hap1_posts: Option<Vec<AllelePosteriors>> = None;
+                let mut hap2_posts: Option<Vec<AllelePosteriors>> = None;
+                let hap1_alt = sm_alt_probs_by_hap[h1_idx.as_usize()].clone();
+                let hap2_alt = sm_alt_probs_by_hap[h2_idx.as_usize()].clone();
                 let mut p1_out = HaplotypePriors::empty();
                 let mut p2_out = HaplotypePriors::empty();
 
                 if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        hap1_posts = posts_from_priors(p);
+                        hap1_posts = Some(posts_from_priors(p));
                         p1_out = p.clone();
                     }
                 } else if use_hmm_h1 {
@@ -4378,12 +4299,12 @@ impl crate::pipelines::ImputationPipeline {
                         last_info_h1.or(prior_marker_idx),
                         donors_h1,
                     );
-                    hap1_posts = posts;
+                    hap1_posts = Some(posts);
                     p1_out = out;
                     update_error_rate(&stats, prior_error_rate);
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        hap1_posts = posts_from_priors(p);
+                        hap1_posts = Some(posts_from_priors(p));
                         p1_out = p.clone();
                     }
                 } else {
@@ -4399,7 +4320,7 @@ impl crate::pipelines::ImputationPipeline {
 
                 if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        hap2_posts = posts_from_priors(p);
+                        hap2_posts = Some(posts_from_priors(p));
                         p2_out = p.clone();
                     }
                 } else if use_hmm_h2 {
@@ -4411,12 +4332,12 @@ impl crate::pipelines::ImputationPipeline {
                         last_info_h2.or(prior_marker_idx),
                         donors_h2,
                     );
-                    hap2_posts = posts;
+                    hap2_posts = Some(posts);
                     p2_out = out;
                     update_error_rate(&stats, prior_error_rate);
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        hap2_posts = posts_from_priors(p);
+                        hap2_posts = Some(posts_from_priors(p));
                         p2_out = p.clone();
                     }
                 } else {
@@ -4437,8 +4358,11 @@ impl crate::pipelines::ImputationPipeline {
                 ImputeResult {
                     result: SampleImputationResult {
                         sample_idx: s,
-                        hap_alt_probs: None,
-                        hap_posteriors: Some((hap1_posts, hap2_posts)),
+                        hap_alt_probs: Some((hap1_alt, hap2_alt)),
+                        hap_posteriors: match (hap1_posts, hap2_posts) {
+                            (Some(p1), Some(p2)) => Some((p1, p2)),
+                            _ => None,
+                        },
                     },
                     priors: Some((p1_out, p2_out)),
                     last_info_idx: match (last_info_h1, last_info_h2) {

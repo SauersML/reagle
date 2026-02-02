@@ -68,6 +68,7 @@ impl RankBeam {
 pub struct ReferencePbwtImpl<I: PbwtIndex> {
     updater: PbwtDivUpdater<I>,
     ppa: Vec<I>,
+    inv_ppa: Vec<usize>,
     div: Vec<i32>,
     permuted_ref: Vec<u8>,
     permuted_bits: Vec<u64>,
@@ -147,9 +148,14 @@ impl PbwtStrictAllele {
 
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     pub fn new(n_ref_haps: usize) -> Self {
+        let mut inv_ppa = vec![0usize; n_ref_haps];
+        for i in 0..n_ref_haps {
+            inv_ppa[i] = i;
+        }
         Self {
             updater: PbwtDivUpdater::new(n_ref_haps),
             ppa: (0..n_ref_haps).map(I::from_usize).collect(),
+            inv_ppa,
             div: vec![0; n_ref_haps],
             permuted_ref: vec![0; n_ref_haps],
             permuted_bits: Vec::new(),
@@ -659,6 +665,12 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
         self.updater
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
+        for (pos, hap) in self.ppa.iter().enumerate() {
+            let h = hap.to_usize();
+            if h < self.inv_ppa.len() {
+                self.inv_ppa[h] = pos;
+            }
+        }
     }
 
     pub fn collect_positions_and_lens(
@@ -672,36 +684,15 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             return;
         }
         let m = marker as i32;
-        if haps.len() <= 32 {
-            for (pos, hap) in self.ppa.iter().enumerate() {
-                let h = hap.to_usize() as u32;
-                let mut found = false;
-                for &cand in haps {
-                    if cand == h {
-                        found = true;
-                        break;
-                    }
-                }
-                if found {
-                    let start = self.div.get(pos).copied().unwrap_or(m);
-                    let len = (m - start).max(0) as f32;
-                    out.push((h, pos, len));
-                }
-            }
-            return;
-        }
-        let mut set: std::collections::HashSet<u32> =
-            std::collections::HashSet::with_capacity(haps.len());
         for &h in haps {
-            set.insert(h);
-        }
-        for (pos, hap) in self.ppa.iter().enumerate() {
-            let h = hap.to_usize() as u32;
-            if set.contains(&h) {
-                let start = self.div.get(pos).copied().unwrap_or(m);
-                let len = (m - start).max(0) as f32;
-                out.push((h, pos, len));
+            let hap = h as usize;
+            if hap >= self.inv_ppa.len() {
+                continue;
             }
+            let pos = self.inv_ppa[hap];
+            let start = self.div.get(pos).copied().unwrap_or(m);
+            let len = (m - start).max(0) as f32;
+            out.push((h, pos, len));
         }
     }
 
