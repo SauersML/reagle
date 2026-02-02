@@ -12,28 +12,8 @@ on:
       - 'README.md'
 
 jobs:
-  check-status:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check PR stability
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Waiting 5 minutes..."
-          sleep 300
-          STATE=$(gh pr view ${{ github.event.pull_request.number }} -R ${{ github.repository }} --json state --jq .state)
-          if [ "$STATE" != "OPEN" ]; then
-            echo "PR closed ($STATE). cancelling."
-            exit 1
-          fi
-      - name: Skip check
-        if: github.event_name != 'pull_request'
-        run: echo "Not a PR, proceeding immediately."
-
   prepare-shared:
-    needs: check-status
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +41,7 @@ jobs:
 
   impute-and-measure:
     needs: prepare-shared
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       PYTHONUNBUFFERED: "1"
     strategy:
@@ -149,7 +129,7 @@ jobs:
 
   generate-report:
     needs: impute-and-measure
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       
