@@ -72,6 +72,7 @@ const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 0.2;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
@@ -7182,8 +7183,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > 500 {
+    let threshold = 0.9 * (informative as f32);
+    if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
         return None;
     }
 
