@@ -45,3 +45,4 @@ scripts/microarray_profile/
 
 # Test data cache (downloaded on demand)
 tests/data/
+temp_tools/
