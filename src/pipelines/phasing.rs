@@ -85,6 +85,7 @@ const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
+const HEURISTIC_MAX_MARKERS: usize = 500;
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
@@ -6756,9 +6757,105 @@ fn sample_dynamic_mcmc(
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
         }
-    } else if let Some(&seed_hap) = neighbors.first() {
-        path1_ref.fill(seed_hap);
-        path2_ref.fill(seed_hap);
+    } else {
+        let mut best_pair = None;
+        let mut best_score = f32::NEG_INFINITY;
+
+        if n_markers <= HEURISTIC_MAX_MARKERS {
+            let candidates = &neighbors[..16.min(neighbors.len())];
+            if candidates.len() >= 2 {
+                let mut informative = 0usize;
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 != 255 || a2 != 255 {
+                        informative += 1;
+                    }
+                }
+
+                if informative > 0 {
+                    let threshold = 0.9 * informative as f32;
+
+                    for (i, &h1) in candidates.iter().enumerate() {
+                        for &h2 in candidates.iter().take(i) {
+                            let mut score = 0.0;
+                            let mut match_orient1 = 0;
+                            let mut match_orient2 = 0;
+
+                            for m in 0..n_markers {
+                                let a1 = seq1[m];
+                                let a2 = seq2[m];
+                                if a1 == 255 && a2 == 255 {
+                                    continue;
+                                }
+
+                                let r1 = phase_ibs.allele(m, h1);
+                                let r2 = phase_ibs.allele(m, h2);
+                                if r1 == 255 || r2 == 255 {
+                                    continue;
+                                }
+
+                                let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                                let compatible = if is_het {
+                                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                                } else {
+                                    let obs = if a1 != 255 { a1 } else { a2 };
+                                    r1 == obs && r2 == obs
+                                };
+
+                                if compatible {
+                                    score += 1.0;
+                                } else {
+                                    score -= 1.0;
+                                }
+
+                                if a1 != 255 && a2 != 255 {
+                                    if r1 == a1 && r2 == a2 {
+                                        match_orient1 += 1;
+                                    }
+                                    if r1 == a2 && r2 == a1 {
+                                        match_orient2 += 1;
+                                    }
+                                }
+                            }
+
+                            if score > best_score && score >= threshold {
+                                best_score = score;
+                                best_pair = Some((h1, h2, match_orient1 >= match_orient2));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((h1, h2, orient_direct)) = best_pair {
+            let (p1, p2) = if orient_direct { (h1, h2) } else { (h2, h1) };
+            path1_ref.fill(p1);
+            path2_ref.fill(p2);
+
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
+                }
+
+                let r1 = phase_ibs.allele(m, p1);
+                let r2 = phase_ibs.allele(m, p2);
+
+                if r1 == a1 && r2 == a2 {
+                    h1_alleles[m] = a1;
+                    h2_alleles[m] = a2;
+                } else if r1 == a2 && r2 == a1 {
+                    h1_alleles[m] = a2;
+                    h2_alleles[m] = a1;
+                }
+            }
+        } else if let Some(&seed_hap) = neighbors.first() {
+            path1_ref.fill(seed_hap);
+            path2_ref.fill(seed_hap);
+        }
     }
 
     fn mix_neighbors(
@@ -7182,8 +7279,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
-    if best_score < threshold || n_markers > 500 {
+    let threshold = 0.9 * (informative as f32);
+    if best_score < threshold || n_markers > HEURISTIC_MAX_MARKERS {
         return None;
     }
 
