@@ -1,0 +1,510 @@
+//! Beam search phaser for condensed targets.
+
+use crate::data::condensed::{CondensedTarget, CallSite};
+use crate::data::ref_packed::{PackedRefView, mask_bit_is_set};
+use crate::data::storage::sample_phase::SamplePhase;
+use crate::data::MarkerIdx;
+use crate::model::parameters::ModelParams;
+use crate::model::reference_pbwt::{ReferencePbwt, RankBeam, PbwtStrictAllele};
+use crate::data::alignment::MarkerAlignment;
+use crate::data::storage::GenotypeMatrix;
+use crate::data::storage::phase_state::Phased;
+use crate::data::marker::AnyMarkerSpace;
+
+#[derive(Clone, Copy, Debug)]
+pub struct BeamConfig {
+    pub beam_width: usize,
+    pub switch_candidates: usize,
+    pub inject_interval: usize,
+    pub inject_k: usize,
+    pub collapse_gap: i32,
+}
+
+impl Default for BeamConfig {
+    fn default() -> Self {
+        Self {
+            beam_width: 64,
+            switch_candidates: 8,
+            inject_interval: 8,
+            inject_k: 16,
+            collapse_gap: 5_000_000, // in fixed-point cost units
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BeamCosts {
+    pub match_cost: i32,
+    pub mismatch_cost: i32,
+}
+
+impl BeamCosts {
+    pub fn from_params(params: &ModelParams) -> Self {
+        let p_err = params.p_mismatch.max(1e-9).min(1.0 - 1e-9);
+        let p_ok = (1.0 - p_err).max(1e-9);
+        let match_cost = (-p_ok.ln() * 1_000_000.0).round() as i32;
+        let mismatch_cost = (-p_err.ln() * 1_000_000.0).round() as i32;
+        Self {
+            match_cost,
+            mismatch_cost,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryIdx(pub u32);
+
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryNode {
+    pub parent: HistoryIdx,
+    pub phase: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryTrie {
+    nodes: Vec<HistoryNode>,
+}
+
+impl HistoryTrie {
+    pub fn new() -> Self {
+        Self {
+            nodes: vec![HistoryNode { parent: HistoryIdx(0), phase: false }],
+        }
+    }
+
+    pub fn push(&mut self, parent: HistoryIdx, phase: bool) -> HistoryIdx {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(HistoryNode { parent, phase });
+        HistoryIdx(idx)
+    }
+
+    pub fn reconstruct(&self, mut idx: HistoryIdx, out: &mut Vec<bool>) {
+        out.clear();
+        while idx.0 != 0 {
+            let node = self.nodes[idx.0 as usize];
+            out.push(node.phase);
+            idx = node.parent;
+        }
+        out.reverse();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BeamPath {
+    pub hap1: usize,
+    pub hap2: usize,
+    pub score: i32,
+    pub history: HistoryIdx,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActivePool {
+    n_ref: usize,
+    list: Vec<usize>,
+    bitset: Vec<u64>,
+}
+
+impl ActivePool {
+    pub fn new(n_ref: usize) -> Self {
+        let n_words = (n_ref + 63) / 64;
+        Self {
+            n_ref,
+            list: Vec::new(),
+            bitset: vec![0u64; n_words],
+        }
+    }
+
+    pub fn add(&mut self, hap: usize) {
+        if hap >= self.n_ref {
+            return;
+        }
+        let w = hap / 64;
+        let b = hap % 64;
+        if ((self.bitset[w] >> b) & 1) != 0 {
+            return;
+        }
+        self.bitset[w] |= 1u64 << b;
+        self.list.push(hap);
+    }
+
+    pub fn list(&self) -> &[usize] {
+        &self.list
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+}
+
+pub trait BeamInjector {
+    fn maybe_inject(&mut self, call_site_idx: usize, hi_idx: usize, marker: MarkerIdx, active_pool: &mut ActivePool);
+}
+
+
+/// PBWT-based dynamic injection (per marker).
+pub struct PbwtBeamIndex {
+    pub donors0: Vec<Vec<u32>>, // hi-freq marker idx -> donor hap ids for allele 0
+    pub donors1: Vec<Vec<u32>>, // hi-freq marker idx -> donor hap ids for allele 1
+}
+
+impl PbwtBeamIndex {
+    pub fn build<RefSpace>(
+        ref_gt: &GenotypeMatrix<Phased, RefSpace>,
+        alignment: &MarkerAlignment<AnyMarkerSpace, RefSpace>,
+        hi_freq_to_orig: &[usize],
+        k: usize,
+    ) -> Self {
+        let n_ref = ref_gt.n_haplotypes();
+        let mut pbwt = ReferencePbwt::new(n_ref);
+        let mut donors0: Vec<Vec<u32>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donors1: Vec<Vec<u32>> = Vec::with_capacity(hi_freq_to_orig.len());
+
+        let mut ref_alleles: Vec<u8> = vec![0u8; n_ref];
+        for (hi_idx, &orig_m) in hi_freq_to_orig.iter().enumerate() {
+            let r_idx = match alignment.target_to_ref.get(orig_m).and_then(|v| *v) {
+                Some(r) => r,
+                None => {
+                    donors0.push(Vec::new());
+                    donors1.push(Vec::new());
+                    continue;
+                }
+            };
+            let marker = ref_gt.marker(r_idx);
+            let n_alleles = marker.n_alleles();
+            if n_alleles != 2 {
+                donors0.push(Vec::new());
+                donors1.push(Vec::new());
+                continue;
+            }
+
+            let col = ref_gt.column(r_idx);
+            for h in 0..n_ref {
+                ref_alleles[h] = col.get(crate::data::haplotype::HapIdx::new(h as u32));
+            }
+
+            let mapping = alignment.allele_mappings.get(orig_m).and_then(|v| v.clone());
+            let (qa0, qa1) = if let Some(map) = mapping {
+                let m0 = map.targ_to_ref.get(0).copied().unwrap_or(-1);
+                let m1 = map.targ_to_ref.get(1).copied().unwrap_or(-1);
+                let qa0 = if m0 >= 0 && m0 <= 1 {
+                    PbwtStrictAllele::allele(m0 as u8).unwrap_or(PbwtStrictAllele::missing())
+                } else {
+                    PbwtStrictAllele::missing()
+                };
+                let qa1 = if m1 >= 0 && m1 <= 1 {
+                    PbwtStrictAllele::allele(m1 as u8).unwrap_or(PbwtStrictAllele::missing())
+                } else {
+                    PbwtStrictAllele::missing()
+                };
+                (qa0, qa1)
+            } else {
+                (PbwtStrictAllele::missing(), PbwtStrictAllele::missing())
+            };
+
+            let mut beams = [RankBeam::full(n_ref as u32), RankBeam::full(n_ref as u32)];
+            pbwt.advance_with_beams_strict(
+                &ref_alleles,
+                n_alleles,
+                hi_idx,
+                &[qa0, qa1],
+                &mut beams,
+            );
+            let mut d0: Vec<u32> = Vec::new();
+            let mut d1: Vec<u32> = Vec::new();
+            pbwt.select_donors_into(&beams[0], k, &mut d0);
+            pbwt.select_donors_into(&beams[1], k, &mut d1);
+            donors0.push(d0);
+            donors1.push(d1);
+        }
+
+        Self { donors0, donors1 }
+    }
+}
+
+pub struct PbwtInjector<'a> {
+    pub index: &'a PbwtBeamIndex,
+    pub k: usize,
+}
+
+impl<'a> PbwtInjector<'a> {
+    pub fn new(index: &'a PbwtBeamIndex, n_ref: usize, k: usize) -> Self {
+        let _ = n_ref;
+        Self { index, k }
+    }
+}
+
+impl<'a> BeamInjector for PbwtInjector<'a> {
+    fn maybe_inject(&mut self, call_site_idx: usize, hi_idx: usize, marker: MarkerIdx, active_pool: &mut ActivePool) {
+        let _ = (call_site_idx, marker);
+        if hi_idx >= self.index.donors0.len() {
+            return;
+        }
+        for &d in self.index.donors0[hi_idx].iter().take(self.k) {
+            active_pool.add(d as usize);
+        }
+        for &d in self.index.donors1[hi_idx].iter().take(self.k) {
+            active_pool.add(d as usize);
+        }
+    }
+}
+
+pub struct BeamPhaser<'a, RefSpace = AnyMarkerSpace> {
+    config: BeamConfig,
+    costs: BeamCosts,
+    packed_ref: &'a PackedRefView<RefSpace>,
+}
+
+impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
+    pub fn new(packed_ref: &'a PackedRefView<RefSpace>, params: &ModelParams, config: BeamConfig) -> Self {
+        Self {
+            config,
+            costs: BeamCosts::from_params(params),
+            packed_ref,
+        }
+    }
+
+    pub fn phase_sample<I: BeamInjector>(
+        &self,
+        condensed: &CondensedTarget,
+        sample_phase: &mut SamplePhase,
+        active_pool: &mut ActivePool,
+        injector: &mut I,
+    ) {
+        if active_pool.is_empty() {
+            active_pool.add(0);
+        }
+
+        let mut trie = HistoryTrie::new();
+        let mut beam: Vec<BeamPath> = self.init_beam(active_pool);
+
+        let n_calls = condensed.call_sites.len();
+        for i in 0..n_calls {
+            let segment = &condensed.segments[i];
+            let call = &condensed.call_sites[i];
+
+            // Segment consistency repair.
+            beam = self.apply_segment_constraints(&beam, segment, active_pool, call.switch_cost);
+            if beam.is_empty() {
+                beam = self.init_beam(active_pool);
+            }
+
+            // Dynamic injection on collapse or interval.
+            if i % self.config.inject_interval == 0 {
+                injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
+            } else if self.beam_collapsed(&beam) {
+                injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
+            }
+
+            // Call site branching (phase decisions)
+            let mut next: Vec<BeamPath> = Vec::with_capacity(self.config.beam_width * 2);
+            for path in &beam {
+                self.expand_call_site(path, call, active_pool, &mut trie, &mut next);
+            }
+            self.prune(&mut next);
+            beam = next;
+        }
+
+        // Apply trailing segment constraints
+        if let Some(last_seg) = condensed.segments.get(n_calls) {
+            beam = self.apply_segment_constraints(&beam, last_seg, active_pool, 0);
+            if beam.is_empty() {
+                beam = self.init_beam(active_pool);
+            }
+        }
+
+        // Pick best path
+        if let Some(best) = beam.iter().min_by_key(|p| p.score).cloned() {
+            let mut phases = Vec::new();
+            trie.reconstruct(best.history, &mut phases);
+            for (i, phase_swapped) in phases.iter().enumerate() {
+                let call = &condensed.call_sites[i];
+                let m = call.marker.as_usize();
+                if *phase_swapped {
+                    sample_phase.swap_alleles(m);
+                }
+                sample_phase.mark_phased(m);
+                sample_phase.set_phase_confidence(m, 1.0);
+            }
+        }
+    }
+
+    fn init_beam(&self, active_pool: &ActivePool) -> Vec<BeamPath> {
+        let mut beam = Vec::new();
+        let top = active_pool.list();
+        let k = (self.config.beam_width as f32).sqrt().ceil() as usize;
+        let n = k.min(top.len()).max(1);
+        for i in 0..n {
+            for j in 0..n {
+                let hap1 = top[i];
+                let hap2 = top[j];
+                beam.push(BeamPath { hap1, hap2, score: 0, history: HistoryIdx(0) });
+                if beam.len() >= self.config.beam_width {
+                    return beam;
+                }
+            }
+        }
+        beam
+    }
+
+    fn apply_segment_constraints(
+        &self,
+        beam: &[BeamPath],
+        segment: &crate::data::condensed::CondensedSegment,
+        active_pool: &ActivePool,
+        switch_cost: i32,
+    ) -> Vec<BeamPath> {
+        let mut out: Vec<BeamPath> = Vec::with_capacity(beam.len());
+        for path in beam {
+            let hap1_candidates = self.repair_hap(path.hap1, &segment.mask, active_pool, switch_cost);
+            let hap2_candidates = self.repair_hap(path.hap2, &segment.mask, active_pool, switch_cost);
+            for (h1, c1) in &hap1_candidates {
+                for (h2, c2) in &hap2_candidates {
+                    out.push(BeamPath {
+                        hap1: *h1,
+                        hap2: *h2,
+                        score: path.score + *c1 + *c2,
+                        history: path.history,
+                    });
+                }
+            }
+        }
+        self.prune_inplace(out)
+    }
+
+    fn repair_hap(
+        &self,
+        hap: usize,
+        mask: &[u64],
+        active_pool: &ActivePool,
+        switch_cost: i32,
+    ) -> Vec<(usize, i32)> {
+        let mut out: Vec<(usize, i32)> = Vec::new();
+        if mask_bit_is_set(mask, hap) {
+            out.push((hap, 0));
+            return out;
+        }
+        // switch to first consistent candidates
+        for &h in active_pool.list().iter().take(self.config.switch_candidates) {
+            if mask_bit_is_set(mask, h) {
+                out.push((h, switch_cost));
+            }
+            if out.len() >= self.config.switch_candidates {
+                break;
+            }
+        }
+        if out.is_empty() {
+            // allow staying with penalty
+            out.push((hap, switch_cost * 2));
+        }
+        out
+    }
+
+    fn expand_call_site(
+        &self,
+        path: &BeamPath,
+        call: &CallSite,
+        active_pool: &ActivePool,
+        trie: &mut HistoryTrie,
+        out: &mut Vec<BeamPath>,
+    ) {
+        let a1 = call.a1;
+        let a2 = call.a2;
+
+        // orientation: a1 on hap1, a2 on hap2
+        self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out);
+        // swapped orientation
+        self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out);
+    }
+
+    fn expand_orientation(
+        &self,
+        path: &BeamPath,
+        call: &CallSite,
+        hap1_al: u8,
+        hap2_al: u8,
+        swapped: bool,
+        active_pool: &ActivePool,
+        trie: &mut HistoryTrie,
+        out: &mut Vec<BeamPath>,
+    ) {
+        let hap1_candidates = self.repair_hap_for_allele(path.hap1, call.marker, hap1_al, active_pool, call.switch_cost);
+        let hap2_candidates = self.repair_hap_for_allele(path.hap2, call.marker, hap2_al, active_pool, call.switch_cost);
+        for (h1, c1, e1) in &hap1_candidates {
+            for (h2, c2, e2) in &hap2_candidates {
+                let history = trie.push(path.history, swapped);
+                out.push(BeamPath {
+                    hap1: *h1,
+                    hap2: *h2,
+                    score: path.score + *c1 + *c2 + *e1 + *e2,
+                    history,
+                });
+            }
+        }
+    }
+
+    fn repair_hap_for_allele(
+        &self,
+        hap: usize,
+        marker: MarkerIdx,
+        targ_allele: u8,
+        active_pool: &ActivePool,
+        switch_cost: i32,
+    ) -> Vec<(usize, i32, i32)> {
+        let mut out: Vec<(usize, i32, i32)> = Vec::new();
+        let marker_idx = marker.as_usize();
+        let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
+        if matches {
+            out.push((hap, 0, self.costs.match_cost));
+            return out;
+        }
+        // Try switching to matching haps
+        for &h in active_pool.list().iter().take(self.config.switch_candidates) {
+            if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                out.push((h, switch_cost, self.costs.match_cost));
+            }
+            if out.len() >= self.config.switch_candidates {
+                break;
+            }
+        }
+        if out.is_empty() {
+            // allow mismatch
+            out.push((hap, 0, self.costs.mismatch_cost));
+        }
+        out
+    }
+
+    #[inline]
+    fn ref_allele_matches(&self, marker: usize, hap: usize, targ_allele: u8) -> bool {
+        match self.packed_ref.ref_allele_targ(marker, hap) {
+            Some(a) => a == targ_allele,
+            None => false,
+        }
+    }
+
+    fn prune(&self, beam: &mut Vec<BeamPath>) {
+        if beam.len() <= self.config.beam_width {
+            return;
+        }
+        let k = self.config.beam_width;
+        beam.select_nth_unstable_by(k, |a, b| a.score.cmp(&b.score));
+        beam.truncate(k);
+    }
+
+    fn prune_inplace(&self, mut beam: Vec<BeamPath>) -> Vec<BeamPath> {
+        self.prune(&mut beam);
+        beam
+    }
+
+    fn beam_collapsed(&self, beam: &[BeamPath]) -> bool {
+        if beam.len() < 2 {
+            return true;
+        }
+        let mut best = i32::MAX;
+        let mut worst = i32::MIN;
+        for p in beam {
+            if p.score < best { best = p.score; }
+            if p.score > worst { worst = p.score; }
+        }
+        (worst - best) > self.config.collapse_gap
+    }
+}

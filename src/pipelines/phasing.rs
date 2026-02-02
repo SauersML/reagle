@@ -61,6 +61,9 @@ use crate::model::types::{combined_from_ref, CombinedHapId, CombinedHapSpace, Re
 use crate::model::states::ThreadedHaps;
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
+use crate::model::beam::{BeamConfig, BeamPhaser, ActivePool, PbwtBeamIndex, PbwtInjector};
+use crate::data::condensed::CondensedTarget;
+use crate::data::ref_packed::PackedRefView;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
 use crate::model::state_allocator::allocate_lms_sparse;
@@ -1744,23 +1747,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             Vec::new()
         };
 
-        // Build IBS2 segments for phase consistency (uses PositionMap fallback if no --map)
-        if let Some(bb) = &self.telemetry {
-            bb.set_stage(Stage::PhasingPrescan);
-            bb.set_producer_stage(Stage::PhasingPrescan);
-            bb.set_op("Phasing prescan: IBS2 segments");
-        }
-        eprintln!("Building IBS2 segments...");
-        let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
-        let n_with_ibs2 = (0..n_samples)
-            .filter(|&s| ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0)
-            .count();
-        eprintln!(
-            "Found {} samples with IBS2 segments, {} total",
-            n_with_ibs2,
-            ibs2.n_samples()
-        );
-
         // Log ploidy information from detected samples
         let samples = target_gt.samples_arc();
         let n_haploid = (0..n_samples)
@@ -1773,49 +1759,58 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             )));
         }
 
-        // Run phasing iterations (STAGE 1: high-frequency markers only)
-        let n_burnin = self.config.burnin;
-        let n_iterations = self.config.iterations;
-        let total_iterations = n_burnin + n_iterations;
+        // Stage 1 (condensed beam) - single pass
         if let Some(bb) = &self.telemetry {
+            bb.set_stage(Stage::PhasingMain);
+            bb.set_producer_stage(Stage::PhasingMain);
             bb.set_total_samples(n_samples as u64);
             bb.set_samples_processed(0);
             bb.set_total_markers(hi_freq_markers.len() as u64);
             bb.set_markers_processed(0);
-            bb.set_total_iterations(total_iterations as u64);
-            bb.set_current_iteration(0);
+            bb.set_total_iterations(1);
+            bb.set_current_iteration(1);
         }
 
-        // Recombination probabilities - mutable so EM can update them
+        let confidence_by_sample = build_sample_confidence(&target_gt);
+        let phase_mask = target_gt.phase_mask();
+        let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample, phase_mask);
         let mut stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
             .collect();
 
-        // Create SamplePhase instances to track phase state (with confidence)
-        let confidence_by_sample = build_sample_confidence(&target_gt);
-        let phase_mask = target_gt.phase_mask();
-        let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample, phase_mask);
+        if self.reference_gt.is_none() {
+            // Build IBS2 segments for phase consistency (target-only)
+            if let Some(bb) = &self.telemetry {
+                bb.set_stage(Stage::PhasingPrescan);
+                bb.set_producer_stage(Stage::PhasingPrescan);
+                bb.set_op("Phasing prescan: IBS2 segments");
+            }
+            eprintln!("Building IBS2 segments...");
+            let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
+            let n_with_ibs2 = (0..n_samples)
+                .filter(|&s| ibs2.n_segments(crate::data::haplotype::SampleIdx::new(s as u32)) > 0)
+                .count();
+            eprintln!(
+                "Found {} samples with IBS2 segments, {} total",
+                n_with_ibs2,
+                ibs2.n_samples()
+            );
 
-        let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
-        let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
-        let threaded_haps_vec = if self.config.profile {
-            info_span!("phase_prescan_build", markers = n_hi_freq, samples = n_samples).in_scope(
-                || {
-                    self.build_phasing_prescan_states(
-                        &target_gt,
-                        &geno,
-                        ref_gt,
-                        self.alignment.as_ref(),
-                        n_hi_freq,
-                        n_samples,
-                        &hi_freq_gen_positions,
-                        self.config.imp_step,
-                        Some(&hi_freq_to_orig),
-                    )
-                },
-            )?
-        } else {
-            self.build_phasing_prescan_states(
+            // Fallback: iterative HMM phasing without reference
+            let n_burnin = self.config.burnin;
+            let n_iterations = self.config.iterations;
+            let total_iterations = n_burnin + n_iterations;
+            if let Some(bb) = &self.telemetry {
+                bb.set_total_samples(n_samples as u64);
+                bb.set_samples_processed(0);
+                bb.set_total_markers(hi_freq_markers.len() as u64);
+                bb.set_markers_processed(0);
+                bb.set_total_iterations(total_iterations as u64);
+                bb.set_current_iteration(0);
+            }
+
+            let ref_gt = self.reference_gt.as_ref().map(|v| v.as_ref());
+            let threaded_haps_vec = self.build_phasing_prescan_states(
                 &target_gt,
                 &geno,
                 ref_gt,
@@ -1825,101 +1820,145 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 &hi_freq_gen_positions,
                 self.config.imp_step,
                 Some(&hi_freq_to_orig),
-            )?
-        };
-        let mut stable_main_iters = 0usize;
-
-        for it in 0..total_iterations {
-            let is_burnin = it < n_burnin;
-            let iter_type = if is_burnin { "burnin" } else { "main" };
-            eprintln!("Iteration {}/{} ({})", it + 1, total_iterations, iter_type);
-            if let Some(bb) = &self.telemetry {
-                let stage = if is_burnin {
-                    Stage::PhasingBurnin
-                } else {
-                    Stage::PhasingMain
-                };
-                bb.set_stage(stage);
-                bb.set_producer_stage(stage);
-                bb.set_current_iteration((it + 1) as u64);
-                bb.set_samples_processed(0);
-                bb.set_markers_processed(0);
-            }
-
-            // Update LR threshold for this iteration
-            self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
-
-            // Run phasing iteration with EM estimation (if enabled and during burnin)
-            let atomic_estimates = if is_burnin && self.config.em {
-                Some(crate::model::parameters::AtomicParamEstimates::new())
-            } else {
-                None
-            };
-
-            let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
-                &target_gt,
-                &mut geno,
-                &threaded_haps_vec,
-                &stage1_p_recomb,
-                &stage1_gen_dists,
-                &hi_freq_to_orig,
-                &stage1_blocks,
-                &ibs2,
-                &mut sample_phases,
-                &mut mcmc_paths,
-                atomic_estimates.as_ref(),
-                it,
             )?;
-            if let Some(bb) = &self.telemetry {
-                bb.set_samples_processed(n_samples as u64);
-                bb.set_markers_processed(hi_freq_markers.len() as u64);
-            }
+            let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            let mut stable_main_iters = 0usize;
 
-            // Update parameters from EM estimates and recompute recombination probabilities
-            if let Some(ref atomic) = atomic_estimates {
-                let est = atomic.to_estimates();
-                let mut params_updated = false;
-
-                if est.n_emit_obs() > 0 {
-                    self.params.update_p_mismatch(est.p_mismatch());
-                    params_updated = true;
-                }
-                if est.n_switch_obs() > 0 {
-                    self.params.update_recomb_intensity(est.recomb_intensity());
-                    params_updated = true;
-                }
-
-                // Recompute recombination probabilities with updated intensity
-                if params_updated {
-                    stage1_p_recomb = std::iter::once(0.0f32)
-                        .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-                        .collect();
+            for it in 0..total_iterations {
+                let is_burnin = it < n_burnin;
+                let iter_type = if is_burnin { "burnin" } else { "main" };
+                eprintln!("Iteration {}/{} ({})", it + 1, total_iterations, iter_type);
+                if let Some(bb) = &self.telemetry {
+                    let stage = if is_burnin {
+                        Stage::PhasingBurnin
+                    } else {
+                        Stage::PhasingMain
+                    };
+                    bb.set_stage(stage);
+                    bb.set_producer_stage(stage);
+                    bb.set_current_iteration((it + 1) as u64);
+                    bb.set_samples_processed(0);
+                    bb.set_markers_processed(0);
                 }
 
-                eprintln!(
-                    "  EM update: p_mismatch={:.6}, recomb_intensity={:.4}",
-                    self.params.p_mismatch, self.params.recomb_intensity
-                );
-            }
-
-            // Early stop if phase state has stabilized in main iterations.
-            if !is_burnin {
-                let remaining_hets = Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
-                let change = total_switches + total_phased;
-                let threshold = (remaining_hets / 100).max(1);
-                if change <= threshold {
-                    stable_main_iters += 1;
-                    if stable_main_iters >= 2 {
-                        eprintln!(
-                            "Phasing converged (changes {} <= threshold {} for 2 main iterations); stopping early.",
-                            change, threshold
-                        );
-                        break;
-                    }
+                self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+                let atomic_estimates = if is_burnin && self.config.em {
+                    Some(crate::model::parameters::AtomicParamEstimates::new())
                 } else {
-                    stable_main_iters = 0;
+                    None
+                };
+
+                let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
+                    &target_gt,
+                    &mut geno,
+                    &threaded_haps_vec,
+                    &stage1_p_recomb,
+                    &stage1_gen_dists,
+                    &hi_freq_to_orig,
+                    &stage1_blocks,
+                    &ibs2,
+                    &mut sample_phases,
+                    &mut mcmc_paths,
+                    atomic_estimates.as_ref(),
+                    it,
+                )?;
+                if let Some(bb) = &self.telemetry {
+                    bb.set_samples_processed(n_samples as u64);
+                    bb.set_markers_processed(hi_freq_markers.len() as u64);
+                }
+
+                if let Some(ref atomic) = atomic_estimates {
+                    let est = atomic.to_estimates();
+                    let mut params_updated = false;
+                    if est.n_emit_obs() > 0 {
+                        self.params.update_p_mismatch(est.p_mismatch());
+                        params_updated = true;
+                    }
+                    if est.n_switch_obs() > 0 {
+                        self.params.update_recomb_intensity(est.recomb_intensity());
+                        params_updated = true;
+                    }
+                    if params_updated {
+                        stage1_p_recomb = std::iter::once(0.0f32)
+                            .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                            .collect();
+                    }
+                }
+
+                if !is_burnin {
+                    let remaining_hets = Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
+                    let change = total_switches + total_phased;
+                    let threshold = (remaining_hets / 100).max(1);
+                    if change <= threshold {
+                        stable_main_iters += 1;
+                        if stable_main_iters >= 2 {
+                            eprintln!(
+                                "Phasing converged (changes {} <= threshold {} for 2 main iterations); stopping early.",
+                                change, threshold
+                            );
+                            break;
+                        }
+                    } else {
+                        stable_main_iters = 0;
+                    }
                 }
             }
+        } else {
+            let ref_gt = match self.reference_gt.as_ref() {
+                Some(r) => r.clone(),
+                None => unreachable!(),
+            };
+            let alignment = self.alignment.as_ref().ok_or_else(|| {
+                crate::error::ReagleError::config("Reference alignment missing for beam phasing")
+            })?;
+
+            let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
+            let beam_config = BeamConfig::default();
+            let beam_index = PbwtBeamIndex::build(&ref_gt, alignment, &hi_freq_to_orig, beam_config.inject_k);
+            let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
+
+            let threaded_haps_vec = self.build_phasing_prescan_states(
+                &target_gt,
+                &geno,
+                Some(ref_gt.as_ref()),
+                self.alignment.as_ref(),
+                n_hi_freq,
+                n_samples,
+                &hi_freq_gen_positions,
+                self.config.imp_step,
+                Some(&hi_freq_to_orig),
+            )?;
+
+            let n_target_haps = target_gt.n_haplotypes();
+            sample_phases
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(s, sp)| {
+                    let mut active_pool = ActivePool::new(packed_ref.n_ref_haps());
+                    let mut tmp = vec![crate::model::types::CombinedHapId::from(0u32); threaded_haps_vec[s].n_states()];
+                    let th = &threaded_haps_vec[s];
+                    th.materialize_at(0, &mut tmp);
+                    for id in tmp {
+                        let hid = id.as_u32() as usize;
+                        if hid >= n_target_haps {
+                            let ref_id = hid - n_target_haps;
+                            if ref_id < packed_ref.n_ref_haps() {
+                                active_pool.add(ref_id);
+                            }
+                        }
+                    }
+
+                    let condensed = CondensedTarget::build(
+                        sp,
+                        &hi_freq_to_orig,
+                        &hi_freq_gen_positions,
+                        &packed_ref,
+                        &self.params,
+                    );
+
+                    let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
+                    phaser.phase_sample(&condensed, sp, &mut active_pool, &mut injector);
+                });
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -2329,13 +2368,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         };
 
         let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
-        let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
-            .map(|m| {
-                let pos1 = target_gt.marker(MarkerIdx::new(m as u32)).pos;
-                let pos2 = target_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
-                gen_maps.gen_dist(chrom, pos1, pos2)
-            })
-            .collect();
 
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
         // Includes reference panel allele counts if available, ensuring homozygous
@@ -2381,27 +2413,50 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .collect()
             };
 
-        let n_burnin = self.config.burnin.min(3);
-        let n_iterations = self.config.iterations.min(6);
-        let total_iterations = n_burnin + n_iterations;
+        // Build hi-frequency / rare marker sets for Stage 1/2
+        let rare_threshold = self.config.rare;
+        let hi_freq_markers: Vec<usize> = (0..n_markers)
+            .filter(|&m| maf[m] >= rare_threshold)
+            .collect();
+        let rare_markers: Vec<usize> = (0..n_markers)
+            .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0)
+            .collect();
+        let hi_freq_to_orig: Vec<usize> = hi_freq_markers.clone();
+
+        // Genetic map for this window
+        let marker_map = if let Some(map) = gen_maps.get(chrom) {
+            MarkerMap::create(target_gt.markers(), map)
+        } else {
+            MarkerMap::from_positions(target_gt.markers())
+        };
+        let gen_positions_vec = marker_map.gen_positions().to_vec();
+        let hi_freq_gen_positions: Vec<f64> = hi_freq_markers
+            .iter()
+            .map(|&m| gen_positions_vec[m])
+            .collect();
+
+        let stage1_gen_dists: Vec<f64> = if hi_freq_markers.len() > 1 {
+            hi_freq_markers
+                .windows(2)
+                .map(|w| gen_positions_vec[w[1]] - gen_positions_vec[w[0]])
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if let Some(bb) = &self.telemetry {
+            bb.set_stage(Stage::PhasingMain);
+            bb.set_producer_stage(Stage::PhasingMain);
             bb.set_total_samples(n_samples as u64);
             bb.set_samples_processed(0);
-            bb.set_total_markers(n_markers as u64);
+            bb.set_total_markers(hi_freq_markers.len() as u64);
             bb.set_markers_processed(0);
-            bb.set_total_iterations(total_iterations as u64);
-            bb.set_current_iteration(0);
+            bb.set_total_iterations(1);
+            bb.set_current_iteration(1);
         }
-
-        // Recombination probabilities - mutable so EM can update them
-        let mut p_recomb: Vec<f32> = std::iter::once(0.0f32)
-            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-            .collect();
 
         // Create sample phases with overlap markers pre-phased
         let confidence_by_sample = build_sample_confidence(&target_gt);
-        // Note: sample_phases tracks phase state per marker but run_phase_baum_iteration
-        // updates geno directly. The overlap constraint is applied via apply_overlap_constraint.
         let phase_mask = target_gt.phase_mask();
         let mut sample_phases = self.create_sample_phases_with_overlap(
             &geno,
@@ -2411,69 +2466,144 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             phase_mask,
         );
 
-        let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
-
-        for it in 0..total_iterations {
-            let is_burnin = it < n_burnin;
-            self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+        if self.reference_gt.is_none() {
+            // Fallback: iterative HMM phasing without reference (overlap-aware)
+            let n_burnin = self.config.burnin.min(3);
+            let n_iterations = self.config.iterations.min(6);
+            let total_iterations = n_burnin + n_iterations;
             if let Some(bb) = &self.telemetry {
-                let stage = if is_burnin {
-                    Stage::PhasingBurnin
-                } else {
-                    Stage::PhasingMain
-                };
-                bb.set_stage(stage);
-                bb.set_producer_stage(stage);
-                bb.set_current_iteration((it + 1) as u64);
+                bb.set_total_samples(n_samples as u64);
                 bb.set_samples_processed(0);
+                bb.set_total_markers(n_markers as u64);
                 bb.set_markers_processed(0);
+                bb.set_total_iterations(total_iterations as u64);
+                bb.set_current_iteration(0);
             }
 
-            let atomic_estimates = if is_burnin && self.config.em {
-                Some(crate::model::parameters::AtomicParamEstimates::new())
-            } else {
-                None
+            let gen_dists: Vec<f64> = (0..n_markers.saturating_sub(1))
+                .map(|m| {
+                    let pos1 = target_gt.marker(MarkerIdx::new(m as u32)).pos;
+                    let pos2 = target_gt.marker(MarkerIdx::new((m + 1) as u32)).pos;
+                    gen_maps.gen_dist(chrom, pos1, pos2)
+                })
+                .collect();
+            let mut p_recomb: Vec<f32> = std::iter::once(0.0f32)
+                .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                .collect();
+
+            let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            for it in 0..total_iterations {
+                let is_burnin = it < n_burnin;
+                self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+                if let Some(bb) = &self.telemetry {
+                    let stage = if is_burnin {
+                        Stage::PhasingBurnin
+                    } else {
+                        Stage::PhasingMain
+                    };
+                    bb.set_stage(stage);
+                    bb.set_producer_stage(stage);
+                    bb.set_current_iteration((it + 1) as u64);
+                    bb.set_samples_processed(0);
+                    bb.set_markers_processed(0);
+                }
+
+                let atomic_estimates = if is_burnin && self.config.em {
+                    Some(crate::model::parameters::AtomicParamEstimates::new())
+                } else {
+                    None
+                };
+
+                self.run_phase_baum_iteration(
+                    target_gt,
+                    &mut geno,
+                    &p_recomb,
+                    &gen_dists,
+                    &mut sample_phases,
+                    &mut mcmc_paths,
+                    atomic_estimates.as_ref(),
+                    &confidence_by_sample,
+                )?;
+                if let Some(bb) = &self.telemetry {
+                    bb.set_samples_processed(n_samples as u64);
+                    bb.set_markers_processed(n_markers as u64);
+                }
+
+                if let Some(ref atomic) = atomic_estimates {
+                    let est = atomic.to_estimates();
+                    let mut params_updated = false;
+                    if est.n_emit_obs() > 0 {
+                        self.params.update_p_mismatch(est.p_mismatch());
+                        params_updated = true;
+                    }
+                    if est.n_switch_obs() > 0 {
+                        self.params.update_recomb_intensity(est.recomb_intensity());
+                        params_updated = true;
+                    }
+                    if params_updated {
+                        p_recomb = std::iter::once(0.0f32)
+                            .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                            .collect();
+                    }
+                }
+            }
+        } else {
+            let ref_gt = match self.reference_gt.as_ref() {
+                Some(r) => r.clone(),
+                None => unreachable!(),
             };
+            let alignment = self.alignment.as_ref().ok_or_else(|| {
+                crate::error::ReagleError::config("Reference alignment missing for beam phasing")
+            })?;
 
-            // Use existing run_phase_baum_iteration - overlap constraint is handled
-            // via the initial geno state set by apply_overlap_constraint
-            self.run_phase_baum_iteration(
+            let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
+            let beam_config = BeamConfig::default();
+            let beam_index =
+                PbwtBeamIndex::build(&ref_gt, alignment, &hi_freq_to_orig, beam_config.inject_k);
+            let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
+
+            let threaded_haps_vec = self.build_phasing_prescan_states(
                 target_gt,
-                &mut geno,
-                &p_recomb,
-                &gen_dists,
-                &mut sample_phases,
-                &mut mcmc_paths,
-                atomic_estimates.as_ref(),
-                &confidence_by_sample,
+                &geno,
+                Some(ref_gt.as_ref()),
+                self.alignment.as_ref(),
+                hi_freq_markers.len(),
+                n_samples,
+                &hi_freq_gen_positions,
+                self.config.imp_step,
+                Some(&hi_freq_to_orig),
             )?;
-            if let Some(bb) = &self.telemetry {
-                bb.set_samples_processed(n_samples as u64);
-                bb.set_markers_processed(n_markers as u64);
-            }
 
-            // Update parameters from EM estimates and recompute recombination probabilities
-            if let Some(ref atomic) = atomic_estimates {
-                let est = atomic.to_estimates();
-                let mut params_updated = false;
+            let n_target_haps = target_gt.n_haplotypes();
+            sample_phases
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(s, sp)| {
+                    let mut active_pool = ActivePool::new(packed_ref.n_ref_haps());
+                    let mut tmp = vec![crate::model::types::CombinedHapId::from(0u32); threaded_haps_vec[s].n_states()];
+                    let th = &threaded_haps_vec[s];
+                    th.materialize_at(0, &mut tmp);
+                    for id in tmp {
+                        let hid = id.as_u32() as usize;
+                        if hid >= n_target_haps {
+                            let ref_id = hid - n_target_haps;
+                            if ref_id < packed_ref.n_ref_haps() {
+                                active_pool.add(ref_id);
+                            }
+                        }
+                    }
 
-                if est.n_emit_obs() > 0 {
-                    self.params.update_p_mismatch(est.p_mismatch());
-                    params_updated = true;
-                }
-                if est.n_switch_obs() > 0 {
-                    self.params.update_recomb_intensity(est.recomb_intensity());
-                    params_updated = true;
-                }
-
-                // Recompute recombination probabilities with updated intensity
-                if params_updated {
-                    p_recomb = std::iter::once(0.0f32)
-                        .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-                        .collect();
-                }
-            }
-
+                    let condensed = CondensedTarget::build(
+                        sp,
+                        &hi_freq_to_orig,
+                        &hi_freq_gen_positions,
+                        &packed_ref,
+                        &self.params,
+                    );
+                    let mut injector =
+                        PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
+                    phaser.phase_sample(&condensed, sp, &mut active_pool, &mut injector);
+                });
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -2482,49 +2612,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // STAGE 2: Phase rare markers using HMM state probability interpolation
         // Now returns state probabilities for the next overlap region if requested
 
-        // Re-compute Stage 1 info for Stage 2
-        let rare_threshold = self.config.rare;
-        let hi_freq_markers: Vec<usize> = (0..n_markers)
-            .filter(|&m| maf[m] >= rare_threshold)
-            .collect();
-        let rare_markers: Vec<usize> = (0..n_markers)
-            .filter(|&m| maf[m] < rare_threshold && maf[m] > 0.0) // Exclude monomorphic
-            .collect();
-
-        // Compute stage 1 genetic distances and recombination probabilities
-        let stage1_gen_dists: Vec<f64> = if hi_freq_markers.len() > 1 {
-            // Need to reconstruct gen_positions from gen_dists/maps?
-            // Actually gen_dists is for ALL markers.
-            // Let's re-use gen_maps to get positions again (cheap)
-            let m_map = if let Some(map) = gen_maps.get(chrom) {
-                MarkerMap::create(target_gt.markers(), map)
-            } else {
-                MarkerMap::from_positions(target_gt.markers())
-            };
-            let positions = m_map.gen_positions();
-
-            hi_freq_markers
-                .windows(2)
-                .map(|w| positions[w[1]] - positions[w[0]])
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
-            .collect();
-
-        // We need gen_positions for stage 2
-        let marker_map_full = if let Some(map) = gen_maps.get(chrom) {
-            MarkerMap::create(target_gt.markers(), map)
-        } else {
-            MarkerMap::from_positions(target_gt.markers())
-        };
-        let gen_positions_vec = marker_map_full.gen_positions().to_vec();
-        let hi_freq_gen_positions: Vec<f64> = hi_freq_markers
-            .iter()
-            .map(|&m| gen_positions_vec[m])
             .collect();
 
         let next_overlap_handoff = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
