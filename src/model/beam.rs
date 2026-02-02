@@ -19,6 +19,8 @@ pub struct BeamConfig {
     pub inject_k: usize,
     pub collapse_gap: i32,
     pub prune_tolerance: i32,
+    pub pbwt_len_weight: i32,
+    pub pbwt_density_weight: i32,
 }
 
 impl Default for BeamConfig {
@@ -30,6 +32,9 @@ impl Default for BeamConfig {
             inject_k: 16,
             collapse_gap: 5_000_000, // in fixed-point cost units
             prune_tolerance: 30_000_000,
+            // Fixed-point weights for PBWT-derived terms (ln(1+x) scaled by 1e6).
+            pbwt_len_weight: 200_000,
+            pbwt_density_weight: 100_000,
         }
     }
 }
@@ -174,6 +179,10 @@ pub trait BeamInjector {
 pub struct PbwtBeamIndex {
     pub donors0: Vec<Option<Vec<u32>>>, // hi-freq marker idx -> donor hap ids for allele 0
     pub donors1: Vec<Option<Vec<u32>>>, // hi-freq marker idx -> donor hap ids for allele 1
+    pub match_len0: Vec<Option<f32>>, // hi-freq marker idx -> mean match length for allele 0
+    pub match_len1: Vec<Option<f32>>, // hi-freq marker idx -> mean match length for allele 1
+    pub density0: Vec<Option<f32>>,   // hi-freq marker idx -> density proxy for allele 0
+    pub density1: Vec<Option<f32>>,   // hi-freq marker idx -> density proxy for allele 1
     pub inject_interval: usize,
 }
 
@@ -189,12 +198,20 @@ impl PbwtBeamIndex {
         let mut pbwt = ReferencePbwt::new(n_ref);
         let mut donors0: Vec<Option<Vec<u32>>> = Vec::with_capacity(hi_freq_to_orig.len());
         let mut donors1: Vec<Option<Vec<u32>>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut match_len0: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut match_len1: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut density0: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut density1: Vec<Option<f32>> = Vec::with_capacity(hi_freq_to_orig.len());
 
         let mut ref_alleles: Vec<u8> = vec![0u8; n_ref];
         for (hi_idx, &orig_m) in hi_freq_to_orig.iter().enumerate() {
             if inject_interval == 0 || (hi_idx % inject_interval) != 0 {
                 donors0.push(None);
                 donors1.push(None);
+                match_len0.push(None);
+                match_len1.push(None);
+                density0.push(None);
+                density1.push(None);
                 continue;
             }
             let r_idx = match alignment.target_to_ref.get(orig_m).and_then(|v| *v) {
@@ -202,6 +219,10 @@ impl PbwtBeamIndex {
                 None => {
                     donors0.push(None);
                     donors1.push(None);
+                    match_len0.push(None);
+                    match_len1.push(None);
+                    density0.push(None);
+                    density1.push(None);
                     continue;
                 }
             };
@@ -210,6 +231,10 @@ impl PbwtBeamIndex {
             if n_alleles != 2 {
                 donors0.push(None);
                 donors1.push(None);
+                match_len0.push(None);
+                match_len1.push(None);
+                density0.push(None);
+                density1.push(None);
                 continue;
             }
 
@@ -251,10 +276,51 @@ impl PbwtBeamIndex {
             pbwt.select_donors_into(&beams[1], k, &mut d1);
             donors0.push(Some(d0));
             donors1.push(Some(d1));
+
+            let (ml0, ml1) = pbwt.mean_match_len_by_allele(&ref_alleles, hi_idx);
+            match_len0.push(Some(ml0));
+            match_len1.push(Some(ml1));
+            let dens0 = beam_span(&beams[0]) as f32;
+            let dens1 = beam_span(&beams[1]) as f32;
+            density0.push(Some(dens0));
+            density1.push(Some(dens1));
         }
 
-        Self { donors0, donors1, inject_interval }
+        Self {
+            donors0,
+            donors1,
+            match_len0,
+            match_len1,
+            density0,
+            density1,
+            inject_interval,
+        }
     }
+
+    pub fn stats_for_hi(&self, hi_idx: usize) -> (f32, f32, f32, f32) {
+        let mut idx = hi_idx;
+        if idx >= self.match_len0.len() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        if self.match_len0[idx].is_none() && self.inject_interval > 0 {
+            idx = hi_idx - (hi_idx % self.inject_interval);
+        }
+        let len0 = self.match_len0.get(idx).and_then(|v| *v).unwrap_or(0.0);
+        let len1 = self.match_len1.get(idx).and_then(|v| *v).unwrap_or(0.0);
+        let den0 = self.density0.get(idx).and_then(|v| *v).unwrap_or(0.0);
+        let den1 = self.density1.get(idx).and_then(|v| *v).unwrap_or(0.0);
+        (len0, len1, den0, den1)
+    }
+}
+
+fn beam_span(beam: &RankBeam) -> u32 {
+    let mut total = 0u32;
+    for &(l, r) in beam.intervals() {
+        if r > l {
+            total = total.saturating_add(r - l);
+        }
+    }
+    total
 }
 
 pub struct PbwtInjector<'a> {
@@ -709,6 +775,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.marker,
             hap1_al,
             hap1_freq,
+            if swapped { call.pbwt_len_a2 } else { call.pbwt_len_a1 },
+            if swapped { call.pbwt_density_a2 } else { call.pbwt_density_a1 },
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -720,6 +788,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.marker,
             hap2_al,
             hap2_freq,
+            if swapped { call.pbwt_len_a1 } else { call.pbwt_len_a2 },
+            if swapped { call.pbwt_density_a1 } else { call.pbwt_density_a2 },
             call.fixed,
             active_pool,
             call.switch_cost,
@@ -764,6 +834,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         marker: MarkerIdx,
         targ_allele: u8,
         targ_freq: f32,
+        pbwt_match_len: f32,
+        pbwt_density: f32,
         fixed: bool,
         active_pool: &ActivePool,
         switch_cost: i32,
@@ -798,6 +870,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let effective_mismatch_cost = ((self.costs.mismatch_cost as f64) + info_content)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        let pbwt_cost = self.pbwt_emission_cost(pbwt_match_len, pbwt_density);
+        let effective_match_cost = effective_match_cost.saturating_add(pbwt_cost);
+        let effective_mismatch_cost = effective_mismatch_cost.saturating_add(pbwt_cost);
 
         // Switch cost: recombination penalty is already encoded in switch_cost.
         // The optimal switch criterion compares LLR gain vs recombination penalty.
@@ -853,6 +928,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         // Always allow staying with a mismatch cost to avoid forced switching.
         // Mismatch cost is MAF-dependent: rare allele mismatch is more surprising.
         out.push((hap, 0, effective_mismatch_cost));
+    }
+
+    #[inline]
+    fn pbwt_emission_cost(&self, match_len: f32, density: f32) -> i32 {
+        let len_term = (1.0 + match_len.max(0.0) as f64).ln();
+        let density_term = (1.0 + density.max(0.0) as f64).ln();
+        let cost = (self.config.pbwt_density_weight as f64 * density_term)
+            - (self.config.pbwt_len_weight as f64 * len_term);
+        cost.round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
 
     #[inline]

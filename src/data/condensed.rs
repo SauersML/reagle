@@ -24,6 +24,14 @@ pub struct CallSite {
     pub a1_freq: f32,
     /// Frequency of allele a2 in the reference panel (for TMRCA-aware scoring).
     pub a2_freq: f32,
+    /// PBWT-derived match length proxy for allele a1 (in marker steps).
+    pub pbwt_len_a1: f32,
+    /// PBWT-derived match length proxy for allele a2 (in marker steps).
+    pub pbwt_len_a2: f32,
+    /// PBWT-derived density proxy for allele a1 (count of candidate haps).
+    pub pbwt_density_a1: f32,
+    /// PBWT-derived density proxy for allele a2 (count of candidate haps).
+    pub pbwt_density_a2: f32,
     pub switch_cost: i32,
     pub flip_cost: i32,
     pub fixed: bool,
@@ -44,6 +52,7 @@ impl CondensedTarget {
         hi_freq_to_orig: &[usize],
         hi_freq_gen_positions: &[f64],
         allele_freqs: Option<&[(f32, f32)]>,
+        pbwt_stats: Option<&[(f32, f32, f32, f32)]>,
         packed_ref: &PackedRefView<RefSpace>,
         params: &ModelParams,
     ) -> Self {
@@ -98,6 +107,26 @@ impl CondensedTarget {
                         (fa1.max(1e-6), fa2.max(1e-6))
                     })
                     .unwrap_or((0.5, 0.5));
+                let (pbwt_len_a1, pbwt_len_a2, pbwt_density_a1, pbwt_density_a2) = pbwt_stats
+                    .and_then(|stats| stats.get(hi_idx).copied())
+                    .map(|(len0, len1, den0, den1)| {
+                        let (l1, d1) = if a1 == 0 {
+                            (len0, den0)
+                        } else if a1 == 1 {
+                            (len1, den1)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let (l2, d2) = if a2 == 0 {
+                            (len0, den0)
+                        } else if a2 == 1 {
+                            (len1, den1)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        (l1, l2, d1, d2)
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0, 0.0));
 
                 call_sites.push(CallSite {
                     marker,
@@ -106,6 +135,10 @@ impl CondensedTarget {
                     a2,
                     a1_freq,
                     a2_freq,
+                    pbwt_len_a1,
+                    pbwt_len_a2,
+                    pbwt_density_a1,
+                    pbwt_density_a2,
                     switch_cost,
                     flip_cost,
                     fixed,
@@ -180,6 +213,10 @@ impl CondensedTarget {
                 a2: cs.a2,
                 a1_freq: cs.a1_freq,
                 a2_freq: cs.a2_freq,
+                pbwt_len_a1: cs.pbwt_len_a1,
+                pbwt_len_a2: cs.pbwt_len_a2,
+                pbwt_density_a1: cs.pbwt_density_a1,
+                pbwt_density_a2: cs.pbwt_density_a2,
                 switch_cost,
                 flip_cost,
                 fixed: cs.fixed,

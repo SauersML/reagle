@@ -1938,13 +1938,18 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             };
 
             let beam_config = BeamConfig::default();
-        let beam_index = PbwtBeamIndex::build(
-            &ref_gt,
-            alignment,
-            &hi_freq_to_orig,
-            beam_config.inject_k,
-            beam_config.inject_interval,
-        );
+            let beam_index = PbwtBeamIndex::build(
+                &ref_gt,
+                alignment,
+                &hi_freq_to_orig,
+                beam_config.inject_k,
+                beam_config.inject_interval,
+            );
+            let pbwt_stats: Option<Vec<(f32, f32, f32, f32)>> = Some(
+                (0..hi_freq_to_orig.len())
+                    .map(|hi_idx| beam_index.stats_for_hi(hi_idx))
+                    .collect(),
+            );
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
             let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
@@ -2024,6 +2029,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         &hi_freq_to_orig,
                         &hi_freq_gen_positions,
                         hi_freq_allele_freqs.as_deref(),
+                        pbwt_stats.as_deref(),
                         &packed_ref,
                         &self.params,
                     );
@@ -2679,6 +2685,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 beam_config.inject_k,
                 beam_config.inject_interval,
             );
+            let pbwt_stats: Option<Vec<(f32, f32, f32, f32)>> = Some(
+                (0..hi_freq_to_orig.len())
+                    .map(|hi_idx| beam_index.stats_for_hi(hi_idx))
+                    .collect(),
+            );
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
             // Compute allele frequencies for TMRCA-aware switch costs
@@ -2739,6 +2750,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         &hi_freq_to_orig,
                         &hi_freq_gen_positions,
                         hi_freq_allele_freqs.as_deref(),
+                        pbwt_stats.as_deref(),
                         &packed_ref,
                         &self.params,
                     );

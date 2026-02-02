@@ -661,6 +661,32 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
     }
 
+    pub fn mean_match_len_by_allele(&self, ref_alleles: &[u8], marker: usize) -> (f32, f32) {
+        let mut sum0 = 0f32;
+        let mut sum1 = 0f32;
+        let mut cnt0 = 0f32;
+        let mut cnt1 = 0f32;
+        let m = marker as i32;
+        for (pos, hap) in self.ppa.iter().enumerate() {
+            let h = hap.to_usize();
+            let allele = ref_alleles.get(h).copied().unwrap_or(255);
+            if allele == 0 || allele == 1 {
+                let start = self.div.get(pos).copied().unwrap_or(m);
+                let len = (m - start).max(0) as f32;
+                if allele == 0 {
+                    sum0 += len;
+                    cnt0 += 1.0;
+                } else {
+                    sum1 += len;
+                    cnt1 += 1.0;
+                }
+            }
+        }
+        let mean0 = if cnt0 > 0.0 { sum0 / cnt0 } else { 0.0 };
+        let mean1 = if cnt1 > 0.0 { sum1 / cnt1 } else { 0.0 };
+        (mean0, mean1)
+    }
+
 }
 
 pub enum ReferencePbwt {
@@ -733,6 +759,17 @@ impl ReferencePbwt {
                 query_alleles,
                 beams,
             ),
+        }
+    }
+
+    pub fn mean_match_len_by_allele(
+        &self,
+        ref_alleles: &[u8],
+        marker: usize,
+    ) -> (f32, f32) {
+        match self {
+            Self::U16(inner) => inner.mean_match_len_by_allele(ref_alleles, marker),
+            Self::U32(inner) => inner.mean_match_len_by_allele(ref_alleles, marker),
         }
     }
 
