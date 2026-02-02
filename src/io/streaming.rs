@@ -971,11 +971,11 @@ impl StreamingVcfReader {
             .collect::<Result<Vec<_>>>()?;
 
         // Skip QUAL and FILTER
-        let _ = next_field()?;
-        let _ = next_field()?;
+        next_field()?;
+        next_field()?;
 
         // Skip INFO
-        let _ = next_field()?;
+        next_field()?;
 
         // Parse FORMAT to find GT position
         let format = next_field()?;

@@ -948,14 +948,14 @@ fn ensure_binary_reference(ref_path: &Path, config: &Config) -> Result<PathBuf> 
                         "Reference conversion rename failed at {:?}: {}. Trying next location...",
                         path, err
                     );
-                    let _ = std::fs::remove_file(&tmp_path);
+                    std::fs::remove_file(&tmp_path).ok();
                     continue;
                 }
                 eprintln!("Converted reference VCF to BREF3 at {:?}", path);
                 return Ok(path);
             }
             Err(err) => {
-                let _ = std::fs::remove_file(&tmp_path);
+                std::fs::remove_file(&tmp_path).ok();
                 eprintln!(
                     "Reference conversion failed at {:?}: {}. Trying next location...",
                     path, err
@@ -979,9 +979,13 @@ struct PrescanCacheGuard {
     path: PathBuf,
 }
 
+impl PrescanCacheGuard {
+    fn touch(&self) {}
+}
+
 impl Drop for PrescanCacheGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        std::fs::remove_file(&self.path).ok();
     }
 }
 
@@ -1126,7 +1130,7 @@ fn prepare_reference_data(
         let mut ref_reader = match open_ref_reader(&ref_path) {
             Ok(reader) => reader,
             Err(err) => {
-                let _ = tx.send(Err(err.into()));
+                tx.send(Err(err.into())).ok();
                 return Ok(());
             }
         };
@@ -1143,11 +1147,11 @@ fn prepare_reference_data(
                     }
                 }
                 Ok(None) => {
-                    let _ = tx.send(Ok(None));
+                    tx.send(Ok(None)).ok();
                     break;
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(err.into()));
+                    tx.send(Err(err.into())).ok();
                     break;
                 }
             }
@@ -1246,7 +1250,7 @@ fn prepare_reference_data(
         Ok(())
     })();
 
-    let _ = reader_handle
+    reader_handle
         .join()
         .map_err(|_| ReagleError::vcf("Reference reader thread panicked".to_string()))??;
     read_result?;
@@ -1277,7 +1281,7 @@ fn prepare_reference_data(
         let writer = cache_writer.ok_or_else(|| {
             ReagleError::vcf("Prescan cache writer missing after scan".to_string())
         })?;
-        let _ = writer.finish()?;
+        writer.finish()?;
         let meta = PrescanCacheMeta {
             path: path.clone(),
             n_ref_haps,
@@ -2400,7 +2404,7 @@ impl crate::pipelines::ImputationPipeline {
             }
             ReferenceData::OnDisk { guard, .. } => {
                 eprintln!("Reference mode: prescan cache (double-pass)");
-                let _ = guard;
+                guard.touch();
             }
         }
 
@@ -2691,7 +2695,7 @@ impl crate::pipelines::ImputationPipeline {
                         next_handoff = handoff;
                         // Drop heavy reference data before writing to reduce peak RSS.
                         // Drop reference genotypes/columns to free large buffers before write.
-                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        std::mem::take(&mut ref_window.ref_columns);
                         ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {
@@ -2949,7 +2953,7 @@ impl crate::pipelines::ImputationPipeline {
                         next_handoff = handoff;
                         // Drop heavy reference data before writing to reduce peak RSS.
                         // Drop reference genotypes/columns to free large buffers before write.
-                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        std::mem::take(&mut ref_window.ref_columns);
                         ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {

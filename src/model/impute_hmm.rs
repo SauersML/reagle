@@ -1183,7 +1183,7 @@ fn run_impute_hmm_seqcoded<Space>(
                         transition_haps,
                     );
                 } else {
-                    let _ = fill_pattern_emissions(
+                    fill_pattern_emissions(
                         seq_patterns.seq_alleles,
                         probs,
                         current_error,
@@ -1499,7 +1499,7 @@ fn run_impute_hmm_dict<Space>(
                         &mut ws.state_patterns,
                         &mut ws.dict_pattern_alleles,
                     );
-                    let _ = fill_pattern_emissions(
+                    fill_pattern_emissions(
                         dict_patterns.pattern_alleles,
                         probs,
                         current_error,

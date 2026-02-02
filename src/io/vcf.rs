@@ -719,8 +719,8 @@ impl VcfReader {
             .collect::<Result<Vec<_>>>()?;
 
         // Skip QUAL and FILTER
-        let _ = next_field()?;
-        let _ = next_field()?;
+        next_field()?;
+        next_field()?;
 
         // Parse INFO field for END tag (field[7])
         // This is important for structural variants and gVCF blocks

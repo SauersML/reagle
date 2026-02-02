@@ -1352,7 +1352,7 @@ impl StreamingRefVcfReader {
             .ok_or_else(|| anyhow::anyhow!("VCF line missing POS"))?;
         let pos: u32 = lexical_parse(pos_str.as_bytes()).context("Invalid POS")?;
 
-        let _ = fields
+        fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("VCF line missing ID"))?;
         let id = None;

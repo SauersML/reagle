@@ -260,12 +260,12 @@ fn maybe_write_pprof(guard: pprof::ProfilerGuard<'static>) {
                 line.push(';');
                 for frame in key.frames.iter().rev() {
                     for symbol in frame.iter().rev() {
-                        let _ = write!(&mut line, "{};", symbol);
+                        write!(&mut line, "{};", symbol).ok();
                     }
                 }
                 line.pop();
-                let _ = write!(&mut line, " {}", value);
-                let _ = writeln!(file, "{}", line);
+                write!(&mut line, " {}", value).ok();
+                writeln!(file, "{}", line).ok();
             }
             eprintln!("pprof folded stacks written to {}", folded_output_path);
         }
