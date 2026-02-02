@@ -3757,6 +3757,7 @@ impl crate::pipelines::ImputationPipeline {
         let n_target_haps = n_target_samples * 2;
         let mut sm_posts_by_hap: Vec<Vec<AllelePosteriors>> =
             vec![Vec::with_capacity(output_markers); n_target_haps];
+        let mut sm_missing_count: Vec<u32> = vec![0; n_target_haps];
         // Information-weighted confusion: weight donor instability by -log(π(X))
         // This is optimal Li-Stephens scoring: rare allele switches are more informative
         let mut sm_low_conf_weighted: Vec<f32> = vec![0.0; n_target_haps];
@@ -3864,6 +3865,13 @@ impl crate::pipelines::ImputationPipeline {
                 })
                 .unwrap_or_default();
             
+            // Precompute allele-frequency prior for missing targets at this marker.
+            let freq_prior = ref_allele_freqs
+                .get(ref_m)
+                .and_then(|freqs| freqs.get(1).copied())
+                .unwrap_or(0.5)
+                .clamp(1e-6, 1.0 - 1e-6);
+
             for hap_idx in 0..n_target_haps {
                 let beam = &beams[hap_idx];
                 pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
@@ -3889,6 +3897,8 @@ impl crate::pipelines::ImputationPipeline {
                 // Track total information for this haplotype
                 if target_allele != 255 {
                     sm_total_info[hap_idx] += info_weight;
+                } else {
+                    sm_missing_count[hap_idx] = sm_missing_count[hap_idx].saturating_add(1);
                 }
                 
                 // Information-weighted donor instability tracking
@@ -3913,8 +3923,14 @@ impl crate::pipelines::ImputationPipeline {
                     RefHapId::new(donor as u32),
                 );
                 if store {
-                    let allele = col.get(HapIdx::new(donor));
-                    sm_posts_by_hap[hap_idx].push(allele_to_posterior(n_alleles, allele));
+                    let ap = if target_allele == 255 {
+                        // Missing target: fall back to population prior to avoid hard-calling
+                        AllelePosteriors::Biallelic(freq_prior)
+                    } else {
+                        let allele = col.get(HapIdx::new(donor));
+                        allele_to_posterior(n_alleles, allele)
+                    };
+                    sm_posts_by_hap[hap_idx].push(ap);
                 }
             }
         }
@@ -3952,18 +3968,24 @@ impl crate::pipelines::ImputationPipeline {
                     .and_then(|p| p.get(h2_idx.as_usize()));
 
                 let (input_probs_h1, input_probs_h2) = build_input_probs_pair(h1_idx, h2_idx, s);
-                // Information-weighted fallback decision: ratio of confused info to total info
-                // This is optimal Li-Stephens: triggers HMM when significant genealogical evidence was unexplained
+                // Information-weighted fallback decision: ratio of confused info to total info.
+                // Missing targets provide no information, so treat missingness as low confidence.
                 let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
                 let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
                 let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
                 let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
+                let missing_ratio_h1 = sm_missing_count[h1_idx.as_usize()] as f32
+                    / output_markers.max(1) as f32;
+                let missing_ratio_h2 = sm_missing_count[h2_idx.as_usize()] as f32
+                    / output_markers.max(1) as f32;
                 let donors_h1 = &sm_donor_counts[h1_idx.as_usize()];
                 let donors_h2 = &sm_donor_counts[h2_idx.as_usize()];
                 // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
                 let use_hmm_h1 = conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                    || missing_ratio_h1 > 0.5
                     || donors_h1.len() < SM_MATCH_MIN_DONORS;
                 let use_hmm_h2 = conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                    || missing_ratio_h2 > 0.5
                     || donors_h2.len() < SM_MATCH_MIN_DONORS;
 
                 let mut warned_no_priors = false;
