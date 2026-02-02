@@ -6756,6 +6756,101 @@ fn sample_dynamic_mcmc(
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
         }
+    } else if n_markers <= 500 {
+        // Inline heuristic for dynamic MCMC: scan top neighbors pairwise
+        // This is similar to find_best_constant_pair_with_buffer but uses phase_ibs directly
+        // and only scans top neighbors to be fast.
+        let heuristic_limit = 16.min(neighbors.len());
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_pair = None;
+
+        for i in 0..heuristic_limit {
+            let h1 = neighbors[i];
+            for j in 0..i {
+                let h2 = neighbors[j];
+                let mut score = 0.0;
+                let mut informative = 0;
+
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 && a2 == 255 {
+                        continue;
+                    }
+
+                    informative += 1;
+                    let r1 = phase_ibs.allele(m, h1);
+                    let r2 = phase_ibs.allele(m, h2);
+
+                    if r1 == 255 || r2 == 255 {
+                        continue;
+                    }
+
+                    let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                    let compatible = if is_het {
+                        (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                    } else {
+                        let obs = if a1 != 255 {
+                            a1
+                        } else {
+                            a2
+                        };
+                        r1 == obs && r2 == obs
+                    };
+
+                    if compatible {
+                        score += 1.0;
+                    } else {
+                        score -= 1.0;
+                    }
+                }
+
+                if informative > 0 && score > best_score {
+                    best_score = score;
+                    best_pair = Some((h1, h2, score, informative));
+                }
+            }
+        }
+
+        let mut heuristic_applied = false;
+        if let Some((h1, h2, score, informative)) = best_pair {
+            let threshold = 0.9 * (informative as f32);
+            if score >= threshold {
+                // Determine best orientation
+                let mut score_direct = 0;
+                let mut score_flip = 0;
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 != 255 && a2 != 255 && a1 != a2 {
+                        let r1 = phase_ibs.allele(m, h1);
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r1 == a1 && r2 == a2 {
+                            score_direct += 1;
+                        }
+                        if r1 == a2 && r2 == a1 {
+                            score_flip += 1;
+                        }
+                    }
+                }
+
+                if score_flip > score_direct {
+                    path1_ref.fill(h2);
+                    path2_ref.fill(h1);
+                } else {
+                    path1_ref.fill(h1);
+                    path2_ref.fill(h2);
+                }
+                heuristic_applied = true;
+            }
+        }
+
+        if !heuristic_applied {
+            if let Some(&seed_hap) = neighbors.first() {
+                path1_ref.fill(seed_hap);
+                path2_ref.fill(seed_hap);
+            }
+        }
     } else if let Some(&seed_hap) = neighbors.first() {
         path1_ref.fill(seed_hap);
         path2_ref.fill(seed_hap);
@@ -7182,7 +7277,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.5 * (informative as f32);
+    let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > 500 {
         return None;
     }
