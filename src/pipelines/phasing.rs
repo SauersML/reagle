@@ -1923,6 +1923,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         );
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
+            let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
+
             let threaded_haps_vec = self.build_phasing_prescan_states(
                 &target_gt,
                 &geno,
@@ -1934,6 +1936,17 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 self.config.imp_step,
                 Some(&hi_freq_to_orig),
             )?;
+
+            let original_unphased: Vec<Vec<usize>> = sample_phases
+                .iter()
+                .map(|sp| {
+                    hi_freq_to_orig
+                        .iter()
+                        .copied()
+                        .filter(|&m| sp.is_unphased(m))
+                        .collect()
+                })
+                .collect();
 
             let n_target_haps = target_gt.n_haplotypes();
             sample_phases
@@ -1990,6 +2003,29 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
                     phaser.phase_sample(&condensed, sp, &mut active_pool, &mut injector);
                 });
+
+            for (s, sp) in sample_phases.iter_mut().enumerate() {
+                for &m in original_unphased[s].iter() {
+                    sp.mark_unphased(m);
+                }
+            }
+
+            // Micro-HMM refinement on hi-frequency markers (single pass).
+            let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            let _ = self.run_phase_baum_iteration_stage1(
+                &target_gt,
+                &mut geno,
+                &threaded_haps_vec,
+                &stage1_p_recomb,
+                &stage1_gen_dists,
+                &hi_freq_to_orig,
+                &stage1_blocks,
+                &ibs2,
+                &mut sample_phases,
+                &mut mcmc_paths,
+                None,
+                0,
+            )?;
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes

@@ -438,7 +438,21 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
         let k = (self.config.beam_width as f32).sqrt().ceil() as usize;
         let n = k.min(list.len()).max(1);
-        let picks = sample_even(list, n);
+        let mut picks: Vec<usize> = Vec::with_capacity(n);
+        let tail_n = n.min(list.len());
+        let tail_start = list.len().saturating_sub(tail_n);
+        picks.extend_from_slice(&list[tail_start..]);
+        if picks.len() < n {
+            let spread = sample_even(list, n);
+            for h in spread {
+                if !picks.contains(&h) {
+                    picks.push(h);
+                    if picks.len() >= n {
+                        break;
+                    }
+                }
+            }
+        }
         for i in 0..picks.len() {
             for j in 0..picks.len() {
                 let hap1 = picks[i];
