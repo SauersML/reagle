@@ -4087,8 +4087,8 @@ impl crate::pipelines::ImputationPipeline {
                 let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
                 let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
                 let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
-                let sufficient_info_h1 = sm_total_info[h1_idx.as_usize()] >= min_info_nats;
-                let sufficient_info_h2 = sm_total_info[h2_idx.as_usize()] >= min_info_nats;
+                let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
+                let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
                 let no_info_h1 = sm_total_info[h1_idx.as_usize()] <= 0.0;
                 let no_info_h2 = sm_total_info[h2_idx.as_usize()] <= 0.0;
                 let has_priors_h1 = priors_h1.map(|p| !p.is_empty()).unwrap_or(false);
@@ -4102,7 +4102,7 @@ impl crate::pipelines::ImputationPipeline {
                     false
                 } else {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                        || sufficient_info_h1
+                        || insufficient_info_h1
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
                 };
                 let use_hmm_h2 = if has_priors_h2 {
@@ -4111,7 +4111,7 @@ impl crate::pipelines::ImputationPipeline {
                     false
                 } else {
                     conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                        || sufficient_info_h2
+                        || insufficient_info_h2
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
                 };
 
