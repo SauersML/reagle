@@ -50,42 +50,10 @@ impl BeamCosts {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HistoryIdx(pub u32);
-
 #[derive(Clone, Copy, Debug)]
-pub struct HistoryNode {
-    pub parent: HistoryIdx,
-    pub phase: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct HistoryTrie {
-    nodes: Vec<HistoryNode>,
-}
-
-impl HistoryTrie {
-    pub fn new() -> Self {
-        Self {
-            nodes: vec![HistoryNode { parent: HistoryIdx(0), phase: false }],
-        }
-    }
-
-    pub fn push(&mut self, parent: HistoryIdx, phase: bool) -> HistoryIdx {
-        let idx = self.nodes.len() as u32;
-        self.nodes.push(HistoryNode { parent, phase });
-        HistoryIdx(idx)
-    }
-
-    pub fn reconstruct(&self, mut idx: HistoryIdx, out: &mut Vec<bool>) {
-        out.clear();
-        while idx.0 != 0 {
-            let node = self.nodes[idx.0 as usize];
-            out.push(node.phase);
-            idx = node.parent;
-        }
-        out.reverse();
-    }
+pub struct BackPtr {
+    pub prev: u32,
+    pub swapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -95,10 +63,11 @@ pub struct BeamPath {
     pub cluster1: u16,
     pub cluster2: u16,
     pub score: i32,
-    pub history: HistoryIdx,
     pub last_swapped: bool,
     pub history_bits: u64,
     pub history_len: u8,
+    pub prev_idx: u32,
+    pub prev_swapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -545,7 +514,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             active_pool.add(0);
         }
 
-        let mut trie = HistoryTrie::new();
         let mut scratch = BeamScratch::new(self.config.switch_candidates.max(4));
 
         // Prefer an unfixed call site for initialization so both orientations are informative.
@@ -561,6 +529,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         };
 
         let n_calls = condensed.call_sites.len();
+        let mut backptrs: Vec<Vec<BackPtr>> = Vec::with_capacity(n_calls);
         let mut logsum_unswapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         let mut logsum_swapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         for i in 0..n_calls {
@@ -603,21 +572,29 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             } else {
                 i32::MAX
             };
-            for path in &beam {
-                self.expand_call_site(
-                    path,
-                    call,
-                    active_pool,
-                    &mut trie,
-                    &mut next,
-                    &mut logsum_unswapped,
-                    &mut logsum_swapped,
-                    i,
-                    cutoff,
-                    &mut scratch,
-                );
-            }
+        for (path_idx, path) in beam.iter().enumerate() {
+            self.expand_call_site(
+                path,
+                path_idx as u32,
+                call,
+                active_pool,
+                &mut next,
+                &mut logsum_unswapped,
+                &mut logsum_swapped,
+                i,
+                cutoff,
+                &mut scratch,
+            );
+        }
             self.prune_and_collapse(&mut next);
+            let mut step_ptrs: Vec<BackPtr> = Vec::with_capacity(next.len());
+            for p in &next {
+                step_ptrs.push(BackPtr {
+                    prev: p.prev_idx,
+                    swapped: p.prev_swapped,
+                });
+            }
+            backptrs.push(step_ptrs);
             beam = next;
         }
 
@@ -636,12 +613,21 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
 
         // Pick best path
-        if let Some(best) = beam.iter().min_by_key(|p| p.score).cloned() {
-            let mut phases = Vec::new();
-            trie.reconstruct(best.history, &mut phases);
-            if phases.len() < n_calls {
-                phases.resize(n_calls, false);
+        if let Some((best_idx, _)) = beam.iter().enumerate().min_by_key(|(_, p)| p.score) {
+            let mut phases = Vec::with_capacity(n_calls);
+            let mut idx = best_idx;
+            for step in (0..n_calls).rev() {
+                if let Some(ptrs) = backptrs.get(step) {
+                    if let Some(bp) = ptrs.get(idx) {
+                        phases.push(bp.swapped);
+                        idx = bp.prev as usize;
+                        continue;
+                    }
+                }
+                phases.push(false);
+                idx = 0;
             }
+            phases.reverse();
             let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
             for (i, phase_swapped) in phases.iter().enumerate() {
                 let call = &condensed.call_sites[i];
@@ -692,10 +678,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     cluster1: u16::MAX,
                     cluster2: u16::MAX,
                     score: 0,
-                    history: HistoryIdx(0),
                     last_swapped: false,
                     history_bits: 0,
                     history_len: 0,
+                    prev_idx: 0,
+                    prev_swapped: false,
                 });
                 if beam.len() >= self.config.beam_width {
                     return beam;
@@ -760,10 +747,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     cluster1: u16::MAX,
                     cluster2: u16::MAX,
                     score: 0,
-                    history: HistoryIdx(0),
                     last_swapped: false,
                     history_bits: 0,
                     history_len: 0,
+                    prev_idx: 0,
+                    prev_swapped: false,
                 });
                 if beam.len() >= half_width {
                     break;
@@ -783,10 +771,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     cluster1: u16::MAX,
                     cluster2: u16::MAX,
                     score: 0,
-                    history: HistoryIdx(0),
                     last_swapped: true,
                     history_bits: 0,
                     history_len: 0,
+                    prev_idx: 0,
+                    prev_swapped: true,
                 });
                 if beam.len() >= self.config.beam_width {
                     break;
@@ -811,6 +800,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         if !segment.any_constraint {
             return beam.to_vec();
         }
+        let soft_segment = segment.len_morgans >= 0.001;
+        let soft_penalty = switch_cost;
         let mut out: Vec<BeamPath> = Vec::with_capacity(beam.len());
         for path in beam {
             self.repair_hap_into(
@@ -818,6 +809,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 &segment.mask,
                 active_pool,
                 switch_cost,
+                soft_segment,
+                soft_penalty,
                 &mut scratch.hap1_candidates,
             );
             self.repair_hap_into(
@@ -825,6 +818,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 &segment.mask,
                 active_pool,
                 switch_cost,
+                soft_segment,
+                soft_penalty,
                 &mut scratch.hap2_candidates,
             );
             for (h1, c1) in scratch.hap1_candidates.iter() {
@@ -835,10 +830,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         cluster1: u16::MAX,
                         cluster2: u16::MAX,
                         score: path.score + *c1 + *c2,
-                        history: path.history,
                         last_swapped: path.last_swapped,
                         history_bits: path.history_bits,
                         history_len: path.history_len,
+                        prev_idx: path.prev_idx,
+                        prev_swapped: path.prev_swapped,
                     });
                 }
             }
@@ -852,12 +848,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         mask: &[u64],
         active_pool: &ActivePool,
         switch_cost: i32,
+        soft_segment: bool,
+        soft_penalty: i32,
         out: &mut Vec<(usize, i32)>,
     ) {
         out.clear();
         let hap_ok = mask_bit_is_set(mask, hap);
         if hap_ok {
             out.push((hap, 0));
+        } else if soft_segment {
+            out.push((hap, soft_penalty));
         }
         // switch to most recently injected candidates first
         for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
@@ -888,9 +888,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     fn expand_call_site(
         &self,
         path: &BeamPath,
+        parent_idx: u32,
         call: &CallSite,
         active_pool: &ActivePool,
-        trie: &mut HistoryTrie,
         out: &mut Vec<BeamPath>,
         logsum_unswapped: &mut [f64],
         logsum_swapped: &mut [f64],
@@ -902,22 +902,64 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let a2 = call.a2;
 
         if call.fixed {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, cutoff, scratch);
+            self.expand_orientation(
+                path,
+                parent_idx,
+                call,
+                a1,
+                a2,
+                false,
+                active_pool,
+                out,
+                logsum_unswapped,
+                logsum_swapped,
+                call_idx,
+                cutoff,
+                scratch,
+            );
         } else {
-            self.expand_orientation(path, call, a1, a2, false, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, cutoff, scratch);
-            self.expand_orientation(path, call, a2, a1, true, active_pool, trie, out, logsum_unswapped, logsum_swapped, call_idx, cutoff, scratch);
+            self.expand_orientation(
+                path,
+                parent_idx,
+                call,
+                a1,
+                a2,
+                false,
+                active_pool,
+                out,
+                logsum_unswapped,
+                logsum_swapped,
+                call_idx,
+                cutoff,
+                scratch,
+            );
+            self.expand_orientation(
+                path,
+                parent_idx,
+                call,
+                a2,
+                a1,
+                true,
+                active_pool,
+                out,
+                logsum_unswapped,
+                logsum_swapped,
+                call_idx,
+                cutoff,
+                scratch,
+            );
         }
     }
 
     fn expand_orientation(
         &self,
         path: &BeamPath,
+        parent_idx: u32,
         call: &CallSite,
         hap1_al: u8,
         hap2_al: u8,
         swapped: bool,
         active_pool: &ActivePool,
-        trie: &mut HistoryTrie,
         out: &mut Vec<BeamPath>,
         logsum_unswapped: &mut [f64],
         logsum_swapped: &mut [f64],
@@ -969,7 +1011,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         );
         for (h1, c1, e1) in scratch.hap1_allele.iter() {
             for (h2, c2, e2) in scratch.hap2_allele.iter() {
-                let history = trie.push(path.history, swapped);
                 let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
                 let flip_penalty = if call_idx == 0 {
                     0
@@ -1001,10 +1042,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         cluster1: c1,
                         cluster2: c2,
                         score,
-                        history,
                         last_swapped: swapped,
                         history_bits,
                         history_len,
+                        prev_idx: parent_idx,
+                        prev_swapped: swapped,
                     });
                 }
             }

@@ -12,6 +12,7 @@ use crate::model::parameters::ModelParams;
 pub struct CondensedSegment {
     pub mask: Vec<u64>,
     pub any_constraint: bool,
+    pub len_morgans: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +182,7 @@ impl CondensedTarget {
                 hi_freq_to_orig,
                 prev_hi,
                 end_hi,
+                hi_freq_gen_positions,
                 packed_ref,
                 n_words,
             );
@@ -193,6 +195,7 @@ impl CondensedTarget {
             hi_freq_to_orig,
             prev_hi,
             hi_freq_to_orig.len(),
+            hi_freq_gen_positions,
             packed_ref,
             n_words,
         );
@@ -293,6 +296,7 @@ fn build_segment_mask<RefSpace>(
     hi_freq_to_orig: &[usize],
     start_hi: usize,
     end_hi: usize,
+    hi_freq_gen_positions: &[f64],
     packed_ref: &PackedRefView<RefSpace>,
     n_words: usize,
 ) -> CondensedSegment {
@@ -302,6 +306,19 @@ fn build_segment_mask<RefSpace>(
     let mut tmp: Vec<u64> = vec![0u64; n_words];
     let mut tmp2: Vec<u64> = vec![0u64; n_words];
     let mut any_constraint = false;
+    let len_morgans = if end_hi > start_hi && hi_freq_gen_positions.len() > 1 {
+        let start_pos = hi_freq_gen_positions
+            .get(start_hi)
+            .copied()
+            .unwrap_or(0.0);
+        let end_pos = hi_freq_gen_positions
+            .get(end_hi.saturating_sub(1))
+            .copied()
+            .unwrap_or(start_pos);
+        (end_pos - start_pos).abs() as f32
+    } else {
+        0.0
+    };
 
     for hi_idx in start_hi..end_hi {
         let orig_m = hi_freq_to_orig[hi_idx];
@@ -346,5 +363,9 @@ fn build_segment_mask<RefSpace>(
         mask_all_ones(&mut mask, packed_ref.n_ref_haps());
     }
 
-    CondensedSegment { mask, any_constraint }
+    CondensedSegment {
+        mask,
+        any_constraint,
+        len_morgans,
+    }
 }
