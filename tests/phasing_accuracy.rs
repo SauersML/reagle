@@ -832,13 +832,19 @@ fn test_phase_confidence_brier_score_noisy_input() {
         for m in 0..n_markers {
             let marker_idx = MarkerIdx::new(m as u32);
             let conf = phased.sample_phase_confidence_f32(marker_idx, 0);
-            let y = if phased.allele(marker_idx, hap1) == hero_pattern[m] {
+            let h1_allele = phased.allele(marker_idx, hap1);
+            let y = if h1_allele == hero_pattern[m] {
                 1.0
             } else {
                 0.0
             };
             let diff = conf - y;
             brier += diff * diff;
+
+            if flip_rate > 0.2 && m < 10 {
+                 println!("DEBUG: m={} conf={:.4} h1={} hero={} y={} diff^2={:.4}", 
+                    m, conf, h1_allele, hero_pattern[m], y, diff*diff);
+            }
         }
         let brier_mean = brier / n_markers as f32;
         println!(

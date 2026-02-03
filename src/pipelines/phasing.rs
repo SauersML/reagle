@@ -7430,7 +7430,7 @@ fn sample_dynamic_mcmc(
             } else if is_anchor {
                 fixed_allele[m] = anchor_a2;
             } else {
-                fixed_allele[m] = 255; // Unphased het: no orientation constraint
+                fixed_allele[m] = h2_alleles[m];
             }
         }
 
@@ -7513,7 +7513,7 @@ fn sample_dynamic_mcmc(
             } else if is_anchor {
                 fixed_allele[m] = anchor_a1;
             } else {
-                fixed_allele[m] = 255; // Unphased het: no orientation constraint
+                fixed_allele[m] = h1_alleles[m];
             }
         }
 
