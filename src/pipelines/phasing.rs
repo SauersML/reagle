@@ -8251,6 +8251,24 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let w1 = (w1 / denom) as f32;
         let w2 = (w2 / denom) as f32;
 
+        // Check for chain alignment (anti-correlation)
+        let mut dot_prod = 0.0f32;
+        for i in 0..het_positions.len() {
+            if obs_counts[i] > 0.0 && obs_counts2[i] > 0.0 {
+                let c1 = swap_counts[i] - 0.5 * obs_counts[i];
+                let c2 = swap_counts2[i] - 0.5 * obs_counts2[i];
+                dot_prod += c1 * c2;
+            }
+        }
+
+        let flip_chain2 = dot_prod < 0.0;
+        if flip_chain2 {
+            // Flip Chain 2 votes to align with Chain 1
+            for i in 0..het_positions.len() {
+                swap_counts2[i] = obs_counts2[i] - swap_counts2[i];
+            }
+        }
+
         for i in 0..het_positions.len() {
             swap_counts[i] = swap_counts[i] * w1 + swap_counts2[i] * w2;
             obs_counts[i] = obs_counts[i] * w1 + obs_counts2[i] * w2;
