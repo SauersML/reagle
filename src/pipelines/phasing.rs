@@ -7770,6 +7770,14 @@ fn sample_swap_bits_mosaic<RefSpace>(
         );
     }
 
+    let mean_recomb = if n_markers > 1 {
+        p_recomb.iter().sum::<f32>() / (n_markers - 1) as f32
+    } else {
+        0.001
+    };
+    let p_err = p_err.max(mean_recomb * 4.0).clamp(0.01, 0.45);
+    let p_no_err = 1.0 - p_err;
+
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
