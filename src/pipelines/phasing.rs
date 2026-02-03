@@ -1207,6 +1207,11 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         }
     }
 
+    fn clear_anchors(&mut self) {
+        self.anchor_hap1.clear();
+        self.anchor_hap2.clear();
+    }
+
     fn update_trace(&mut self) {
         if self.n_markers == 0 {
             self.trace.mean_state = 0.0;
@@ -4226,6 +4231,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         self.config.mcmc_lr_samples,
                                         p_no_err,
                                         p_err,
+                                        true,
                                         ws,
                                     );
                                     result
@@ -4288,7 +4294,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        let conf = p_orient.max(1.0 - p_orient).min(0.95);
+                        sp.set_phase_confidence(m, conf);
                     }
 
                     let lr_threshold = self.params.lr_threshold;
@@ -4648,10 +4655,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let local_prior_raw = prior_paths[s]
                                 .as_ref()
                                 .and_then(|gp| global_to_local_paths(gp, &threaded_haps, n_hi_freq));
-                            // Ignore anchors for refinement to allow error correction
                             let local_prior = local_prior_raw.as_ref();
-                            let anchor_h1: Vec<u8> = vec![255; n_hi_freq];
-                            let anchor_h2: Vec<u8> = vec![255; n_hi_freq];
+                            let mut anchor_h1 = vec![255u8; n_hi_freq];
+                            let mut anchor_h2 = vec![255u8; n_hi_freq];
+                            for (i, &m) in hi_freq_to_orig.iter().enumerate() {
+                                if !sp.is_unphased(m) {
+                                    anchor_h1[i] = sp.allele1(m);
+                                    anchor_h2[i] = sp.allele2(m);
+                                }
+                            }
 
                             let block_starts = block_starts.clone();
                             let result = if self.config.profile {
@@ -4679,6 +4691,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         self.config.mcmc_lr_samples,
                                         p_no_err,
                                         p_err,
+                                        true,
                                         ws,
                                     )
                                 })
@@ -4706,6 +4719,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     self.config.mcmc_lr_samples,
                                     p_no_err,
                                     p_err,
+                                    true,
                                     ws,
                                 )
                             };
@@ -4898,7 +4912,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             for (hi_freq_idx, p_orient) in het_phase_values {
                 let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient);
+                // Force cap to verify control
+                let capped = p_orient.min(0.95);
+                sp.set_phase_confidence(m, capped);
             }
 
             if let Some(paths) = new_paths {
@@ -7730,6 +7746,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     lr_samples_param: usize,
     p_no_err: f32,
     p_err: f32,
+    release_anchors: bool,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
@@ -7751,7 +7768,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
     // Use adaptive error rate for chain sampling and confidence to prevent overconfidence
     // when user-specified err is too low for the actual noise/structure.
-    let chain_p_err = p_err.max(mean_recomb * 100.0).clamp(0.05, 0.45);
+    let chain_p_err = p_err.max(mean_recomb * 10.0).clamp(0.0001, 0.45);
     let chain_p_no_err = 1.0 - chain_p_err;
 
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
@@ -8003,6 +8020,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         for _ in 0..burnin {
             chain.step();
+        }
+
+        if release_anchors {
+            chain.clear_anchors();
         }
 
         let mut swap_counts = vec![0u32; het_positions.len()];
@@ -9310,6 +9331,7 @@ mod tests {
             32,
             p_no_err,
             p_err,
+            false,
             &mut workspace,
         );
 
