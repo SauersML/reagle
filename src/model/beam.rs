@@ -1281,7 +1281,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
         }
         // Always allow staying with a mismatch cost to avoid forced switching.
-        // Mismatch cost is MAF-dependent: rare allele mismatch is more surprising.
+        // Mismatch cost is error-rate dependent under the uniform error model.
         out.push((hap, pbwt_stay_cost, effective_mismatch_cost));
     }
 
