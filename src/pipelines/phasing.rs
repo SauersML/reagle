@@ -8202,11 +8202,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let (swap_counts1, obs_counts1, new_paths, mut buffers, log_like1) =
+    let (swap_counts1, obs_counts1, mut new_paths, mut buffers, log_like1) =
         run_chain(chain_seed, start_paths, buffers, ref_provider);
 
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
+    let best_log_like = log_like1;
 
     if !has_anchor {
         let flipped_paths = if let Some(paths) = start_paths {
@@ -8244,16 +8245,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
-        let max_ll = log_like1.max(log_like2);
-        let w1 = (log_like1 - max_ll).exp();
-        let w2 = (log_like2 - max_ll).exp();
-        let denom = (w1 + w2).max(f64::EPSILON);
-        let w1 = (w1 / denom) as f32;
-        let w2 = (w2 / denom) as f32;
-
-        for i in 0..het_positions.len() {
-            swap_counts[i] = swap_counts[i] * w1 + swap_counts2[i] * w2;
-            obs_counts[i] = obs_counts[i] * w1 + obs_counts2[i] * w2;
+        if log_like2 > best_log_like {
+            swap_counts = swap_counts2;
+            obs_counts = obs_counts2;
+            new_paths = paths2;
         }
     }
 
