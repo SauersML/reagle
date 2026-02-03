@@ -918,6 +918,9 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 let start = m * active_states;
                 ws.fwd_history[start..start + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
+                if prior_marker_idx == Some(m) {
+                    final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+                }
             }
             tile_start = tile_end;
         }
@@ -929,8 +932,6 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
         }
 
         ws.bwd.fill(1.0);
-        let mut prior_state_post: Option<Vec<f32>> = None;
-
         let mut tile_end = active_markers;
         while tile_end > 0 {
             let tile_start = tile_end.saturating_sub(TILE_SIZE);
@@ -1014,22 +1015,6 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                     posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
                 }
 
-                if prior_marker_idx == Some(m_rev) {
-                    let mut state_post = vec![0.0f32; active_states];
-                    let mut total = 0.0f32;
-                    for i in 0..active_states {
-                        let v = fwd_slice[i] * ws.bwd[i];
-                        state_post[i] = v;
-                        total += v;
-                    }
-                    if total > 0.0 {
-                        let inv = 1.0 / total;
-                        for v in state_post.iter_mut() {
-                            *v *= inv;
-                        }
-                    }
-                    prior_state_post = Some(state_post);
-                }
             }
 
             // Update beta for the previous marker.
@@ -1100,7 +1085,6 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
 
         if is_final {
             final_posteriors = posteriors;
-            final_prior_state_post = prior_state_post;
         }
     }
 

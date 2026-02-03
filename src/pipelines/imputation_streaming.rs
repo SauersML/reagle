@@ -2497,6 +2497,10 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        if self.config.err.is_none() {
+            // For imputation, copy-mismatch reflects mutation rather than panel size.
+            self.params.p_mismatch = crate::model::parameters::ModelParams::new().p_mismatch;
+        }
         self.params.recomb_intensity = self
             .params
             .recomb_intensity
@@ -3995,7 +3999,8 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
                 let use_hmm_h1 = if has_priors_h1 {
-                    last_info_h1.is_some()
+                    // Priors require HMM propagation even when emissions are uniform.
+                    true
                 } else if no_info_h1 {
                     false
                 } else {
@@ -4004,7 +4009,8 @@ impl crate::pipelines::ImputationPipeline {
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
                 };
                 let use_hmm_h2 = if has_priors_h2 {
-                    last_info_h2.is_some()
+                    // Priors require HMM propagation even when emissions are uniform.
+                    true
                 } else if no_info_h2 {
                     false
                 } else {
@@ -4205,7 +4211,6 @@ impl crate::pipelines::ImputationPipeline {
 
                 let mut process_haplotype = |hap_idx: HapIdx,
                                              priors: Option<&HaplotypePriors>,
-                                             use_priors_in_hmm: bool,
                                              input_probs: &TargetAlleleProbs,
                                              error_rate: f32,
                                              prior_marker_idx: Option<usize>,
@@ -4237,8 +4242,7 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    let state_priors = if use_priors_in_hmm {
-                        priors.and_then(|p| {
+                    let state_priors = priors.and_then(|p| {
                         if p.is_empty() {
                             if !warned_no_priors {
                                 warn!(
@@ -4287,10 +4291,7 @@ impl crate::pipelines::ImputationPipeline {
                             blended.push(p);
                         }
                         Some(blended)
-                        })
-                    } else {
-                        None
-                    };
+                    });
 
                     let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
@@ -4311,41 +4312,8 @@ impl crate::pipelines::ImputationPipeline {
                     )
                 });
 
-                    // For handoff, prefer a direct emission-based posterior at the prior marker
-                    // to keep recent hard genotype signals from being washed out by p_mismatch.
-                    let mut handoff_state_post: Option<Vec<f32>> = None;
-                    if let Some(pm) = prior_marker_idx {
-                        if !input_probs.is_uniform_marker(pm) {
-                            let probs = input_probs.probs_for_marker(pm);
-                            if !probs.is_empty() {
-                                let mut post = vec![0.0f32; state_haps.len()];
-                                let mut sum = 0.0f32;
-                                for (i, hap) in state_haps.iter().enumerate() {
-                                    let allele = ref_columns
-                                        .get(pm)
-                                        .map(|c| c.get(HapIdx::new(hap.as_u32())))
-                                        .unwrap_or(255);
-                                    if allele == 255 {
-                                        continue;
-                                    }
-                                    let p = probs.get(allele as usize).copied().unwrap_or(0.0);
-                                    post[i] = p;
-                                    sum += p;
-                                }
-                                if sum > 0.0 {
-                                    let inv = 1.0 / sum;
-                                    for v in post.iter_mut() {
-                                        *v *= inv;
-                                    }
-                                    handoff_state_post = Some(post);
-                                }
-                            }
-                        }
-                    }
-
                     let mut next_priors = HaplotypePriors::empty();
-                    let state_post_for_handoff = handoff_state_post.as_ref().or(state_post.as_ref());
-                    if let Some(state_post) = state_post_for_handoff {
+                    if let Some(state_post) = state_post.as_ref() {
                         let pairs = state_posteriors_to_priors(&state_haps, state_post, 0.0);
                         if !pairs.is_empty() {
                             let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = pairs
@@ -4394,10 +4362,9 @@ impl crate::pipelines::ImputationPipeline {
                     let (posts, out, stats) = process_haplotype(
                         h1_idx,
                         priors_h1,
-                        last_info_h1.is_none(),
                         &input_probs_h1,
                         (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
-                        last_info_h1.or(prior_marker_idx),
+                        prior_marker_idx,
                         &donors_h1,
                     );
                     hap1_posts = Some(posts);
@@ -4431,10 +4398,9 @@ impl crate::pipelines::ImputationPipeline {
                     let (posts, out, stats) = process_haplotype(
                         h2_idx,
                         priors_h2,
-                        last_info_h2.is_none(),
                         &input_probs_h2,
                         (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
-                        last_info_h2.or(prior_marker_idx),
+                        prior_marker_idx,
                         &donors_h2,
                     );
                     hap2_posts = Some(posts);
@@ -4688,7 +4654,7 @@ impl crate::pipelines::ImputationPipeline {
                 window_idx, output_markers
             ));
         }
-        let handoff_marker_idx = handoff_marker_idx.or(prior_marker_idx);
+        let handoff_marker_idx = prior_marker_idx.or(handoff_marker_idx);
         let handoff_global_idx = handoff_marker_idx.map(|idx| idx + global_start);
         let handoff_gen_pos = handoff_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
         Ok(Some(ImputationWindowResults {
