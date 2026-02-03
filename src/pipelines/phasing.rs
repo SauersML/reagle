@@ -7728,7 +7728,9 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.9 * (informative as f32);
+    // Use a low threshold to allow initialization even with noisy/recombinant data.
+    // Any pair better than random (score > 0) is a valid starting point.
+    let threshold = 0.0;
     if best_score < threshold || n_markers > 2000 {
         return None;
     }
@@ -10223,5 +10225,66 @@ mod tests {
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
         );
+    }
+
+    #[test]
+    fn test_heuristic_threshold_sensitivity() {
+        use crate::data::storage::MutableGenotypes;
+        use crate::model::states::ThreadedHaps;
+
+        let n_markers = 10;
+        let n_states = 2;
+
+        // State 0: all 0
+        // State 1: all 1
+        let mut data = Vec::new();
+        for _ in 0..n_markers {
+            data.push(0);
+            data.push(1);
+        }
+
+        let geno = MutableGenotypes::from_fn(n_markers, n_states, |m, h| {
+            data[m * n_states + h]
+        });
+        let mut threaded = ThreadedHaps::<CombinedHapSpace>::new(n_states, n_states, n_markers);
+        for h in 0..n_states {
+            threaded.push_new(CombinedHapId::new(h as u32));
+        }
+        let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
+
+        // Target: 7 matches with (0,1), 3 mismatches (homozygous vs het)
+        // 7 markers: seq1=0, seq2=1 (matches state 0, state 1)
+        // 3 markers: seq1=0, seq2=0 (incompatible with 0/1 pair)
+        let mut seq1 = Vec::new();
+        let mut seq2 = Vec::new();
+        for m in 0..n_markers {
+            if m < 7 {
+                seq1.push(0);
+                seq2.push(1);
+            } else {
+                seq1.push(0);
+                seq2.push(0);
+            }
+        }
+
+        let mut scores = Vec::new();
+        let paths = find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            &seq1,
+            &seq2,
+            &mut ref_provider,
+            &mut scores,
+        );
+
+        // Should find best pair even with noise if threshold is reasonable (e.g. > 0.0)
+        assert!(paths.is_some(), "Should find best pair even with some noise");
+        
+        let p = paths.unwrap();
+        // Check if it picked (0, 1) or (1, 0)
+        let s1 = p.path1[0] as usize;
+        let s2 = p.path2[0] as usize;
+        assert!( (s1 == 0 && s2 == 1) || (s1 == 1 && s2 == 0) );
     }
 }
