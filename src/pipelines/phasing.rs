@@ -69,7 +69,6 @@ use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
 use crate::model::state_allocator::allocate_lms_sparse;
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 use mini_mcmc::core::{MarkovChain, Trace};
-use sysinfo::System;
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
@@ -161,82 +160,6 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
     let avg = span / (gen_positions.len().saturating_sub(1).max(1) as f64);
     let block = avg * STAGE1_BLOCK_TARGET_MARKERS as f64;
     block.clamp(STAGE1_BLOCK_MIN_CM, STAGE1_BLOCK_MAX_CM)
-}
-
-fn available_memory_bytes() -> Option<u64> {
-    fn read_cgroup_limit_bytes() -> Option<u64> {
-        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
-        if let Some(s) = v2 {
-            let t = s.trim();
-            if t != "max" {
-                if let Ok(v) = t.parse::<u64>() {
-                    if v > 0 && v < (1u64 << 60) {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
-        if let Some(s) = v1 {
-            let t = s.trim();
-            if let Ok(v) = t.parse::<u64>() {
-                if v > 0 && v < (1u64 << 60) {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    }
-
-    fn read_cgroup_available_bytes(limit: u64) -> Option<u64> {
-        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok();
-        if let Some(s) = v2 {
-            if let Ok(cur) = s.trim().parse::<u64>() {
-                return Some(limit.saturating_sub(cur));
-            }
-        }
-        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok();
-        if let Some(s) = v1 {
-            if let Ok(cur) = s.trim().parse::<u64>() {
-                return Some(limit.saturating_sub(cur));
-            }
-        }
-        None
-    }
-
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let mut avail_bytes = sys.available_memory();
-    let mut total_bytes = sys.total_memory();
-    if total_bytes > 0 {
-        let scaled_total = total_bytes.saturating_mul(1024);
-        let looks_like_kib = total_bytes < 1_073_741_824
-            && scaled_total >= 1_073_741_824
-            && scaled_total <= (1u64 << 50);
-        if looks_like_kib {
-            avail_bytes = avail_bytes.saturating_mul(1024);
-            total_bytes = scaled_total;
-        }
-    }
-    if let Some(limit) = read_cgroup_limit_bytes() {
-        if limit > 0 {
-            total_bytes = total_bytes.min(limit);
-            if let Some(avail) = read_cgroup_available_bytes(limit) {
-                avail_bytes = avail_bytes.min(avail);
-            } else {
-                avail_bytes = avail_bytes.min(limit);
-            }
-        }
-    }
-
-    if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
-        return Some(avail_bytes);
-    }
-    if total_bytes > 0 {
-        Some(total_bytes)
-    } else {
-        None
-    }
 }
 
 fn estimate_phase_state_budget(
@@ -3321,7 +3244,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .nthreads
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1);
-        let mut avail_bytes = available_memory_bytes().unwrap_or(0);
+        let mut avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
         if avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING {
             avail_bytes = 0;
         }
@@ -3486,7 +3409,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 unphased_hets
             );
         }
-        let avail = available_memory_bytes().unwrap_or(0);
+        let avail = crate::utils::memory::available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
         let batches_per_window = (n_haps + batch_size - 1) / batch_size;
         let total_batches = num_windows.saturating_mul(batches_per_window).max(1);

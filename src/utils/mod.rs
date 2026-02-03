@@ -4,3 +4,4 @@
 
 pub mod telemetry;
 pub mod workspace;
+pub mod memory;

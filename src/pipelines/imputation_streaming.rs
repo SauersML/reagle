@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 
 use rayon::prelude::*;
-use sysinfo::System;
 use tracing::{info_span, instrument, warn};
 
 use crate::data::alignment::MarkerAlignment;
@@ -96,85 +95,6 @@ const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
-
-fn available_memory_bytes() -> Option<u64> {
-    fn read_cgroup_limit_bytes() -> Option<u64> {
-        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
-        if let Some(s) = v2 {
-            let t = s.trim();
-            if t != "max" {
-                if let Ok(v) = t.parse::<u64>() {
-                    if v > 0 && v < (1u64 << 60) {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
-        if let Some(s) = v1 {
-            let t = s.trim();
-            if let Ok(v) = t.parse::<u64>() {
-                if v > 0 && v < (1u64 << 60) {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    }
-
-    fn read_cgroup_available_bytes(limit: u64) -> Option<u64> {
-        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok();
-        if let Some(s) = v2 {
-            if let Ok(cur) = s.trim().parse::<u64>() {
-                return Some(limit.saturating_sub(cur));
-            }
-        }
-        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok();
-        if let Some(s) = v1 {
-            if let Ok(cur) = s.trim().parse::<u64>() {
-                return Some(limit.saturating_sub(cur));
-            }
-        }
-        None
-    }
-
-    let mut sys = System::new();
-    sys.refresh_memory();
-    // sysinfo reports memory values in bytes.
-    let mut avail_bytes = sys.available_memory();
-    let mut total_bytes = sys.total_memory();
-    // Some sysinfo versions report memory in KiB. Detect and normalize.
-    // Heuristic: if total < 1 GiB but total*1024 looks like a plausible RAM size,
-    // treat the values as KiB. This avoids collapsing available memory to ~0.
-    if total_bytes > 0 {
-        let scaled_total = total_bytes.saturating_mul(1024);
-        let looks_like_kib =
-            total_bytes < 1_073_741_824 && scaled_total >= 1_073_741_824 && scaled_total <= (1u64 << 50);
-        if looks_like_kib {
-            avail_bytes = avail_bytes.saturating_mul(1024);
-            total_bytes = scaled_total;
-        }
-    }
-    if let Some(limit) = read_cgroup_limit_bytes() {
-        if limit > 0 {
-            total_bytes = total_bytes.min(limit);
-            if let Some(avail) = read_cgroup_available_bytes(limit) {
-                avail_bytes = avail_bytes.min(avail);
-            } else {
-                avail_bytes = avail_bytes.min(limit);
-            }
-        }
-    }
-
-    if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
-        return Some(avail_bytes);
-    }
-    if total_bytes > 0 {
-        Some(total_bytes)
-    } else {
-        None
-    }
-}
 
 fn estimate_state_budget(
     available_bytes: u64,
@@ -2348,7 +2268,7 @@ impl crate::pipelines::ImputationPipeline {
             .nthreads
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1);
-        let mut avail_bytes = available_memory_bytes().unwrap_or(0);
+        let mut avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
         if avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING {
             // Treat unknown/low memory as "planning disabled" to avoid
             // tiny caps in CI/small test runs.
