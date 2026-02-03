@@ -70,9 +70,11 @@ impl SamplePhase {
         assert_eq!(hap2_alleles.len(), n_markers, "hap2 length mismatch");
         assert_eq!(confidence.len(), n_markers, "confidence length mismatch");
 
-        // Copy alleles directly - preserves multiallelic values
-        let hap1: Vec<u8> = hap1_alleles.to_vec();
-        let hap2: Vec<u8> = hap2_alleles.to_vec();
+        // Copy alleles directly - preserves multiallelic values.
+        // For unphased hets, enforce a deterministic ordering to avoid
+        // artificial orientation noise across markers.
+        let mut hap1: Vec<u8> = hap1_alleles.to_vec();
+        let mut hap2: Vec<u8> = hap2_alleles.to_vec();
         let confidence: Vec<f32> = confidence.to_vec();
 
         let mut status = Vec::with_capacity(n_markers);
@@ -97,6 +99,18 @@ impl SamplePhase {
             let a1 = hap1_alleles[m];
             let a2 = hap2_alleles[m];
 
+            if is_unphased
+                && a1 != 255
+                && a2 != 255
+                && a1 != a2
+                && a1 > a2
+                && a1 <= 1
+                && a2 <= 1
+            {
+                hap1[m] = a2;
+                hap2[m] = a1;
+            }
+
             let st = Self::determine_status(is_missing, is_unphased, a1, a2);
             status_counts[st as usize] += 1;
             status.push(st);
@@ -105,6 +119,7 @@ impl SamplePhase {
             } else if is_unphased {
                 0.5
             } else {
+                // Input-phased hets act as an orientation prior (anchors).
                 1.0
             };
             phase_confidence.push(phase_p);

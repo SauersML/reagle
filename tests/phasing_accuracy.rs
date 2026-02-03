@@ -829,6 +829,10 @@ fn test_phase_confidence_brier_score_noisy_input() {
 
         let hap1 = SampleIdx::new(0).hap1();
         let mut brier = 0.0f32;
+        let mut correct = 0usize;
+        let mut conf_sum = 0.0f32;
+        let mut conf_wrong_sum = 0.0f32;
+        let mut wrong_count = 0usize;
         for m in 0..n_markers {
             let marker_idx = MarkerIdx::new(m as u32);
             let conf = phased.sample_phase_confidence_f32(marker_idx, 0);
@@ -837,13 +841,27 @@ fn test_phase_confidence_brier_score_noisy_input() {
             } else {
                 0.0
             };
+            if y > 0.5 {
+                correct += 1;
+            } else {
+                wrong_count += 1;
+                conf_wrong_sum += conf;
+            }
+            conf_sum += conf;
             let diff = conf - y;
             brier += diff * diff;
         }
         let brier_mean = brier / n_markers as f32;
+        let acc = correct as f32 / n_markers as f32;
+        let mean_conf = conf_sum / n_markers as f32;
+        let mean_conf_wrong = if wrong_count > 0 {
+            conf_wrong_sum / wrong_count as f32
+        } else {
+            0.0
+        };
         println!(
-            "[phase_confidence_brier] flip_rate={:.2} unphased_rate={:.2} brier={:.4}",
-            flip_rate, unphased_rate, brier_mean
+            "[phase_confidence_brier] flip_rate={:.2} unphased_rate={:.2} brier={:.4} acc={:.3} mean_conf={:.3} mean_conf_wrong={:.3}",
+            flip_rate, unphased_rate, brier_mean, acc, mean_conf, mean_conf_wrong
         );
         assert!(
             brier_mean < 0.18,
