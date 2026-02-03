@@ -7980,6 +7980,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     }
     let lr_samples = lr_samples_param.max(1);
 
+    let mean_recomb = p_recomb.iter().sum::<f32>() / p_recomb.len().max(1) as f32;
+    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.0001, 0.25);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     let run_chain = |seed: u64,
                      init_paths: Option<&MosaicPaths>,
                      buffers: MosaicBuffers,
@@ -7996,8 +8000,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
