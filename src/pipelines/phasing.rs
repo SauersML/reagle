@@ -7797,10 +7797,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     }
     let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > 2000 {
-        eprintln!("[find_best] failed threshold: best={} thresh={} informative={}", best_score, threshold, informative);
         return None;
     }
-    eprintln!("[find_best] success: best={} pair={:?}", best_score, best_pair);
 
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];

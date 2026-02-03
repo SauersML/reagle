@@ -90,7 +90,9 @@ impl CondensedTarget {
                 };
                 let fixed = !sample_phase.is_unphased(orig_m);
                 let flip_cost = if fixed {
-                    let conf = sample_phase.phase_confidence(orig_m).clamp(1e-6, 1.0 - 1e-6) as f64;
+                    // Cap confidence at 0.99 to allow strong reference evidence (e.g. from dense markers)
+                    // to override input phase errors. This prevents "infinite" costs for VCF-derived phase.
+                    let conf = sample_phase.phase_confidence(orig_m).clamp(1e-6, 0.99) as f64;
                     let odds = (1.0 - conf) / conf;
                     (-(odds.ln()) * 1_000_000.0).round() as i32
                 } else {
