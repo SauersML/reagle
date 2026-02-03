@@ -7770,6 +7770,16 @@ fn sample_swap_bits_mosaic<RefSpace>(
         );
     }
 
+    let mean_recomb = if !p_recomb.is_empty() {
+        p_recomb.iter().sum::<f32>() / p_recomb.len() as f32
+    } else {
+        0.0
+    };
+    // Use adaptive error rate for chain sampling and confidence to prevent overconfidence
+    // when user-specified err is too low for the actual noise/structure.
+    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.01, 0.45);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
@@ -7996,8 +8006,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
@@ -8311,10 +8321,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let ref1 = ref_alleles[p1];
             let ref2 = ref_alleles[p2];
             let conf_m = conf[m];
-            let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-            let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
+            let keep = emit_prob(ref1, a1, conf_m, chain_p_no_err, chain_p_err)
+                * emit_prob(ref2, a2, conf_m, chain_p_no_err, chain_p_err);
+            let swap = emit_prob(ref1, a2, conf_m, chain_p_no_err, chain_p_err)
+                * emit_prob(ref2, a1, conf_m, chain_p_no_err, chain_p_err);
             let denom = keep + swap;
             let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
             let p_keep = 1.0 - p_swap;
