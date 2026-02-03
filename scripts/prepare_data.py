@@ -314,8 +314,8 @@ def run_conversion(input_path, output_vcf, panel_path):
     ]
 
     print(f"Running: {' '.join(cmd)}")
-    cmd_str = " ".join(shlex.quote(part) for part in cmd)
-    subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+    _bump_nofile_limit()
+    subprocess.check_call(cmd)
 
     temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
     if not temp_hg38_vcf:
