@@ -925,6 +925,11 @@ fn test_phase_confidence_brier_score_noisy_input() {
             flip_rate, unphased_rate, brier_mean, acc, mean_conf, mean_conf_wrong, ece
         );
         assert!(
+            ece < 0.12,
+            "Expected reasonably low ECE; flip_rate={:.2} unphased_rate={:.2} ece={:.4}",
+            flip_rate, unphased_rate, ece
+        );
+        assert!(
             brier_mean < 0.30,
             "Expected calibrated Brier score (unphased target); flip_rate={:.2} unphased_rate={:.2} brier={:.4}",
             flip_rate, unphased_rate, brier_mean
