@@ -274,7 +274,7 @@ impl PrescanCacheReader {
         if version != CACHE_VERSION {
             return Err(ReagleError::vcf("unsupported prescan cache version".to_string()));
         }
-        let _ = read_u32(&mut reader)? as usize;
+        read_u32(&mut reader)?;
         let data_offset = reader.stream_position()?;
         Ok(Self {
             reader,

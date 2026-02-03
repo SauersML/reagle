@@ -720,12 +720,11 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             };
 
         let try_fill_pattern_emissions =
-            |m: usize,
-             partner: u8,
-             allele_probs_opt: Option<&[f32]>,
-             emissions: &mut [f32],
-             state_buf: &[HapId<HapSpace>]| {
-                let _ = (m, partner, allele_probs_opt, emissions, state_buf);
+            |_: usize,
+             _: u8,
+             _: Option<&[f32]>,
+             _: &mut [f32],
+             _: &[HapId<HapSpace>]| {
                 false
             };
 
