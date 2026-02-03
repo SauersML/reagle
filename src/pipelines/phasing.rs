@@ -2022,21 +2022,17 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 Some(&hi_freq_to_orig),
             )?;
 
-            let beam_confidence: Vec<std::sync::Mutex<Vec<(usize, u8, u8, f32)>>> =
-                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-            let beam_donors: Vec<std::sync::Mutex<Vec<usize>>> =
-                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-            let fast_confidence: Vec<std::sync::Mutex<Vec<(usize, u8, u8, f32)>>> =
-                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-
             let n_target_haps = target_gt.n_haplotypes();
             // Fast pass: fix high-confidence hets using a smaller beam.
-            sample_phases
+            let fast_confidence: Vec<Vec<(usize, u8, u8, f32)>> = sample_phases
                 .par_iter()
                 .enumerate()
-                .for_each(|(s, sp)| {
+                .map(|(s, sp)| {
                     let mut active_pool = ActivePool::new(packed_ref.n_ref_haps());
-                    let mut tmp = vec![crate::model::types::CombinedHapId::from(0u32); threaded_haps_vec[s].n_states()];
+                    let mut tmp = vec![
+                        crate::model::types::CombinedHapId::from(0u32);
+                        threaded_haps_vec[s].n_states()
+                    ];
                     let th = &threaded_haps_vec[s];
                     th.materialize_at(0, &mut tmp);
                     for id in tmp.iter().copied() {
@@ -2078,7 +2074,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     } else {
                         None
                     };
-                    let constraint_max_expected = Some(beam_config_fast.switch_candidates.max(2) as f64);
+                    let constraint_max_expected =
+                        Some(beam_config_fast.switch_candidates.max(2) as f64);
                     let condensed = CondensedTarget::build(
                         sp,
                         &hi_freq_to_orig,
@@ -2092,11 +2089,21 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     );
 
                     let mut sp_fast = sp.clone();
-                    let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config_fast.inject_k);
-                    let fwd = phaser_fast.phase_sample(&condensed, &mut sp_fast, &mut active_pool, &mut injector);
+                    let mut injector = PbwtInjector::new(
+                        &beam_index,
+                        packed_ref.n_ref_haps(),
+                        beam_config_fast.inject_k,
+                    );
+                    let fwd = phaser_fast.phase_sample(
+                        &condensed,
+                        &mut sp_fast,
+                        &mut active_pool,
+                        &mut injector,
+                    );
                     let condensed_rev = condensed.reversed(&hi_freq_gen_positions);
                     let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
-                    let mut tmp_rev = vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
+                    let mut tmp_rev =
+                        vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
                     th.materialize_at(0, &mut tmp_rev);
                     for id in tmp_rev.iter().copied() {
                         let hid = id.as_u32() as usize;
@@ -2108,27 +2115,37 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         }
                     }
                     let mut sp_rev = sp.clone();
-                    let mut injector_rev = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config_fast.inject_k);
-                    let bwd = phaser_fast.phase_sample(&condensed_rev, &mut sp_rev, &mut active_pool_rev, &mut injector_rev);
+                    let mut injector_rev = PbwtInjector::new(
+                        &beam_index,
+                        packed_ref.n_ref_haps(),
+                        beam_config_fast.inject_k,
+                    );
+                    let bwd = phaser_fast.phase_sample(
+                        &condensed_rev,
+                        &mut sp_rev,
+                        &mut active_pool_rev,
+                        &mut injector_rev,
+                    );
                     let mut p_swapped_bwd = bwd.p_swapped;
                     p_swapped_bwd.reverse();
                     let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
-                    if let Ok(mut slot) = fast_confidence[s].lock() {
-                        slot.clear();
-                        for (i, &p) in combined.iter().enumerate() {
-                            let call = &condensed.call_sites[i];
-                            slot.push((call.marker.as_usize(), call.a1, call.a2, p));
-                        }
+
+                    let mut confidence = Vec::with_capacity(combined.len());
+                    for (i, &p) in combined.iter().enumerate() {
+                        let call = &condensed.call_sites[i];
+                        confidence.push((call.marker.as_usize(), call.a1, call.a2, p));
                     }
-                });
+                    confidence
+                })
+                .collect();
 
             let mut fast_fixed: Vec<Vec<usize>> = vec![Vec::new(); n_samples];
             for (s, sp) in sample_phases.iter_mut().enumerate() {
-                if let Ok(slot) = fast_confidence[s].lock() {
-                    for &(m, a1, a2, p) in slot.iter() {
-                        if !sp.is_unphased(m) {
-                            continue;
-                        }
+                let slot = &fast_confidence[s];
+                for &(m, a1, a2, p) in slot.iter() {
+                    if !sp.is_unphased(m) {
+                        continue;
+                    }
                         let conf = if has_input_phase {
                             p.max(1.0 - p)
                         } else {
@@ -2146,7 +2163,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         sp.set_phase_confidence(m, conf);
                         fast_fixed[s].push(m);
                     }
-                }
             }
 
             let mut original_unphased: Vec<Vec<usize>> = sample_phases
@@ -2170,55 +2186,59 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 original_unphased[s].retain(|m| !fixed.contains(m));
             }
 
-            sample_phases
+            let beam_donors: Vec<Vec<usize>> = sample_phases
                 .par_iter_mut()
                 .enumerate()
-                .for_each(|(s, sp)| {
+                .map(|(s, sp)| {
                     let mut active_pool = ActivePool::new(packed_ref.n_ref_haps());
-                    let mut tmp = vec![crate::model::types::CombinedHapId::from(0u32); threaded_haps_vec[s].n_states()];
+                    let mut tmp = vec![
+                        crate::model::types::CombinedHapId::from(0u32);
+                        threaded_haps_vec[s].n_states()
+                    ];
                     let th = &threaded_haps_vec[s];
                     th.materialize_at(0, &mut tmp);
-                for id in tmp.iter().copied() {
-                    let hid = id.as_u32() as usize;
-                    if hid >= n_target_haps {
-                        let ref_id = hid - n_target_haps;
-                        if ref_id < packed_ref.n_ref_haps() {
-                            active_pool.add(ref_id);
-                        }
-                    }
-                }
-
-                // Re-rank: push best matching reference haps to the end so they are prioritized.
-                let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
-                for &h in active_pool.list() {
-                    let mut score = 0i32;
-                    for &m in hi_freq_to_orig.iter() {
-                        let a1 = sp.allele1(m);
-                        let a2 = sp.allele2(m);
-                        if a1 == 255 || a2 == 255 {
-                            continue;
-                        }
-                        if let Some(r) = packed_ref.ref_allele_targ(m, h) {
-                            if a1 == a2 {
-                                score += if r == a1 { 2 } else { -2 };
-                            } else {
-                                score += if r == a1 || r == a2 { 1 } else { -1 };
+                    for id in tmp.iter().copied() {
+                        let hid = id.as_u32() as usize;
+                        if hid >= n_target_haps {
+                            let ref_id = hid - n_target_haps;
+                            if ref_id < packed_ref.n_ref_haps() {
+                                active_pool.add(ref_id);
                             }
                         }
                     }
-                    scored.push((score, h));
-                }
-                scored.sort_by(|a, b| b.0.cmp(&a.0));
-                for &(_, h) in scored.iter().take(4) {
-                    active_pool.promote(h);
-                }
+
+                    // Re-rank: push best matching reference haps to the end so they are prioritized.
+                    let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
+                    for &h in active_pool.list() {
+                        let mut score = 0i32;
+                        for &m in hi_freq_to_orig.iter() {
+                            let a1 = sp.allele1(m);
+                            let a2 = sp.allele2(m);
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+                            if let Some(r) = packed_ref.ref_allele_targ(m, h) {
+                                if a1 == a2 {
+                                    score += if r == a1 { 2 } else { -2 };
+                                } else {
+                                    score += if r == a1 || r == a2 { 1 } else { -1 };
+                                }
+                            }
+                        }
+                        scored.push((score, h));
+                    }
+                    scored.sort_by(|a, b| b.0.cmp(&a.0));
+                    for &(_, h) in scored.iter().take(4) {
+                        active_pool.promote(h);
+                    }
 
                     let hard_threshold_nats = if beam_config.prune_tolerance > 0 {
                         Some((beam_config.prune_tolerance as f64) / 1_000_000.0)
                     } else {
                         None
                     };
-                    let constraint_max_expected = Some(beam_config.switch_candidates.max(2) as f64);
+                    let constraint_max_expected =
+                        Some(beam_config.switch_candidates.max(2) as f64);
                     let condensed = CondensedTarget::build(
                         sp,
                         &hi_freq_to_orig,
@@ -2231,50 +2251,68 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         constraint_max_expected,
                     );
 
-                    let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
+                    let mut injector = PbwtInjector::new(
+                        &beam_index,
+                        packed_ref.n_ref_haps(),
+                        beam_config.inject_k,
+                    );
                     let fwd = phaser.phase_sample(&condensed, sp, &mut active_pool, &mut injector);
 
-                    let condensed_rev = condensed.reversed(&hi_freq_gen_positions);
-                    let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
-                    let mut tmp_rev = vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
-                    th.materialize_at(0, &mut tmp_rev);
-                    for id in tmp_rev.iter().copied() {
-                        let hid = id.as_u32() as usize;
-                        if hid >= n_target_haps {
-                            let ref_id = hid - n_target_haps;
-                            if ref_id < packed_ref.n_ref_haps() {
-                                active_pool_rev.add(ref_id);
+                    if !condensed.call_sites.is_empty() {
+                        let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
+                        let mut tmp_rev =
+                            vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
+                        th.materialize_at(0, &mut tmp_rev);
+                        for id in tmp_rev.iter().copied() {
+                            let hid = id.as_u32() as usize;
+                            if hid >= n_target_haps {
+                                let ref_id = hid - n_target_haps;
+                                if ref_id < packed_ref.n_ref_haps() {
+                                    active_pool_rev.add(ref_id);
+                                }
                             }
                         }
-                    }
-                    let mut sp_rev = sp.clone();
-                    let mut injector_rev = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
-                    let bwd = phaser.phase_sample(&condensed_rev, &mut sp_rev, &mut active_pool_rev, &mut injector_rev);
-                    let mut p_swapped_bwd = bwd.p_swapped;
-                    p_swapped_bwd.reverse();
-                    let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
+                        let condensed_rev = condensed.reversed(&hi_freq_gen_positions);
+                        let mut injector_rev = PbwtInjector::new(
+                            &beam_index,
+                            packed_ref.n_ref_haps(),
+                            beam_config.inject_k,
+                        );
+                        let mut sp_rev = sp.clone();
+                        let bwd = phaser.phase_sample(
+                            &condensed_rev,
+                            &mut sp_rev,
+                            &mut active_pool_rev,
+                            &mut injector_rev,
+                        );
+                        let mut p_swapped_bwd = bwd.p_swapped;
+                        p_swapped_bwd.reverse();
+                        let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
 
-                    if let Ok(mut slot) = beam_confidence[s].lock() {
-                        slot.clear();
-                        for (i, &p) in combined.iter().enumerate() {
-                            let call = &condensed.call_sites[i];
-                            slot.push((call.marker.as_usize(), call.a1, call.a2, p));
+                        for (i, &swapped) in fwd.decisions.iter().enumerate() {
+                            let m = condensed.call_sites[i].marker.as_usize();
+                            let p = combined.get(i).copied().unwrap_or(0.5);
+                            let conf = if has_input_phase {
+                                if swapped { p } else { 1.0 - p }
+                            } else {
+                                0.5
+                            };
+                            sp.set_phase_confidence(m, conf);
                         }
                     }
-                    if let Ok(mut slot) = beam_donors[s].lock() {
-                        slot.clear();
-                        let list = active_pool.list();
-                        let cap = beam_config
-                            .beam_width
-                            .max(beam_config.inject_k.saturating_mul(2))
-                            .max(beam_config.switch_candidates.saturating_mul(4));
-                        if list.len() > cap {
-                            slot.extend_from_slice(&list[list.len() - cap..]);
-                        } else {
-                            slot.extend_from_slice(list);
-                        }
+
+                    let list = active_pool.list();
+                    let cap = beam_config
+                        .beam_width
+                        .max(beam_config.inject_k.saturating_mul(2))
+                        .max(beam_config.switch_candidates.saturating_mul(4));
+                    if list.len() > cap {
+                        list[list.len() - cap..].to_vec()
+                    } else {
+                        list.to_vec()
                     }
-                });
+                })
+                .collect();
 
             for (s, sp) in sample_phases.iter_mut().enumerate() {
                 for &m in original_unphased[s].iter() {
@@ -2286,9 +2324,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             if packed_ref.n_ref_haps() > 0 {
                 let offset = n_target_haps as u32;
                 for s in 0..n_samples {
-                    let Ok(donors) = beam_donors[s].lock() else {
-                        continue;
-                    };
+                    let donors = &beam_donors[s];
                     if donors.is_empty() {
                         continue;
                     }
@@ -2325,20 +2361,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 None,
                 0,
             )?;
-
-            for (s, sp) in sample_phases.iter_mut().enumerate() {
-                if let Ok(slot) = beam_confidence[s].lock() {
-                    for &(m, a1, a2, p) in slot.iter() {
-                        let swapped = sp.allele1(m) == a2 && sp.allele2(m) == a1;
-                        let conf = if has_input_phase {
-                            if swapped { p } else { 1.0 - p }
-                        } else {
-                            0.5
-                        };
-                        sp.set_phase_confidence(m, conf);
-                    }
-                }
-            }
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -7313,6 +7335,11 @@ fn sample_dynamic_mcmc(
         hap1_idx: u32,
         rng: &mut impl rand::Rng,
     ) {
+        if n_haps == 0 {
+            neighbors.clear();
+            return;
+        }
+
         // If there are no other haplotypes to sample from, fall back to self so we can proceed.
         // This avoids an infinite loop for single-sample or haploid inputs.
         if n_haps <= 2 {
