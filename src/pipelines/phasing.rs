@@ -4051,8 +4051,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             // 2. Extract current alleles for H1 and H2
                             let seq1 = ref_geno.haplotype(hap1);
                             let seq2 = ref_geno.haplotype(hap2);
-                            // Use pre-computed confidence instead of recomputing
-                            let sample_conf = &confidence_by_sample[s];
+                            // Clone confidence so we can zero out heterozygotes for re-phasing
+                            let mut sample_conf_vec = confidence_by_sample[s].clone();
+
+                            // Clamp confidence at heterozygotes to prevent HMM from being excessively biased by input phase.
+                            // We cap at 0.9 to allow the HMM to override input phase if the reference panel provides strong evidence.
+                            // This preserves stability for good inputs (e.g. BeamPhaser results) while allowing correction of bad inputs.
+                            for m in 0..n_markers {
+                                let a1 = seq1[m];
+                                let a2 = seq2[m];
+                                if a1 != 255 && a2 != 255 && a1 != a2 {
+                                    sample_conf_vec[m] = sample_conf_vec[m].min(0.9);
+                                }
+                            }
+                            let sample_conf = &sample_conf_vec;
 
                             // 3. Run HMM with per-heterozygote swap probabilities
                             // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
@@ -4435,7 +4447,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                         let seq1 = std::mem::take(&mut ws.seq1);
                         let seq2 = std::mem::take(&mut ws.seq2);
-                        let sample_conf = std::mem::take(&mut ws.sample_conf);
+                        let mut sample_conf = std::mem::take(&mut ws.sample_conf);
 
                         let sample_seed = (self.config.seed as u64)
                             .wrapping_add(s as u64)
@@ -4454,6 +4466,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 het_positions_all.push(i);
                                 het_index_map[i] = idx;
                                 het_positions.push(i);
+                                // Clamp confidence at heterozygotes to allow re-phasing.
+                                // Cap at 0.9 to allow correction while maintaining stability.
+                                sample_conf[i] = sample_conf[i].min(0.9);
                             }
                         }
 
@@ -4749,7 +4764,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let mut swap_mask = vec![false; n_hi_freq];
-                        let mut anchor_resets = 0usize;
                         let mut p_swap = vec![0.5f32; n_hi_freq];
                         for &pos in het_positions.iter() {
                             let idx = het_index_map[pos];
@@ -4762,28 +4776,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             p_swap[pos] = p.clamp(0.0, 1.0);
                             swap_mask[pos] = p_swap[pos] > 0.5;
                         }
-                        for i in 0..n_hi_freq {
-                            let m = hi_freq_to_orig[i];
-                            let a1 = seq1[i];
-                            let a2 = seq2[i];
-                            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-                            let is_phased_het = is_het && !sp.is_unphased(m);
-                            if is_phased_het {
-                                let a1_anchor = sp.allele1(m);
-                                let a2_anchor = sp.allele2(m);
-                                if a1 == a1_anchor && a2 == a2_anchor {
-                                    swap_mask[i] = false;
-                                } else if a1 == a2_anchor && a2 == a1_anchor {
-                                    swap_mask[i] = true;
-                                }
-                                anchor_resets += 1;
-                            }
-                        }
+                        // We do NOT override the HMM decision for already-phased markers here.
+                        // The HMM was allowed to re-evaluate them (by zeroing confidence),
+                        // so we should respect its new decision.
 
                         eprintln!(
-                            "[phase anchors] sample={} anchors={} hets={}",
+                            "[phase anchors] sample={} anchors=0 hets={}",
                             s,
-                            anchor_resets,
                             het_positions.len()
                         );
 
