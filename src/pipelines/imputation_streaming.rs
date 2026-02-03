@@ -5035,19 +5035,27 @@ impl crate::pipelines::ImputationPipeline {
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(output_start);
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
-            let n_alleles =
-                ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles().max(1);
 
-            // If error correction is enabled, prioritize imputed dosages.
-            // Otherwise, prefer hard calls from input when available.
-            let use_hard_call = !correct_errors && hard_call.is_some();
+            // Prefer hard calls if error correction is disabled
+            if !correct_errors {
+                if let Some((a1, a2)) = hard_call {
+                    let d = (a1 + a2) as f32;
+                    return if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                        d
+                    } else {
+                        d * 0.5
+                    };
+                }
+            }
 
-            let dosage = if use_hard_call {
-                let (a1, a2) = hard_call.unwrap();
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+            let n_alleles = ref_markers
+                .marker(MarkerIdx::new(marker_idx as u32))
+                .n_alleles()
+                .max(1);
+            let local_m = marker_idx.saturating_sub(output_start);
+
+            let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
                     let d1 = p1
                         .get(local_m)
@@ -5086,14 +5094,10 @@ impl crate::pipelines::ImputationPipeline {
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                     dosage_from_gp(n_alleles, &gp)
-                } else if let Some((a1, a2)) = hard_call {
-                    // Fallback to hard call if imputation result is missing
-                    (a1 + a2) as f32
                 } else {
                     0.0
                 }
             } else if let Some((a1, a2)) = hard_call {
-                // Fallback to hard call if imputation result is missing
                 (a1 + a2) as f32
             } else {
                 0.0
@@ -5108,23 +5112,28 @@ impl crate::pipelines::ImputationPipeline {
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(output_start);
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
 
-            let use_hard_call = !correct_errors && hard_call.is_some();
+            // Prefer hard calls if error correction is disabled
+            if !correct_errors {
+                if let Some(gt) = hard_call {
+                    return gt;
+                }
+            }
 
-            if use_hard_call {
-                hard_call.unwrap()
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                let n_alleles =
-                    ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles().max(1);
+            let local_m = marker_idx.saturating_sub(output_start);
+
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(marker_idx as u32))
+                    .n_alleles()
+                    .max(1);
                 if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
                     if n_alleles <= 2 {
                         let p1_alt = p1.get(local_m).map(|p| p.prob(1)).unwrap_or(0.0);
                         let p2_alt = p2.get(local_m).map(|p| p.prob(1)).unwrap_or(0.0);
                         let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
-                        let gp01 =
-                            p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
+                        let gp01 = p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
                         let gp11 = p1_alt * p2_alt;
                         if gp01 >= gp00 && gp01 >= gp11 {
                             let p10 = p1_alt * (1.0 - p2_alt);
@@ -5199,11 +5208,10 @@ impl crate::pipelines::ImputationPipeline {
                 }
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                    let n_alleles =
-                        ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    let n_alleles = ref_markers
+                        .marker(MarkerIdx::new(marker_idx as u32))
+                        .n_alleles();
                     best_gt_from_gp(n_alleles, &gp)
-                } else if let Some(gt) = hard_call {
-                    gt
                 } else {
                     (0, 0)
                 }
