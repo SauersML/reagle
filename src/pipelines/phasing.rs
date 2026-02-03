@@ -8256,7 +8256,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Derive swap emissions from the sampled haplotype paths and run the label
     // HMM on those emissions. This ties swaps to the inferred paths rather than
     // per-marker orientation counts, which can be unstable.
-    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers && lr_samples_param <= 1 {
         // Align seq1/seq2 to anchors with a single global flip to avoid
         // per-marker label noise when anchors are sparse.
         let mut flip_to_anchor = false;
