@@ -1297,7 +1297,8 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 if a2 == 255 {
                     continue;
                 }
-                if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob {
+                if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob
+                {
                     continue;
                 }
                 self.hap2_use_combined[m] = false;
@@ -1357,7 +1358,8 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 if a1 == 255 {
                     continue;
                 }
-                if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob {
+                if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob
+                {
                     continue;
                 }
                 self.hap1_use_combined[m] = false;
@@ -7998,7 +8000,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                      init_paths: Option<&MosaicPaths>,
                      buffers: MosaicBuffers,
                      ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>|
-     -> (Vec<u32>, Vec<u32>, MosaicPaths, MosaicBuffers) {
+     -> (Vec<f32>, Vec<f32>, MosaicPaths, MosaicBuffers, f64) {
         let mut chain = MosaicChain::new_with_buffers(
             seed,
             n_markers,
@@ -8035,8 +8037,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             chain.step();
         }
 
-        let mut swap_counts = vec![0u32; het_positions.len()];
-        let mut obs_counts = vec![0u32; het_positions.len()];
+        let mut swap_counts = vec![0f32; het_positions.len()];
+        let mut obs_counts = vec![0f32; het_positions.len()];
         let mut new_paths = MosaicPaths {
             path1: Vec::new(),
             path2: Vec::new(),
@@ -8127,8 +8129,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
 
                 if let Some(orient) = orient {
-                    swap_counts[i] += orient as u32;
-                    obs_counts[i] += 1;
+                    swap_counts[i] += orient as f32;
+                    obs_counts[i] += 1.0;
                 }
             }
 
@@ -8140,8 +8142,31 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
+        let log_like = {
+            let mut ll = 0.0f64;
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 {
+                    continue;
+                }
+                chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
+                let p1 = chain.path1[m] as usize;
+                let p2 = chain.path2[m] as usize;
+                if p1 >= n_states || p2 >= n_states {
+                    continue;
+                }
+                let ref1 = chain.ref_alleles[p1];
+                let ref2 = chain.ref_alleles[p2];
+                let conf_m = conf[m];
+                let emit = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
+                    * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
+                ll += (emit as f64).ln();
+            }
+            ll
+        };
         let returned = chain.into_buffers();
-        (swap_counts, obs_counts, new_paths, returned)
+        (swap_counts, obs_counts, new_paths, returned, log_like)
     };
 
     let ref_view = ref_provider.ref_gt;
@@ -8177,7 +8202,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let (swap_counts1, obs_counts1, new_paths, mut buffers) =
+    let (swap_counts1, obs_counts1, new_paths, mut buffers, log_like1) =
         run_chain(chain_seed, start_paths, buffers, ref_provider);
 
     let mut swap_counts = swap_counts1;
@@ -8204,7 +8229,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         let chain_seed_2 = seed.wrapping_add(0xBAD_CAFE_F00Du64);
         let ref_provider_2 = RefAlleleProvider::new(ref_view, threaded_haps);
-        let (swap_counts2, obs_counts2, paths2, buffers2) = run_chain(
+        let (swap_counts2, obs_counts2, paths2, buffers2, log_like2) = run_chain(
             chain_seed_2,
             flipped_paths.as_ref(),
             buffers,
@@ -8219,10 +8244,16 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
+        let max_ll = log_like1.max(log_like2);
+        let w1 = (log_like1 - max_ll).exp();
+        let w2 = (log_like2 - max_ll).exp();
+        let denom = (w1 + w2).max(f64::EPSILON);
+        let w1 = (w1 / denom) as f32;
+        let w2 = (w2 / denom) as f32;
+
         for i in 0..het_positions.len() {
-            let s2 = swap_counts2[i];
-            swap_counts[i] = swap_counts[i].saturating_add(s2);
-            obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
+            swap_counts[i] = swap_counts[i] * w1 + swap_counts2[i] * w2;
+            obs_counts[i] = obs_counts[i] * w1 + obs_counts2[i] * w2;
         }
     }
 
@@ -8237,18 +8268,18 @@ fn sample_swap_bits_mosaic<RefSpace>(
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] == 0 {
+        if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] < 0.5 {
             swap_bits.push(0);
             swap_lr.push(1.0);
             swap_probs.push(0.5);
             swap_probs_conf.push(0.5);
-            if obs_counts[i] == 0 {
+            if obs_counts[i] < 0.5 {
                 obs_zero += 1;
             }
             continue;
         }
 
-        let p_swap = (swap_counts[i] as f32 + 0.5) / (obs_counts[i] as f32 + 1.0);
+        let p_swap = (swap_counts[i] + 0.5) / (obs_counts[i] + 1.0);
         let p_keep = 1.0 - p_swap;
         let chosen_swap = p_swap > 0.5;
         swap_bits.push(chosen_swap as u8);
@@ -8258,9 +8289,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
             (p_keep, p_swap)
         };
         let lr = if min_p < 1e-30 {
-            1e6
+            1e6_f32
         } else {
-            (max_p / min_p).min(1e6)
+            (max_p / min_p).min(1e6_f32)
         };
         swap_lr.push(lr);
         let p = p_swap.clamp(0.0, 1.0);
