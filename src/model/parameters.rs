@@ -384,4 +384,18 @@ mod tests {
         assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
     }
+
+    #[test]
+    fn test_param_estimates_recomb_intensity_scaling() {
+        let mut est = ParamEstimates::new();
+        // Add 10 expected switches over 100 cM
+        // 100 cM = 1 Morgan.
+        // So intensity should be 10 switches / 1 Morgan = 10.0
+        //
+        // Currently, without scaling, it calculates 10 / 100 = 0.1
+        est.add_switch(100.0, 10.0);
+
+        let intensity = est.recomb_intensity().unwrap();
+        assert!((intensity - 10.0).abs() < 0.001, "Expected intensity 10.0, got {}", intensity);
+    }
 }
