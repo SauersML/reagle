@@ -1791,6 +1791,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         let confidence_by_sample = build_sample_confidence(&target_gt);
         let phase_mask = target_gt.phase_mask();
+        let has_input_phase = phase_mask
+            .as_ref()
+            .map(|mask| mask.iter().any(|row| row.iter().any(|&v| v != 0)))
+            .unwrap_or(false);
         let mut sample_phases = self.create_sample_phases(&geno, &confidence_by_sample, phase_mask);
         let mut stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
@@ -2102,7 +2106,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         if !sp.is_unphased(m) {
                             continue;
                         }
-                        let conf = p.max(1.0 - p);
+                        let conf = if has_input_phase {
+                            p.max(1.0 - p)
+                        } else {
+                            0.5
+                        };
                         if conf < FAST_BEAM_FIX_CONF {
                             continue;
                         }
@@ -2299,7 +2307,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 if let Ok(slot) = beam_confidence[s].lock() {
                     for &(m, a1, a2, p) in slot.iter() {
                         let swapped = sp.allele1(m) == a2 && sp.allele2(m) == a1;
-                        let conf = if swapped { p } else { 1.0 - p };
+                        let conf = if has_input_phase {
+                            if swapped { p } else { 1.0 - p }
+                        } else {
+                            0.5
+                        };
                         sp.set_phase_confidence(m, conf);
                     }
                 }
@@ -2803,6 +2815,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Create sample phases with overlap markers pre-phased
         let confidence_by_sample = build_sample_confidence(&target_gt);
         let phase_mask = target_gt.phase_mask();
+        let has_input_phase = phase_mask
+            .as_ref()
+            .map(|mask| mask.iter().any(|row| row.iter().any(|&v| v != 0)))
+            .unwrap_or(false);
         let mut sample_phases = self.create_sample_phases_with_overlap(
             &geno,
             &missing_mask,
@@ -3017,7 +3033,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         for (i, &swapped) in fwd.decisions.iter().enumerate() {
                             let m = condensed.call_sites[i].marker.as_usize();
                             let p = combined.get(i).copied().unwrap_or(0.5);
-                            let conf = if swapped { p } else { 1.0 - p };
+                            let conf = if has_input_phase {
+                                if swapped { p } else { 1.0 - p }
+                            } else {
+                                0.5
+                            };
                             sp.set_phase_confidence(m, conf);
                         }
                     }
@@ -4417,17 +4437,23 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
 
-                        // Identify UNPHASED heterozygote positions in hi-freq marker space
-                        ws.het_positions.clear();
+                        // Identify heterozygotes (all) and unphased hets (subset) in hi-freq space
+                        let mut het_positions_all: Vec<usize> = Vec::new();
+                        let mut het_positions: Vec<usize> = Vec::new();
+                        let mut het_index_map: Vec<usize> = vec![usize::MAX; n_hi_freq];
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
-                            if a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m) {
-                                ws.het_positions.push(i);
+                            if a1 != 255 && a2 != 255 && a1 != a2 {
+                                let idx = het_positions_all.len();
+                                het_positions_all.push(i);
+                                het_index_map[i] = idx;
+                                if sp.is_unphased(m) {
+                                    het_positions.push(i);
+                                }
                             }
                         }
-                        let het_positions = std::mem::take(&mut ws.het_positions);
 
                         if het_positions.is_empty() {
                             // No hets to phase: no swaps needed, no LR values
@@ -4609,7 +4635,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     phase_ibs.as_ref().expect("phase_ibs"),
                                     ibs2,
                                     s as u32,
-                                    &het_positions,
+                                    &het_positions_all,
                                     sample_seed,
                                     self.config.mcmc_steps,
                                     p_no_err,
@@ -4697,7 +4723,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         subset_to_orig: Some(hi_freq_to_orig),
                                     }),
                                     block_starts,
-                                    &het_positions,
+                                    &het_positions_all,
                                     local_prior,
                                     Some(&anchor_h1),
                                     Some(&anchor_h2),
@@ -4717,7 +4743,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mut swap_mask = vec![false; n_hi_freq];
                         let mut anchor_resets = 0usize;
                         let mut p_swap = vec![0.5f32; n_hi_freq];
-                        for (idx, &pos) in het_positions.iter().enumerate() {
+                        for &pos in het_positions.iter() {
+                            let idx = het_index_map[pos];
+                            if idx == usize::MAX {
+                                continue;
+                            }
                             let p_orient = swap_probs.get(idx).copied().unwrap_or(0.5);
                             let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
                             let p = if swap_bit == 1 { p_orient } else { 1.0 - p_orient };
@@ -4749,32 +4779,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             het_positions.len()
                         );
 
-                        if let Some(ref paths) = new_paths {
-                            if paths.path1.len() == n_hi_freq && paths.path2.len() == n_hi_freq {
-                                for i in 0..n_hi_freq {
-                                    let a1 = seq1[i];
-                                    let a2 = seq2[i];
-                                    if a1 == 255 || a2 == 255 || a1 == a2 {
-                                        continue;
-                                    }
-                                    let h1 = paths.path1[i].as_u32();
-                                    let h2 = paths.path2[i].as_u32();
-                                    let ref1 = subset_view.allele(
-                                        MarkerIdx::new(i as u32),
-                                        HapIdx::new(h1),
-                                    );
-                                    let ref2 = subset_view.allele(
-                                        MarkerIdx::new(i as u32),
-                                        HapIdx::new(h2),
-                                    );
-                                    if ref1 == a1 && ref2 == a2 {
-                                        swap_mask[i] = false;
-                                    } else if ref1 == a2 && ref2 == a1 {
-                                        swap_mask[i] = true;
-                                    }
-                                }
-                            }
-                        }
                         if s == 0 && n_hi_freq <= 12 {
                             let mut rows = Vec::with_capacity(n_hi_freq);
                             let mut p1_ids = Vec::with_capacity(n_hi_freq);
@@ -4811,15 +4815,35 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let het_lr_values: Vec<(usize, f32)> = het_positions
                             .iter()
                             .copied()
-                            .zip(swap_lr.into_iter())
+                            .filter_map(|idx| {
+                                let map_idx = het_index_map[idx];
+                                if map_idx == usize::MAX {
+                                    None
+                                } else {
+                                    Some((idx, *swap_lr.get(map_idx).unwrap_or(&1.0)))
+                                }
+                            })
                             .collect();
+                        // Phase confidence should reflect absolute label certainty.
+                        // If there are no anchored/phased markers yet, labels are symmetric,
+                        // so confidence should remain ~0.5 even if a single chain picks a side.
+                        let has_anchor_conf = sp.phased_count() > 0;
                         let het_phase_values: Vec<(usize, f32)> = het_positions
                             .iter()
                             .copied()
-                            .zip(swap_probs.iter().copied())
-                            .map(|(idx, p_swap)| {
-                                let conf = p_swap.max(1.0 - p_swap);
-                                (idx, conf)
+                            .filter_map(|idx| {
+                                let map_idx = het_index_map[idx];
+                                if map_idx == usize::MAX {
+                                    None
+                                } else {
+                                    let p_swap = *swap_probs.get(map_idx).unwrap_or(&0.5);
+                                    let conf = if has_anchor_conf {
+                                        p_swap.max(1.0 - p_swap)
+                                    } else {
+                                        0.5
+                                    };
+                                    Some((idx, conf))
+                                }
                             })
                             .collect();
 
@@ -8145,16 +8169,24 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor && start_paths.is_none() {
-        let flipped_paths =
-            if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+    if !has_anchor {
+        let flipped_paths = if let Some(paths) = start_paths {
+            if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
                 Some(MosaicPaths {
-                    path1: new_paths.path2.clone(),
-                    path2: new_paths.path1.clone(),
+                    path1: paths.path2.clone(),
+                    path2: paths.path1.clone(),
                 })
             } else {
                 None
-            };
+            }
+        } else if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+            Some(MosaicPaths {
+                path1: new_paths.path2.clone(),
+                path2: new_paths.path1.clone(),
+            })
+        } else {
+            None
+        };
 
         let chain_seed_2 = seed.wrapping_add(0xBAD_CAFE_F00Du64);
         let ref_provider_2 = RefAlleleProvider::new(ref_view, threaded_haps);
@@ -8173,36 +8205,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
         }
 
-        // Chain alignment: check if chain 2 is anti-aligned with chain 1
-        // Centered probability dot product: sum((p1 - 0.5) * (p2 - 0.5))
-        let mut dot_product = 0.0f32;
-        let mut aligned_obs = 0usize;
-
         for i in 0..het_positions.len() {
-            if obs_counts[i] > 0 && obs_counts2[i] > 0 {
-                let p1 = (swap_counts[i] as f32 + 0.5) / (obs_counts[i] as f32 + 1.0);
-                let p2 = (swap_counts2[i] as f32 + 0.5) / (obs_counts2[i] as f32 + 1.0);
-                dot_product += (p1 - 0.5) * (p2 - 0.5);
-                aligned_obs += 1;
-            }
-        }
-
-        let flip_chain2 = dot_product < 0.0;
-        if aligned_obs > 0 {
-            tracing::debug!(
-                "Mosaic chain alignment: dot_product={:.4} ({} sites), flip={}",
-                dot_product,
-                aligned_obs,
-                flip_chain2
-            );
-        }
-
-        for i in 0..het_positions.len() {
-            let s2 = if flip_chain2 {
-                obs_counts2[i].saturating_sub(swap_counts2[i])
-            } else {
-                swap_counts2[i]
-            };
+            let s2 = swap_counts2[i];
             swap_counts[i] = swap_counts[i].saturating_add(s2);
             obs_counts[i] = obs_counts[i].saturating_add(obs_counts2[i]);
         }
@@ -8249,7 +8253,92 @@ fn sample_swap_bits_mosaic<RefSpace>(
         p_max = p_max.max(p);
         p_sum += p;
     }
-    if has_anchor && !het_positions.is_empty() {
+    // Derive swap emissions from the sampled haplotype paths and run the label
+    // HMM on those emissions. This ties swaps to the inferred paths rather than
+    // per-marker orientation counts, which can be unstable.
+    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+        // Align seq1/seq2 to anchors with a single global flip to avoid
+        // per-marker label noise when anchors are sparse.
+        let mut flip_to_anchor = false;
+        if has_anchor {
+            let mut score_direct: i32 = 0;
+            let mut score_flip: i32 = 0;
+            for m in 0..n_markers {
+                let a1_anchor = anchor_h1.get(m).copied().unwrap_or(255);
+                let a2_anchor = anchor_h2.get(m).copied().unwrap_or(255);
+                if a1_anchor == 255 && a2_anchor == 255 {
+                    continue;
+                }
+                let s1 = seq1[m];
+                let s2 = seq2[m];
+                if s1 == 255 || s2 == 255 || s1 == s2 {
+                    continue;
+                }
+                if a1_anchor != 255 {
+                    score_direct += if s1 == a1_anchor { 1 } else { -1 };
+                    score_flip += if s2 == a1_anchor { 1 } else { -1 };
+                }
+                if a2_anchor != 255 {
+                    score_direct += if s2 == a2_anchor { 1 } else { -1 };
+                    score_flip += if s1 == a2_anchor { 1 } else { -1 };
+                }
+            }
+            if score_flip > score_direct {
+                flip_to_anchor = true;
+            }
+        }
+        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+        let ref_alleles = &mut buffers.ref_alleles;
+        p_min = 1.0;
+        p_max = 0.0;
+        p_sum = 0.0;
+        for (i, &m) in het_positions.iter().enumerate() {
+            let a1 = if flip_to_anchor { seq2[m] } else { seq1[m] };
+            let a2 = if flip_to_anchor { seq1[m] } else { seq2[m] };
+            if a1 == 255 || a2 == 255 || a1 == a2 {
+                swap_probs[i] = 0.5;
+                swap_lr[i] = 1.0;
+                continue;
+            }
+            path_provider.fill_ref_alleles(m, ref_alleles);
+            let p1 = new_paths.path1[m] as usize;
+            let p2 = new_paths.path2[m] as usize;
+            if p1 >= n_states || p2 >= n_states {
+                swap_probs[i] = 0.5;
+                swap_lr[i] = 1.0;
+                continue;
+            }
+            let ref1 = ref_alleles[p1];
+            let ref2 = ref_alleles[p2];
+            let conf_m = conf[m];
+            let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
+                * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
+            let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
+                * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
+            let denom = keep + swap;
+            let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
+            let p_keep = 1.0 - p_swap;
+            let (max_p, min_p) = if p_swap >= p_keep {
+                (p_swap, p_keep)
+            } else {
+                (p_keep, p_swap)
+            };
+            let lr = if min_p < 1e-30 {
+                1e6
+            } else {
+                (max_p / min_p).min(1e6)
+            };
+            swap_probs[i] = p_swap.clamp(0.0, 1.0);
+            swap_lr[i] = lr;
+            p_min = p_min.min(p_swap);
+            p_max = p_max.max(p_swap);
+            p_sum += p_swap;
+        }
+    }
+    if !het_positions.is_empty() {
+        // Phase label switches are NOT recombination events. Use a tiny, fixed
+        // switch prior to avoid artificial oscillations when evidence is symmetric.
+        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];
@@ -8272,7 +8361,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
             }
 
-            let r = p_recomb.get(m).copied().unwrap_or(0.0).clamp(1e-9, 1.0 - 1e-9);
+            let r = label_switch;
             let stay = (1.0 - r).ln();
             let sw = r.ln();
 

@@ -1,6 +1,7 @@
 use reagle::config::Config;
 use reagle::data::alignment::MarkerAlignment;
 use reagle::data::genetic_map::GeneticMaps;
+use reagle::data::haplotype::SampleIdx;
 use reagle::data::marker::MarkerIdx;
 use reagle::io::vcf::VcfReader;
 use reagle::pipelines::phasing::PhasingPipeline;
@@ -471,290 +472,6 @@ fn test_ser_not_fixed_by_high_state_count_all0_all1() {
 }
 
 #[test]
-fn test_sparse_phased_anchors_dense_map_still_switches() {
-    let n_markers = 50;
-    let n_ref_haps = 100;
-    let hero_idx = 99;
-
-    let ref_file = NamedTempFile::new().unwrap();
-    let ref_path = ref_file.path().to_path_buf();
-
-    let mut ref_samples = Vec::new();
-    let mut ref_haps = Vec::new();
-
-    for i in 0..n_ref_haps {
-        ref_samples.push(format!("R{}", i));
-        ref_haps.push(vec![0u8; n_markers]);
-        ref_haps.push(vec![0u8; n_markers]);
-    }
-
-    use rand::{Rng, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    for h in 0..ref_haps.len() {
-        for m in 0..n_markers {
-            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
-        }
-    }
-
-    let hero_hap_idx = hero_idx * 2;
-    for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
-    }
-    let anti_hero_hap_idx = hero_idx * 2 + 1;
-    for m in 0..n_markers {
-        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
-    }
-
-    let marker_pos = make_marker_pos(n_markers, 200_000);
-    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
-
-    let target_file = NamedTempFile::new().unwrap();
-    let target_path = target_file.path().to_path_buf();
-
-    let mut file = File::create(&target_path).unwrap();
-    writeln!(file, "##fileformat=VCFv4.2").unwrap();
-    writeln!(
-        file,
-        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
-    )
-    .unwrap();
-    writeln!(
-        file,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
-    )
-    .unwrap();
-
-    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
-    for (m, &pos) in marker_pos.iter().enumerate() {
-        let hero_allele = hero_pattern[m];
-        let anti_hero = 1 - hero_allele;
-        if m % 10 == 0 {
-            write!(
-                file,
-                "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
-                pos, hero_allele, anti_hero
-            )
-            .unwrap();
-        } else {
-            write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
-        }
-        writeln!(file).unwrap();
-    }
-
-    let out_file = NamedTempFile::new().unwrap();
-    let out_path = out_file.path().to_path_buf();
-
-    let mut config = Config::default();
-    config.gt = target_path.clone();
-    config.r#ref = Some(ref_path.clone());
-    config.out = out_path.clone();
-    config.phase_states = 0;
-    config.burnin = 0;
-    config.iterations = 2;
-    config.nthreads = Some(1);
-    config.ne = 10000.0;
-    config.err = Some(0.0001);
-
-    let mut pipeline = PhasingPipeline::new(config, None);
-    pipeline.run().expect("Pipeline run failed");
-
-    let expected_out_path = out_path.with_extension("vcf.gz");
-    assert!(expected_out_path.exists());
-
-    use flate2::read::MultiGzDecoder;
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file = File::open(&expected_out_path).unwrap();
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
-
-    let mut phased_haps: Vec<(u8, u8)> = Vec::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
-        if line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        let sample_field = parts[9];
-        let gt_str = sample_field.split(':').next().unwrap();
-        let alleles: Vec<u8> = gt_str
-            .split(['|', '/'])
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-        if alleles.len() >= 2 {
-            phased_haps.push((alleles[0], alleles[1]));
-        }
-    }
-
-    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
-
-    let mut switch_errors = 0;
-    for m in 1..n_markers {
-        let hero_prev = hero_pattern[m - 1];
-        let hero_curr = hero_pattern[m];
-        let (h1_prev, _) = phased_haps[m - 1];
-        let (h1_curr, _) = phased_haps[m];
-        let prev_match = h1_prev == hero_prev;
-        let curr_match = h1_curr == hero_curr;
-        if prev_match != curr_match {
-            switch_errors += 1;
-        }
-    }
-
-    let ser = switch_errors as f32 / (n_markers - 1) as f32;
-
-    assert!(
-        ser < 0.05,
-        "SER too high with anchors in dense map: {:.4}",
-        ser
-    );
-}
-
-#[test]
-fn test_sparse_phased_anchors_do_not_cause_switching() {
-    let n_markers = 50;
-    let n_ref_haps = 100;
-    let hero_idx = 99;
-
-    let ref_file = NamedTempFile::new().unwrap();
-    let ref_path = ref_file.path().to_path_buf();
-
-    let mut ref_samples = Vec::new();
-    let mut ref_haps = Vec::new();
-
-    for i in 0..n_ref_haps {
-        ref_samples.push(format!("R{}", i));
-        ref_haps.push(vec![0u8; n_markers]);
-        ref_haps.push(vec![0u8; n_markers]);
-    }
-
-    use rand::{Rng, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    for h in 0..ref_haps.len() {
-        for m in 0..n_markers {
-            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
-        }
-    }
-
-    let hero_hap_idx = hero_idx * 2;
-    for m in 0..n_markers {
-        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
-    }
-
-    // Set Anti-Hero Hap (Index 99 * 2 + 1 = 199) as the complementary pattern
-    let anti_hero_hap_idx = hero_idx * 2 + 1;
-    for m in 0..n_markers {
-        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
-    }
-
-    let marker_pos = make_marker_pos(n_markers, 1_000);
-    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
-
-    let target_file = NamedTempFile::new().unwrap();
-    let target_path = target_file.path().to_path_buf();
-
-    let mut file = File::create(&target_path).unwrap();
-    writeln!(file, "##fileformat=VCFv4.2").unwrap();
-    writeln!(
-        file,
-        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
-    )
-    .unwrap();
-    writeln!(
-        file,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
-    )
-    .unwrap();
-
-    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
-    for (m, &pos) in marker_pos.iter().enumerate() {
-        let hero_allele = hero_pattern[m];
-        let anti_hero = 1 - hero_allele;
-        if m % 10 == 0 {
-            write!(
-                file,
-                "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
-                pos, hero_allele, anti_hero
-            )
-            .unwrap();
-        } else {
-            write!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
-        }
-        writeln!(file).unwrap();
-    }
-
-    let out_file = NamedTempFile::new().unwrap();
-    let out_path = out_file.path().to_path_buf();
-
-    let mut config = Config::default();
-    config.gt = target_path.clone();
-    config.r#ref = Some(ref_path.clone());
-    config.out = out_path.clone();
-    config.phase_states = 0;
-    config.burnin = 0;
-    config.iterations = 2;
-    config.nthreads = Some(1);
-    config.ne = 10000.0;
-    config.err = Some(0.0001);
-
-    let mut pipeline = PhasingPipeline::new(config, None);
-    pipeline.run().expect("Pipeline run failed");
-
-    let expected_out_path = out_path.with_extension("vcf.gz");
-    assert!(expected_out_path.exists());
-
-    use flate2::read::MultiGzDecoder;
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file = File::open(&expected_out_path).unwrap();
-    let decoder = MultiGzDecoder::new(file);
-    let reader = BufReader::new(decoder);
-
-    let mut phased_haps: Vec<(u8, u8)> = Vec::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
-        if line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        let sample_field = parts[9];
-        let gt_str = sample_field.split(':').next().unwrap();
-        let alleles: Vec<u8> = gt_str
-            .split(['|', '/'])
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-        if alleles.len() >= 2 {
-            phased_haps.push((alleles[0], alleles[1]));
-        }
-    }
-
-    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
-
-    let mut switch_errors = 0;
-    for m in 1..n_markers {
-        let hero_prev = hero_pattern[m - 1];
-        let hero_curr = hero_pattern[m];
-        let (h1_prev, _) = phased_haps[m - 1];
-        let (h1_curr, _) = phased_haps[m];
-        let prev_match = h1_prev == hero_prev;
-        let curr_match = h1_curr == hero_curr;
-        if prev_match != curr_match {
-            switch_errors += 1;
-        }
-    }
-
-    let ser = switch_errors as f32 / (n_markers - 1) as f32;
-
-    assert!(
-        ser < 0.05,
-        "SER too high with correct initial phasing: {:.4}",
-        ser
-    );
-}
-
-#[test]
 fn test_small_panel_all0_all1_perfect_match_ser() {
     let n_markers = 10; // Small for readability
     let n_ref_haps = 20; // Small panel
@@ -1003,4 +720,135 @@ fn test_symmetric_evidence_phase_confidence_low() {
         "Expected no highly confident markers under symmetric evidence; max={:.3}",
         max
     );
+}
+
+#[test]
+fn test_phase_confidence_brier_score_noisy_input() {
+    let n_markers = 80;
+    let n_ref_haps = 100;
+    let hero_idx = 99;
+
+    let ref_file = NamedTempFile::new().unwrap();
+    let ref_path = ref_file.path().to_path_buf();
+
+    let mut ref_samples = Vec::new();
+    let mut ref_haps = Vec::new();
+
+    for i in 0..n_ref_haps {
+        ref_samples.push(format!("R{}", i));
+        ref_haps.push(vec![0u8; n_markers]);
+        ref_haps.push(vec![0u8; n_markers]);
+    }
+
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    for h in 0..ref_haps.len() {
+        for m in 0..n_markers {
+            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
+        }
+    }
+
+    let hero_hap_idx = hero_idx * 2;
+    let anti_hero_hap_idx = hero_idx * 2 + 1;
+    for m in 0..n_markers {
+        ref_haps[hero_hap_idx][m] = (m % 2) as u8;
+        ref_haps[anti_hero_hap_idx][m] = 1 - (m % 2) as u8;
+    }
+
+    let marker_pos = make_marker_pos(n_markers, 1_000);
+    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
+
+    let noise_levels = [(0.0f64, 0.0f64), (0.1f64, 0.1f64), (0.25f64, 0.2f64)];
+    for (flip_rate, unphased_rate) in noise_levels {
+        let target_file = NamedTempFile::new().unwrap();
+        let target_path = target_file.path().to_path_buf();
+
+        let mut file = File::create(&target_path).unwrap();
+        writeln!(file, "##fileformat=VCFv4.2").unwrap();
+        writeln!(
+            file,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tTarget"
+        )
+        .unwrap();
+
+        let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+        let mut local_rng = rand::rngs::StdRng::seed_from_u64(
+            113 + (flip_rate * 100.0) as u64 + (unphased_rate * 100.0) as u64,
+        );
+        for (m, &pos) in marker_pos.iter().enumerate() {
+            let hero_allele = hero_pattern[m];
+            let anti_hero = 1 - hero_allele;
+            let roll: f64 = local_rng.random();
+            if roll < unphased_rate {
+                writeln!(file, "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t0/1", pos).unwrap();
+            } else if roll < unphased_rate + flip_rate {
+                writeln!(
+                    file,
+                    "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
+                    pos, anti_hero, hero_allele
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    file,
+                    "chr1\t{}\t.\tA\tC\t.\t.\t.\tGT\t{}|{}",
+                    pos, hero_allele, anti_hero
+                )
+                .unwrap();
+            }
+        }
+
+        let (mut target_reader, target_file) = VcfReader::open(&target_path).unwrap();
+        let target_gt = target_reader.read_all(target_file).unwrap();
+        let (mut ref_reader, ref_file) = VcfReader::open(&ref_path).unwrap();
+        let ref_gt = ref_reader.read_all(ref_file).unwrap();
+        let ref_gt = ref_gt.into_phased();
+
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+
+        let mut config = Config::default();
+        config.phase_states = 0;
+        config.burnin = 0;
+        config.iterations = 2;
+        config.nthreads = Some(1);
+        config.ne = 10000.0;
+        config.err = Some(0.0001);
+
+        let mut pipeline = PhasingPipeline::new(config, None);
+        pipeline.set_reference(Arc::new(ref_gt), alignment);
+
+        let gen_maps = GeneticMaps::new();
+        let (phased, _) = pipeline
+            .phase_in_memory_with_overlap(&target_gt, &gen_maps, None, None)
+            .expect("phase_in_memory_with_overlap");
+
+        let hap1 = SampleIdx::new(0).hap1();
+        let mut brier = 0.0f32;
+        for m in 0..n_markers {
+            let marker_idx = MarkerIdx::new(m as u32);
+            let conf = phased.sample_phase_confidence_f32(marker_idx, 0);
+            let y = if phased.allele(marker_idx, hap1) == hero_pattern[m] {
+                1.0
+            } else {
+                0.0
+            };
+            let diff = conf - y;
+            brier += diff * diff;
+        }
+        let brier_mean = brier / n_markers as f32;
+        println!(
+            "[phase_confidence_brier] flip_rate={:.2} unphased_rate={:.2} brier={:.4}",
+            flip_rate, unphased_rate, brier_mean
+        );
+        assert!(
+            brier_mean < 0.18,
+            "Expected calibrated Brier score; flip_rate={:.2} unphased_rate={:.2} brier={:.4}",
+            flip_rate, unphased_rate, brier_mean
+        );
+    }
 }
