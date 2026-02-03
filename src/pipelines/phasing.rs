@@ -1121,6 +1121,7 @@ struct MosaicChain<'a, RefSpace = crate::data::AnyMarkerSpace> {
     pl_provider: Option<PlProvider<'a>>,
     anchor_hap1: Vec<u8>,
     anchor_hap2: Vec<u8>,
+    anchor_drop_prob: f32,
 }
 
 impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
@@ -1141,6 +1142,17 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         anchor_hap1: Vec<u8>,
         anchor_hap2: Vec<u8>,
     ) -> Self {
+        let anchor_count = anchor_hap1
+            .iter()
+            .zip(anchor_hap2.iter())
+            .filter(|(a1, a2)| **a1 != 255 || **a2 != 255)
+            .count();
+        let anchor_frac = if n_markers > 0 {
+            anchor_count as f32 / n_markers as f32
+        } else {
+            0.0
+        };
+        let anchor_drop_prob = (1.0 - anchor_frac).clamp(0.0, 0.5);
         let out = Self {
             rng: rand::rngs::SmallRng::seed_from_u64(seed),
             n_markers,
@@ -1180,6 +1192,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             pl_provider,
             anchor_hap1,
             anchor_hap2,
+            anchor_drop_prob,
         };
         out
     }
@@ -1278,14 +1291,18 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             }
         }
         if !self.anchor_hap2.is_empty() {
+            use rand::Rng;
             for m in 0..self.n_markers {
                 let a2 = self.anchor_hap2[m];
                 if a2 == 255 {
                     continue;
                 }
+                if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob {
+                    continue;
+                }
                 self.hap2_use_combined[m] = false;
                 self.hap2_allele[m] = a2;
-                self.hap2_hard_match[m] = true;
+                self.hap2_hard_match[m] = false;
                 let a1 = self.anchor_hap1.get(m).copied().unwrap_or(255);
                 if a1 != 255 {
                     self.hap2_partner_allele[m] = a1;
@@ -1334,14 +1351,18 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             }
         }
         if !self.anchor_hap1.is_empty() {
+            use rand::Rng;
             for m in 0..self.n_markers {
                 let a1 = self.anchor_hap1[m];
                 if a1 == 255 {
                     continue;
                 }
+                if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob {
+                    continue;
+                }
                 self.hap1_use_combined[m] = false;
                 self.hap1_allele[m] = a1;
-                self.hap1_hard_match[m] = true;
+                self.hap1_hard_match[m] = false;
                 let a2 = self.anchor_hap2.get(m).copied().unwrap_or(255);
                 if a2 != 255 {
                     self.hap1_partner_allele[m] = a2;
@@ -4191,7 +4212,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let p_err = self.params.p_mismatch;
                             let p_no_err = 1.0 - p_err;
 
-                            let (swap_bits, swap_lr, swap_probs, new_paths) = THREAD_WORKSPACE
+                            let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = THREAD_WORKSPACE
                                 .with(|ws| {
                                     let mut workspace = ws.borrow_mut();
                                     if workspace.is_none() {
@@ -4259,9 +4280,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 .collect();
                             *het_phase_out = het_positions
                                 .iter()
-                                .copied()
-                                .zip(swap_probs.into_iter())
+                                .enumerate()
+                                .map(|(idx, &m)| {
+                                    let p_swap = swap_probs_conf.get(idx).copied().unwrap_or(0.5);
+                                    let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
+                                    let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
+                                    (m, p_orient)
+                                })
                                 .collect();
+                            let swap_probs_mask_sum: f32 = swap_probs.iter().sum();
+                            assert!(swap_probs_mask_sum.is_finite());
                             assert!(swap_lr.len() <= n_markers);
                             assert!(het_phase_out.len() <= het_positions.len());
                             let mut swapped = false;
@@ -4437,21 +4465,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
 
-                        // Identify heterozygotes (all) and unphased hets (subset) in hi-freq space
-                        let mut het_positions_all: Vec<usize> = Vec::new();
+                        // Identify heterozygotes (all) in hi-freq space
                         let mut het_positions: Vec<usize> = Vec::new();
                         let mut het_index_map: Vec<usize> = vec![usize::MAX; n_hi_freq];
                         for i in 0..n_hi_freq {
-                            let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             if a1 != 255 && a2 != 255 && a1 != a2 {
-                                let idx = het_positions_all.len();
-                                het_positions_all.push(i);
+                                let idx = het_positions.len();
+                                het_positions.push(i);
                                 het_index_map[i] = idx;
-                                if sp.is_unphased(m) {
-                                    het_positions.push(i);
-                                }
                             }
                         }
 
@@ -4587,7 +4610,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             atomic.add_estimation_data(&local_est);
                         }
 
-                        let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
+                        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
@@ -4601,7 +4624,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 anchor_h2.push(anchor_h2_full[m]);
                             }
 
-                            let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
+                            let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if self.config.profile {
                                 info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
                                     sample_dynamic_mcmc(
                                         n_hi_freq,
@@ -4635,7 +4658,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     phase_ibs.as_ref().expect("phase_ibs"),
                                     ibs2,
                                     s as u32,
-                                    &het_positions_all,
+                                        &het_positions,
                                     sample_seed,
                                     self.config.mcmc_steps,
                                     p_no_err,
@@ -4650,7 +4673,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 path1: new_paths.path1.into_iter().map(CombinedHapId::from).collect(),
                                 path2: new_paths.path2.into_iter().map(CombinedHapId::from).collect(),
                             };
-                            (swap_bits, swap_lr, swap_probs, Some(global_paths))
+                            (swap_bits, swap_lr, swap_probs, swap_probs_conf, Some(global_paths))
                         } else {
                             // Classic Beagle-style: static state space MCMC with thread-local workspace
                             let ref_provider = if self.config.profile {
@@ -4723,7 +4746,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         subset_to_orig: Some(hi_freq_to_orig),
                                     }),
                                     block_starts,
-                                    &het_positions_all,
+                                    &het_positions,
                                     local_prior,
                                     Some(&anchor_h1),
                                     Some(&anchor_h2),
@@ -4736,8 +4759,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 )
                             };
                             let global_paths =
-                                local_to_global_paths(&result.3, &threaded_haps, n_hi_freq);
-                            (result.0, result.1, result.2, Some(global_paths))
+                                local_to_global_paths(&result.4, &threaded_haps, n_hi_freq);
+                            (result.0, result.1, result.2, result.3, Some(global_paths))
                         };
 
                         let mut swap_mask = vec![false; n_hi_freq];
@@ -4759,15 +4782,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-                            let is_phased_het = is_het && !sp.is_unphased(m);
-                            if is_phased_het {
-                                let a1_anchor = sp.allele1(m);
-                                let a2_anchor = sp.allele2(m);
-                                if a1 == a1_anchor && a2 == a2_anchor {
-                                    swap_mask[i] = false;
-                                } else if a1 == a2_anchor && a2 == a1_anchor {
-                                    swap_mask[i] = true;
-                                }
+                            if is_het && !sp.is_unphased(m) {
                                 anchor_resets += 1;
                             }
                         }
@@ -4827,23 +4842,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         // Phase confidence should reflect absolute label certainty.
                         // If there are no anchored/phased markers yet, labels are symmetric,
                         // so confidence should remain ~0.5 even if a single chain picks a side.
-                        let has_anchor_conf = sp.phased_count() > 0;
                         let het_phase_values: Vec<(usize, f32)> = het_positions
                             .iter()
                             .copied()
                             .filter_map(|idx| {
                                 let map_idx = het_index_map[idx];
                                 if map_idx == usize::MAX {
-                                    None
-                                } else {
-                                    let p_swap = *swap_probs.get(map_idx).unwrap_or(&0.5);
-                                    let conf = if has_anchor_conf {
-                                        p_swap.max(1.0 - p_swap)
-                                    } else {
-                                        0.5
-                                    };
-                                    Some((idx, conf))
+                                    return None;
                                 }
+                                let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                let swap_bit = *swap_bits.get(map_idx).unwrap_or(&0);
+                                let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
+                                Some((idx, p_orient.clamp(0.0, 1.0)))
                             })
                             .collect();
 
@@ -7170,11 +7180,12 @@ fn sample_dynamic_mcmc(
     anchor_hap1: Option<&[u8]>,
     anchor_hap2: Option<&[u8]>,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
-) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -7260,6 +7271,7 @@ fn sample_dynamic_mcmc(
     let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
     if initial_neighbors.is_empty() {
         return (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -7573,7 +7585,6 @@ fn sample_dynamic_mcmc(
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
     let mut swap_probs = Vec::with_capacity(het_positions.len());
-
     for &m in het_positions {
         let a1 = seq1[m];
         let a2 = seq2[m];
@@ -7608,10 +7619,12 @@ fn sample_dynamic_mcmc(
         swap_probs.push(lr / (1.0 + lr));
     }
 
+    let swap_probs_conf = swap_probs.clone();
     (
         swap_bits,
         swap_lr,
         swap_probs,
+        swap_probs_conf,
         MosaicPaths {
             path1: path1_ref,
             path2: path2_ref,
@@ -7757,9 +7770,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     p_no_err: f32,
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
-) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths) {
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -8215,6 +8229,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
     let mut swap_probs = Vec::with_capacity(het_positions.len());
+    let mut swap_probs_conf = Vec::with_capacity(het_positions.len());
     let mut obs_zero = 0usize;
     let mut p_min = 1.0f32;
     let mut p_max = 0.0f32;
@@ -8226,6 +8241,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             swap_bits.push(0);
             swap_lr.push(1.0);
             swap_probs.push(0.5);
+            swap_probs_conf.push(0.5);
             if obs_counts[i] == 0 {
                 obs_zero += 1;
             }
@@ -8247,7 +8263,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
             (max_p / min_p).min(1e6)
         };
         swap_lr.push(lr);
-        swap_probs.push(p_swap.clamp(0.0, 1.0));
+        let p = p_swap.clamp(0.0, 1.0);
+        swap_probs.push(p);
+        swap_probs_conf.push(p);
         let p = p_swap.clamp(0.0, 1.0);
         p_min = p_min.min(p);
         p_max = p_max.max(p);
@@ -8339,63 +8357,55 @@ fn sample_swap_bits_mosaic<RefSpace>(
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
         let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
+        let has_anchor = het_positions.iter().any(|&m| {
+            let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            a1 != 255 || a2 != 255
+        });
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];
+        let mut emit0_log = vec![f32::NEG_INFINITY; het_positions.len()];
+        let mut emit1_log = vec![f32::NEG_INFINITY; het_positions.len()];
 
         for (i, &m) in het_positions.iter().enumerate() {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
             let p_swap = swap_probs[i].clamp(1e-6, 1.0 - 1e-6);
             let p_keep = (1.0 - p_swap).clamp(1e-6, 1.0 - 1e-6);
             let emit0 = p_keep.ln();
             let emit1 = p_swap.ln();
-            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            let mut force: Option<u8> = None;
-            if anchor_a1 != 255 || anchor_a2 != 255 {
-                if a1 == anchor_a1 && a2 == anchor_a2 {
-                    force = Some(0);
-                } else if a1 == anchor_a2 && a2 == anchor_a1 {
-                    force = Some(1);
-                }
+            emit0_log[i] = emit0;
+            emit1_log[i] = emit1;
+            if has_anchor {
+                let _ = anchor_h1.get(m);
             }
-
             let r = label_switch;
             let stay = (1.0 - r).ln();
             let sw = r.ln();
 
             if i == 0 {
-                dp0[i] = emit0;
-                dp1[i] = emit1;
+                dp0[i] = emit0_log[i];
+                dp1[i] = emit1_log[i];
             } else {
                 let from0_to0 = dp0[i - 1] + stay;
                 let from1_to0 = dp1[i - 1] + sw;
                 if from0_to0 >= from1_to0 {
-                    dp0[i] = from0_to0 + emit0;
+                    dp0[i] = from0_to0 + emit0_log[i];
                     prev_state[i] = 0;
                 } else {
-                    dp0[i] = from1_to0 + emit0;
+                    dp0[i] = from1_to0 + emit0_log[i];
                     prev_state[i] = 1;
                 }
 
                 let from0_to1 = dp0[i - 1] + sw;
                 let from1_to1 = dp1[i - 1] + stay;
                 if from0_to1 >= from1_to1 {
-                    dp1[i] = from0_to1 + emit1;
+                    dp1[i] = from0_to1 + emit1_log[i];
                 } else {
-                    dp1[i] = from1_to1 + emit1;
+                    dp1[i] = from1_to1 + emit1_log[i];
                     prev_state[i] |= 2;
                 }
             }
 
-            if let Some(state) = force {
-                if state == 0 {
-                    dp1[i] = f32::NEG_INFINITY;
-                } else {
-                    dp0[i] = f32::NEG_INFINITY;
-                }
-            }
         }
 
         let mut state = if dp1[het_positions.len() - 1] > dp0[het_positions.len() - 1] {
@@ -8415,6 +8425,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 state = if (prev & 2) != 0 { 1 } else { 0 };
             }
         }
+
     }
     if !het_positions.is_empty() {
         let denom = (het_positions.len().saturating_sub(obs_zero)).max(1) as f32;
@@ -8464,7 +8475,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     workspace.fwd_block = buffers.fwd_block;
     workspace.combined_checkpoint_data = combined_checkpoints.into_buffer();
 
-    (swap_bits, swap_lr, swap_probs, new_paths)
+    (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths)
 }
 
 /// Decision type for Stage 2 marker processing
@@ -9388,7 +9399,7 @@ mod tests {
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(8, 0);
         let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th);
 
-        let (swap_bits, swap_lr, swap_probs, paths) = sample_swap_bits_mosaic(
+        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_swap_bits_mosaic(
             n_markers,
             2,
             &p_recomb,
@@ -9409,6 +9420,8 @@ mod tests {
             p_err,
             &mut workspace,
         );
+        let swap_probs_conf_sum: f32 = swap_probs_conf.iter().sum();
+        assert!(swap_probs_conf_sum.is_finite());
 
         let mut switches1 = 0usize;
         let mut switches2 = 0usize;
@@ -9995,7 +10008,7 @@ mod tests {
 
         // Sample 0: haplotypes 0 and 1
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
-        let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
+        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
             &p_recomb,
@@ -10015,6 +10028,8 @@ mod tests {
             None,
             &mut workspace,
         );
+        let swap_probs_conf_sum: f32 = swap_probs_conf.iter().sum();
+        assert!(swap_probs_conf_sum.is_finite());
         assert_eq!(paths.path1.len(), n_markers);
         assert_eq!(paths.path2.len(), n_markers);
 
@@ -10078,7 +10093,7 @@ mod tests {
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
-        let (swap_bits, swap_lr, swap_probs, paths) = sample_dynamic_mcmc(
+        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_dynamic_mcmc(
             n_markers,
             n_total_haps,
             &p_recomb,
@@ -10098,6 +10113,8 @@ mod tests {
             None,
             &mut workspace,
         );
+        let swap_probs_conf_sum: f32 = swap_probs_conf.iter().sum();
+        assert!(swap_probs_conf_sum.is_finite());
         assert_eq!(paths.path1.len(), n_markers);
         assert_eq!(paths.path2.len(), n_markers);
 
