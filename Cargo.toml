@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-tree = "0.4"
 
 # VCF parsing (genomics)
-noodles = { version = "0.104", features = ["vcf", "bgzf", "csi", "tabix"] }
+noodles = { version = "0.104", features = ["vcf", "bgzf", "csi", "tabix", "bcf"] }
 
 # Random number generation (for sampling)
 rand = "0.9"
