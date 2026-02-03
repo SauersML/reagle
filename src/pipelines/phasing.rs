@@ -87,6 +87,7 @@ const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
+const MIN_CHAIN_ERROR_RATE: f32 = 0.01;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -3042,6 +3043,32 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                     }
                 });
+
+            // Micro-HMM refinement on hi-frequency markers (single pass)
+            // This applies the HMM-based phase correction (with relaxed error tolerance)
+            // to fix errors that the Beam Phaser might have locked in.
+            let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
+            let stage1_blocks =
+                partition_markers_by_cm(&hi_freq_gen_positions, stage1_block_cm(&hi_freq_gen_positions));
+            let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+                .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                .collect();
+            let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+
+            let _ = self.run_phase_baum_iteration_stage1(
+                target_gt,
+                &mut geno,
+                &threaded_haps_vec,
+                &stage1_p_recomb,
+                &stage1_gen_dists,
+                &hi_freq_to_orig,
+                &stage1_blocks,
+                &ibs2,
+                &mut sample_phases,
+                &mut mcmc_paths,
+                None,
+                0,
+            )?;
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -7770,6 +7797,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
         );
     }
 
+    // Relax error rate for chain sampling to improve mixing and robustness to local errors
+    let chain_p_err = p_err.max(MIN_CHAIN_ERROR_RATE);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
@@ -7957,8 +7988,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             fwd,
             fwd_prior,
             ref_alleles,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             EmissionMode::Combined,
         );
     }
@@ -7996,8 +8027,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
