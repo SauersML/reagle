@@ -1,4 +1,5 @@
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
+use std::collections::HashMap;
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -112,6 +113,17 @@ impl PbwtQueryAllele {
     #[inline]
     pub fn value(self) -> u8 {
         self.0
+    }
+
+    /// Returns the allele value (0 or 1) if this is a valid allele query,
+    /// or None if it's a wildcard or missing.
+    #[inline]
+    pub fn as_allele(self) -> Option<u8> {
+        if self.0 <= 1 {
+            Some(self.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -541,27 +553,19 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
 
                 if next.len == 0 {
-                    scratch.clear();
-                    for &(l, r) in old.intervals() {
-                        for b in 0..n_bins {
-                            let nl =
-                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
-                            let nr =
-                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
-                            if nl < nr {
-                                let len = nr - nl;
-                                let score = len.saturating_mul(self.count_for(b, n_alleles));
-                                scratch.push((nl, nr, score));
-                            }
-                        }
+                    // When no matches found in current intervals for the queried allele,
+                    // reset to the FULL panel filtered to that allele, not all alleles.
+                    // This ensures we track haps matching the target after recombination.
+                    let queried_bin = Self::bin_for_allele(qa, n_alleles);
+                    let nl = self.offset_for(queried_bin, n_alleles);
+                    let nr = nl + self.count_for(queried_bin, n_alleles);
+                    if nl < nr {
+                        next.intervals[0] = (nl, nr);
+                        next.len = 1;
+                    } else {
+                        // Fallback to full panel if queried allele has no occurrences
+                        next = RankBeam::full(n_ref as u32);
                     }
-
-                    scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                    let keep = scratch.len().min(MAX_RANK_INTERVALS);
-                    for i in 0..keep {
-                        next.intervals[i] = (scratch[i].0, scratch[i].1);
-                    }
-                    next.len = keep;
                 }
             }
 
@@ -658,6 +662,41 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
     }
 
+    pub fn collect_positions_and_lens(
+        &self,
+        marker: usize,
+        haps: &[u32],
+        out: &mut Vec<(u32, usize, i32)>,
+    ) {
+        out.clear();
+        if haps.is_empty() {
+            return;
+        }
+        let m = marker as i32;
+        let mut wanted: HashMap<u32, usize> = HashMap::with_capacity(haps.len());
+        for (i, &h) in haps.iter().enumerate() {
+            wanted.insert(h, i);
+        }
+        let mut found: Vec<Option<(usize, i32)>> = vec![None; haps.len()];
+        let mut remaining = wanted.len();
+        for (pos, hap) in self.ppa.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let h = hap.to_usize() as u32;
+            if let Some(&idx) = wanted.get(&h) {
+                let start = self.div.get(pos).copied().unwrap_or(m);
+                found[idx] = Some((pos, start));
+                remaining -= 1;
+            }
+        }
+        for (i, &h) in haps.iter().enumerate() {
+            if let Some((pos, start)) = found[i] {
+                out.push((h, pos, start));
+            }
+        }
+    }
+
 }
 
 pub enum ReferencePbwt {
@@ -707,6 +746,43 @@ impl ReferencePbwt {
         }
     }
 
+    pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
+        match self {
+            Self::U16(inner) => inner.prepare_step(ref_alleles, n_alleles),
+            Self::U32(inner) => inner.prepare_step(ref_alleles, n_alleles),
+        }
+    }
+
+    pub fn update_beams_with_scratch_query(
+        &mut self,
+        beams: &mut [RankBeam],
+        query_alleles: &[PbwtQueryAllele],
+        n_alleles: usize,
+        scratch: &mut Vec<(u32, u32, u32)>,
+    ) {
+        match self {
+            Self::U16(inner) => inner.update_beams_with_scratch_query(
+                beams,
+                query_alleles,
+                n_alleles,
+                scratch,
+            ),
+            Self::U32(inner) => inner.update_beams_with_scratch_query(
+                beams,
+                query_alleles,
+                n_alleles,
+                scratch,
+            ),
+        }
+    }
+
+    pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
+        match self {
+            Self::U16(inner) => inner.finalize_step(ref_alleles, n_alleles, marker),
+            Self::U32(inner) => inner.finalize_step(ref_alleles, n_alleles, marker),
+        }
+    }
+
     pub fn advance_with_beams_strict(
         &mut self,
         ref_alleles: &[u8],
@@ -730,6 +806,18 @@ impl ReferencePbwt {
                 query_alleles,
                 beams,
             ),
+        }
+    }
+
+    pub fn collect_positions_and_lens(
+        &self,
+        marker: usize,
+        haps: &[u32],
+        out: &mut Vec<(u32, usize, i32)>,
+    ) {
+        match self {
+            Self::U16(inner) => inner.collect_positions_and_lens(marker, haps, out),
+            Self::U32(inner) => inner.collect_positions_and_lens(marker, haps, out),
         }
     }
 

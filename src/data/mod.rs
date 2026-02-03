@@ -15,6 +15,8 @@ pub mod genetic_map;
 pub mod haplotype;
 pub mod marker;
 pub mod storage;
+pub mod condensed;
+pub mod ref_packed;
 
 // Re-export commonly used types
 pub use haplotype::{HapIdx, SampleIdx};

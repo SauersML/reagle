@@ -78,6 +78,7 @@ pub struct Config {
     #[arg(long, default_value = "0.002")]
     pub rare: f32,
 
+
     // ============ Imputation Parameters ============
     /// Impute ungenotyped markers
     #[arg(long, default_value = "true")]

@@ -7,6 +7,7 @@
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 
 use rayon::prelude::*;
@@ -36,7 +37,7 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
 };
-use crate::model::reference_pbwt::{PbwtStrictAllele, RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{PbwtQueryAllele, PbwtStrictAllele, RankBeam, ReferencePbwt};
 use crate::model::types::RefHapId;
 use crate::model::impute_hmm::{
     ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
@@ -71,6 +72,14 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
     candidates
 }
 
+#[inline]
+fn fill_ref_alleles(col: &GenotypeColumn, out: &mut [u8]) {
+    let n = out.len();
+    for (i, v) in out.iter_mut().enumerate().take(n) {
+        *v = col.get(HapIdx::new(i as u32));
+    }
+}
+
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
@@ -78,6 +87,9 @@ const PBWT_MAX_PER_HAP: usize = 256;
 const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
+const SM_MATCH_DONORS: usize = 16;
+const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
+const SM_MATCH_MIN_DONORS: usize = 2;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
@@ -2571,11 +2583,7 @@ impl crate::pipelines::ImputationPipeline {
                     let phased_target_pl = target_window_pl
                         .as_ref()
                         .map(|w| w.genotypes.clone().into_phased());
-                    let target_missing = if target_was_unphased_for_impute {
-                        target_window_pl.as_ref().map(|w| &w.genotypes)
-                    } else {
-                        None
-                    };
+                    let target_missing = target_window_pl.as_ref().map(|w| &w.genotypes);
                     if !header_written {
                         writer.write_header_extended(
                             &ref_window.markers,
@@ -2682,6 +2690,7 @@ impl crate::pipelines::ImputationPipeline {
                     )?;
 
                     let mut next_handoff = None;
+                    let mut next_overlap_opt: Option<PhasedOverlap> = None;
                     if let Some(window_results) = window_results {
                         let ImputationWindowResults {
                             all_results,
@@ -2689,11 +2698,13 @@ impl crate::pipelines::ImputationPipeline {
                             handoff,
                         } = window_results;
                         next_handoff = handoff;
-                        // Drop heavy reference data before writing to reduce peak RSS.
-                        // Drop reference genotypes/columns to free large buffers before write.
-                        let _ = std::mem::take(&mut ref_window.ref_columns);
-                        ref_window.ref_genotypes = None;
-
+                        next_overlap_opt = Some(self.extract_imputed_overlap_streaming(
+                            &phased_target,
+                            &alignment,
+                            ref_window.output_start,
+                            ref_window.output_end,
+                            &all_results,
+                        ));
                         if let Some(bb) = &self.telemetry {
                             let output_markers =
                                 ref_window.output_end.saturating_sub(ref_window.output_start);
@@ -2713,14 +2724,20 @@ impl crate::pipelines::ImputationPipeline {
                             ));
                         }
 
+                        let ref_allele_freqs = RefAlleleFreqs::new(
+                            &ref_window.ref_columns,
+                            &ref_window.markers,
+                        );
                         self.write_imputed_window_streaming(
                             &ref_window.markers,
                             &phased_target,
                             phased_target_pl.as_ref(),
+                            target_missing,
                             &alignment,
                             &mut writer,
                             &mut window_quality,
                             &ref_is_biallelic,
+                            &ref_allele_freqs,
                             ref_window.output_start,
                             ref_window.output_end,
                             ref_window.output_start,
@@ -2729,6 +2746,10 @@ impl crate::pipelines::ImputationPipeline {
                             self.config.ap,
                             self.config.err.is_some(),
                         )?;
+
+                        // Drop heavy reference data after writing to reduce peak RSS.
+                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {
                             let output_markers =
@@ -2743,12 +2764,15 @@ impl crate::pipelines::ImputationPipeline {
 
                     total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
 
-                    let mut next_overlap = self.extract_imputed_overlap_streaming(
-                        &phased_target,
-                        &ref_window.markers,
-                        &alignment,
-                        ref_window.output_end,
-                    );
+                    let mut next_overlap = next_overlap_opt.unwrap_or_else(|| {
+                        self.extract_imputed_overlap_streaming(
+                            &phased_target,
+                            &alignment,
+                            ref_window.output_start,
+                            ref_window.output_end,
+                            &[],
+                        )
+                    });
                     if let Some(handoff) = next_handoff {
                         next_overlap.set_hap_priors(handoff.priors);
                         if let Some(idx) = handoff.prior_global_idx {
@@ -2829,11 +2853,7 @@ impl crate::pipelines::ImputationPipeline {
                     let phased_target_pl = target_window_pl
                         .as_ref()
                         .map(|w| w.genotypes.clone().into_phased());
-                    let target_missing = if target_was_unphased_for_impute {
-                        target_window_pl.as_ref().map(|w| &w.genotypes)
-                    } else {
-                        None
-                    };
+                    let target_missing = target_window_pl.as_ref().map(|w| &w.genotypes);
                     if !header_written {
                         writer.write_header_extended(
                             &ref_window.markers,
@@ -2940,6 +2960,7 @@ impl crate::pipelines::ImputationPipeline {
                     )?;
 
                     let mut next_handoff = None;
+                    let mut next_overlap_opt: Option<PhasedOverlap> = None;
                     if let Some(window_results) = window_results {
                         let ImputationWindowResults {
                             all_results,
@@ -2947,11 +2968,13 @@ impl crate::pipelines::ImputationPipeline {
                             handoff,
                         } = window_results;
                         next_handoff = handoff;
-                        // Drop heavy reference data before writing to reduce peak RSS.
-                        // Drop reference genotypes/columns to free large buffers before write.
-                        let _ = std::mem::take(&mut ref_window.ref_columns);
-                        ref_window.ref_genotypes = None;
-
+                        next_overlap_opt = Some(self.extract_imputed_overlap_streaming(
+                            &phased_target,
+                            &alignment,
+                            ref_window.output_start,
+                            ref_window.output_end,
+                            &all_results,
+                        ));
                         if let Some(bb) = &self.telemetry {
                             let output_markers =
                                 ref_window.output_end.saturating_sub(ref_window.output_start);
@@ -2971,14 +2994,20 @@ impl crate::pipelines::ImputationPipeline {
                             ));
                         }
 
+                        let ref_allele_freqs = RefAlleleFreqs::new(
+                            &ref_window.ref_columns,
+                            &ref_window.markers,
+                        );
                         self.write_imputed_window_streaming(
                             &ref_window.markers,
                             &phased_target,
                             phased_target_pl.as_ref(),
+                            target_missing,
                             &alignment,
                             &mut writer,
                             &mut window_quality,
                             &ref_is_biallelic,
+                            &ref_allele_freqs,
                             ref_window.output_start,
                             ref_window.output_end,
                             ref_window.output_start,
@@ -2987,6 +3016,10 @@ impl crate::pipelines::ImputationPipeline {
                             self.config.ap,
                             self.config.err.is_some(),
                         )?;
+
+                        // Drop heavy reference data after writing to reduce peak RSS.
+                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {
                             let output_markers =
@@ -3001,12 +3034,15 @@ impl crate::pipelines::ImputationPipeline {
 
                     total_markers += ref_window.output_end.saturating_sub(ref_window.output_start);
 
-                    let mut next_overlap = self.extract_imputed_overlap_streaming(
-                        &phased_target,
-                        &ref_window.markers,
-                        &alignment,
-                        ref_window.output_end,
-                    );
+                    let mut next_overlap = next_overlap_opt.unwrap_or_else(|| {
+                        self.extract_imputed_overlap_streaming(
+                            &phased_target,
+                            &alignment,
+                            ref_window.output_start,
+                            ref_window.output_end,
+                            &[],
+                        )
+                    });
                     if let Some(handoff) = next_handoff {
                         next_overlap.set_hap_priors(handoff.priors);
                         if let Some(idx) = handoff.prior_global_idx {
@@ -3319,13 +3355,20 @@ impl crate::pipelines::ImputationPipeline {
             self.params.p_mismatch
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
-        let build_input_probs_pair = |hap1: HapIdx, hap2: HapIdx, sample_idx: usize| -> (TargetAlleleProbs, TargetAlleleProbs) {
+        let overlap_size = 1000.min(output_end);
+        let overlap_start = output_end.saturating_sub(overlap_size);
+        let build_input_probs_pair = |hap1: HapIdx,
+                                      hap2: HapIdx,
+                                      sample_idx: usize|
+         -> (TargetAlleleProbs, TargetAlleleProbs, Option<usize>, Option<usize>) {
             let mut offsets1 = Vec::with_capacity(n_ref_markers + 1);
             let mut offsets2 = Vec::with_capacity(n_ref_markers + 1);
             let mut probs1: Vec<f32> = Vec::new();
             let mut probs2: Vec<f32> = Vec::new();
             offsets1.push(0);
             offsets2.push(0);
+            let mut last_info1: Option<usize> = None;
+            let mut last_info2: Option<usize> = None;
             let mut dbg_genotyped = 0usize;
             let mut dbg_hard_used = 0usize;
             let mut dbg_pl_present_with_hard = 0usize;
@@ -3703,6 +3746,12 @@ impl crate::pipelines::ImputationPipeline {
 
                 normalize_probs(&mut aligned1);
                 normalize_probs(&mut aligned2);
+                if !is_uniform(&aligned1) && ref_m >= overlap_start {
+                    last_info1 = Some(ref_m);
+                }
+                if !is_uniform(&aligned2) && ref_m >= overlap_start {
+                    last_info2 = Some(ref_m);
+                }
 
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
@@ -3721,8 +3770,153 @@ impl crate::pipelines::ImputationPipeline {
             (
                 TargetAlleleProbs::new(offsets1, probs1),
                 TargetAlleleProbs::new(offsets2, probs2),
+                last_info1,
+                last_info2,
             )
         };
+
+        let n_target_haps = n_target_samples * 2;
+        let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
+        // Information-weighted confusion: normalized entropy of the PBWT match set
+        // scaled by the emission-model LLR to keep confidence in probabilistic units.
+        let mut sm_low_conf_weighted: Vec<f32> = vec![0.0; n_target_haps];
+        let mut sm_total_info: Vec<f32> = vec![0.0; n_target_haps];
+        let mut sm_donor_counts: Vec<HashMap<RefHapId, u32>> =
+            vec![HashMap::new(); n_target_haps];
+        let sm_needed: Vec<AtomicBool> =
+            (0..n_target_haps).map(|_| AtomicBool::new(false)).collect();
+
+        let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
+        let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+        let batch_size = 4096usize;
+        let mut batches: Vec<(Vec<usize>, Vec<RankBeam>, Vec<PbwtQueryAllele>, Vec<u32>, Vec<(u32, u32, u32)>)> =
+            Vec::new();
+        let mut start = 0usize;
+        while start < n_target_haps {
+            let end = (start + batch_size).min(n_target_haps);
+            let haps: Vec<usize> = (start..end).collect();
+            let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
+            let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+            let current_donor = vec![0u32; haps.len()];
+            let scratch = Vec::new();
+            batches.push((haps, beams, query_alleles, current_donor, scratch));
+            start = end;
+        }
+
+        let push_donor_count = |counts: &mut HashMap<RefHapId, u32>, hap: RefHapId| {
+            let entry = counts.entry(hap).or_insert(0);
+            *entry = entry.saturating_add(1);
+        };
+
+        for ref_m in 0..n_ref_markers {
+            let col = &ref_columns[ref_m];
+            fill_ref_alleles(col, &mut ref_alleles);
+            let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles().max(1);
+
+            pbwt.prepare_step(&ref_alleles, n_alleles);
+            for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
+                if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
+                    let target_idx = target_m.as_usize();
+                    let mapping = alignment
+                        .allele_mappings
+                        .get(target_idx)
+                        .and_then(|m| m.as_ref());
+
+                    for (i, &hap_idx) in haps.iter().enumerate() {
+                        let sample_idx = hap_idx / 2;
+                        let local = hap_idx % 2;
+                        let h = HapIdx::new((sample_idx * 2 + local) as u32);
+                        let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
+                        if let Some(missing) = target_missing {
+                            if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
+                                a = 255;
+                            }
+                        }
+                        let a = if a == 255 {
+                            255
+                        } else if let Some(mapping) = mapping {
+                            if (a as usize) < mapping.targ_to_ref.len() {
+                                let r = mapping.targ_to_ref[a as usize];
+                                if r >= 0 { r as u8 } else { 255 }
+                            } else {
+                                255
+                            }
+                        } else {
+                            a
+                        };
+                        query_alleles[i] =
+                            PbwtQueryAllele::allele(a).unwrap_or_else(PbwtQueryAllele::wildcard);
+                    }
+                } else {
+                    for qa in query_alleles.iter_mut() {
+                        *qa = PbwtQueryAllele::wildcard();
+                    }
+                }
+
+                pbwt.update_beams_with_scratch_query(
+                    beams,
+                    query_alleles,
+                    n_alleles,
+                    scratch,
+                );
+            }
+            pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
+
+            let store = ref_m >= overlap_start && ref_m < output_end;
+            
+            // Compute per-allele information weights: LLR(match vs mismatch)
+            let allele_info_weights: Vec<f32> = ref_allele_freqs
+                .get(ref_m)
+                .map(|freqs| {
+                    let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
+                    let llr = ((1.0 - theta) / theta).ln();
+                    freqs.iter().map(|_| llr).collect()
+                })
+                .unwrap_or_default();
+            
+            if store {
+                for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
+                    let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                    for (i, &hap_idx) in haps.iter().enumerate() {
+                        let beam = &beams[i];
+                        pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                        let donor = donor_candidates.first().copied().unwrap_or(current_donor[i]);
+                        current_donor[i] = donor;
+
+                        let target_allele = query_alleles
+                            .get(i)
+                            .and_then(|qa| qa.as_allele())
+                            .unwrap_or(255);
+                        let info_weight = if target_allele == 255 {
+                            0.0
+                        } else {
+                            allele_info_weights
+                                .get(target_allele as usize)
+                                .copied()
+                                .unwrap_or(0.0)
+                        };
+                        if target_allele != 255 {
+                            sm_total_info[hap_idx] += info_weight;
+                        }
+
+                        if info_weight > 0.0 {
+                            let mut match_count: u32 = 0;
+                            for &(l, r) in beam.intervals() {
+                                match_count = match_count.saturating_add(r.saturating_sub(l));
+                            }
+                            let n_matches = (match_count.max(1) as f32).ln();
+                            let max_entropy = (plan.n_ref_haps as f32).ln().max(1e-6);
+                            let normalized_entropy = (n_matches / max_entropy).clamp(0.0, 1.0);
+                            sm_low_conf_weighted[hap_idx] += info_weight * normalized_entropy;
+                        }
+                        push_donor_count(
+                            &mut sm_donor_counts[hap_idx],
+                            RefHapId::new(donor as u32),
+                        );
+                    }
+                }
+            }
+        }
 
         thread_local! {
             static LOCAL_WORKSPACE: std::cell::RefCell<Option<ImputeWorkspace>> =
@@ -3734,19 +3928,10 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
-        let prior_global_idx = prior_marker_idx.map(|idx| idx + global_start);
-        let prior_gen_pos = prior_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
-        let min_informative_sites =
-            (output_markers as f64 * 0.05).clamp(20.0, 150.0);
-        let ratio_low = 0.6f32;
-        let ratio_high = 1.7f32;
-        let ratio_floor = 1e-4f32;
-        let ema_fast = 0.2f32;
-        let ema_slow = 0.1f32;
-
         struct ImputeResult {
             result: SampleImputationResult,
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
+            last_info_idx: Option<usize>,
         }
 
         let telemetry = self.telemetry.clone();
@@ -3764,23 +3949,226 @@ impl crate::pipelines::ImputationPipeline {
                     .and_then(|o| o.hap_priors())
                     .and_then(|p| p.get(h2_idx.as_usize()));
 
+                let (input_probs_h1, input_probs_h2, last_info_h1, last_info_h2) =
+                    build_input_probs_pair(h1_idx, h2_idx, s);
+                // Information-weighted fallback decision: ratio of confused info to total info.
+                // Missing targets provide no information, so treat missingness as low confidence.
+                let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
+                let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
+                let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
+                let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
+                let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
+                let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
+                let no_info_h1 = sm_total_info[h1_idx.as_usize()] <= 0.0;
+                let no_info_h2 = sm_total_info[h2_idx.as_usize()] <= 0.0;
+                let has_priors_h1 = priors_h1.map(|p| !p.is_empty()).unwrap_or(false);
+                let has_priors_h2 = priors_h2.map(|p| !p.is_empty()).unwrap_or(false);
+                let mut donors_h1: Vec<(RefHapId, u32)> = sm_donor_counts[h1_idx.as_usize()]
+                    .iter()
+                    .map(|(h, c)| (*h, *c))
+                    .collect();
+                let mut donors_h2: Vec<(RefHapId, u32)> = sm_donor_counts[h2_idx.as_usize()]
+                    .iter()
+                    .map(|(h, c)| (*h, *c))
+                    .collect();
+                donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
+                let use_hmm_h1 = if has_priors_h1 {
+                    last_info_h1.is_some()
+                } else if no_info_h1 {
+                    false
+                } else {
+                    conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        || insufficient_info_h1
+                        || donors_h1.len() < SM_MATCH_MIN_DONORS
+                };
+                let use_hmm_h2 = if has_priors_h2 {
+                    last_info_h2.is_some()
+                } else if no_info_h2 {
+                    false
+                } else {
+                    conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        || insufficient_info_h2
+                        || donors_h2.len() < SM_MATCH_MIN_DONORS
+                };
+
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
-                let (input_probs_h1, input_probs_h2) = build_input_probs_pair(h1_idx, h2_idx, s);
+                let update_error_rate = |stats: &crate::model::impute_hmm::EmStats,
+                                         prior_error_rate: &mut f32| {
+                    if stats.informative_sites > 0.0 {
+                        let ratio = (stats.expected_mismatches / stats.informative_sites)
+                            .clamp(1e-6, 0.5) as f32;
+                        *prior_error_rate =
+                            (*prior_error_rate * 0.8 + ratio * 0.2).clamp(err_floor, 0.5);
+                    }
+                };
+                let posts_from_priors = |priors: &HaplotypePriors| -> Vec<AllelePosteriors> {
+                    let mut out: Vec<AllelePosteriors> =
+                        Vec::with_capacity(output_end.saturating_sub(output_start));
+                    for ref_m in output_start..output_end {
+                        let n_alleles = ref_markers
+                            .marker(MarkerIdx::new(ref_m as u32))
+                            .n_alleles()
+                            .max(1);
+                        let mut probs = vec![0.0f32; n_alleles];
+                        for (id, p) in priors.ids().iter().zip(priors.probs().iter()) {
+                            let hap = HapIdx::new(id.0);
+                            let allele = ref_columns
+                                .get(ref_m)
+                                .map(|c| c.get(hap))
+                                .unwrap_or(255);
+                            if allele == 255 {
+                                continue;
+                            }
+                            let idx = allele as usize;
+                            if idx < probs.len() {
+                                probs[idx] += *p;
+                            }
+                        }
+                        let mut sum: f32 = probs.iter().sum();
+                        if sum <= 0.0 {
+                            if let Some(freqs) = ref_allele_freqs.get(ref_m) {
+                                probs.clear();
+                                probs.extend_from_slice(freqs);
+                                sum = probs.iter().sum();
+                            }
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0 / sum;
+                            for v in probs.iter_mut() {
+                                *v *= inv;
+                            }
+                        } else {
+                            let uniform = 1.0 / n_alleles.max(1) as f32;
+                            for v in probs.iter_mut() {
+                                *v = uniform;
+                            }
+                        }
+                        if n_alleles == 2 {
+                            out.push(AllelePosteriors::Biallelic(
+                                probs.get(1).copied().unwrap_or(0.0),
+                            ));
+                        } else {
+                            out.push(AllelePosteriors::Multiallelic(probs));
+                        }
+                    }
+                    out
+                };
+                let posts_from_ref_freqs = || -> Vec<AllelePosteriors> {
+                    let mut out: Vec<AllelePosteriors> =
+                        Vec::with_capacity(output_end.saturating_sub(output_start));
+                    for ref_m in output_start..output_end {
+                        let n_alleles = ref_markers
+                            .marker(MarkerIdx::new(ref_m as u32))
+                            .n_alleles()
+                            .max(1);
+                        let mut probs = if let Some(freqs) = ref_allele_freqs.get(ref_m) {
+                            freqs.to_vec()
+                        } else {
+                            vec![0.0f32; n_alleles]
+                        };
+                        if probs.len() != n_alleles {
+                            probs.resize(n_alleles, 0.0);
+                        }
+                        let mut sum: f32 = probs.iter().sum();
+                        if sum <= 0.0 {
+                            let uniform = 1.0 / n_alleles.max(1) as f32;
+                            for v in probs.iter_mut() {
+                                *v = uniform;
+                            }
+                            sum = 1.0;
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0 / sum;
+                            for v in probs.iter_mut() {
+                                *v *= inv;
+                            }
+                        }
+                        if n_alleles == 2 {
+                            out.push(AllelePosteriors::Biallelic(
+                                probs.get(1).copied().unwrap_or(0.0),
+                            ));
+                        } else {
+                            out.push(AllelePosteriors::Multiallelic(probs));
+                        }
+                    }
+                    out
+                };
+
+                let build_state_haps = |hap_idx: HapIdx,
+                                        priors: Option<&HaplotypePriors>,
+                                        donors: &[(RefHapId, u32)]|
+                 -> Vec<RefHapId> {
+                    let mut out: Vec<RefHapId> = Vec::new();
+                    let mut seen: std::collections::HashSet<RefHapId> = std::collections::HashSet::new();
+
+                    if let Some(p) = priors {
+                        for id in p.ids() {
+                            let hap = RefHapId::new(id.0);
+                            if seen.insert(hap) {
+                                out.push(hap);
+                                if out.len() >= per_window_cap_local {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+
+                    for (hap, _) in donors.iter() {
+                        if seen.insert(*hap) {
+                            out.push(*hap);
+                            if out.len() >= per_window_cap_local {
+                                return out;
+                            }
+                        }
+                    }
+
+                    if let Some(core) = plan.core_states.get(hap_idx.as_usize()) {
+                        for &hap in core {
+                            if seen.insert(hap) {
+                                out.push(hap);
+                                if out.len() >= per_window_cap_local {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+
+                    if out.is_empty() {
+                        if let Some(full) = full_states.as_ref() {
+                            for &hap in full {
+                                if seen.insert(hap) {
+                                    out.push(hap);
+                                    if out.len() >= per_window_cap_local {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if let Some(states) = state_haps_by_hap.get(hap_idx.as_usize()) {
+                            for &hap in states {
+                                if seen.insert(hap) {
+                                    out.push(hap);
+                                    if out.len() >= per_window_cap_local {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    out
+                };
+
                 let mut process_haplotype = |hap_idx: HapIdx,
-                                         priors: Option<&HaplotypePriors>,
-                                         input_probs: &TargetAlleleProbs,
-                                         error_rate: f32|
+                                             priors: Option<&HaplotypePriors>,
+                                             input_probs: &TargetAlleleProbs,
+                                             error_rate: f32,
+                                             prior_marker_idx: Option<usize>,
+                                             donors: &[(RefHapId, u32)]|
                  -> (Vec<AllelePosteriors>, HaplotypePriors, crate::model::impute_hmm::EmStats) {
-                    let plan_idx = hap_idx.as_usize();
-                    let state_haps = if let Some(full) = full_states.as_ref() {
-                        full.as_slice()
-                    } else {
-                        state_haps_by_hap
-                            .get(plan_idx)
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[])
-                    };
+                    let state_haps = build_state_haps(hap_idx, priors, donors);
                     assert!(
                         !state_haps.is_empty(),
                         "State selection produced empty haplotype set"
@@ -3799,24 +4187,42 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let mapper = prior_mappers_by_hap
                             .as_ref()
-                            .and_then(|v| v.get(plan_idx))
+                            .and_then(|v| v.get(hap_idx.as_usize()))
                             .and_then(|m| m.as_ref());
                         let mapped = if let Some(mapper) = mapper {
                             mapper.map(p.probs()).into_vec()
                         } else {
                             let prev_states: Vec<RefHapId> =
                                 p.ids().iter().map(|id| RefHapId::new(id.0)).collect();
-                            let mapper = TransitionMatrix::build(&prev_states, state_haps);
+                            let mapper = TransitionMatrix::build(&prev_states, &state_haps);
                             mapper.map(p.probs()).into_vec()
                         };
-                        if mapped.iter().all(|v| !v.is_finite() || *v <= 0.0) && !warned_empty_map {
+                        let mut sum = 0.0f32;
+                        for v in mapped.iter() {
+                            if v.is_finite() && *v > 0.0 {
+                                sum += *v;
+                            }
+                        }
+                        if sum <= 0.0 && !warned_empty_map {
                             warn!(
                                 "State handoff mapped to empty priors for window {} (state set mismatch)",
                                 window_idx
                             );
                             warned_empty_map = true;
                         }
-                        Some(mapped)
+                        if sum <= 0.0 {
+                            return None;
+                        }
+                        let inv = 1.0 / sum;
+                        let prior_floor = 1e-3f32;
+                        let uniform = 1.0 / state_haps.len().max(1) as f32;
+                        let mut blended = Vec::with_capacity(mapped.len());
+                        for v in mapped {
+                            let mut p = v * inv;
+                            p = (1.0 - prior_floor) * p + prior_floor * uniform;
+                            blended.push(p);
+                        }
+                        Some(blended)
                     });
 
                     let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
@@ -3826,7 +4232,7 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let ws = ws_opt.as_mut().unwrap();
                         run_impute_hmm(
-                            state_haps,
+                            &state_haps,
                             ref_columns,
                             input_probs,
                             &p_recomb,
@@ -3853,127 +4259,277 @@ impl crate::pipelines::ImputationPipeline {
                     (posteriors, next_priors, stats)
                 };
 
-                let prior_error = (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5);
-                let (mut post1_full, mut p1_out, stats1) =
-                    process_haplotype(h1_idx, priors_h1, &input_probs_h1, prior_error);
-                let (mut post2_full, mut p2_out, stats2) =
-                    process_haplotype(h2_idx, priors_h2, &input_probs_h2, prior_error);
+                let mut hap1_posts: Option<Vec<AllelePosteriors>> = None;
+                let mut hap2_posts: Option<Vec<AllelePosteriors>> = None;
+                let mut p1_out = HaplotypePriors::empty();
+                let mut p2_out = HaplotypePriors::empty();
 
-                let total_sites = stats1.informative_sites + stats2.informative_sites;
-                let total_mismatch = stats1.expected_mismatches + stats2.expected_mismatches;
-                let posterior_rate = if total_sites > 0.0 {
-                    (total_mismatch / total_sites).clamp(1e-6, 0.5) as f32
+                if no_info_h1 && has_priors_h1 {
+                    if let Some(p) = priors_h1 {
+                        hap1_posts = Some(posts_from_priors(p));
+                        p1_out = p.clone();
+                    }
+                } else if use_hmm_h1 {
+                    let (posts, out, stats) = process_haplotype(
+                        h1_idx,
+                        priors_h1,
+                        &input_probs_h1,
+                        (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
+                        last_info_h1.or(prior_marker_idx),
+                        &donors_h1,
+                    );
+                    hap1_posts = Some(posts);
+                    p1_out = out;
+                    update_error_rate(&stats, prior_error_rate);
+                } else if has_priors_h1 {
+                    if let Some(p) = priors_h1 {
+                        hap1_posts = Some(posts_from_priors(p));
+                        p1_out = p.clone();
+                    }
                 } else {
-                    prior_error
-                };
-
-                let mut next_error = prior_error;
-                if total_sites >= min_informative_sites {
-                    let baseline = prior_error.max(ratio_floor);
-                    let ratio = posterior_rate / baseline;
-                    let divergent = ratio < ratio_low || ratio > ratio_high;
-                    if divergent {
-                        let local_rate = posterior_rate.clamp(1e-6, 0.5);
-                        let (post1_rerun, p1_rerun, _) =
-                            process_haplotype(h1_idx, priors_h1, &input_probs_h1, local_rate);
-                        let (post2_rerun, p2_rerun, _) =
-                            process_haplotype(h2_idx, priors_h2, &input_probs_h2, local_rate);
-                        post1_full = post1_rerun;
-                        post2_full = post2_rerun;
-                        p1_out = p1_rerun;
-                        p2_out = p2_rerun;
-                        next_error = (1.0 - ema_fast) * prior_error + ema_fast * local_rate;
-                    } else {
-                        next_error = (1.0 - ema_slow) * prior_error + ema_slow * posterior_rate;
+                    let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
+                    if total > 0 {
+                        let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h1
+                        .iter()
+                        .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
+                        .unzip();
+                        p1_out = HaplotypePriors::new(ids, probs);
                     }
                 }
-                *prior_error_rate = next_error;
-
-                let output_len = output_end.saturating_sub(output_start);
-                let include_posteriors = self.config.gp || self.config.ap;
-                let mut hap1_alt = if !include_posteriors {
-                    Some(Vec::with_capacity(output_len))
-                } else {
-                    None
-                };
-                let mut hap2_alt = if !include_posteriors {
-                    Some(Vec::with_capacity(output_len))
-                } else {
-                    None
-                };
-                let mut hap1_posts = if include_posteriors {
-                    Some(Vec::with_capacity(output_len))
-                } else {
-                    None
-                };
-                let mut hap2_posts = if include_posteriors {
-                    Some(Vec::with_capacity(output_len))
-                } else {
-                    None
-                };
-
-                for m in output_start..output_end {
-                    let p1 = &post1_full[m];
-                    let p2 = &post2_full[m];
-
-                    let prob1 = match p1 {
-                        AllelePosteriors::Biallelic(p) => *p,
-                        AllelePosteriors::Multiallelic(probs) => {
-                            if probs.len() > 1 { probs[1] } else { 0.0 }
-                        }
-                    };
-
-                    let prob2 = match p2 {
-                        AllelePosteriors::Biallelic(p) => *p,
-                        AllelePosteriors::Multiallelic(probs) => {
-                            if probs.len() > 1 { probs[1] } else { 0.0 }
-                        }
-                    };
-
-                    if let Some(v) = hap1_alt.as_mut() {
-                        v.push(prob1);
-                    }
-                    if let Some(v) = hap2_alt.as_mut() {
-                        v.push(prob2);
-                    }
-                    if let Some(v) = hap1_posts.as_mut() {
-                        v.push(p1.clone());
-                    }
-                    if let Some(v) = hap2_posts.as_mut() {
-                        v.push(p2.clone());
-                    }
+                if hap1_posts.is_none() {
+                    hap1_posts = Some(posts_from_ref_freqs());
                 }
 
-                let hap_alt_probs = match (hap1_alt, hap2_alt) {
-                    (Some(h1), Some(h2)) => Some((h1, h2)),
-                    _ => None,
-                };
-
-                let hap_posteriors = match (hap1_posts, hap2_posts) {
-                    (Some(h1), Some(h2)) => Some((h1, h2)),
-                    _ => None,
-                };
+                if no_info_h2 && has_priors_h2 {
+                    if let Some(p) = priors_h2 {
+                        hap2_posts = Some(posts_from_priors(p));
+                        p2_out = p.clone();
+                    }
+                } else if use_hmm_h2 {
+                    let (posts, out, stats) = process_haplotype(
+                        h2_idx,
+                        priors_h2,
+                        &input_probs_h2,
+                        (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
+                        last_info_h2.or(prior_marker_idx),
+                        &donors_h2,
+                    );
+                    hap2_posts = Some(posts);
+                    p2_out = out;
+                    update_error_rate(&stats, prior_error_rate);
+                } else if has_priors_h2 {
+                    if let Some(p) = priors_h2 {
+                        hap2_posts = Some(posts_from_priors(p));
+                        p2_out = p.clone();
+                    }
+                } else {
+                    let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
+                    if total > 0 {
+                        let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h2
+                            .iter()
+                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
+                            .unzip();
+                        p2_out = HaplotypePriors::new(ids, probs);
+                    }
+                }
+                if hap2_posts.is_none() {
+                    hap2_posts = Some(posts_from_ref_freqs());
+                }
 
                 if let Some(bb) = telemetry.as_ref() {
                     bb.add_samples(1);
                 }
 
+                let need_sm_h1 = hap1_posts.is_none();
+                let need_sm_h2 = hap2_posts.is_none();
+                if need_sm_h1 {
+                    sm_needed[h1_idx.as_usize()].store(true, Ordering::Relaxed);
+                }
+                if need_sm_h2 {
+                    sm_needed[h2_idx.as_usize()].store(true, Ordering::Relaxed);
+                }
+
                 ImputeResult {
                     result: SampleImputationResult {
                         sample_idx: s,
-                        hap_alt_probs,
-                        hap_posteriors,
+                        hap_alt_probs: None,
+                        hap_posteriors: match (hap1_posts, hap2_posts) {
+                            (Some(p1), Some(p2)) => Some((p1, p2)),
+                            _ => None,
+                        },
                     },
                     priors: Some((p1_out, p2_out)),
+                    last_info_idx: match (last_info_h1, last_info_h2) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    },
                 }
             })
             .collect();
 
+        let output_markers = output_end.saturating_sub(output_start);
+        let mut sm_alt_probs_by_hap: Vec<Option<Vec<f32>>> = vec![None; n_target_haps];
+        let sm_haps: Vec<usize> = sm_needed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| if f.load(Ordering::Relaxed) { Some(i) } else { None })
+            .collect();
+        if !sm_haps.is_empty() && output_markers > 0 {
+            let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
+            let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+            let batch_size = 4096usize;
+            let mut batches: Vec<(Vec<usize>, Vec<RankBeam>, Vec<PbwtQueryAllele>, Vec<u32>, Vec<(u32, u32, u32)>)> =
+                Vec::new();
+            let mut start = 0usize;
+            while start < sm_haps.len() {
+                let end = (start + batch_size).min(sm_haps.len());
+                let haps: Vec<usize> = sm_haps[start..end].to_vec();
+                let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
+                let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+                let current_donor = vec![0u32; haps.len()];
+                let scratch = Vec::new();
+                for &hap in &haps {
+                    sm_alt_probs_by_hap[hap] = Some(Vec::with_capacity(output_markers));
+                }
+                batches.push((haps, beams, query_alleles, current_donor, scratch));
+                start = end;
+            }
+
+            for ref_m in 0..n_ref_markers {
+                let col = &ref_columns[ref_m];
+                fill_ref_alleles(col, &mut ref_alleles);
+                let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles().max(1);
+
+                pbwt.prepare_step(&ref_alleles, n_alleles);
+            for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
+                    if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
+                        let target_idx = target_m.as_usize();
+                        let mapping = alignment
+                            .allele_mappings
+                            .get(target_idx)
+                            .and_then(|m| m.as_ref());
+
+                        for (i, &hap_idx) in haps.iter().enumerate() {
+                            let sample_idx = hap_idx / 2;
+                            let local = hap_idx % 2;
+                            let h = HapIdx::new((sample_idx * 2 + local) as u32);
+                            let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
+                            if let Some(missing) = target_missing {
+                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
+                                    a = 255;
+                                }
+                            }
+                            let a = if a == 255 {
+                                255
+                            } else if let Some(mapping) = mapping {
+                                if (a as usize) < mapping.targ_to_ref.len() {
+                                    let r = mapping.targ_to_ref[a as usize];
+                                    if r >= 0 { r as u8 } else { 255 }
+                                } else {
+                                    255
+                                }
+                            } else {
+                                a
+                            };
+                            query_alleles[i] = PbwtQueryAllele::allele(a)
+                                .unwrap_or_else(PbwtQueryAllele::wildcard);
+                        }
+                    } else {
+                        for qa in query_alleles.iter_mut() {
+                            *qa = PbwtQueryAllele::wildcard();
+                        }
+                    }
+
+                    pbwt.update_beams_with_scratch_query(
+                        beams,
+                        query_alleles,
+                        n_alleles,
+                        scratch,
+                    );
+                }
+                pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
+
+                if ref_m < output_start || ref_m >= output_end {
+                    continue;
+                }
+                for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
+                    let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                    for (i, &hap_idx) in haps.iter().enumerate() {
+                        let beam = &beams[i];
+                        pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                        let mut donor = current_donor[i];
+                        let mut found = false;
+                        for &cand in &donor_candidates {
+                            if cand == donor {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            if let Some(&cand) = donor_candidates.first() {
+                                donor = cand;
+                                current_donor[i] = donor;
+                            }
+                        }
+                        let target_allele = query_alleles
+                            .get(i)
+                            .and_then(|qa| qa.as_allele())
+                            .unwrap_or(255);
+                        let p_alt = if n_alleles <= 2 {
+                            if target_allele == 255 {
+                                if donor_candidates.is_empty() {
+                                    panic!(
+                                        "SM-match donor set empty at ref_m={} for hap_idx={} (cannot impute missing site)",
+                                        ref_m, hap_idx
+                                    );
+                                }
+                                let mut alt_sum = 0u32;
+                                for &cand in &donor_candidates {
+                                    let allele = col.get(HapIdx::new(cand));
+                                    if allele == 1 {
+                                        alt_sum += 1;
+                                    }
+                                }
+                                (alt_sum as f32 / donor_candidates.len() as f32)
+                                    .clamp(1e-6, 1.0 - 1e-6)
+                            } else {
+                                let allele = col.get(HapIdx::new(donor));
+                                if allele == 1 { 1.0 } else { 0.0 }
+                            }
+                        } else {
+                            0.0
+                        };
+                        if let Some(buf) = sm_alt_probs_by_hap[hap_idx].as_mut() {
+                            buf.push(p_alt);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut all_results = Vec::with_capacity(n_target_samples);
         let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
+        let mut handoff_marker_idx: Option<usize> = None;
 
-        for item in sample_results {
+        for mut item in sample_results {
             let sample_idx = item.result.sample_idx;
+            let h1 = sample_idx * 2;
+            let h2 = h1 + 1;
+            let need1 = sm_alt_probs_by_hap.get(h1).and_then(|v| v.as_ref()).is_some();
+            let need2 = sm_alt_probs_by_hap.get(h2).and_then(|v| v.as_ref()).is_some();
+            if (need1 || need2) && output_markers > 0 {
+                let p1 = sm_alt_probs_by_hap
+                    .get_mut(h1)
+                    .and_then(|v| v.take())
+                    .unwrap_or_default();
+                let p2 = sm_alt_probs_by_hap
+                    .get_mut(h2)
+                    .and_then(|v| v.take())
+                    .unwrap_or_default();
+                item.result.hap_alt_probs = Some((p1, p2));
+            }
             all_results.push(item.result);
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
@@ -3981,6 +4537,12 @@ impl crate::pipelines::ImputationPipeline {
                     next_priors_vec[base] = p1;
                     next_priors_vec[base + 1] = p2;
                 }
+            }
+            if let Some(idx) = item.last_info_idx {
+                handoff_marker_idx = Some(match handoff_marker_idx {
+                    Some(prev) => prev.max(idx),
+                    None => idx,
+                });
             }
         }
 
@@ -4003,30 +4565,66 @@ impl crate::pipelines::ImputationPipeline {
                 window_idx, output_markers
             ));
         }
+        let handoff_marker_idx = handoff_marker_idx.or(prior_marker_idx);
+        let handoff_global_idx = handoff_marker_idx.map(|idx| idx + global_start);
+        let handoff_gen_pos = handoff_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
         Ok(Some(ImputationWindowResults {
             all_results,
             ref_is_biallelic,
             handoff: Some(ImputationHandoff {
                 priors: next_priors_vec,
-                prior_global_idx,
-                prior_gen_pos,
+                prior_global_idx: handoff_global_idx,
+                prior_gen_pos: handoff_gen_pos,
             }),
         }))
     }
     fn extract_imputed_overlap_streaming<TargetSpace, RefSpace>(
         &self,
         target_win: &GenotypeMatrix<Phased, TargetSpace>,
-        ref_markers: &crate::data::marker::Markers<RefSpace>,
         alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+        output_start: usize,
         output_end: usize,
+        all_results: &[SampleImputationResult],
     ) -> PhasedOverlap {
-        let overlap_size = 1000.min(ref_markers.len().saturating_sub(output_end));
-        let start = output_end;
-        let end = output_end.saturating_add(overlap_size);
+        let overlap_size = 1000.min(output_end);
+        let start = output_end.saturating_sub(overlap_size);
+        let end = output_end;
         let n_haps = target_win.n_haplotypes();
         let mut alleles = vec![255u8; overlap_size * n_haps];
+        let n_samples = target_win.n_samples();
+        let mut result_by_sample: Vec<Option<&SampleImputationResult>> = vec![None; n_samples];
+        for result in all_results {
+            if result.sample_idx < n_samples {
+                result_by_sample[result.sample_idx] = Some(result);
+            }
+        }
         for h in 0..n_haps {
+            let sample_idx = h / 2;
+            let hap_idx = h % 2;
+            let posteriors = result_by_sample
+                .get(sample_idx)
+                .and_then(|r| *r)
+                .and_then(|r| r.hap_posteriors.as_ref());
             for (local_m, ref_m) in (start..end).enumerate() {
+                let out_local = ref_m.saturating_sub(output_start);
+                if let Some((p1, p2)) = posteriors {
+                    let post = if hap_idx == 0 { p1 } else { p2 };
+                    if let Some(ap) = post.get(out_local) {
+                        let allele = match ap {
+                            AllelePosteriors::Biallelic(p_alt) => {
+                                if *p_alt >= 0.5 { 1u8 } else { 0u8 }
+                            }
+                            AllelePosteriors::Multiallelic(probs) => probs
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                                .map(|(i, _)| i as u8)
+                                .unwrap_or(255),
+                        };
+                        alleles[h * overlap_size + local_m] = allele;
+                        continue;
+                    }
+                }
                 if let Some(target_m) =
                     alignment.target_marker(MarkerIdx::new(ref_m as u32))
                 {
@@ -4040,15 +4638,21 @@ impl crate::pipelines::ImputationPipeline {
 
     /// Write imputed window results to VCF
     #[allow(clippy::too_many_arguments)]
-    fn write_imputed_window_streaming<TargetSpace: Sync, RefMarkerSpace: Sync>(
+    fn write_imputed_window_streaming<
+        TargetSpace: Sync,
+        RefMarkerSpace: Sync,
+        TargetMissingState: PhaseState + Sync,
+    >(
         &self,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
         target_win: &GenotypeMatrix<Phased, TargetSpace>,
         target_pl: Option<&GenotypeMatrix<Phased, TargetSpace>>,
+        target_missing: Option<&GenotypeMatrix<TargetMissingState, TargetSpace>>,
         alignment: &MarkerAlignment<TargetSpace, RefMarkerSpace>,
         writer: &mut VcfWriter,
         quality: &mut ImputationQuality,
         ref_is_biallelic: &[bool],
+        ref_allele_freqs: &RefAlleleFreqs<'_, RefMarkerSpace>,
         output_start: usize,
         output_end: usize,
         markers_to_process_start: usize,
@@ -4124,28 +4728,6 @@ impl crate::pipelines::ImputationPipeline {
             }
         };
 
-        let get_posteriors_for_writer = if include_posteriors {
-            Some(|marker_idx: usize, sample_idx: usize| {
-                let local_m = marker_idx.saturating_sub(output_start);
-                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
-                        let post1 = p1
-                            .get(local_m)
-                            .cloned()
-                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
-                        let post2 = p2
-                            .get(local_m)
-                            .cloned()
-                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
-                        return (post1, post2);
-                    }
-                }
-                default_posteriors(marker_idx)
-            })
-        } else {
-            None
-        };
-
         let samples = target_win.samples_arc();
         let target_pl = target_pl.unwrap_or(target_win);
 
@@ -4153,6 +4735,13 @@ impl crate::pipelines::ImputationPipeline {
             let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
             let h1 = HapIdx::new((sample_idx * 2) as u32);
             let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+            if let Some(missing) = target_missing {
+                let miss_a1 = missing.allele(target_m, h1);
+                let miss_a2 = missing.allele(target_m, h2);
+                if miss_a1 == 255 || miss_a2 == 255 {
+                    return None;
+                }
+            }
             let raw_a1 = target_win.allele(target_m, h1);
             let raw_a2 = target_win.allele(target_m, h2);
             if raw_a1 == 255 || raw_a2 == 255 {
@@ -4184,6 +4773,29 @@ impl crate::pipelines::ImputationPipeline {
             } else {
                 Some((a1, a2))
             }
+        };
+
+        let get_posteriors_for_writer = if include_posteriors {
+            Some(|marker_idx: usize, sample_idx: usize| {
+                let _ = (ref_markers, ref_allele_freqs);
+                let local_m = marker_idx.saturating_sub(output_start);
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
+                        let post1 = p1
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).0);
+                        let post2 = p2
+                            .get(local_m)
+                            .cloned()
+                            .unwrap_or_else(|| default_posteriors(marker_idx).1);
+                        return (post1, post2);
+                    }
+                }
+                default_posteriors(marker_idx)
+            })
+        } else {
+            None
         };
 
         let genotype_index = |a: usize, b: usize| -> usize {
@@ -4619,7 +5231,7 @@ use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::GenotypeColumn;
-    use crate::data::storage::phase_state::Unphased;
+    use crate::data::storage::phase_state::{Phased, Unphased};
     use crate::io::bref3::StreamingRefVcfReader;
     use crate::io::vcf::{ImputationQuality, VcfWriter};
     use crate::pipelines::ImputationPipeline;
@@ -4728,14 +5340,18 @@ use crate::data::ChromIdx;
 
         let pipeline = ImputationPipeline::new(Config::default(), None);
         let ref_is_biallelic = vec![true; ref_markers.len()];
+        let ref_columns: Vec<crate::data::storage::GenotypeColumn> = Vec::new();
+        let ref_allele_freqs = RefAlleleFreqs::new(&ref_columns, &ref_markers);
         let result = pipeline.write_imputed_window_streaming(
             &ref_markers,
             &target_win,
             None,
+            None::<&GenotypeMatrix<Phased, crate::data::AnyMarkerSpace>>,
             &alignment,
             &mut writer,
             &mut quality,
             &ref_is_biallelic,
+            &ref_allele_freqs,
             output_start,
             output_end,
             output_start,

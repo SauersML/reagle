@@ -43,6 +43,7 @@
 //! phasing and imputation.
 
 pub mod hmm;
+pub mod beam;
 pub mod ibs2;
 pub mod parameters;
 pub mod pbwt;

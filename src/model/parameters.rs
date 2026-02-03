@@ -32,6 +32,7 @@ pub struct ModelParams {
 
     /// Initial likelihood ratio threshold
     pub initial_lr: f32,
+
 }
 
 impl ModelParams {
@@ -171,6 +172,7 @@ impl ModelParams {
     pub fn set_n_states(&mut self, n_states: usize) {
         self.n_states = n_states;
     }
+
 }
 
 impl Default for ModelParams {
