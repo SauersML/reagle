@@ -894,17 +894,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         beam
     }
 
-    fn apply_segment_constraints(
-        &self,
-        beam: &[BeamPath],
-        segment: &crate::data::condensed::CondensedSegment,
-        active_pool: &ActivePool,
-        scratch: &mut BeamScratch,
-    ) -> Vec<BeamPath> {
-        let (out, _) = self.apply_segment_constraints_with_ptrs(beam, segment, active_pool, scratch);
-        out
-    }
-
     fn apply_segment_constraints_with_ptrs(
         &self,
         beam: &[BeamPath],
@@ -1395,11 +1384,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             Some(a) => a == targ_allele,
             None => false,
         }
-    }
-
-    fn prune_inplace(&self, mut beam: Vec<BeamPath>) -> Vec<BeamPath> {
-        self.prune_and_collapse(&mut beam);
-        beam
     }
 
     fn prune_inplace_with_ptrs(&self, mut beam: Vec<BeamPath>, mut ptrs: Vec<u32>) -> (Vec<BeamPath>, Vec<u32>) {
