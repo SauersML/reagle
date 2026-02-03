@@ -20,6 +20,7 @@ pub struct SegmentConstraint {
     pub marker: MarkerIdx<AnyMarkerSpace>,
     pub alleles: [u8; 2],
     pub n_alleles: u8,
+    pub mismatch_cost: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -32,17 +33,16 @@ pub struct CallSite {
     pub a1_freq: f32,
     /// Frequency of allele a2 in the reference panel (for TMRCA-aware scoring).
     pub a2_freq: f32,
-    /// PBWT-derived match length proxy for allele a1 (in marker steps).
-    pub pbwt_len_a1: f32,
-    /// PBWT-derived match length proxy for allele a2 (in marker steps).
-    pub pbwt_len_a2: f32,
+    /// PBWT-derived match length proxy for allele a1 (Morgans).
+    pub pbwt_len_morgans_a1: f32,
+    /// PBWT-derived match length proxy for allele a2 (Morgans).
+    pub pbwt_len_morgans_a2: f32,
     /// PBWT-derived density proxy for allele a1 (count of candidate haps).
     pub pbwt_density_a1: f32,
     /// PBWT-derived density proxy for allele a2 (count of candidate haps).
     pub pbwt_density_a2: f32,
     /// Genetic distance to previous call site (Morgans).
     pub dist_morgans: f32,
-    pub switch_cost: i32,
     pub flip_cost: i32,
     pub fixed: bool,
 }
@@ -65,6 +65,8 @@ impl CondensedTarget {
         pbwt_stats: Option<&[(f32, f32, f32, f32)]>,
         packed_ref: &PackedRefView<RefSpace>,
         params: &ModelParams,
+        hard_threshold_nats: Option<f64>,
+        constraint_max_expected: Option<f64>,
     ) -> Self {
         let mut call_sites: Vec<CallSite> = Vec::new();
         let mut segments: Vec<CondensedSegment> = Vec::new();
@@ -82,11 +84,10 @@ impl CondensedTarget {
                 let marker = MarkerIdx::new(orig_m as u32);
                 let pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
                 let dist = if let Some(prev_pos) = last_call_pos {
-                    (pos - prev_pos).max(0.0)
+                    ((pos - prev_pos).max(0.0)) / 100.0
                 } else {
                     0.0
                 };
-                let switch_cost = 0;
                 let fixed = !sample_phase.is_unphased(orig_m);
                 let flip_cost = if fixed {
                     let conf = sample_phase.phase_confidence(orig_m).clamp(1e-6, 1.0 - 1e-6) as f64;
@@ -107,7 +108,7 @@ impl CondensedTarget {
                         (fa1.max(1e-6), fa2.max(1e-6))
                     })
                     .unwrap_or((0.5, 0.5));
-                let (pbwt_len_a1, pbwt_len_a2, pbwt_density_a1, pbwt_density_a2) = pbwt_stats
+                let (pbwt_len_morgans_a1, pbwt_len_morgans_a2, pbwt_density_a1, pbwt_density_a2) = pbwt_stats
                     .and_then(|stats| stats.get(hi_idx).copied())
                     .map(|(len0, len1, den0, den1)| {
                         let (l1, d1) = if a1 == 0 {
@@ -134,12 +135,11 @@ impl CondensedTarget {
                     a2,
                     a1_freq,
                     a2_freq,
-                    pbwt_len_a1,
-                    pbwt_len_a2,
+                    pbwt_len_morgans_a1,
+                    pbwt_len_morgans_a2,
                     pbwt_density_a1,
                     pbwt_density_a2,
                     dist_morgans: dist as f32,
-                    switch_cost,
                     flip_cost,
                     fixed,
                 });
@@ -148,7 +148,9 @@ impl CondensedTarget {
         }
 
         let theta = params.p_mismatch.max(1e-9) as f64;
-        let hard_threshold = theta.ln().neg() + 6.0;
+        let hard_threshold = hard_threshold_nats.unwrap_or(6.0);
+        let max_expected = constraint_max_expected.unwrap_or(8.0);
+        let n_ref_haps = packed_ref.n_ref_haps();
         // Build segments between call sites (including leading/trailing).
         let mut prev_hi = 0usize;
         for cs in call_sites.iter() {
@@ -161,7 +163,9 @@ impl CondensedTarget {
                 hi_freq_gen_positions,
                 allele_freqs,
                 hard_threshold,
+                max_expected,
                 theta,
+                n_ref_haps,
                 packed_ref,
             );
             segments.push(seg);
@@ -176,7 +180,9 @@ impl CondensedTarget {
             hi_freq_gen_positions,
             allele_freqs,
             hard_threshold,
+            max_expected,
             theta,
+            n_ref_haps,
             packed_ref,
         );
         segments.push(trailing);
@@ -188,20 +194,17 @@ impl CondensedTarget {
     pub fn reversed(
         &self,
         hi_freq_gen_positions: &[f64],
-        params: &ModelParams,
     ) -> Self {
         let mut call_sites_rev: Vec<CallSite> = Vec::with_capacity(self.call_sites.len());
         let mut last_pos: Option<f64> = None;
         for cs in self.call_sites.iter().rev() {
             let pos = hi_freq_gen_positions.get(cs.hi_idx).copied().unwrap_or(0.0);
             let dist = if let Some(prev_pos) = last_pos {
-                (pos - prev_pos).abs()
+                ((pos - prev_pos).abs()) / 100.0
             } else {
                 0.0
             };
-            let switch_cost = 0;
             let flip_cost = cs.flip_cost;
-            let hi_idx = cs.hi_idx;
             call_sites_rev.push(CallSite {
                 marker: cs.marker,
                 hi_idx: cs.hi_idx,
@@ -209,12 +212,11 @@ impl CondensedTarget {
                 a2: cs.a2,
                 a1_freq: cs.a1_freq,
                 a2_freq: cs.a2_freq,
-                pbwt_len_a1: cs.pbwt_len_a1,
-                pbwt_len_a2: cs.pbwt_len_a2,
+                pbwt_len_morgans_a1: cs.pbwt_len_morgans_a1,
+                pbwt_len_morgans_a2: cs.pbwt_len_morgans_a2,
                 pbwt_density_a1: cs.pbwt_density_a1,
                 pbwt_density_a2: cs.pbwt_density_a2,
                 dist_morgans: dist as f32,
-                switch_cost,
                 flip_cost,
                 fixed: cs.fixed,
             });
@@ -230,10 +232,9 @@ impl CondensedTarget {
 
 /// Segment constraints are stored compactly as per-marker allowed alleles.
 ///
-/// We add homozygous constraints for any mapped allele (strong signal), and
-/// add phased heterozygous constraints as an allowed-allele set. This avoids
-/// materializing full reference bitmasks while preserving the same filtering
-/// semantics for candidate haplotypes.
+/// We only add homozygous constraints when the implied mismatch cost is high
+/// enough to safely hard-prune paths under the current scoring tolerance.
+/// Phased heterozygotes are handled as call sites and do not appear here.
 
 fn build_segment_mask<RefSpace>(
     sample_phase: &SamplePhase,
@@ -243,7 +244,9 @@ fn build_segment_mask<RefSpace>(
     hi_freq_gen_positions: &[f64],
     allele_freqs: Option<&[(f32, f32)]>,
     hard_threshold: f64,
+    max_expected: f64,
     theta: f64,
+    n_ref_haps: usize,
     packed_ref: &PackedRefView<RefSpace>,
 ) -> CondensedSegment {
     let mut constraints: Vec<SegmentConstraint> = Vec::new();
@@ -257,11 +260,15 @@ fn build_segment_mask<RefSpace>(
             .get(end_hi.saturating_sub(1))
             .copied()
             .unwrap_or(start_pos);
-        (end_pos - start_pos).abs() as f32
+        ((end_pos - start_pos).abs() / 100.0) as f32
     } else {
         0.0
     };
 
+    let llr = ((1.0 - theta).max(1e-12) / theta.max(1e-12)).ln();
+    let mismatch_cost = (-(theta.max(1e-12)).ln() * 1_000_000.0)
+        .round()
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
     for hi_idx in start_hi..end_hi {
         let orig_m = hi_freq_to_orig[hi_idx];
         let a1 = sample_phase.allele1(orig_m);
@@ -275,12 +282,13 @@ fn build_segment_mask<RefSpace>(
                 .map(|&(f0, f1)| if a1 == 0 { f0 } else { f1 })
                 .unwrap_or(0.5)
                 .max(1e-9) as f64;
-            let mismatch_cost = -((theta * pi).max(1e-12)).ln();
-            if mismatch_cost >= hard_threshold && packed_ref.can_map_targ_allele(orig_m, a1) {
+            let expected = (n_ref_haps as f64) * pi;
+            if expected <= max_expected && llr >= hard_threshold && packed_ref.can_map_targ_allele(orig_m, a1) {
                 constraints.push(SegmentConstraint {
                     marker: MarkerIdx::new(orig_m as u32),
                     alleles: [a1, a1],
                     n_alleles: 1,
+                    mismatch_cost,
                 });
                 any_constraint = true;
             }

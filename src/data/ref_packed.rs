@@ -90,4 +90,36 @@ impl<RefSpace: Send + Sync> PackedRefView<RefSpace> {
             phantom: std::marker::PhantomData,
         }
     }
+
+    /// Build a PackedRefView aligned to a sparse subset of target markers.
+    pub fn build_sparse<TargetState: PhaseState>(
+        target_gt: &GenotypeMatrix<TargetState, AnyMarkerSpace>,
+        ref_gt: &GenotypeMatrix<crate::data::storage::phase_state::Phased, RefSpace>,
+        alignment: &MarkerAlignment<AnyMarkerSpace, RefSpace>,
+        target_markers: &[usize],
+    ) -> Self {
+        let n_targets = target_gt.n_markers();
+        let n_ref_haps = ref_gt.n_haplotypes();
+        let mut columns: Vec<Option<PackedRefColumn>> = vec![None; n_targets];
+        let mut allele_maps: Vec<Option<AlleleMapping>> = vec![None; n_targets];
+
+        for &t in target_markers {
+            if t >= n_targets {
+                continue;
+            }
+            if let Some(r_idx) = alignment.target_to_ref[t] {
+                let col = ref_gt.column(r_idx);
+                let packed = PackedRefColumn::pack_from_column(r_idx, ref_gt.markers(), &col);
+                columns[t] = Some(packed);
+                allele_maps[t] = alignment.allele_mappings[t].clone();
+            }
+        }
+
+        Self {
+            n_ref_haps,
+            columns,
+            allele_maps,
+            phantom: std::marker::PhantomData,
+        }
+    }
 }

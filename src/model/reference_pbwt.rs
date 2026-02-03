@@ -1,4 +1,5 @@
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
+use std::collections::HashMap;
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -68,7 +69,6 @@ impl RankBeam {
 pub struct ReferencePbwtImpl<I: PbwtIndex> {
     updater: PbwtDivUpdater<I>,
     ppa: Vec<I>,
-    inv_ppa: Vec<usize>,
     div: Vec<i32>,
     permuted_ref: Vec<u8>,
     permuted_bits: Vec<u64>,
@@ -148,14 +148,9 @@ impl PbwtStrictAllele {
 
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     pub fn new(n_ref_haps: usize) -> Self {
-        let mut inv_ppa = vec![0usize; n_ref_haps];
-        for i in 0..n_ref_haps {
-            inv_ppa[i] = i;
-        }
         Self {
             updater: PbwtDivUpdater::new(n_ref_haps),
             ppa: (0..n_ref_haps).map(I::from_usize).collect(),
-            inv_ppa,
             div: vec![0; n_ref_haps],
             permuted_ref: vec![0; n_ref_haps],
             permuted_bits: Vec::new(),
@@ -665,12 +660,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
         self.updater
             .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
-        for (pos, hap) in self.ppa.iter().enumerate() {
-            let h = hap.to_usize();
-            if h < self.inv_ppa.len() {
-                self.inv_ppa[h] = pos;
-            }
-        }
     }
 
     pub fn collect_positions_and_lens(
@@ -684,14 +673,27 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             return;
         }
         let m = marker as i32;
-        for &h in haps {
-            let hap = h as usize;
-            if hap >= self.inv_ppa.len() {
-                continue;
+        let mut wanted: HashMap<u32, usize> = HashMap::with_capacity(haps.len());
+        for (i, &h) in haps.iter().enumerate() {
+            wanted.insert(h, i);
+        }
+        let mut found: Vec<Option<(usize, i32)>> = vec![None; haps.len()];
+        let mut remaining = wanted.len();
+        for (pos, hap) in self.ppa.iter().enumerate() {
+            if remaining == 0 {
+                break;
             }
-            let pos = self.inv_ppa[hap];
-            let start = self.div.get(pos).copied().unwrap_or(m);
-            out.push((h, pos, start));
+            let h = hap.to_usize() as u32;
+            if let Some(&idx) = wanted.get(&h) {
+                let start = self.div.get(pos).copied().unwrap_or(m);
+                found[idx] = Some((pos, start));
+                remaining -= 1;
+            }
+        }
+        for (i, &h) in haps.iter().enumerate() {
+            if let Some((pos, start)) = found[i] {
+                out.push((h, pos, start));
+            }
         }
     }
 
@@ -744,6 +746,43 @@ impl ReferencePbwt {
         }
     }
 
+    pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
+        match self {
+            Self::U16(inner) => inner.prepare_step(ref_alleles, n_alleles),
+            Self::U32(inner) => inner.prepare_step(ref_alleles, n_alleles),
+        }
+    }
+
+    pub fn update_beams_with_scratch_query(
+        &mut self,
+        beams: &mut [RankBeam],
+        query_alleles: &[PbwtQueryAllele],
+        n_alleles: usize,
+        scratch: &mut Vec<(u32, u32, u32)>,
+    ) {
+        match self {
+            Self::U16(inner) => inner.update_beams_with_scratch_query(
+                beams,
+                query_alleles,
+                n_alleles,
+                scratch,
+            ),
+            Self::U32(inner) => inner.update_beams_with_scratch_query(
+                beams,
+                query_alleles,
+                n_alleles,
+                scratch,
+            ),
+        }
+    }
+
+    pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
+        match self {
+            Self::U16(inner) => inner.finalize_step(ref_alleles, n_alleles, marker),
+            Self::U32(inner) => inner.finalize_step(ref_alleles, n_alleles, marker),
+        }
+    }
+
     pub fn advance_with_beams_strict(
         &mut self,
         ref_alleles: &[u8],
@@ -774,7 +813,7 @@ impl ReferencePbwt {
         &self,
         marker: usize,
         haps: &[u32],
-        out: &mut Vec<(u32, usize, f32)>,
+        out: &mut Vec<(u32, usize, i32)>,
     ) {
         match self {
             Self::U16(inner) => inner.collect_positions_and_lens(marker, haps, out),

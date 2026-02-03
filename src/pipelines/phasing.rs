@@ -12,7 +12,7 @@
 //!
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bitvec::prelude::*;
@@ -83,6 +83,10 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 8;
 const PBWT_ANCHOR_TOP_HAPS: usize = 32;
+const FAST_BEAM_WIDTH: usize = 16;
+const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
+const FAST_BEAM_INJECT_K: usize = 8;
+const FAST_BEAM_FIX_CONF: f32 = 0.99;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -1912,7 +1916,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 crate::error::ReagleError::config("Reference alignment missing for beam phasing")
             })?;
 
-            let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
+            let packed_ref =
+                PackedRefView::build_sparse(&target_gt, &ref_gt, alignment, &hi_freq_to_orig);
 
             // Compute allele frequencies for TMRCA-aware beam scoring.
             // For each hi-freq marker, compute (freq_allele0, freq_allele1) from reference.
@@ -1938,24 +1943,33 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             };
 
             let beam_config = BeamConfig::default();
+            let mut beam_config_fast = beam_config;
+            beam_config_fast.beam_width = FAST_BEAM_WIDTH;
+            beam_config_fast.switch_candidates = FAST_BEAM_SWITCH_CANDIDATES;
+            beam_config_fast.inject_k = FAST_BEAM_INJECT_K.min(beam_config.inject_k.max(1));
+            if beam_config_fast.inject_interval == 0 {
+                beam_config_fast.inject_interval = beam_config.inject_interval;
+            }
             let beam_index = PbwtBeamIndex::build(
                 &ref_gt,
                 alignment,
                 &hi_freq_to_orig,
                 &hi_freq_gen_positions,
-                beam_config.inject_k,
+                beam_config.inject_k.max(beam_config_fast.inject_k),
                 beam_config.inject_interval,
+                self.params.recomb_intensity,
             );
             let pbwt_stats: Option<Vec<(f32, f32, f32, f32)>> = Some(
                 (0..hi_freq_to_orig.len())
                     .map(|hi_idx| beam_index.stats_for_hi(hi_idx))
                     .collect(),
             );
+            let phaser_fast = BeamPhaser::new(&packed_ref, &self.params, beam_config_fast);
             let phaser = BeamPhaser::new(&packed_ref, &self.params, beam_config);
 
             let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
 
-            let threaded_haps_vec = self.build_phasing_prescan_states(
+            let mut threaded_haps_vec = self.build_phasing_prescan_states(
                 &target_gt,
                 &geno,
                 Some(ref_gt.as_ref()),
@@ -1967,7 +1981,111 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 Some(&hi_freq_to_orig),
             )?;
 
-            let original_unphased: Vec<Vec<usize>> = sample_phases
+            let beam_confidence: Vec<std::sync::Mutex<Vec<(usize, u8, u8, f32)>>> =
+                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let beam_donors: Vec<std::sync::Mutex<Vec<usize>>> =
+                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let fast_confidence: Vec<std::sync::Mutex<Vec<(usize, u8, u8, f32)>>> =
+                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+
+            let n_target_haps = target_gt.n_haplotypes();
+            // Fast pass: fix high-confidence hets using a smaller beam.
+            sample_phases
+                .par_iter()
+                .enumerate()
+                .for_each(|(s, sp)| {
+                    let mut active_pool = ActivePool::new(packed_ref.n_ref_haps());
+                    let mut tmp = vec![crate::model::types::CombinedHapId::from(0u32); threaded_haps_vec[s].n_states()];
+                    let th = &threaded_haps_vec[s];
+                    th.materialize_at(0, &mut tmp);
+                    for id in tmp.iter().copied() {
+                        let hid = id.as_u32() as usize;
+                        if hid >= n_target_haps {
+                            let ref_id = hid - n_target_haps;
+                            if ref_id < packed_ref.n_ref_haps() {
+                                active_pool.add(ref_id);
+                            }
+                        }
+                    }
+
+                    let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
+                    for &h in active_pool.list() {
+                        let mut score = 0i32;
+                        for &m in hi_freq_to_orig.iter() {
+                            let a1 = sp.allele1(m);
+                            let a2 = sp.allele2(m);
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+                            if let Some(r) = packed_ref.ref_allele_targ(m, h) {
+                                if a1 == a2 {
+                                    score += if r == a1 { 2 } else { -2 };
+                                } else {
+                                    score += if r == a1 || r == a2 { 1 } else { -1 };
+                                }
+                            }
+                        }
+                        scored.push((score, h));
+                    }
+                    scored.sort_by(|a, b| b.0.cmp(&a.0));
+                    for &(_, h) in scored.iter().take(4) {
+                        active_pool.promote(h);
+                    }
+
+                    let hard_threshold_nats = if beam_config_fast.prune_tolerance > 0 {
+                        Some((beam_config_fast.prune_tolerance as f64) / 1_000_000.0)
+                    } else {
+                        None
+                    };
+                    let constraint_max_expected = Some(beam_config_fast.switch_candidates.max(2) as f64);
+                    let condensed = CondensedTarget::build(
+                        sp,
+                        &hi_freq_to_orig,
+                        &hi_freq_gen_positions,
+                        hi_freq_allele_freqs.as_deref(),
+                        pbwt_stats.as_deref(),
+                        &packed_ref,
+                        &self.params,
+                        hard_threshold_nats,
+                        constraint_max_expected,
+                    );
+
+                    let mut sp_fast = sp.clone();
+                    let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config_fast.inject_k);
+                    let fwd = phaser_fast.phase_sample(&condensed, &mut sp_fast, &mut active_pool, &mut injector);
+                    if let Ok(mut slot) = fast_confidence[s].lock() {
+                        slot.clear();
+                        for (i, &p) in fwd.p_swapped.iter().enumerate() {
+                            let call = &condensed.call_sites[i];
+                            slot.push((call.marker.as_usize(), call.a1, call.a2, p));
+                        }
+                    }
+                });
+
+            let mut fast_fixed: Vec<Vec<usize>> = vec![Vec::new(); n_samples];
+            for (s, sp) in sample_phases.iter_mut().enumerate() {
+                if let Ok(slot) = fast_confidence[s].lock() {
+                    for &(m, a1, a2, p) in slot.iter() {
+                        if !sp.is_unphased(m) {
+                            continue;
+                        }
+                        let conf = p.max(1.0 - p);
+                        if conf < FAST_BEAM_FIX_CONF {
+                            continue;
+                        }
+                        let want_swapped = p >= 0.5;
+                        let swapped_now = sp.allele1(m) == a2 && sp.allele2(m) == a1;
+                        if want_swapped != swapped_now {
+                            sp.swap_alleles(m);
+                        }
+                        sp.mark_phased(m);
+                        sp.set_phase_confidence(m, conf);
+                        fast_fixed[s].push(m);
+                    }
+                }
+            }
+
+            let mut original_unphased: Vec<Vec<usize>> = sample_phases
                 .iter()
                 .map(|sp| {
                     hi_freq_to_orig
@@ -1977,11 +2095,17 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         .collect()
                 })
                 .collect();
+            for s in 0..n_samples {
+                if fast_fixed[s].is_empty() {
+                    continue;
+                }
+                let mut fixed = HashSet::with_capacity(fast_fixed[s].len());
+                for &m in &fast_fixed[s] {
+                    fixed.insert(m);
+                }
+                original_unphased[s].retain(|m| !fixed.contains(m));
+            }
 
-            let beam_confidence: Vec<std::sync::Mutex<Vec<(usize, u8, u8, f32)>>> =
-                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-
-            let n_target_haps = target_gt.n_haplotypes();
             sample_phases
                 .par_iter_mut()
                 .enumerate()
@@ -2025,6 +2149,12 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     active_pool.promote(h);
                 }
 
+                    let hard_threshold_nats = if beam_config.prune_tolerance > 0 {
+                        Some((beam_config.prune_tolerance as f64) / 1_000_000.0)
+                    } else {
+                        None
+                    };
+                    let constraint_max_expected = Some(beam_config.switch_candidates.max(2) as f64);
                     let condensed = CondensedTarget::build(
                         sp,
                         &hi_freq_to_orig,
@@ -2033,6 +2163,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         pbwt_stats.as_deref(),
                         &packed_ref,
                         &self.params,
+                        hard_threshold_nats,
+                        constraint_max_expected,
                     );
 
                     let mut injector = PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
@@ -2046,11 +2178,51 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             slot.push((call.marker.as_usize(), call.a1, call.a2, p));
                         }
                     }
+                    if let Ok(mut slot) = beam_donors[s].lock() {
+                        slot.clear();
+                        let list = active_pool.list();
+                        let cap = beam_config
+                            .beam_width
+                            .max(beam_config.inject_k.saturating_mul(2))
+                            .max(beam_config.switch_candidates.saturating_mul(4));
+                        if list.len() > cap {
+                            slot.extend_from_slice(&list[list.len() - cap..]);
+                        } else {
+                            slot.extend_from_slice(list);
+                        }
+                    }
                 });
 
             for (s, sp) in sample_phases.iter_mut().enumerate() {
                 for &m in original_unphased[s].iter() {
                     sp.mark_unphased(m);
+                }
+            }
+
+            // Feed beam-selected donors back into the HMM state set.
+            if packed_ref.n_ref_haps() > 0 {
+                let offset = n_target_haps as u32;
+                for s in 0..n_samples {
+                    let Ok(donors) = beam_donors[s].lock() else {
+                        continue;
+                    };
+                    if donors.is_empty() {
+                        continue;
+                    }
+                    let threaded_haps = &mut threaded_haps_vec[s];
+                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
+                    threaded_haps.materialize_at(0, &mut existing);
+                    let mut seen: HashSet<u32> = HashSet::with_capacity(existing.len() + donors.len());
+                    for id in existing {
+                        seen.insert(id.as_u32());
+                    }
+                    for &h in donors.iter() {
+                        let combined = combined_from_ref(RefHapId::from(h), offset);
+                        let id = combined.as_u32();
+                        if seen.insert(id) {
+                            threaded_haps.push_new(combined);
+                        }
+                    }
                 }
             }
 
@@ -2677,7 +2849,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 crate::error::ReagleError::config("Reference alignment missing for beam phasing")
             })?;
 
-            let packed_ref = PackedRefView::build(&target_gt, &ref_gt, alignment);
+            let packed_ref =
+                PackedRefView::build_sparse(&target_gt, &ref_gt, alignment, &hi_freq_to_orig);
             let beam_config = BeamConfig::default();
             let beam_index = PbwtBeamIndex::build(
                 &ref_gt,
@@ -2686,6 +2859,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &hi_freq_gen_positions,
                 beam_config.inject_k,
                 beam_config.inject_interval,
+                self.params.recomb_intensity,
             );
             let pbwt_stats: Option<Vec<(f32, f32, f32, f32)>> = Some(
                 (0..hi_freq_to_orig.len())
@@ -2747,6 +2921,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                     }
 
+                    let hard_threshold_nats = if beam_config.prune_tolerance > 0 {
+                        Some((beam_config.prune_tolerance as f64) / 1_000_000.0)
+                    } else {
+                        None
+                    };
+                    let constraint_max_expected = Some(beam_config.switch_candidates.max(2) as f64);
                     let condensed = CondensedTarget::build(
                         sp,
                         &hi_freq_to_orig,
@@ -2755,6 +2935,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         pbwt_stats.as_deref(),
                         &packed_ref,
                         &self.params,
+                        hard_threshold_nats,
+                        constraint_max_expected,
                     );
                     let mut injector =
                         PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
@@ -2772,7 +2954,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 }
                             }
                         }
-                        let condensed_rev = condensed.reversed(&hi_freq_gen_positions, &self.params);
+                        let condensed_rev = condensed.reversed(&hi_freq_gen_positions);
                         let mut injector_rev =
                             PbwtInjector::new(&beam_index, packed_ref.n_ref_haps(), beam_config.inject_k);
                         let mut sp_rev = sp.clone();
