@@ -149,7 +149,7 @@ impl CondensedTarget {
 
         let theta = params.p_mismatch.max(1e-9) as f64;
         let hard_threshold = hard_threshold_nats.unwrap_or(6.0);
-        let max_expected = constraint_max_expected.unwrap_or(8.0);
+        let max_expected = constraint_max_expected.unwrap_or(8.0).max(1.0);
         let n_ref_haps = packed_ref.n_ref_haps();
         // Build segments between call sites (including leading/trailing).
         let mut prev_hi = 0usize;
@@ -232,9 +232,10 @@ impl CondensedTarget {
 
 /// Segment constraints are stored compactly as per-marker allowed alleles.
 ///
-/// We only add homozygous constraints when the implied mismatch cost is high
-/// enough to safely hard-prune paths under the current scoring tolerance.
-/// Phased heterozygotes are handled as call sites and do not appear here.
+/// We only add homozygous constraints when they are expected to collapse the
+/// compatible reference set (panel-size-aware) and when the emission-model LLR
+/// is strong enough to justify pruning. Phased heterozygotes are handled as
+/// call sites and do not appear here.
 
 fn build_segment_mask<RefSpace>(
     sample_phase: &SamplePhase,
