@@ -2312,7 +2312,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         } else {
                             0.5
                         };
-                        sp.set_phase_confidence(m, conf);
+                        // Clamp beam confidence to prevent overconfidence on noisy data
+                        sp.set_phase_confidence(m, conf.min(0.9));
                     }
                 }
             }
@@ -4931,7 +4932,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             for (hi_freq_idx, p_orient) in het_phase_values {
                 let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient.max(1.0 - p_orient));
+                let conf = p_orient.max(1.0 - p_orient);
+                // Clamp HMM confidence to prevent overconfidence on noisy data
+                sp.set_phase_confidence(m, conf.min(0.9));
             }
 
             if let Some(paths) = new_paths {
