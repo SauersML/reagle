@@ -7398,6 +7398,10 @@ fn sample_dynamic_mcmc(
 
     // MCMC loop: Gibbs sampling alternating between H1 and H2
     for step in 0..n_mcmc_steps {
+        if step == 0 {
+            let max_r = p_recomb.iter().fold(0.0f32, |a, &b| a.max(b));
+            eprintln!("[mcmc] max_p_recomb={:.6}", max_r);
+        }
         // === Sample H1 | (G, H2_fixed) ===
 
         // 1. Select neighbors using "Latent State" approach:
@@ -8420,14 +8424,32 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let denom = (het_positions.len().saturating_sub(obs_zero)).max(1) as f32;
         let mean = p_sum / denom;
         eprintln!(
-            "[swap stats] hets={} obs0={} p_min={:.3} p_mean={:.3} p_max={:.3} anchors={}",
+            "[swap stats] hets={} obs0={} p_min={:.3} p_mean={:.3} p_max={:.3} anchors={} p_err={:.6}",
             het_positions.len(),
             obs_zero,
             p_min,
             mean,
             p_max,
-            chain_anchor_hap1.iter().filter(|&&a| a != 255).count()
+            chain_anchor_hap1.iter().filter(|&&a| a != 255).count(),
+            p_err
         );
+        // Debugging for Brier score investigation
+        if het_positions.len() >= 40 && p_max > 0.9 {
+             let limit = het_positions.len().min(80);
+             for i in 0..limit {
+                 let m = het_positions[i];
+                 if swap_probs[i] > 0.1 && swap_probs[i] < 0.9 {
+                     eprintln!(
+                         "[swap stats detail] m={} obs={} swap_ct={} p={:.3} lr={:.3}",
+                         m,
+                         obs_counts[i],
+                         swap_counts[i],
+                         swap_probs[i],
+                         swap_lr[i]
+                     );
+                 }
+             }
+        }
         if n_markers <= 60 {
             let limit = het_positions.len().min(12);
             for i in 0..limit {
