@@ -371,13 +371,13 @@ impl PbwtBeamIndex {
             pbwt.collect_positions_and_lens(hi_idx, &union, &mut pos_lens);
             let gen_pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
             let step_morgans = if hi_idx > 0 {
-                ((gen_pos - hi_freq_gen_positions[hi_idx - 1]).abs() / 100.0)
+                (gen_pos - hi_freq_gen_positions[hi_idx - 1]).abs() / 100.0
             } else if hi_idx + 1 < hi_freq_gen_positions.len() {
-                ((hi_freq_gen_positions[hi_idx + 1] - gen_pos).abs() / 100.0)
+                (hi_freq_gen_positions[hi_idx + 1] - gen_pos).abs() / 100.0
             } else {
                 0.0
             };
-            let select_best_by_transition = |donors: &mut Vec<u32>| {
+            let select_best_by_transition = |donors: &mut Vec<u32>, beam: &RankBeam| {
                 const EULER_MASCHERONI: f64 = 0.5772156649015329;
                 let rho = recomb_intensity.max(1e-12) as f64;
                 let d = (step_morgans.max(1e-12)) as f64;
@@ -412,8 +412,8 @@ impl PbwtBeamIndex {
                     donors.truncate(k);
                 }
             };
-            select_best_by_transition(&mut d0);
-            select_best_by_transition(&mut d1);
+            select_best_by_transition(&mut d0, &beams[0]);
+            select_best_by_transition(&mut d1, &beams[1]);
             let meta0 = build_donor_meta(&d0, &beams[0], &pos_lens, gen_pos, hi_freq_gen_positions);
             let meta1 = build_donor_meta(&d1, &beams[1], &pos_lens, gen_pos, hi_freq_gen_positions);
             donor_meta0.push(Some(meta0));
