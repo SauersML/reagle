@@ -613,6 +613,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
 
         let n_calls = condensed.call_sites.len();
         let mut backptrs: Vec<Vec<u16>> = Vec::with_capacity(n_calls);
+        let mut segment_ptrs: Vec<Vec<u32>> = Vec::with_capacity(n_calls);
         let mut logsum_unswapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         let mut logsum_swapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         for i in 0..n_calls {
@@ -620,18 +621,21 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             let call = &condensed.call_sites[i];
 
             // Segment consistency repair.
-            beam = self.apply_segment_constraints(
+            let (mut constrained, mut seg_ptrs) = self.apply_segment_constraints_with_ptrs(
                 &beam,
                 segment,
                 active_pool,
                 &mut scratch,
             );
-            if beam.is_empty() {
-                beam = self.init_beam_with_alleles(active_pool, call.marker, call.a1, call.a2);
-                if beam.is_empty() {
-                    beam = self.init_beam(active_pool);
+            if constrained.is_empty() {
+                constrained = self.init_beam_with_alleles(active_pool, call.marker, call.a1, call.a2);
+                if constrained.is_empty() {
+                    constrained = self.init_beam(active_pool);
                 }
+                seg_ptrs = vec![0u32; constrained.len()];
             }
+            beam = constrained;
+            segment_ptrs.push(seg_ptrs);
 
             // Dynamic injection on collapse or interval.
             let inject_interval = self.config.inject_interval;
@@ -687,28 +691,41 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
 
         // Apply trailing segment constraints
+        let mut trailing_ptrs: Option<Vec<u32>> = None;
         if let Some(last_seg) = condensed.segments.get(n_calls) {
-            beam = self.apply_segment_constraints(
+            let (mut constrained, mut seg_ptrs) = self.apply_segment_constraints_with_ptrs(
                 &beam,
                 last_seg,
                 active_pool,
                 &mut scratch,
             );
-            if beam.is_empty() {
-                beam = self.init_beam(active_pool);
+            if constrained.is_empty() {
+                constrained = self.init_beam(active_pool);
+                seg_ptrs = vec![0u32; constrained.len()];
             }
+            beam = constrained;
+            trailing_ptrs = Some(seg_ptrs);
         }
 
         // Pick best path
         if let Some((best_idx, _)) = beam.iter().enumerate().min_by_key(|(_, p)| p.score) {
             let mut phases = Vec::with_capacity(n_calls);
             let mut idx = best_idx;
+            if let Some(ptrs) = trailing_ptrs.as_ref() {
+                idx = ptrs.get(idx).copied().unwrap_or(0) as usize;
+            }
             for step in (0..n_calls).rev() {
                 if let Some(ptrs) = backptrs.get(step) {
                     if let Some(packed) = ptrs.get(idx) {
                         let bp = unpack_backptr(*packed);
                         phases.push(bp.swapped);
-                        idx = bp.prev as usize;
+                        let prev_idx = bp.prev as usize;
+                        let mapped_prev = segment_ptrs
+                            .get(step)
+                            .and_then(|m| m.get(prev_idx))
+                            .copied()
+                            .unwrap_or(0) as usize;
+                        idx = mapped_prev;
                         continue;
                     }
                 }
@@ -884,13 +901,29 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         scratch: &mut BeamScratch,
     ) -> Vec<BeamPath> {
+        let (out, _) = self.apply_segment_constraints_with_ptrs(beam, segment, active_pool, scratch);
+        out
+    }
+
+    fn apply_segment_constraints_with_ptrs(
+        &self,
+        beam: &[BeamPath],
+        segment: &crate::data::condensed::CondensedSegment,
+        active_pool: &ActivePool,
+        scratch: &mut BeamScratch,
+    ) -> (Vec<BeamPath>, Vec<u32>) {
         if !segment.any_constraint {
-            return beam.to_vec();
+            let mut ptrs: Vec<u32> = Vec::with_capacity(beam.len());
+            for i in 0..beam.len() {
+                ptrs.push(i as u32);
+            }
+            return (beam.to_vec(), ptrs);
         }
         let soft_segment = segment.len_morgans >= 0.001;
         let switch_cost = self.segment_switch_cost(segment.len_morgans);
         let mut out: Vec<BeamPath> = Vec::with_capacity(beam.len());
-        for path in beam {
+        let mut ptrs: Vec<u32> = Vec::with_capacity(beam.len());
+        for (src_idx, path) in beam.iter().enumerate() {
             self.repair_hap_into(
                 path.hap1,
                 &segment.constraints,
@@ -921,10 +954,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         prev_idx: path.prev_idx,
                         prev_swapped: path.prev_swapped,
                     });
+                    ptrs.push(src_idx as u32);
                 }
             }
         }
-        self.prune_inplace(out)
+        self.prune_inplace_with_ptrs(out, ptrs)
     }
 
     fn repair_hap_into(
@@ -1368,6 +1402,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         beam
     }
 
+    fn prune_inplace_with_ptrs(&self, mut beam: Vec<BeamPath>, mut ptrs: Vec<u32>) -> (Vec<BeamPath>, Vec<u32>) {
+        self.prune_and_collapse_with_ptrs(&mut beam, &mut ptrs);
+        (beam, ptrs)
+    }
+
     fn prune_and_collapse(&self, beam: &mut Vec<BeamPath>) {
         if beam.is_empty() {
             return;
@@ -1431,6 +1470,101 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             let k = self.config.beam_width;
             beam.select_nth_unstable_by(k, |a, b| a.score.cmp(&b.score));
             beam.truncate(k);
+        }
+    }
+
+    fn prune_and_collapse_with_ptrs(&self, beam: &mut Vec<BeamPath>, ptrs: &mut Vec<u32>) {
+        if beam.is_empty() {
+            return;
+        }
+        if beam.len() != ptrs.len() {
+            ptrs.clear();
+            ptrs.resize(beam.len(), 0);
+        }
+        // Prune by tolerance relative to best score.
+        let mut best = i32::MAX;
+        for p in beam.iter() {
+            if p.score < best {
+                best = p.score;
+            }
+        }
+        let cutoff = if self.config.prune_tolerance > 0 {
+            best.saturating_add(self.config.prune_tolerance)
+        } else {
+            i32::MAX
+        };
+        let mut write = 0usize;
+        for i in 0..beam.len() {
+            if beam[i].score <= cutoff {
+                if write != i {
+                    beam[write] = beam[i].clone();
+                    ptrs[write] = ptrs[i];
+                }
+                write += 1;
+            }
+        }
+        beam.truncate(write);
+        ptrs.truncate(write);
+        if beam.is_empty() {
+            return;
+        }
+
+        // Collapse identical states (hap1, hap2, history fingerprint, last_swapped).
+        let cluster_key = |cluster: u16, hap: usize| -> u32 {
+            if cluster != u16::MAX {
+                cluster as u32
+            } else {
+                0x8000_0000u32 | (hap as u32 & 0x7FFF_FFFF)
+            }
+        };
+        let mut zipped: Vec<(BeamPath, u32)> = beam
+            .iter()
+            .cloned()
+            .zip(ptrs.iter().copied())
+            .collect();
+        zipped.sort_unstable_by(|(a, _), (b, _)| {
+            let a1 = cluster_key(a.cluster1, a.hap1);
+            let b1 = cluster_key(b.cluster1, b.hap1);
+            let a2 = cluster_key(a.cluster2, a.hap2);
+            let b2 = cluster_key(b.cluster2, b.hap2);
+            a1.cmp(&b1)
+                .then(a2.cmp(&b2))
+                .then(a.history_bits.cmp(&b.history_bits))
+                .then(a.history_len.cmp(&b.history_len))
+                .then(a.last_swapped.cmp(&b.last_swapped))
+                .then(a.score.cmp(&b.score))
+        });
+        let mut write = 1usize;
+        for i in 1..zipped.len() {
+            let (ref prev, _) = zipped[write - 1];
+            let (ref curr, _) = zipped[i];
+            let same = cluster_key(prev.cluster1, prev.hap1) == cluster_key(curr.cluster1, curr.hap1)
+                && cluster_key(prev.cluster2, prev.hap2) == cluster_key(curr.cluster2, curr.hap2)
+                && prev.history_bits == curr.history_bits
+                && prev.history_len == curr.history_len
+                && prev.last_swapped == curr.last_swapped;
+            if !same {
+                if write != i {
+                    zipped[write] = zipped[i].clone();
+                }
+                write += 1;
+            }
+        }
+        zipped.truncate(write);
+
+        if zipped.len() > self.config.beam_width {
+            let k = self.config.beam_width;
+            zipped.select_nth_unstable_by(k, |a, b| a.0.score.cmp(&b.0.score));
+            zipped.truncate(k);
+        }
+
+        beam.clear();
+        ptrs.clear();
+        beam.reserve(zipped.len());
+        ptrs.reserve(zipped.len());
+        for (p, ptr) in zipped {
+            beam.push(p);
+            ptrs.push(ptr);
         }
     }
 

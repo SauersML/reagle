@@ -195,10 +195,16 @@ impl CondensedTarget {
         &self,
         hi_freq_gen_positions: &[f64],
     ) -> Self {
+        let n_hi = hi_freq_gen_positions.len();
         let mut call_sites_rev: Vec<CallSite> = Vec::with_capacity(self.call_sites.len());
         let mut last_pos: Option<f64> = None;
         for cs in self.call_sites.iter().rev() {
-            let pos = hi_freq_gen_positions.get(cs.hi_idx).copied().unwrap_or(0.0);
+            let hi_idx = if n_hi > 0 {
+                (n_hi - 1).saturating_sub(cs.hi_idx)
+            } else {
+                cs.hi_idx
+            };
+            let pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
             let dist = if let Some(prev_pos) = last_pos {
                 ((pos - prev_pos).abs()) / 100.0
             } else {
@@ -207,7 +213,7 @@ impl CondensedTarget {
             let flip_cost = cs.flip_cost;
             call_sites_rev.push(CallSite {
                 marker: cs.marker,
-                hi_idx: cs.hi_idx,
+                hi_idx,
                 a1: cs.a1,
                 a2: cs.a2,
                 a1_freq: cs.a1_freq,
@@ -277,7 +283,7 @@ fn build_segment_mask<RefSpace>(
         if a1 == 255 || a2 == 255 {
             continue;
         }
-        if a1 == a2 {
+        if a1 == a2 && a1 <= 1 {
             let pi = allele_freqs
                 .and_then(|af| af.get(hi_idx))
                 .map(|&(f0, f1)| if a1 == 0 { f0 } else { f1 })
