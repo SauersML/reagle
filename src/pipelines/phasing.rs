@@ -2303,19 +2303,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 0,
             )?;
 
-            for (s, sp) in sample_phases.iter_mut().enumerate() {
-                if let Ok(slot) = beam_confidence[s].lock() {
-                    for &(m, a1, a2, p) in slot.iter() {
-                        let swapped = sp.allele1(m) == a2 && sp.allele2(m) == a1;
-                        let conf = if has_input_phase {
-                            if swapped { p } else { 1.0 - p }
-                        } else {
-                            0.5
-                        };
-                        sp.set_phase_confidence(m, conf);
-                    }
-                }
-            }
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -4442,16 +4429,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mut het_positions: Vec<usize> = Vec::new();
                         let mut het_index_map: Vec<usize> = vec![usize::MAX; n_hi_freq];
                         for i in 0..n_hi_freq {
-                            let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             if a1 != 255 && a2 != 255 && a1 != a2 {
                                 let idx = het_positions_all.len();
                                 het_positions_all.push(i);
                                 het_index_map[i] = idx;
-                                if sp.is_unphased(m) {
-                                    het_positions.push(i);
-                                }
+                                het_positions.push(i);
                             }
                         }
 
@@ -4664,20 +4648,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let local_prior_raw = prior_paths[s]
                                 .as_ref()
                                 .and_then(|gp| global_to_local_paths(gp, &threaded_haps, n_hi_freq));
-                            let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
-                            let has_anchors = anchor_h1_full.iter().any(|&a| a != 255)
-                                || anchor_h2_full.iter().any(|&a| a != 255);
-                            let local_prior = if has_anchors {
-                                None
-                            } else {
-                                local_prior_raw.as_ref()
-                            };
-                            let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
-                            let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
-                            for &m in hi_freq_to_orig {
-                                anchor_h1.push(anchor_h1_full[m]);
-                                anchor_h2.push(anchor_h2_full[m]);
-                            }
+                            // Ignore anchors for refinement to allow error correction
+                            let local_prior = local_prior_raw.as_ref();
+                            let anchor_h1: Vec<u8> = vec![255; n_hi_freq];
+                            let anchor_h2: Vec<u8> = vec![255; n_hi_freq];
 
                             let block_starts = block_starts.clone();
                             let result = if self.config.profile {
@@ -7770,6 +7744,16 @@ fn sample_swap_bits_mosaic<RefSpace>(
         );
     }
 
+    let mean_recomb = if !p_recomb.is_empty() {
+        p_recomb.iter().sum::<f32>() / p_recomb.len() as f32
+    } else {
+        0.0
+    };
+    // Use adaptive error rate for chain sampling and confidence to prevent overconfidence
+    // when user-specified err is too low for the actual noise/structure.
+    let chain_p_err = p_err.max(mean_recomb * 100.0).clamp(0.05, 0.45);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
@@ -7996,8 +7980,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
@@ -8253,88 +8237,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         p_max = p_max.max(p);
         p_sum += p;
     }
-    // Derive swap emissions from the sampled haplotype paths and run the label
-    // HMM on those emissions. This ties swaps to the inferred paths rather than
-    // per-marker orientation counts, which can be unstable.
-    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
-        // Align seq1/seq2 to anchors with a single global flip to avoid
-        // per-marker label noise when anchors are sparse.
-        let mut flip_to_anchor = false;
-        if has_anchor {
-            let mut score_direct: i32 = 0;
-            let mut score_flip: i32 = 0;
-            for m in 0..n_markers {
-                let a1_anchor = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2_anchor = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1_anchor == 255 && a2_anchor == 255 {
-                    continue;
-                }
-                let s1 = seq1[m];
-                let s2 = seq2[m];
-                if s1 == 255 || s2 == 255 || s1 == s2 {
-                    continue;
-                }
-                if a1_anchor != 255 {
-                    score_direct += if s1 == a1_anchor { 1 } else { -1 };
-                    score_flip += if s2 == a1_anchor { 1 } else { -1 };
-                }
-                if a2_anchor != 255 {
-                    score_direct += if s2 == a2_anchor { 1 } else { -1 };
-                    score_flip += if s1 == a2_anchor { 1 } else { -1 };
-                }
-            }
-            if score_flip > score_direct {
-                flip_to_anchor = true;
-            }
-        }
-        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
-        let ref_alleles = &mut buffers.ref_alleles;
-        p_min = 1.0;
-        p_max = 0.0;
-        p_sum = 0.0;
-        for (i, &m) in het_positions.iter().enumerate() {
-            let a1 = if flip_to_anchor { seq2[m] } else { seq1[m] };
-            let a2 = if flip_to_anchor { seq1[m] } else { seq2[m] };
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                swap_probs[i] = 0.5;
-                swap_lr[i] = 1.0;
-                continue;
-            }
-            path_provider.fill_ref_alleles(m, ref_alleles);
-            let p1 = new_paths.path1[m] as usize;
-            let p2 = new_paths.path2[m] as usize;
-            if p1 >= n_states || p2 >= n_states {
-                swap_probs[i] = 0.5;
-                swap_lr[i] = 1.0;
-                continue;
-            }
-            let ref1 = ref_alleles[p1];
-            let ref2 = ref_alleles[p2];
-            let conf_m = conf[m];
-            let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-            let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-            let denom = keep + swap;
-            let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
-            let p_keep = 1.0 - p_swap;
-            let (max_p, min_p) = if p_swap >= p_keep {
-                (p_swap, p_keep)
-            } else {
-                (p_keep, p_swap)
-            };
-            let lr = if min_p < 1e-30 {
-                1e6
-            } else {
-                (max_p / min_p).min(1e6)
-            };
-            swap_probs[i] = p_swap.clamp(0.0, 1.0);
-            swap_lr[i] = lr;
-            p_min = p_min.min(p_swap);
-            p_max = p_max.max(p_swap);
-            p_sum += p_swap;
-        }
-    }
+
     if !het_positions.is_empty() {
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
