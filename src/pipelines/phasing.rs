@@ -4184,7 +4184,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     a1 != 255
                                         && a2 != 255
                                         && a1 != a2
-                                        && sample_phase_view[s].is_unphased(m)
                                 })
                                 .collect();
 
@@ -4203,8 +4202,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     ws.clear(); // Explicit reset between samples to prevent state contamination
                                     let ref_provider =
                                         RefAlleleProvider::new(ref_view, &threaded_haps);
-                                    let (anchor_h1, anchor_h2) =
+                                    let (mut anchor_h1, mut anchor_h2) =
                                         build_anchor_constraints(&sample_phase_view[s]);
+                                    for &m in &het_positions {
+                                        if m < anchor_h1.len() {
+                                            anchor_h1[m] = 255;
+                                            anchor_h2[m] = 255;
+                                        }
+                                    }
 
                                     let donor_blocks =
                                         partition_markers_by_cm(&gen_positions, stage1_block_cm(&gen_positions));
@@ -4301,7 +4306,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        sp.set_phase_confidence(m, p_orient.max(1.0 - p_orient));
                     }
 
                     let lr_threshold = self.params.lr_threshold;
@@ -4442,16 +4447,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mut het_positions: Vec<usize> = Vec::new();
                         let mut het_index_map: Vec<usize> = vec![usize::MAX; n_hi_freq];
                         for i in 0..n_hi_freq {
-                            let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             if a1 != 255 && a2 != 255 && a1 != a2 {
                                 let idx = het_positions_all.len();
                                 het_positions_all.push(i);
                                 het_index_map[i] = idx;
-                                if sp.is_unphased(m) {
-                                    het_positions.push(i);
-                                }
+                                het_positions.push(i);
                             }
                         }
 
@@ -4599,6 +4601,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             for &m in hi_freq_to_orig {
                                 anchor_h1.push(anchor_h1_full[m]);
                                 anchor_h2.push(anchor_h2_full[m]);
+                            }
+                            for &i in &het_positions {
+                                if i < anchor_h1.len() {
+                                    anchor_h1[i] = 255;
+                                    anchor_h2[i] = 255;
+                                }
                             }
 
                             let (swap_bits, swap_lr, swap_probs, new_paths) = if self.config.profile {
@@ -4924,7 +4932,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             for (hi_freq_idx, p_orient) in het_phase_values {
                 let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient);
+                sp.set_phase_confidence(m, p_orient.max(1.0 - p_orient));
             }
 
             if let Some(paths) = new_paths {
@@ -7713,10 +7721,14 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.9 * (informative as f32);
+    // Relaxed threshold to allow heuristic initialization even with noisy data.
+    // If the best pair has a positive score (more matches than mismatches), it's a good starting point.
+    // The previous 0.9 threshold was too strict for noisy input (e.g. 25% errors).
+    let threshold = 0.1 * (informative as f32);
     if best_score < threshold || n_markers > 2000 {
         return None;
     }
+
 
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
