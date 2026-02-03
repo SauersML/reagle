@@ -4184,7 +4184,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     a1 != 255
                                         && a2 != 255
                                         && a1 != a2
-                                        && sample_phase_view[s].is_unphased(m)
                                 })
                                 .collect();
 
@@ -4301,7 +4300,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
 
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        sp.set_phase_confidence(m, p_orient.max(1.0 - p_orient));
                     }
 
                     let lr_threshold = self.params.lr_threshold;
