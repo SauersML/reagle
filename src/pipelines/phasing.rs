@@ -87,6 +87,7 @@ const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
+const MIN_CHAIN_ERROR_RATE: f32 = 0.01;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -1647,8 +1648,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Initialize parameters based on TOTAL haplotype count (target + ref)
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if self.config.phase_states > 0 {
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -2695,8 +2698,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if self.config.phase_states > 0 {
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -7758,6 +7763,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
+    let chain_p_err = p_err.max(MIN_CHAIN_ERROR_RATE);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
             Vec::new(),
@@ -7957,8 +7965,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             fwd,
             fwd_prior,
             ref_alleles,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             EmissionMode::Combined,
         );
     }
@@ -7996,8 +8004,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
