@@ -7770,6 +7770,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
         );
     }
 
+    // Relax error rate for chain sampling to improve mixing and robustness to local errors
+    let chain_p_err = p_err.max(0.01);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
@@ -7957,8 +7961,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             fwd,
             fwd_prior,
             ref_alleles,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             EmissionMode::Combined,
         );
     }
@@ -7996,8 +8000,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
