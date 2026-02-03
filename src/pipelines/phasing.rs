@@ -87,7 +87,7 @@ const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
-const MIN_CHAIN_ERROR_RATE: f32 = 0.01;
+const MIN_CHAIN_ERROR_RATE: f32 = 0.1;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -4482,7 +4482,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                         }
 
-                        if het_positions.is_empty() {
+                        if het_positions_all.is_empty() {
                             // No hets to phase: no swaps needed, no LR values
                             ws.seq1 = seq1;
                             ws.seq2 = seq2;
@@ -4614,7 +4614,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             atomic.add_estimation_data(&local_est);
                         }
 
-                        let (swap_bits, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
+                        let (_, swap_lr, swap_probs, new_paths) = if use_dynamic_mcmc {
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
@@ -4723,10 +4723,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             subset_to_orig: Some(hi_freq_to_orig),
                                         }),
                                         block_starts,
-                                        &het_positions,
+                                        &het_positions_all,
                                         local_prior,
-                                        Some(&anchor_h1),
-                                        Some(&anchor_h2),
+                                        None, // anchor_h1
+                                        None, // anchor_h2
                                         sample_seed,
                                         self.config.mcmc_burnin,
                                         self.config.mcmc_lr_samples,
@@ -4752,8 +4752,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     block_starts,
                                     &het_positions_all,
                                     local_prior,
-                                    Some(&anchor_h1),
-                                    Some(&anchor_h2),
+                                        None, // anchor_h1
+                                        None, // anchor_h2
                                     sample_seed,
                                     self.config.mcmc_burnin,
                                     self.config.mcmc_lr_samples,
@@ -4768,35 +4768,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let mut swap_mask = vec![false; n_hi_freq];
-                        let mut anchor_resets = 0usize;
+                        let anchor_resets = 0usize;
                         let mut p_swap = vec![0.5f32; n_hi_freq];
-                        for &pos in het_positions.iter() {
+
+                        for &pos in het_positions_all.iter() {
                             let idx = het_index_map[pos];
                             if idx == usize::MAX {
                                 continue;
                             }
                             let p_orient = swap_probs.get(idx).copied().unwrap_or(0.5);
-                            let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
-                            let p = if swap_bit == 1 { p_orient } else { 1.0 - p_orient };
-                            p_swap[pos] = p.clamp(0.0, 1.0);
+                            p_swap[pos] = p_orient.clamp(0.0, 1.0);
                             swap_mask[pos] = p_swap[pos] > 0.5;
-                        }
-                        for i in 0..n_hi_freq {
-                            let m = hi_freq_to_orig[i];
-                            let a1 = seq1[i];
-                            let a2 = seq2[i];
-                            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-                            let is_phased_het = is_het && !sp.is_unphased(m);
-                            if is_phased_het {
-                                let a1_anchor = sp.allele1(m);
-                                let a2_anchor = sp.allele2(m);
-                                if a1 == a1_anchor && a2 == a2_anchor {
-                                    swap_mask[i] = false;
-                                } else if a1 == a2_anchor && a2 == a1_anchor {
-                                    swap_mask[i] = true;
-                                }
-                                anchor_resets += 1;
-                            }
                         }
 
                         eprintln!(
@@ -4839,7 +4821,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             eprintln!("[swap debug] i a1 a2 ref1 ref2 swap={:?}", rows);
                         }
 
-                        let het_lr_values: Vec<(usize, f32)> = het_positions
+                        let het_lr_values: Vec<(usize, f32)> = het_positions_all
                             .iter()
                             .copied()
                             .filter_map(|idx| {
@@ -4855,7 +4837,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         // If there are no anchored/phased markers yet, labels are symmetric,
                         // so confidence should remain ~0.5 even if a single chain picks a side.
                         let has_anchor_conf = sp.phased_count() > 0;
-                        let het_phase_values: Vec<(usize, f32)> = het_positions
+                        let het_phase_values: Vec<(usize, f32)> = het_positions_all
                             .iter()
                             .copied()
                             .filter_map(|idx| {
@@ -8288,38 +8270,63 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // HMM on those emissions. This ties swaps to the inferred paths rather than
     // per-marker orientation counts, which can be unstable.
     if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
-        // Align seq1/seq2 to anchors with a single global flip to avoid
+        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+        let ref_alleles = &mut buffers.ref_alleles;
+
+        // Align seq1/seq2 to anchors (or paths) with a single global flip to avoid
         // per-marker label noise when anchors are sparse.
+        // If no anchors are provided, align to the inferred paths themselves (to minimize swaps).
         let mut flip_to_anchor = false;
-        if has_anchor {
+        {
             let mut score_direct: i32 = 0;
             let mut score_flip: i32 = 0;
+            // Use anchors if available, otherwise use paths themselves as reference
+            // to orient seq1/seq2 (minimizing hamming distance to path1/path2).
+            let use_anchors = has_anchor;
+
             for m in 0..n_markers {
-                let a1_anchor = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2_anchor = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1_anchor == 255 && a2_anchor == 255 {
-                    continue;
-                }
                 let s1 = seq1[m];
                 let s2 = seq2[m];
                 if s1 == 255 || s2 == 255 || s1 == s2 {
                     continue;
                 }
-                if a1_anchor != 255 {
-                    score_direct += if s1 == a1_anchor { 1 } else { -1 };
-                    score_flip += if s2 == a1_anchor { 1 } else { -1 };
-                }
-                if a2_anchor != 255 {
-                    score_direct += if s2 == a2_anchor { 1 } else { -1 };
-                    score_flip += if s1 == a2_anchor { 1 } else { -1 };
+
+                if use_anchors {
+                    let a1_anchor = anchor_h1.get(m).copied().unwrap_or(255);
+                    let a2_anchor = anchor_h2.get(m).copied().unwrap_or(255);
+                    if a1_anchor != 255 {
+                        score_direct += if s1 == a1_anchor { 1 } else { -1 };
+                        score_flip += if s2 == a1_anchor { 1 } else { -1 };
+                    }
+                    if a2_anchor != 255 {
+                        score_direct += if s2 == a2_anchor { 1 } else { -1 };
+                        score_flip += if s1 == a2_anchor { 1 } else { -1 };
+                    }
+                } else {
+                    // Align seq1 to path1
+                    if new_paths.path1.len() > m && new_paths.path2.len() > m {
+                        let p1 = new_paths.path1[m] as usize;
+                        let p2 = new_paths.path2[m] as usize;
+                        if p1 < n_states && p2 < n_states {
+                            path_provider.fill_ref_alleles(m, ref_alleles);
+                            let r1 = ref_alleles[p1];
+                            let r2 = ref_alleles[p2];
+                            if r1 != 255 && r2 != 255 {
+                                // Direct: s1~r1, s2~r2
+                                score_direct += if s1 == r1 { 1 } else { -1 };
+                                score_direct += if s2 == r2 { 1 } else { -1 };
+                                // Flip: s1~r2, s2~r1
+                                score_flip += if s1 == r2 { 1 } else { -1 };
+                                score_flip += if s2 == r1 { 1 } else { -1 };
+                            }
+                        }
+                    }
                 }
             }
             if score_flip > score_direct {
                 flip_to_anchor = true;
             }
         }
-        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
-        let ref_alleles = &mut buffers.ref_alleles;
         p_min = 1.0;
         p_max = 0.0;
         p_sum = 0.0;
