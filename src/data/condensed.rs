@@ -42,8 +42,6 @@ pub struct CallSite {
     pub pbwt_density_a2: f32,
     /// Genetic distance to previous call site (Morgans).
     pub dist_morgans: f32,
-    /// Local genetic step per marker (Morgans).
-    pub pbwt_step_morgans: f32,
     pub switch_cost: i32,
     pub flip_cost: i32,
     pub fixed: bool,
@@ -88,14 +86,7 @@ impl CondensedTarget {
                 } else {
                     0.0
                 };
-                let switch_cost = if dist > 0.0 {
-                    // Use log-odds cost so "stay" is the implicit baseline.
-                    let p_switch = params.p_recomb(dist).clamp(1e-12, 0.5 - 1e-12);
-                    let odds = p_switch / (1.0 - p_switch);
-                    (-odds.ln() * 1_000_000.0).round() as i32
-                } else {
-                    0
-                };
+                let switch_cost = 0;
                 let fixed = !sample_phase.is_unphased(orig_m);
                 let flip_cost = if fixed {
                     if switch_cost == 0 {
@@ -140,22 +131,6 @@ impl CondensedTarget {
                         (l1, l2, d1, d2)
                     })
                     .unwrap_or((0.0, 0.0, 0.0, 0.0));
-                let local_step = if hi_idx > 0 && hi_idx + 1 < hi_freq_gen_positions.len() {
-                    let left = (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1])
-                        .abs();
-                    let right =
-                        (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs();
-                    (left + right) * 0.5
-                } else if hi_idx > 0 {
-                    (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1]).abs()
-                } else if hi_idx + 1 < hi_freq_gen_positions.len() {
-                    (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs()
-                } else {
-                    0.0
-                };
-                let pbwt_len_a1 = pbwt_len_a1 * local_step as f32;
-                let pbwt_len_a2 = pbwt_len_a2 * local_step as f32;
-
                 call_sites.push(CallSite {
                     marker,
                     hi_idx,
@@ -168,7 +143,6 @@ impl CondensedTarget {
                     pbwt_density_a1,
                     pbwt_density_a2,
                     dist_morgans: dist as f32,
-                    pbwt_step_morgans: local_step as f32,
                     switch_cost,
                     flip_cost,
                     fixed,
@@ -177,6 +151,8 @@ impl CondensedTarget {
             }
         }
 
+        let theta = params.p_mismatch.max(1e-9) as f64;
+        let hard_threshold = theta.ln().neg() + 6.0;
         // Build segments between call sites (including leading/trailing).
         let mut prev_hi = 0usize;
         for cs in call_sites.iter() {
@@ -187,6 +163,9 @@ impl CondensedTarget {
                 prev_hi,
                 end_hi,
                 hi_freq_gen_positions,
+                allele_freqs,
+                hard_threshold,
+                theta,
                 packed_ref,
             );
             segments.push(seg);
@@ -199,6 +178,9 @@ impl CondensedTarget {
             prev_hi,
             hi_freq_to_orig.len(),
             hi_freq_gen_positions,
+            allele_freqs,
+            hard_threshold,
+            theta,
             packed_ref,
         );
         segments.push(trailing);
@@ -221,13 +203,7 @@ impl CondensedTarget {
             } else {
                 0.0
             };
-            let switch_cost = if dist > 0.0 {
-                let p_switch = params.p_recomb(dist).clamp(1e-12, 0.5 - 1e-12);
-                let odds = p_switch / (1.0 - p_switch);
-                (-odds.ln() * 1_000_000.0).round() as i32
-            } else {
-                0
-            };
+            let switch_cost = 0;
             let flip_cost = if cs.fixed {
                 if switch_cost == 0 {
                     250_000
@@ -240,19 +216,6 @@ impl CondensedTarget {
                 switch_cost.max(1_000_000)
             };
             let hi_idx = cs.hi_idx;
-            let local_step = if hi_idx > 0 && hi_idx + 1 < hi_freq_gen_positions.len() {
-                let left = (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1])
-                    .abs();
-                let right =
-                    (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs();
-                (left + right) * 0.5
-            } else if hi_idx > 0 {
-                (hi_freq_gen_positions[hi_idx] - hi_freq_gen_positions[hi_idx - 1]).abs()
-            } else if hi_idx + 1 < hi_freq_gen_positions.len() {
-                (hi_freq_gen_positions[hi_idx + 1] - hi_freq_gen_positions[hi_idx]).abs()
-            } else {
-                0.0
-            };
             call_sites_rev.push(CallSite {
                 marker: cs.marker,
                 hi_idx: cs.hi_idx,
@@ -265,7 +228,6 @@ impl CondensedTarget {
                 pbwt_density_a1: cs.pbwt_density_a1,
                 pbwt_density_a2: cs.pbwt_density_a2,
                 dist_morgans: dist as f32,
-                pbwt_step_morgans: local_step as f32,
                 switch_cost,
                 flip_cost,
                 fixed: cs.fixed,
@@ -293,6 +255,9 @@ fn build_segment_mask<RefSpace>(
     start_hi: usize,
     end_hi: usize,
     hi_freq_gen_positions: &[f64],
+    allele_freqs: Option<&[(f32, f32)]>,
+    hard_threshold: f64,
+    theta: f64,
     packed_ref: &PackedRefView<RefSpace>,
 ) -> CondensedSegment {
     let mut constraints: Vec<SegmentConstraint> = Vec::new();
@@ -319,26 +284,19 @@ fn build_segment_mask<RefSpace>(
             continue;
         }
         if a1 == a2 {
-            if packed_ref.can_map_targ_allele(orig_m, a1) {
+            let pi = allele_freqs
+                .and_then(|af| af.get(hi_idx))
+                .map(|&(f0, f1)| if a1 == 0 { f0 } else { f1 })
+                .unwrap_or(0.5)
+                .max(1e-9) as f64;
+            let mismatch_cost = -((theta * pi).max(1e-12)).ln();
+            if mismatch_cost >= hard_threshold && packed_ref.can_map_targ_allele(orig_m, a1) {
                 constraints.push(SegmentConstraint {
                     marker: MarkerIdx::new(orig_m as u32),
                     alleles: [a1, a1],
                     n_alleles: 1,
                 });
                 any_constraint = true;
-            }
-        } else if a1 <= 1 && a2 <= 1 {
-            if !sample_phase.is_unphased(orig_m) {
-                let ok1 = packed_ref.can_map_targ_allele(orig_m, a1);
-                let ok2 = packed_ref.can_map_targ_allele(orig_m, a2);
-                if ok1 || ok2 {
-                    constraints.push(SegmentConstraint {
-                        marker: MarkerIdx::new(orig_m as u32),
-                        alleles: [a1, a2],
-                        n_alleles: 2,
-                    });
-                    any_constraint = true;
-                }
             }
         }
     }

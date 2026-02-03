@@ -1942,6 +1942,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 &ref_gt,
                 alignment,
                 &hi_freq_to_orig,
+                &hi_freq_gen_positions,
                 beam_config.inject_k,
                 beam_config.inject_interval,
             );
@@ -2682,6 +2683,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &ref_gt,
                 alignment,
                 &hi_freq_to_orig,
+                &hi_freq_gen_positions,
                 beam_config.inject_k,
                 beam_config.inject_interval,
             );

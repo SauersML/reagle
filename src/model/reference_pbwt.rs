@@ -677,7 +677,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         &self,
         marker: usize,
         haps: &[u32],
-        out: &mut Vec<(u32, usize, f32)>,
+        out: &mut Vec<(u32, usize, i32)>,
     ) {
         out.clear();
         if haps.is_empty() {
@@ -691,8 +691,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             }
             let pos = self.inv_ppa[hap];
             let start = self.div.get(pos).copied().unwrap_or(m);
-            let len = (m - start).max(0) as f32;
-            out.push((h, pos, len));
+            out.push((h, pos, start));
         }
     }
 

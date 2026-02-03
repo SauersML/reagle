@@ -3891,13 +3891,6 @@ impl crate::pipelines::ImputationPipeline {
                 })
                 .unwrap_or_default();
             
-            // Precompute allele-frequency prior for missing targets at this marker.
-            let freq_prior = ref_allele_freqs
-                .get(ref_m)
-                .and_then(|freqs| freqs.get(1).copied())
-                .unwrap_or(0.5)
-                .clamp(1e-6, 1.0 - 1e-6);
-
             for hap_idx in 0..n_target_haps {
                 let beam = &beams[hap_idx];
                 pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
@@ -3949,27 +3942,20 @@ impl crate::pipelines::ImputationPipeline {
                 if store {
                     let p_alt = if n_alleles <= 2 {
                         if target_allele == 255 {
-                            // Missing target: blend donor ensemble with ref prior based on information.
-                            let w = (sm_total_info[hap_idx] / min_info_nats).clamp(0.0, 1.0);
-                            let donor_mean = if donor_candidates.is_empty() {
-                                let donor = current_donor[hap_idx];
-                                let allele = col.get(HapIdx::new(donor));
-                                if allele <= 1 { allele as f32 } else { freq_prior }
-                            } else if w >= 0.5 {
-                                let donor = current_donor[hap_idx];
-                                let allele = col.get(HapIdx::new(donor));
-                                if allele <= 1 { allele as f32 } else { freq_prior }
-                            } else {
-                                let mut alt_sum = 0u32;
-                                for &cand in &donor_candidates {
-                                    let allele = col.get(HapIdx::new(cand));
-                                    if allele == 1 {
-                                        alt_sum += 1;
-                                    }
+                            if donor_candidates.is_empty() {
+                                panic!(
+                                    "SM-match donor set empty at ref_m={} for hap_idx={} (cannot impute missing site)",
+                                    ref_m, hap_idx
+                                );
+                            }
+                            let mut alt_sum = 0u32;
+                            for &cand in &donor_candidates {
+                                let allele = col.get(HapIdx::new(cand));
+                                if allele == 1 {
+                                    alt_sum += 1;
                                 }
-                                alt_sum as f32 / donor_candidates.len() as f32
-                            };
-                            (w * donor_mean + (1.0 - w) * freq_prior)
+                            }
+                            (alt_sum as f32 / donor_candidates.len() as f32)
                                 .clamp(1e-6, 1.0 - 1e-6)
                         } else {
                             let allele = col.get(HapIdx::new(donor));

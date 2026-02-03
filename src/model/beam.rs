@@ -277,6 +277,7 @@ impl PbwtBeamIndex {
         ref_gt: &GenotypeMatrix<Phased, RefSpace>,
         alignment: &MarkerAlignment<AnyMarkerSpace, RefSpace>,
         hi_freq_to_orig: &[usize],
+        hi_freq_gen_positions: &[f64],
         k: usize,
         inject_interval: usize,
     ) -> Self {
@@ -351,19 +352,34 @@ impl PbwtBeamIndex {
                     union.push(h);
                 }
             }
-            let mut pos_lens: Vec<(u32, usize, f32)> = Vec::new();
+            let mut pos_lens: Vec<(u32, usize, i32)> = Vec::new();
             pbwt.collect_positions_and_lens(hi_idx, &union, &mut pos_lens);
+            let gen_pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
             let select_longest = |donors: &mut Vec<u32>| {
                 donors.sort_unstable_by(|a, b| {
                     let la = pos_lens
                         .iter()
                         .find(|(h, _, _)| h == a)
-                        .map(|(_, _, l)| *l)
+                        .map(|(_, _, start)| {
+                            let start_idx = (*start).max(0) as usize;
+                            let start_pos = hi_freq_gen_positions
+                                .get(start_idx)
+                                .copied()
+                                .unwrap_or(gen_pos);
+                            (gen_pos - start_pos).abs() as f32
+                        })
                         .unwrap_or(0.0);
                     let lb = pos_lens
                         .iter()
                         .find(|(h, _, _)| h == b)
-                        .map(|(_, _, l)| *l)
+                        .map(|(_, _, start)| {
+                            let start_idx = (*start).max(0) as usize;
+                            let start_pos = hi_freq_gen_positions
+                                .get(start_idx)
+                                .copied()
+                                .unwrap_or(gen_pos);
+                            (gen_pos - start_pos).abs() as f32
+                        })
                         .unwrap_or(0.0);
                     lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
                 });
@@ -373,8 +389,8 @@ impl PbwtBeamIndex {
             };
             select_longest(&mut d0);
             select_longest(&mut d1);
-            let meta0 = build_donor_meta(&d0, &beams[0], &pos_lens);
-            let meta1 = build_donor_meta(&d1, &beams[1], &pos_lens);
+            let meta0 = build_donor_meta(&d0, &beams[0], &pos_lens, gen_pos, hi_freq_gen_positions);
+            let meta1 = build_donor_meta(&d1, &beams[1], &pos_lens, gen_pos, hi_freq_gen_positions);
             donor_meta0.push(Some(meta0));
             donor_meta1.push(Some(meta1));
         }
@@ -415,17 +431,25 @@ fn find_cluster(beam: &RankBeam, pos: usize) -> (u16, f32) {
 fn build_donor_meta(
     donors: &[u32],
     beam: &RankBeam,
-    pos_lens: &[(u32, usize, f32)],
+    pos_lens: &[(u32, usize, i32)],
+    gen_pos: f64,
+    hi_freq_gen_positions: &[f64],
 ) -> Vec<PbwtDonorMeta> {
     let mut out = Vec::with_capacity(donors.len());
     for &hap in donors {
-        if let Some((_, pos, len)) = pos_lens.iter().find(|(h, _, _)| *h == hap).copied() {
+        if let Some((_, pos, start)) = pos_lens.iter().find(|(h, _, _)| *h == hap).copied() {
+            let start_idx = start.max(0) as usize;
+            let start_pos = hi_freq_gen_positions
+                .get(start_idx)
+                .copied()
+                .unwrap_or(gen_pos);
+            let len_morgans = (gen_pos - start_pos).abs() as f32;
             let (cluster_id, cluster_size) = find_cluster(beam, pos);
             out.push(PbwtDonorMeta {
                 hap,
                 cluster_id,
                 cluster_size,
-                match_len_markers: len,
+                match_len_markers: len_morgans,
             });
         } else {
             out.push(PbwtDonorMeta {
@@ -843,7 +867,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return beam.to_vec();
         }
         let soft_segment = segment.len_morgans >= 0.001;
-        let soft_penalty = switch_cost;
+        let soft_penalty = if soft_segment { 250_000 } else { 0 };
         let mut out: Vec<BeamPath> = Vec::with_capacity(beam.len());
         for path in beam {
             self.repair_hap_into(
@@ -1029,7 +1053,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if swapped { call.pbwt_len_a2 } else { call.pbwt_len_a1 },
             if swapped { call.pbwt_density_a2 } else { call.pbwt_density_a1 },
             call.dist_morgans,
-            call.pbwt_step_morgans,
             pbwt_version as u32,
             call.fixed,
             active_pool,
@@ -1044,7 +1067,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if swapped { call.pbwt_len_a1 } else { call.pbwt_len_a2 },
             if swapped { call.pbwt_density_a1 } else { call.pbwt_density_a2 },
             call.dist_morgans,
-            call.pbwt_step_morgans,
             pbwt_version as u32,
             call.fixed,
             active_pool,
@@ -1104,7 +1126,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         pbwt_match_len: f32,
         pbwt_density: f32,
         dist_morgans: f32,
-        pbwt_step_morgans: f32,
         pbwt_version: u32,
         fixed: bool,
         active_pool: &ActivePool,
@@ -1134,21 +1155,19 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let meta_curr = active_pool.pbwt_meta(allele, hap, pbwt_version);
         let (match_len_morgans, cluster_size, cluster_id) = if let Some(meta) = meta_curr {
             (
-                (meta.match_len_markers * pbwt_step_morgans).max(0.0),
+                meta.match_len_markers.max(0.0),
                 meta.cluster_size.max(0.0),
                 meta.cluster_id,
             )
         } else {
             (pbwt_match_len.max(0.0), pbwt_density.max(0.0), u16::MAX)
         };
-        let pbwt_switch_cost = self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans, false);
-        // Note: pbwt_switch_cost already incorporates genetic distance via the
-        // coalescent stay/switch model, so we do not add the global switch_cost
-        // here to avoid double-counting recombination distance.
+        let (pbwt_stay_cost, pbwt_switch_cost) =
+            self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans);
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if matches {
-            out.push((hap, 0, effective_match_cost));
+            out.push((hap, pbwt_stay_cost, effective_match_cost));
             // also allow a limited switch to a strong candidate for future-proofing
             for &h in active_pool.list().iter().rev().take(1) {
                 if h != hap && self.ref_allele_matches(marker_idx, h, targ_allele) {
@@ -1157,7 +1176,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let effective_switch_cost = if same_cluster {
-                        0
+                        pbwt_stay_cost
                     } else {
                         pbwt_switch_cost
                     };
@@ -1175,7 +1194,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let effective_switch_cost = if same_cluster {
-                        0
+                        pbwt_stay_cost
                     } else {
                         pbwt_switch_cost
                     };
@@ -1186,7 +1205,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 }
             }
             if out.is_empty() {
-                out.push((hap, 0, effective_mismatch_cost));
+                out.push((hap, pbwt_stay_cost, effective_mismatch_cost));
             }
             return;
         }
@@ -1198,7 +1217,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     .map(|m| m.cluster_id == cluster_id)
                     .unwrap_or(false);
                 let effective_switch_cost = if same_cluster {
-                    0
+                    pbwt_stay_cost
                 } else {
                     pbwt_switch_cost
                 };
@@ -1217,7 +1236,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let effective_switch_cost = if same_cluster {
-                        0
+                        pbwt_stay_cost
                     } else {
                         pbwt_switch_cost
                     };
@@ -1230,7 +1249,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
         // Always allow staying with a mismatch cost to avoid forced switching.
         // Mismatch cost is MAF-dependent: rare allele mismatch is more surprising.
-        out.push((hap, 0, effective_mismatch_cost));
+        out.push((hap, pbwt_stay_cost, effective_mismatch_cost));
     }
 
     #[inline]
@@ -1239,16 +1258,22 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         match_len_morgans: f32,
         density: f32,
         dist_morgans: f32,
-        same_cluster: bool,
-    ) -> i32 {
-        // Coalescent-based stay probability from PBWT match length with
+    ) -> (i32, i32) {
+        // Coalescent-based stay probability from PBWT one-sided match length with
         // explicit recombination intensity scaling (rho = 4Ne in Morgans):
-        //   prior: t ~ Gamma(α=2, β=1) over TMRCA (coalescent units)
+        //   prior: t ~ Exp(1) over TMRCA (coalescent units)
         //   L | t ~ Exp(rate = rho * t)
         //   t | L ~ Gamma(α=2, β=1 + rho * L)
-        //   P(stay | L, d) = E[exp(-rho * t * d)] = (β / (β + rho * d))^α
-        // Switch odds = P(switch)/P(stay), cost = -ln(odds).
-        let l = match_len_morgans.max(0.0) as f64;
+        //   P(stay | L, d) = E[exp(-rho * t * d)] = (β / (β + rho * d))^2
+        // Use true negative log transition probabilities (no log-odds).
+        let l_raw = match_len_morgans.max(0.0) as f64;
+        let k = density.max(0.0) as f64;
+        let l = if k > 0.0 {
+            let denom = 1.0 + 0.1 * (1.0 + k).ln();
+            l_raw / denom
+        } else {
+            l_raw
+        };
         let d = dist_morgans.max(0.0) as f64;
         let rho = self.costs.recomb_intensity;
         let beta = 1.0 + rho * l;
@@ -1260,20 +1285,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         };
         let p_stay = p_stay.clamp(1e-12, 1.0 - 1e-12);
         let p_switch = (1.0 - p_stay).clamp(1e-12, 1.0 - 1e-12);
-        let switch_odds = p_switch / p_stay;
-        if same_cluster {
-            return 0;
-        }
-        let mut cost = -switch_odds.ln();
-        // Density prior (cluster multiplicity): picking one donor from K
-        // equally plausible candidates adds +log K to the cost.
-        let k = density.max(0.0) as f64;
-        if k > 0.0 {
-            cost += (1.0 + k).ln();
-        }
-        (cost * 1_000_000.0)
+        let stay_cost = (-(p_stay.ln()) * 1_000_000.0)
             .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        let switch_cost = (-(p_switch.ln()) * 1_000_000.0)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        (stay_cost, switch_cost)
     }
 
     #[inline]
