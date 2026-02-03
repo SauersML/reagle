@@ -18,6 +18,95 @@ use std::process::Command;
 const HGDP_1KG_CHR22_URL: &str = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf";
 const GSA_SITES_URL: &str = "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
 
+/// Check if bcftools is available in the environment
+pub fn has_bcftools() -> bool {
+    Command::new("bcftools")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Generate synthetic VCF data for testing without external dependencies
+pub fn generate_synthetic_vcf(
+    path: &Path,
+    start_sample_idx: usize,
+    n_samples: usize,
+    n_markers: usize,
+    phased: bool,
+    sparse_factor: usize,
+) {
+    let chrom = "chr22";
+    let start_pos = 16000000u32;
+    let step = 100u32;
+
+    // Use a temporary uncompressed file
+    let vcf_path = path.with_extension("");
+    let file = File::create(&vcf_path).expect("Create synthetic VCF");
+    let mut out = std::io::BufWriter::new(file);
+
+    writeln!(out, "##fileformat=VCFv4.2").expect("Write header");
+    writeln!(out, "##contig=<ID={}>", chrom).expect("Write header");
+    writeln!(out, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">").expect("Write header");
+
+    write!(out, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").expect("Write header");
+    for i in 0..n_samples {
+        write!(out, "\tS{}", start_sample_idx + i).expect("Write sample");
+    }
+    writeln!(out).expect("Write newline");
+
+    // Prebuild a deterministic genotype string for speed is harder with different samples.
+    // Use a simple pattern: Haplotype h has allele (h + m) % 2 at marker m.
+    // This creates blocks of LD structure.
+
+    let mut pos = start_pos;
+    for m in 0..n_markers {
+        // If sparse, skip some markers (simulate array sites)
+        if sparse_factor > 1 && (m % sparse_factor) != 0 {
+            pos += step;
+            continue;
+        }
+
+        write!(
+            out,
+            "{chrom}\t{pos}\t.\tA\tC\t.\tPASS\t.\tGT",
+            chrom = chrom,
+            pos = pos
+        ).expect("Write marker info");
+
+        for s in 0..n_samples {
+            // Global sample index determines haplotype identity
+            let global_s = start_sample_idx + s;
+            let h1 = global_s * 2;
+            let h2 = global_s * 2 + 1;
+
+            // Simple pattern: (h % 5 + m % 3) % 2
+            // This ensures haplotypes repeat every 5 samples (10 haplotypes)
+            // and markers have some variation.
+            let a1 = ((h1 % 10) + (m % 4)) % 2;
+            let a2 = ((h2 % 10) + (m % 4)) % 2;
+
+            let sep = if phased { "|" } else { "/" };
+            write!(out, "\t{}{}{}", a1, sep, a2).expect("Write GT");
+        }
+        writeln!(out).expect("Write newline");
+        pos += step;
+    }
+    out.flush().expect("Flush VCF");
+
+    // Gzip it
+    let status = Command::new("gzip")
+        .args(["-c"])
+        .stdin(File::open(&vcf_path).unwrap())
+        .stdout(File::create(path).unwrap())
+        .status()
+        .expect("gzip failed");
+    assert!(status.success(), "gzip failed");
+
+    // Remove uncompressed file
+    std::fs::remove_file(vcf_path).ok();
+}
+
 /// Get the test data cache directory
 pub fn cache_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -165,6 +254,32 @@ pub struct TestData {
 /// - region: genomic region to extract (e.g., "chr22:16000000-17000000")
 pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &str) -> TestData {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
+
+    if !has_bcftools() {
+        eprintln!("bcftools not found, using synthetic data generation");
+        let ref_vcf = work_dir.path().join("ref.vcf.gz");
+        let target_vcf = work_dir.path().join("target.vcf.gz");
+        let target_sparse_vcf = work_dir.path().join("target_sparse.vcf.gz");
+
+        let n_markers = 1000;
+
+        // Generate reference panel (samples 0 to ref_samples-1)
+        generate_synthetic_vcf(&ref_vcf, 0, ref_samples, n_markers, true, 1);
+
+        // Generate target panel (samples ref_samples to ref_samples+target_samples-1)
+        generate_synthetic_vcf(&target_vcf, ref_samples, target_samples, n_markers, true, 1);
+
+        // Generate sparse target (same samples, but sparse markers)
+        // sparse_factor=10 means keep 1 in 10 markers
+        generate_synthetic_vcf(&target_sparse_vcf, ref_samples, target_samples, n_markers, true, 10);
+
+        return TestData {
+            ref_vcf,
+            target_vcf,
+            target_sparse_vcf,
+            work_dir,
+        };
+    }
 
     // Get sample list from remote (only fetches header)
     let all_samples = get_remote_sample_list();
