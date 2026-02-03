@@ -8209,17 +8209,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut obs_counts = obs_counts1;
     let best_log_like = log_like1;
 
-    if !has_anchor {
-        let flipped_paths = if let Some(paths) = start_paths {
-            if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
-                Some(MosaicPaths {
-                    path1: paths.path2.clone(),
-                    path2: paths.path1.clone(),
-                })
-            } else {
-                None
-            }
-        } else if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+    if !has_anchor && start_paths.is_none() {
+        let flipped_paths = if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers
+        {
             Some(MosaicPaths {
                 path1: new_paths.path2.clone(),
                 path2: new_paths.path1.clone(),
