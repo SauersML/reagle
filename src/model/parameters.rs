@@ -48,7 +48,7 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Maximum recombination intensity
-    pub const MAX_RECOMB_INTENSITY: f32 = 5.0;
+    pub const MAX_RECOMB_INTENSITY: f32 = 15.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
@@ -74,7 +74,7 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = 0.04 * ne / n_haps as f32;
+        let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -162,7 +162,7 @@ impl ModelParams {
     pub fn update_recomb_intensity(&mut self, new_intensity: Option<f32>) {
         if let Some(r) = new_intensity {
             if r.is_finite() && r > 0.0 {
-                self.recomb_intensity = r;
+                self.recomb_intensity = r.min(Self::MAX_RECOMB_INTENSITY);
             }
         }
     }
@@ -244,7 +244,10 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // sum_gen_dist is in cM, but we want intensity in Morgans^-1
+        // 1 Morgan = 100 cM
+        // intensity = switches / (gen_dist_cm / 100.0) = (switches / gen_dist_cm) * 100.0
+        Some((self.sum_expected_switches / self.sum_gen_dist) as f32 * 100.0)
     }
 
     /// Estimate mismatch probability
@@ -325,10 +328,11 @@ mod tests {
 
     #[test]
     fn test_recomb_intensity_formula() {
-        let params = ModelParams::for_phasing(1000, 1_000_000.0, None);
+        // Use ne=100,000 to ensure result (4.0) is below MAX_RECOMB_INTENSITY (15.0)
+        let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 1_000_000 / 1000 = 40.0
-        let expected = 0.04 * 1_000_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
 
@@ -383,5 +387,19 @@ mod tests {
 
         assert!((e1.sum_gen_dist - 0.8).abs() < 0.0001);
         assert_eq!(e1.n_switch_obs(), 2);
+    }
+
+    #[test]
+    fn test_param_estimates_recomb_intensity_scaling() {
+        let mut est = ParamEstimates::new();
+        // Add 10 expected switches over 100 cM
+        // 100 cM = 1 Morgan.
+        // So intensity should be 10 switches / 1 Morgan = 10.0
+        //
+        // Currently, without scaling, it calculates 10 / 100 = 0.1
+        est.add_switch(100.0, 10.0);
+
+        let intensity = est.recomb_intensity().unwrap();
+        assert!((intensity - 10.0).abs() < 0.001, "Expected intensity 10.0, got {}", intensity);
     }
 }
