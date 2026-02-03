@@ -7708,8 +7708,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // with significant input noise (e.g. 25% flips).
     // Net score for 75% match (25% flips) is (0.75 - 0.25) = 0.5.
     // Net score for random (50% match) is 0.0.
-    // Threshold of 0.4 corresponds to 70% match.
-    let threshold = 0.4 * (informative as f32);
+    // Threshold of 0.0 corresponds to 50% match (better than random).
+    let threshold = 0.0 * (informative as f32);
     if best_score < threshold || n_markers > 2000 {
         return None;
     }
@@ -7764,8 +7764,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // This causes it to follow noisy input errors instead of correcting them using the reference.
     // By enforcing p_err > p_recomb (e.g. 4x), we prioritize the reference structure.
     // Clamp to 0.45 to avoid excessive flatness, but allow enough flexibility for calibration.
-    // Min clamp 0.01 ensures we remain sticky even in very dense maps with low user-specified error.
-    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.01, 0.45);
+    // Min clamp 0.05 ensures we remain sticky even if recombination intensity is high (e.g. up to 15.0).
+    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.05, 0.45);
     let chain_p_no_err = 1.0 - chain_p_err;
     // Suppress unused variable warning since we intentionally skip using p_no_err
     // in the final recalculation block (disabled for calibration).
@@ -8337,12 +8337,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     continue;
                 }
                 if a1_anchor != 255 {
-                    if s1 == a1_anchor { score_direct += 1; } else { score_direct -= 1; }
-                    if s2 == a1_anchor { score_flip += 1; } else { score_flip -= 1; }
+                    score_direct += if s1 == a1_anchor { 1 } else { -1 };
+                    score_flip += if s2 == a1_anchor { 1 } else { -1 };
                 }
                 if a2_anchor != 255 {
-                    if s2 == a2_anchor { score_direct += 1; } else { score_direct -= 1; }
-                    if s1 == a2_anchor { score_flip += 1; } else { score_flip -= 1; }
+                    score_direct += if s2 == a2_anchor { 1 } else { -1 };
+                    score_flip += if s1 == a2_anchor { 1 } else { -1 };
                 }
             }
             if score_flip > score_direct {
@@ -8398,7 +8398,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             p_sum += p_swap;
         }
     }
-
     if !het_positions.is_empty() {
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
