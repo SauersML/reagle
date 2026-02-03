@@ -2325,20 +2325,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 None,
                 0,
             )?;
-
-            for (s, sp) in sample_phases.iter_mut().enumerate() {
-                if let Ok(slot) = beam_confidence[s].lock() {
-                    for &(m, a1, a2, p) in slot.iter() {
-                        let swapped = sp.allele1(m) == a2 && sp.allele2(m) == a1;
-                        let conf = if has_input_phase {
-                            if swapped { p } else { 1.0 - p }
-                        } else {
-                            0.5
-                        };
-                        sp.set_phase_confidence(m, conf);
-                    }
-                }
-            }
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
@@ -2981,7 +2967,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             };
 
-            let threaded_haps_vec = self.build_phasing_prescan_states(
+            let mut threaded_haps_vec = self.build_phasing_prescan_states(
                 target_gt,
                 &geno,
                 Some(ref_gt.as_ref()),
@@ -2992,6 +2978,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 self.config.imp_step,
                 Some(&hi_freq_to_orig),
             )?;
+
+            let beam_donors: Vec<std::sync::Mutex<Vec<usize>>> =
+                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
 
             let n_target_haps = target_gt.n_haplotypes();
             sample_phases
@@ -3010,6 +2999,31 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 active_pool.add(ref_id);
                             }
                         }
+                    }
+
+                    // Re-rank: push best matching reference haps to the end so they are prioritized.
+                    let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
+                    for &h in active_pool.list() {
+                        let mut score = 0i32;
+                        for &m in hi_freq_to_orig.iter() {
+                            let a1 = sp.allele1(m);
+                            let a2 = sp.allele2(m);
+                            if a1 == 255 || a2 == 255 {
+                                continue;
+                            }
+                            if let Some(r) = packed_ref.ref_allele_targ(m, h) {
+                                if a1 == a2 {
+                                    score += if r == a1 { 2 } else { -2 };
+                                } else {
+                                    score += if r == a1 || r == a2 { 1 } else { -1 };
+                                }
+                            }
+                        }
+                        scored.push((score, h));
+                    }
+                    scored.sort_by(|a, b| b.0.cmp(&a.0));
+                    for &(_, h) in scored.iter().take(4) {
+                        active_pool.promote(h);
                     }
 
                     let hard_threshold_nats = if beam_config.prune_tolerance > 0 {
@@ -3064,7 +3078,71 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             sp.set_phase_confidence(m, conf);
                         }
                     }
+
+                    if let Ok(mut slot) = beam_donors[s].lock() {
+                        slot.clear();
+                        let list = active_pool.list();
+                        let cap = beam_config
+                            .beam_width
+                            .max(beam_config.inject_k.saturating_mul(2))
+                            .max(beam_config.switch_candidates.saturating_mul(4));
+                        if list.len() > cap {
+                            slot.extend_from_slice(&list[list.len() - cap..]);
+                        } else {
+                            slot.extend_from_slice(list);
+                        }
+                    }
                 });
+
+            // Feed beam-selected donors back into the HMM state set.
+            if packed_ref.n_ref_haps() > 0 {
+                let offset = n_target_haps as u32;
+                for s in 0..n_samples {
+                    let Ok(donors) = beam_donors[s].lock() else {
+                        continue;
+                    };
+                    if donors.is_empty() {
+                        continue;
+                    }
+                    let threaded_haps = &mut threaded_haps_vec[s];
+                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
+                    threaded_haps.materialize_at(0, &mut existing);
+                    let mut seen: HashSet<u32> = HashSet::with_capacity(existing.len() + donors.len());
+                    for id in existing {
+                        seen.insert(id.as_u32());
+                    }
+                    for &h in donors.iter() {
+                        let combined = combined_from_ref(RefHapId::from(h), offset);
+                        let id = combined.as_u32();
+                        if seen.insert(id) {
+                            threaded_haps.push_new(combined);
+                        }
+                    }
+                }
+            }
+
+            let stage1_blocks = partition_markers_by_cm(&hi_freq_gen_positions, stage1_block_cm(&hi_freq_gen_positions));
+            let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
+            let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+                .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                .collect();
+
+            // Micro-HMM refinement on hi-frequency markers (single pass).
+            let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            let _ = self.run_phase_baum_iteration_stage1(
+                &target_gt,
+                &mut geno,
+                &threaded_haps_vec,
+                &stage1_p_recomb,
+                &stage1_gen_dists,
+                &hi_freq_to_orig,
+                &stage1_blocks,
+                &ibs2,
+                &mut sample_phases,
+                &mut mcmc_paths,
+                None,
+                0,
+            )?;
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
