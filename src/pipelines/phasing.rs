@@ -4745,9 +4745,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let mut swap_mask = vec![false; n_hi_freq];
-                        let mut anchor_resets = 0usize;
+                        let anchor_resets = 0usize;
                         let mut p_swap = vec![0.5f32; n_hi_freq];
-                        for &pos in het_positions.iter() {
+                        // Use het_positions_all to allow MCMC to correct input phase errors (flips)
+                        for &pos in het_positions_all.iter() {
                             let idx = het_index_map[pos];
                             if idx == usize::MAX {
                                 continue;
@@ -4758,23 +4759,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             p_swap[pos] = p.clamp(0.0, 1.0);
                             swap_mask[pos] = p_swap[pos] > 0.5;
                         }
-                        for i in 0..n_hi_freq {
-                            let m = hi_freq_to_orig[i];
-                            let a1 = seq1[i];
-                            let a2 = seq2[i];
-                            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-                            let is_phased_het = is_het && !sp.is_unphased(m);
-                            if is_phased_het {
-                                let a1_anchor = sp.allele1(m);
-                                let a2_anchor = sp.allele2(m);
-                                if a1 == a1_anchor && a2 == a2_anchor {
-                                    swap_mask[i] = false;
-                                } else if a1 == a2_anchor && a2 == a1_anchor {
-                                    swap_mask[i] = true;
-                                }
-                                anchor_resets += 1;
-                            }
-                        }
+                        // Input phase is treated as a soft suggestion via MCMC initialization/priors,
+                        // not a hard constraint. We do NOT force swap_mask based on input phase here.
+                        // This allows correction of phasing errors (flips) in the input VCF.
 
                         eprintln!(
                             "[phase anchors] sample={} anchors={} hets={}",
@@ -7717,7 +7704,12 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.9 * (informative as f32);
+    // Relaxed threshold to allow heuristic to pick up reference haplotypes even
+    // with significant input noise (e.g. 25% flips).
+    // Net score for 75% match (25% flips) is (0.75 - 0.25) = 0.5.
+    // Net score for random (50% match) is 0.0.
+    // Threshold of 0.4 corresponds to 70% match.
+    let threshold = 0.4 * (informative as f32);
     if best_score < threshold || n_markers > 2000 {
         return None;
     }
@@ -7771,8 +7763,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // If p_err < p_recomb, the model prefers switching (to match input) over mismatching (to match reference).
     // This causes it to follow noisy input errors instead of correcting them using the reference.
     // By enforcing p_err > p_recomb (e.g. 4x), we prioritize the reference structure.
-    // Clamp to 0.25 to avoid excessive flatness.
-    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.0001, 0.25);
+    // Clamp to 0.45 to avoid excessive flatness, but allow enough flexibility for calibration.
+    // Min clamp 0.01 ensures we remain sticky even in very dense maps with low user-specified error.
+    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.01, 0.45);
     let chain_p_no_err = 1.0 - chain_p_err;
     // Suppress unused variable warning since we intentionally skip using p_no_err
     // in the final recalculation block (disabled for calibration).
@@ -7868,6 +7861,55 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     "[anchor init] kept heuristic paths (direct={} flip={})",
                     score_direct, score_flip
                 );
+            }
+        }
+    } else {
+        // If no explicit anchors, use input sequence (seq1/seq2) as soft orientation guide.
+        // This ensures the initialized path starts aligned with the input phase,
+        // which helps when the input is "mostly correct" (e.g. 75% hero).
+        if let Some(paths) = heuristic_paths.as_mut() {
+            let mut score_direct: i32 = 0;
+            let mut score_flip: i32 = 0;
+            let ref_alleles = &mut workspace.ref_alleles;
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 {
+                    continue;
+                }
+                ref_provider.fill_ref_alleles(m, ref_alleles);
+                let p1 = paths.path1[m] as usize;
+                let p2 = paths.path2[m] as usize;
+                if p1 >= n_states || p2 >= n_states {
+                    continue;
+                }
+                let r1 = ref_alleles[p1];
+                let r2 = ref_alleles[p2];
+                // Check if path1 matches seq1 (direct) or seq2 (flip)
+                if r1 == a1 {
+                    score_direct += 1;
+                } else {
+                    score_direct -= 1;
+                }
+                if r1 == a2 {
+                    score_flip += 1;
+                } else {
+                    score_flip -= 1;
+                }
+                // Check if path2 matches seq2 (direct) or seq1 (flip)
+                if r2 == a2 {
+                    score_direct += 1;
+                } else {
+                    score_direct -= 1;
+                }
+                if r2 == a1 {
+                    score_flip += 1;
+                } else {
+                    score_flip -= 1;
+                }
+            }
+            if score_flip > score_direct {
+                std::mem::swap(&mut paths.path1, &mut paths.path2);
             }
         }
     }
