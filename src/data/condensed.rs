@@ -88,11 +88,17 @@ impl CondensedTarget {
                 } else {
                     0.0
                 };
-                let fixed = !sample_phase.is_unphased(orig_m);
-                let flip_cost = if fixed {
+                let is_phased = !sample_phase.is_unphased(orig_m);
+                // Always treat phase as soft (fixed=false) to allow beam search to explore swaps
+                // if the HMM evidence strongly contradicts the input phase.
+                let fixed = false;
+
+                let flip_cost = if is_phased {
                     let conf = sample_phase.phase_confidence(orig_m).clamp(1e-6, 1.0 - 1e-6) as f64;
                     let odds = (1.0 - conf) / conf;
-                    (-(odds.ln()) * 1_000_000.0).round() as i32
+                    let cost = (-(odds.ln()) * 1_000_000.0).round() as i32;
+                    // Cap flip cost to ensure correction is possible
+                    cost.min(2_000_000)
                 } else {
                     0
                 };

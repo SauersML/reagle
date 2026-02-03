@@ -837,6 +837,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let n1 = k.min(match_a1.len()).max(1);
         let n2 = k.min(match_a2.len()).max(1);
 
+        // Reverse match lists to prioritize recently promoted (best) haplotypes which are at the end
+        match_a1.reverse();
+        match_a2.reverse();
+
         let picks_a1 = sample_even(&match_a1, n1);
         let picks_a2 = sample_even(&match_a2, n2);
 
@@ -1118,7 +1122,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             for (h2, c2, e2) in scratch.hap2_allele.iter() {
                 let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
                 let flip_penalty = if call_idx == 0 {
-                    0
+                    if swapped { call.flip_cost } else { 0 }
                 } else if swapped != path.last_swapped {
                     call.flip_cost
                 } else {
