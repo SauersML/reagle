@@ -7918,6 +7918,20 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut combined_checkpoints =
         FwdCheckpoints::from_buffer(block_starts.clone(), n_states, combined_data);
 
+    // Adaptive error rate for robustness against noisy input and low-recomb regions.
+    // This prevents the HMM from being overconfident when user supplies a very low err.
+    let mut sum_recomb = 0.0;
+    for &r in p_recomb {
+        sum_recomb += r;
+    }
+    let mean_recomb = if n_markers > 0 {
+        sum_recomb / n_markers as f32
+    } else {
+        0.0
+    };
+    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.05, 0.45);
+    let chain_p_no_err = 1.0 - chain_p_err;
+
     if start_paths.is_none() {
         if workspace.dummy_target.len() < n_markers {
             workspace.dummy_target.resize(n_markers, 255);
@@ -7957,8 +7971,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             fwd,
             fwd_prior,
             ref_alleles,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             EmissionMode::Combined,
         );
     }
@@ -7996,8 +8010,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider,
             combined_checkpoints_ref,
             buffers,
-            p_no_err,
-            p_err,
+            chain_p_no_err,
+            chain_p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
@@ -8311,10 +8325,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let ref1 = ref_alleles[p1];
             let ref2 = ref_alleles[p2];
             let conf_m = conf[m];
-            let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-            let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
+            let keep = emit_prob(ref1, a1, conf_m, chain_p_no_err, chain_p_err)
+                * emit_prob(ref2, a2, conf_m, chain_p_no_err, chain_p_err);
+            let swap = emit_prob(ref1, a2, conf_m, chain_p_no_err, chain_p_err)
+                * emit_prob(ref2, a1, conf_m, chain_p_no_err, chain_p_err);
             let denom = keep + swap;
             let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
             let p_keep = 1.0 - p_swap;
