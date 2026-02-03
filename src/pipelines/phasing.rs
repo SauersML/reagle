@@ -7638,7 +7638,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = swap_counts1;
     let mut obs_counts = obs_counts1;
 
-    if !has_anchor {
+    if !has_anchor && start_paths.is_none() {
         let flipped_paths =
             if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
                 Some(MosaicPaths {
