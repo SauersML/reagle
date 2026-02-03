@@ -87,7 +87,6 @@ const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
-const MIN_CHAIN_ERROR_RATE: f32 = 0.01;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -7763,8 +7762,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, MosaicPaths) {
-    let chain_p_err = p_err.max(MIN_CHAIN_ERROR_RATE);
+    let mean_recomb = if !p_recomb.is_empty() {
+        p_recomb.iter().sum::<f32>() / p_recomb.len() as f32
+    } else {
+        0.0
+    };
+    // Adapt chain error rate to recombination rate to ensure structural stickiness.
+    // If p_err < p_recomb, the model prefers switching (to match input) over mismatching (to match reference).
+    // This causes it to follow noisy input errors instead of correcting them using the reference.
+    // By enforcing p_err > p_recomb (e.g. 4x), we prioritize the reference structure.
+    // Clamp to 0.25 to avoid excessive flatness.
+    let chain_p_err = p_err.max(mean_recomb * 4.0).clamp(0.0001, 0.25);
     let chain_p_no_err = 1.0 - chain_p_err;
+    // Suppress unused variable warning since we intentionally skip using p_no_err
+    // in the final recalculation block (disabled for calibration).
+    let _ = p_no_err;
 
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
@@ -8283,12 +8295,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     continue;
                 }
                 if a1_anchor != 255 {
-                    score_direct += if s1 == a1_anchor { 1 } else { -1 };
-                    score_flip += if s2 == a1_anchor { 1 } else { -1 };
+                    if s1 == a1_anchor { score_direct += 1; } else { score_direct -= 1; }
+                    if s2 == a1_anchor { score_flip += 1; } else { score_flip -= 1; }
                 }
                 if a2_anchor != 255 {
-                    score_direct += if s2 == a2_anchor { 1 } else { -1 };
-                    score_flip += if s1 == a2_anchor { 1 } else { -1 };
+                    if s2 == a2_anchor { score_direct += 1; } else { score_direct -= 1; }
+                    if s1 == a2_anchor { score_flip += 1; } else { score_flip -= 1; }
                 }
             }
             if score_flip > score_direct {
@@ -8319,10 +8331,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let ref1 = ref_alleles[p1];
             let ref2 = ref_alleles[p2];
             let conf_m = conf[m];
-            let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-            let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
+            // Use chain_p_err here to match the exploration behavior and provide softer confidence
+            let keep = emit_prob(ref1, a1, conf_m, chain_p_no_err, chain_p_err)
+                * emit_prob(ref2, a2, conf_m, chain_p_no_err, chain_p_err);
+            let swap = emit_prob(ref1, a2, conf_m, chain_p_no_err, chain_p_err)
+                * emit_prob(ref2, a1, conf_m, chain_p_no_err, chain_p_err);
             let denom = keep + swap;
             let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
             let p_keep = 1.0 - p_swap;
@@ -8343,6 +8356,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             p_sum += p_swap;
         }
     }
+
     if !het_positions.is_empty() {
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
