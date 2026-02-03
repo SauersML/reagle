@@ -89,15 +89,11 @@ impl CondensedTarget {
                 let switch_cost = 0;
                 let fixed = !sample_phase.is_unphased(orig_m);
                 let flip_cost = if fixed {
-                    if switch_cost == 0 {
-                        250_000
-                    } else {
-                        switch_cost.max(250_000)
-                    }
-                } else if switch_cost == 0 {
-                    1_000_000
+                    let conf = sample_phase.phase_confidence(orig_m).clamp(1e-6, 1.0 - 1e-6) as f64;
+                    let odds = (1.0 - conf) / conf;
+                    (-(odds.ln()) * 1_000_000.0).round() as i32
                 } else {
-                    switch_cost.max(1_000_000)
+                    0
                 };
 
                 // Get allele frequencies (default to 0.5 if not available).
@@ -204,17 +200,7 @@ impl CondensedTarget {
                 0.0
             };
             let switch_cost = 0;
-            let flip_cost = if cs.fixed {
-                if switch_cost == 0 {
-                    250_000
-                } else {
-                    switch_cost.max(250_000)
-                }
-            } else if switch_cost == 0 {
-                1_000_000
-            } else {
-                switch_cost.max(1_000_000)
-            };
+            let flip_cost = cs.flip_cost;
             let hi_idx = cs.hi_idx;
             call_sites_rev.push(CallSite {
                 marker: cs.marker,
