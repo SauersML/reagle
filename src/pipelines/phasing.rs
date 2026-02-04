@@ -1775,8 +1775,15 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Initialize parameters based on TOTAL haplotype count (target + ref)
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if self.config.phase_states > 0 {
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
+
+        eprintln!(
+            "Phasing parameters: p_mismatch={}, recomb_intensity={}, n_states={} (requested phase_states={})",
+            self.params.p_mismatch, self.params.recomb_intensity, self.params.n_states, self.config.phase_states
+        );
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -2877,8 +2884,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if self.config.phase_states > 0 {
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -8077,14 +8086,20 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
     let mut heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair_with_buffer(
+        let res = find_best_constant_pair_with_buffer(
             n_markers,
             n_states_usize,
             seq1,
             seq2,
             &mut ref_provider,
             &mut workspace.scores,
-        )
+        );
+        if res.is_some() {
+            eprintln!("Heuristic initialization found a constant pair path");
+        } else {
+            eprintln!("Heuristic initialization failed to find a good pair");
+        }
+        res
     } else {
         None
     };
