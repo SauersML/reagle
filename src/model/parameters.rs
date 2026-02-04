@@ -75,7 +75,7 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
+        let recomb_intensity = (0.01 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -330,8 +330,8 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 100_000 / 1000 = 4.0
-        let expected = 0.04 * 100_000.0 / 1000.0;
+        // Should be 0.01 * 100_000 / 1000 = 1.0
+        let expected = 0.01 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
 
