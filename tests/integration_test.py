@@ -461,7 +461,7 @@ def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2):
 def run_reagle(ref_vcf, target_vcf, output_prefix, reagle_bin):
     """Run Reagle for imputation."""
     output_vcf = f"{output_prefix}.vcf.gz"
-    cmd = f"{reagle_bin} --ref {ref_vcf} --gt {target_vcf} --out {output_prefix} --gp"
+    cmd = f"{reagle_bin} --ref {ref_vcf} --gt {target_vcf} --out {output_prefix}"
     try:
         run(cmd)
         if os.path.exists(output_vcf):

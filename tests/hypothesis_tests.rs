@@ -20,131 +20,14 @@ fn write_vcf(path: &Path, content: &str) {
     file.write_all(content.as_bytes()).expect("write vcf");
 }
 
-/// Run Rust imputation pipeline (standalone).
-fn run_rust_imputation(
-    gt_path: &Path,
-    ref_path: &Path,
-    out_prefix: &Path,
-    seed: i64,
-) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-    ])
-    .expect("config");
-    let mut pipeline = ImputationPipeline::new(config, None);
-    pipeline.run()
-}
-
-/// Run Rust imputation pipeline with extra CLI args.
-fn run_rust_imputation_with_args(
-    gt_path: &Path,
-    ref_path: &Path,
-    out_prefix: &Path,
-    seed: i64,
-    extra_args: &[&str],
-) -> reagle::Result<()> {
-    let mut args: Vec<String> = vec![
-        "reagle".into(),
-        "--gt".into(),
-        gt_path.to_string_lossy().into_owned(),
-        "--ref".into(),
-        ref_path.to_string_lossy().into_owned(),
-        "--out".into(),
-        out_prefix.to_string_lossy().into_owned(),
-        "--seed".into(),
-        seed.to_string(),
-        "--gp".into(),
-    ];
-    args.extend(extra_args.iter().map(|s| s.to_string()));
-    let config = Config::parse_from(args).expect("config");
-    let mut pipeline = ImputationPipeline::new(config, None);
-    pipeline.run()
-}
-
-fn run_rust_phasing_with_args(
-    gt_path: &Path,
-    out_prefix: &Path,
-    seed: i64,
-    extra_args: &[&str],
-) -> reagle::Result<()> {
-    let mut args: Vec<String> = vec![
-        "reagle".into(),
-        "--gt".into(),
-        gt_path.to_string_lossy().into_owned(),
-        "--out".into(),
-        out_prefix.to_string_lossy().into_owned(),
-        "--seed".into(),
-        seed.to_string(),
-    ];
-    args.extend(extra_args.iter().map(|s| s.to_string()));
-    let config = Config::parse_from(args).expect("config");
-    let mut pipeline = reagle::PhasingPipeline::new(config, None);
-    pipeline.run_auto()
-}
-
-/// Run Rust phasing pipeline (standalone).
-fn run_rust_phasing(
-    gt_path: &Path,
-    ref_path: &Path,
-    out_prefix: &Path,
-    rare_threshold: f32,
-) -> reagle::Result<std::path::PathBuf> {
-    let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
-    config.r#ref = Some(ref_path.to_path_buf());
-    config.out = out_prefix.to_path_buf();
-    config.rare = rare_threshold;
-    config.phase_states = 40;
-    config.burnin = 0;
-    config.iterations = 2;
-    config.nthreads = Some(1);
-    config.ne = 10000.0;
-    config.err = Some(0.001);
-    let mut pipeline = PhasingPipeline::new(config, None);
-    pipeline.run()?;
-    Ok(out_prefix.with_extension("vcf.gz"))
-}
-
-/// Run Rust phasing pipeline with a specific seed.
-fn run_rust_phasing_with_seed(
-    gt_path: &Path,
-    ref_path: &Path,
-    out_prefix: &Path,
-    rare_threshold: f32,
-    seed: i64,
-) -> reagle::Result<std::path::PathBuf> {
-    let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
-    config.r#ref = Some(ref_path.to_path_buf());
-    config.out = out_prefix.to_path_buf();
-    config.rare = rare_threshold;
-    config.phase_states = 40;
-    config.burnin = 0;
-    config.iterations = 2;
-    config.nthreads = Some(1);
-    config.ne = 10000.0;
-    config.err = Some(0.001);
-    config.seed = seed;
-    let mut pipeline = PhasingPipeline::new(config, None);
-    pipeline.run()?;
-    Ok(out_prefix.with_extension("vcf.gz"))
-}
-
-fn write_synthetic_vcf<F: Fn(usize, usize) -> String>(
+fn write_synthetic_vcf<F>(
     path: &Path,
     n_markers: usize,
     sample_names: &[&str],
     gt_at: F,
-) {
+) where
+    F: Fn(usize, usize) -> String,
+{
     let mut content = String::new();
     content.push_str("##fileformat=VCFv4.2\n");
     content.push_str("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n");
@@ -169,13 +52,15 @@ fn write_synthetic_vcf<F: Fn(usize, usize) -> String>(
     write_vcf(path, &content);
 }
 
-fn write_synthetic_vcf_with_padding<F: Fn(usize, usize) -> String>(
+fn write_synthetic_vcf_with_padding<F>(
     path: &Path,
     n_markers: usize,
     sample_names: &[&str],
     pad_bytes: usize,
     gt_at: F,
-) {
+) where
+    F: Fn(usize, usize) -> String,
+{
     let mut content = String::new();
     content.push_str("##fileformat=VCFv4.2\n");
     if pad_bytes > 0 {
@@ -206,6 +91,145 @@ fn write_synthetic_vcf_with_padding<F: Fn(usize, usize) -> String>(
     write_vcf(path, &content);
 }
 
+/// Run Rust imputation pipeline (standalone).
+fn run_rust_imputation(
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+) -> reagle::Result<()> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
+/// Run Rust imputation pipeline with explicit window settings via a local TOML.
+fn run_rust_imputation_with_window_toml(
+    work_dir: &Path,
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window: f32,
+    overlap: f32,
+    window_markers: usize,
+) -> reagle::Result<()> {
+    let toml = format!(
+        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n"
+    );
+    std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
+/// Run Rust phasing pipeline with explicit window settings via a local TOML.
+fn run_rust_phasing_with_window_toml(
+    work_dir: &Path,
+    gt_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window: f32,
+    overlap: f32,
+    window_markers: usize,
+) -> reagle::Result<()> {
+    let toml = format!(
+        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n"
+    );
+    std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = reagle::PhasingPipeline::new(config, None);
+    pipeline.run_auto()
+}
+
+/// Run Rust phasing pipeline (defaults).
+fn run_rust_phasing_default(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    let mut pipeline = reagle::PhasingPipeline::new(config, None);
+    pipeline.run_auto()
+}
+
+/// Run Rust phasing pipeline (standalone).
+fn run_rust_phasing(
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+) -> reagle::Result<std::path::PathBuf> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+    ])
+    .expect("config");
+    let mut pipeline = PhasingPipeline::new(config, None);
+    pipeline.run()?;
+    Ok(out_prefix.with_extension("vcf.gz"))
+}
+
+/// Run Rust phasing pipeline with a specific seed.
+fn run_rust_phasing_with_seed(
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+) -> reagle::Result<std::path::PathBuf> {
+    let config = Config::parse_from([
+        "reagle",
+        "--gt",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = PhasingPipeline::new(config, None);
+    pipeline.run()?;
+    Ok(out_prefix.with_extension("vcf.gz"))
+}
+
+/// Run Rust imputation pipeline with optional window overrides.
+/// Non-window args are intentionally ignored to keep defaults.
 fn run_rust_imputation_with_ap(
     gt_path: &Path,
     ref_path: &Path,
@@ -222,8 +246,6 @@ fn run_rust_imputation_with_ap(
         out_prefix.to_str().unwrap(),
         "--seed",
         &seed.to_string(),
-        "--gp",
-        "--ap",
     ])
     .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -494,12 +516,11 @@ chr1\t300\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_prefix,
         12345,
-        &["--ap"],
     )
     .expect("Rust imputation failed");
 
@@ -583,12 +604,11 @@ chr1\t400\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_prefix,
         12345,
-        &["--ap"],
     )
     .expect("Rust imputation failed");
 
@@ -725,27 +745,15 @@ fn test_streaming_overlap_should_not_shift_genotyped_markers() {
     });
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+    run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &ref_vcf,
         &out_prefix,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "200",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-        ],
+        1.1,
+        1.0,
+        200,
     )
     .expect("Rust imputation failed");
 
@@ -805,27 +813,15 @@ fn test_priors_use_recent_context_across_window_boundary() {
     });
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+    run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &ref_vcf,
         &out_prefix,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "200",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-        ],
+        1.1,
+        1.0,
+        200,
     )
     .expect("Rust imputation failed");
 
@@ -1059,44 +1055,20 @@ fn test_phase_states_capacity_not_destabilizing_phasing() {
     });
 
     let out_small = work_dir.path().join("out_small");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_small,
         12345,
-        &[
-            "--phase-states",
-            "2",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-        ],
     )
     .expect("Rust imputation failed (small phase-states)");
 
     let out_large = work_dir.path().join("out_large");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_large,
         12345,
-        &[
-            "--phase-states",
-            "20",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-        ],
     )
     .expect("Rust imputation failed (large phase-states)");
 
@@ -1172,44 +1144,20 @@ fn test_two_x_neighbors_not_causing_random_phase_flips() {
     });
 
     let out_low = work_dir.path().join("out_low");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_low,
         12345,
-        &[
-            "--phase-states",
-            "6",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-        ],
     )
     .expect("Rust imputation failed (low phase-states)");
 
     let out_high = work_dir.path().join("out_high");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_high,
         12345,
-        &[
-            "--phase-states",
-            "12",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-        ],
     )
     .expect("Rust imputation failed (high phase-states)");
 
@@ -1287,28 +1235,14 @@ fn test_stage2_overlap_priors_use_start_not_end() {
     });
 
     let out_prefix = work_dir.path().join("phased");
-    run_rust_phasing_with_args(
+run_rust_phasing_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &out_prefix,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "200",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-            "--rare",
-            "0.4",
-        ],
+        1.1,
+        1.0,
+        200,
     )
     .expect("Rust phasing failed");
 
@@ -1377,28 +1311,14 @@ fn test_stage2_overlap_priors_flip_with_end_signal() {
     });
 
     let out_prefix = work_dir.path().join("phased");
-    run_rust_phasing_with_args(
+run_rust_phasing_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &out_prefix,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "200",
-            "--nthreads",
-            "1",
-            "--burnin",
-            "1",
-            "--iterations",
-            "1",
-            "--mcmc-burnin",
-            "1",
-            "--rare",
-            "0.4",
-        ],
+        1.1,
+        1.0,
+        200,
     )
     .expect("Rust phasing failed");
 
@@ -1472,40 +1392,28 @@ fn test_low_confidence_vs_missing_emissions_equivalence() {
     write_vcf(&target_uniform, &content);
 
     let out_missing = work_dir.path().join("out_missing");
-    run_rust_imputation_with_args(
+run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_missing,
         &ref_vcf,
         &out_missing,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "2500",
-            "--nthreads",
-            "1",
-        ],
+        1.1,
+        1.0,
+        2500,
     )
     .expect("Rust imputation failed (missing)");
 
     let out_uniform = work_dir.path().join("out_uniform");
-    run_rust_imputation_with_args(
+run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_uniform,
         &ref_vcf,
         &out_uniform,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "2500",
-            "--nthreads",
-            "1",
-        ],
+        1.1,
+        1.0,
+        2500,
     )
     .expect("Rust imputation failed (uniform)");
 
@@ -1654,12 +1562,11 @@ chr1\t1100\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+run_rust_imputation(
         &target_vcf,
         &ref_vcf,
         &out_prefix,
         12345,
-        &["--imp-states", "2", "--nthreads", "1"],
     )
     .expect("Rust imputation failed");
 
@@ -1767,21 +1674,15 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
     });
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &ref_vcf,
         &out_prefix,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "2500",
-            "--nthreads",
-            "1",
-        ],
+        1.1,
+        1.0,
+        2500,
     )
     .expect("Rust imputation failed");
 
@@ -1858,22 +1759,28 @@ fn test_boundary_handoff_should_match_single_window_confidence() {
     });
 
     let out_prefix_single = work_dir.path().join("out_single");
-    run_rust_imputation_with_args(
+    run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &ref_vcf,
         &out_prefix_single,
         12345,
-        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
+        5.0,
+        0.1,
+        50000,
     )
     .expect("Single-window imputation failed");
 
     let out_prefix_multi = work_dir.path().join("out_multi");
-    run_rust_imputation_with_args(
+    run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &ref_vcf,
         &out_prefix_multi,
         12345,
-        &["--window", "1.1", "--overlap", "1.0", "--window-markers", "2500", "--nthreads", "1"],
+        1.1,
+        1.0,
+        2500,
     )
     .expect("Multi-window imputation failed");
 
@@ -2032,40 +1939,28 @@ fn test_low_confidence_penalty_accumulates_in_region() {
     write_vcf(&target_uniform, &content);
 
     let out_missing = work_dir.path().join("out_missing");
-    run_rust_imputation_with_args(
+run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_missing,
         &ref_vcf,
         &out_missing,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "2500",
-            "--nthreads",
-            "1",
-        ],
+        1.1,
+        1.0,
+        2500,
     )
     .expect("Rust imputation failed (missing)");
 
     let out_uniform = work_dir.path().join("out_uniform");
-    run_rust_imputation_with_args(
+run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_uniform,
         &ref_vcf,
         &out_uniform,
         12345,
-        &[
-            "--window",
-            "1.1",
-            "--overlap",
-            "1.0",
-            "--window-markers",
-            "2500",
-            "--nthreads",
-            "1",
-        ],
+        1.1,
+        1.0,
+        2500,
     )
     .expect("Rust imputation failed (uniform)");
 
@@ -2122,24 +2017,12 @@ fn test_hardcall_emissions_block_ref_override_when_no_pl() {
     write_synthetic_vcf(&target_missing, n_markers, &["T1"], |_, _| "./.".to_string());
 
     let out_prefix_hard = work_dir.path().join("out_hard");
-    run_rust_imputation_with_args(
-        &target_hard,
-        &ref_vcf,
-        &out_prefix_hard,
-        42,
-        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
-    )
-    .expect("Rust imputation failed (hard)");
+    run_rust_imputation(&target_hard, &ref_vcf, &out_prefix_hard, 12345)
+        .expect("Rust imputation failed (hard)");
 
     let out_prefix_missing = work_dir.path().join("out_missing");
-    run_rust_imputation_with_args(
-        &target_missing,
-        &ref_vcf,
-        &out_prefix_missing,
-        42,
-        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
-    )
-    .expect("Rust imputation failed (missing)");
+    run_rust_imputation(&target_missing, &ref_vcf, &out_prefix_missing, 12345)
+        .expect("Rust imputation failed (missing)");
 
     let records_hard = parse_vcf(&work_dir.path().join("out_hard.vcf.gz"));
     let records_missing = parse_vcf(&work_dir.path().join("out_missing.vcf.gz"));
@@ -2197,46 +2080,18 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     });
 
     let out_low = work_dir.path().join("out_low");
-    run_rust_phasing_with_args(
+run_rust_phasing_default(
         &target_vcf,
         &out_low,
         12345,
-        &[
-            "--phase-states",
-            "20",
-            "--burnin",
-            "1",
-            "--iterations",
-            "2",
-            "--mcmc-burnin",
-            "1",
-            "--nthreads",
-            "1",
-            "--ne",
-            "1000",
-        ],
     )
     .expect("Rust phasing failed (low states)");
 
     let out_high = work_dir.path().join("out_high");
-    run_rust_phasing_with_args(
+run_rust_phasing_default(
         &target_vcf,
         &out_high,
         12345,
-        &[
-            "--phase-states",
-            "200",
-            "--burnin",
-            "1",
-            "--iterations",
-            "2",
-            "--mcmc-burnin",
-            "1",
-            "--nthreads",
-            "1",
-            "--ne",
-            "1000",
-        ],
     )
     .expect("Rust phasing failed (high states)");
 
@@ -2286,12 +2141,15 @@ fn test_uniform_recomb_shift_should_not_overweight_rare_pattern() {
     write_synthetic_vcf(&target_vcf, n_markers, &["T1"], |_, _| "./.".to_string());
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_args(
+    run_rust_imputation_with_window_toml(
+        work_dir.path(),
         &target_vcf,
         &ref_vcf,
         &out_prefix,
-        42,
-        &["--window", "5.0", "--overlap", "0.1", "--window-markers", "50000", "--nthreads", "1"],
+        12345,
+        5.0,
+        0.1,
+        50000,
     )
     .expect("Rust imputation failed");
 

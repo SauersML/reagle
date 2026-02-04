@@ -34,6 +34,10 @@ pub struct CliArgs {
     /// Enable profiling output (hierarchical timing tree)
     #[arg(long, default_value = "false")]
     pub profile: bool,
+
+    /// Random seed for reproducibility
+    #[arg(long, value_name = "INT")]
+    pub seed: Option<i64>,
 }
 
 /// Reagle: High-performance genotype phasing and imputation
@@ -348,6 +352,9 @@ impl Config {
         config.out = cli.out;
         if cli.profile {
             config.profile = true;
+        }
+        if let Some(seed) = cli.seed {
+            config.seed = seed;
         }
 
         config.validate()?;

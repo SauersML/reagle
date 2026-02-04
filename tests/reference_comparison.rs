@@ -2831,22 +2831,13 @@ fn run_rust_phasing_with_map(
     window_cm: f32,
     overlap_cm: f32,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--map",
-        map_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--window",
-        &window_cm.to_string(),
-        "--overlap",
-        &overlap_cm.to_string(),
-    ])
-    .expect("config");
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.map = Some(map_path.to_path_buf());
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.window = window_cm;
+    config.overlap = overlap_cm;
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -2858,19 +2849,11 @@ fn run_rust_imputation(
     out_prefix: &Path,
     seed: i64,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-    ])
-    .expect("config");
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.r#ref = Some(ref_path.to_path_buf());
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2883,21 +2866,12 @@ fn run_rust_imputation_with_err(
     seed: i64,
     err: f32,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-        "--err",
-        &err.to_string(),
-    ])
-    .expect("config");
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.r#ref = Some(ref_path.to_path_buf());
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.err = Some(err);
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2910,21 +2884,12 @@ fn run_rust_imputation_with_ne(
     seed: i64,
     ne: i64,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-        "--ne",
-        &ne.to_string(),
-    ])
-    .expect("config");
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.r#ref = Some(ref_path.to_path_buf());
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.ne = ne as f32;
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2937,21 +2902,12 @@ fn run_rust_imputation_with_cluster(
     seed: i64,
     cluster: f32,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-        "--cluster",
-        &cluster.to_string(),
-    ])
-    .expect("config");
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.r#ref = Some(ref_path.to_path_buf());
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.cluster = cluster;
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2966,25 +2922,14 @@ fn run_rust_imputation_with_map(
     window_cm: f32,
     overlap_cm: f32,
 ) -> reagle::Result<()> {
-    let config = Config::parse_from([
-        "reagle",
-        "--gt",
-        gt_path.to_str().unwrap(),
-        "--ref",
-        ref_path.to_str().unwrap(),
-        "--map",
-        map_path.to_str().unwrap(),
-        "--out",
-        out_prefix.to_str().unwrap(),
-        "--seed",
-        &seed.to_string(),
-        "--gp",
-        "--window",
-        &window_cm.to_string(),
-        "--overlap",
-        &overlap_cm.to_string(),
-    ])
-    .expect("config");
+    let mut config = Config::default();
+    config.gt = gt_path.to_path_buf();
+    config.r#ref = Some(ref_path.to_path_buf());
+    config.map = Some(map_path.to_path_buf());
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.window = window_cm;
+    config.overlap = overlap_cm;
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
