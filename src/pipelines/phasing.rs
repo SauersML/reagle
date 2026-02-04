@@ -69,6 +69,7 @@ use crate::data::ref_packed::PackedRefView;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
 use crate::model::state_allocator::allocate_lms_sparse;
+use crate::utils::state::{StateAVec32, StateCount, StateVec};
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
 
 #[derive(Default)]
@@ -1056,11 +1057,12 @@ impl Trace for MosaicTrace {
 }
 
 struct MosaicBuffers {
-    fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
-    fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
-    ref_alleles: Vec<u8>,
+    n_states: StateCount,
+    fwd: StateAVec32<f32>,
+    fwd_prior: StateAVec32<f32>,
+    ref_alleles: StateVec<u8>,
     ref_alleles_flat: Vec<u8>,
-    weights: Vec<f32>,
+    weights: StateVec<f32>,
     allele_probs: Vec<f32>,
     hap1_checkpoints: FwdCheckpoints,
     hap2_checkpoints: FwdCheckpoints,
@@ -1164,19 +1166,19 @@ fn global_to_local_paths(
 struct MosaicChain<'a, RefSpace = crate::data::AnyMarkerSpace> {
     rng: rand::rngs::SmallRng,
     n_markers: usize,
-    n_states: usize,
+    n_states: StateCount,
     p_recomb: &'a [f32],
     seq1: &'a [u8],
     seq2: &'a [u8],
     conf: &'a [f32],
     ref_provider: RefAlleleProvider<'a, AnyMarkerSpace, RefSpace>,
     combined_checkpoints: &'a FwdCheckpoints,
-    fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
-    fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
-    ref_alleles: Vec<u8>,
+    fwd: StateAVec32<f32>,
+    fwd_prior: StateAVec32<f32>,
+    ref_alleles: StateVec<u8>,
     ref_alleles_flat: Vec<u8>,
     ref_alleles_flat_ref: Option<&'a [u8]>,
-    weights: Vec<f32>,
+    weights: StateVec<f32>,
     allele_probs: Vec<f32>,
     hap1_checkpoints: FwdCheckpoints,
     hap1_allele: Vec<u8>,
@@ -1205,7 +1207,6 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
     fn new_with_buffers(
         seed: u64,
         n_markers: usize,
-        n_states: usize,
         p_recomb: &'a [f32],
         seq1: &'a [u8],
         seq2: &'a [u8],
@@ -1220,25 +1221,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         anchor_hap1: Vec<u8>,
         anchor_hap2: Vec<u8>,
     ) -> Self {
-        let mut fwd = buffers.fwd;
-        let mut fwd_prior = buffers.fwd_prior;
-        let mut ref_alleles = buffers.ref_alleles;
-        let mut weights = buffers.weights;
-        // Defensive sizing: ensure per-state buffers are large enough.
-        // This avoids panics if a workspace buffer was emptied but n_states was retained.
-        if fwd.len() < n_states {
-            fwd = aligned_vec::AVec::from_iter(32, std::iter::repeat(0.0).take(n_states.max(1)));
-        }
-        if fwd_prior.len() < n_states {
-            fwd_prior =
-                aligned_vec::AVec::from_iter(32, std::iter::repeat(0.0).take(n_states.max(1)));
-        }
-        if ref_alleles.len() < n_states {
-            ref_alleles.resize(n_states, 0);
-        }
-        if weights.len() < n_states {
-            weights.resize(n_states, 0.0);
-        }
+        let n_states = buffers.n_states;
         let anchor_count = anchor_hap1
             .iter()
             .zip(anchor_hap2.iter())
@@ -1260,12 +1243,12 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             conf,
             ref_provider,
             combined_checkpoints,
-            fwd,
-            fwd_prior,
-            ref_alleles,
+            fwd: buffers.fwd,
+            fwd_prior: buffers.fwd_prior,
+            ref_alleles: buffers.ref_alleles,
             ref_alleles_flat: buffers.ref_alleles_flat,
             ref_alleles_flat_ref,
-            weights,
+            weights: buffers.weights,
             allele_probs: buffers.allele_probs,
             hap1_checkpoints: buffers.hap1_checkpoints,
             hap1_allele: buffers.hap1_allele,
@@ -1298,6 +1281,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
 
     fn into_buffers(self) -> MosaicBuffers {
         MosaicBuffers {
+            n_states: self.n_states,
             fwd: self.fwd,
             fwd_prior: self.fwd_prior,
             ref_alleles: self.ref_alleles,
@@ -1358,17 +1342,18 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
 
     #[inline]
     fn ref_row(&mut self, marker: usize) -> &[u8] {
+        let n_states = self.n_states.get();
         if let Some(flat) = self.ref_alleles_flat_ref {
-            let offset = marker * self.n_states;
-            return &flat[offset..offset + self.n_states];
+            let offset = marker * n_states;
+            return &flat[offset..offset + n_states];
         }
         if !self.ref_alleles_flat.is_empty() {
-            let offset = marker * self.n_states;
-            return &self.ref_alleles_flat[offset..offset + self.n_states];
+            let offset = marker * n_states;
+            return &self.ref_alleles_flat[offset..offset + n_states];
         }
         self.ref_provider
-            .fill_ref_alleles(marker, &mut self.ref_alleles);
-        &self.ref_alleles[..self.n_states]
+            .fill_ref_alleles(marker, self.ref_alleles.as_mut_slice());
+        self.ref_alleles.as_slice()
     }
 
     fn build_hap2_inputs(&mut self) {
@@ -1510,7 +1495,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 &mut self.path1,
                 &self.combined_checkpoints,
                 self.n_markers,
-                self.n_states,
+                self.n_states.get(),
                 self.p_recomb,
                 self.seq1,
                 self.seq2,
@@ -1528,8 +1513,8 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 self.p_err,
                 &mut self.rng,
                 &mut self.fwd_block,
-                &mut self.weights,
-                &mut self.ref_alleles,
+                self.weights.as_mut_slice(),
+                self.ref_alleles.as_mut_slice(),
                 &mut self.allele_probs,
                 EmissionMode::Combined,
             );
@@ -1538,13 +1523,13 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             // Gibbs step: sample H1 | H2
             // Build hap1 constraints based on current path2
             self.build_hap1_inputs();
-            let fwd = &mut self.fwd[..self.n_states];
-            let fwd_prior = &mut self.fwd_prior[..self.n_states];
-            let ref_alleles = &mut self.ref_alleles[..self.n_states];
+            let fwd = self.fwd.as_mut_slice();
+            let fwd_prior = self.fwd_prior.as_mut_slice();
+            let ref_alleles = self.ref_alleles.as_mut_slice();
             build_fwd_checkpoints(
                 &mut self.hap1_checkpoints,
                 self.n_markers,
-                self.n_states,
+                self.n_states.get(),
                 self.p_recomb,
                 self.seq1,
                 self.seq2,
@@ -1570,7 +1555,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 &mut self.path1,
                 &self.hap1_checkpoints,
                 self.n_markers,
-                self.n_states,
+                self.n_states.get(),
                 self.p_recomb,
                 self.seq1,
                 self.seq2,
@@ -1588,8 +1573,8 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 self.p_err,
                 &mut self.rng,
                 &mut self.fwd_block,
-                &mut self.weights,
-                &mut self.ref_alleles,
+                self.weights.as_mut_slice(),
+                self.ref_alleles.as_mut_slice(),
                 &mut self.allele_probs,
                 EmissionMode::Hap,
             );
@@ -1597,13 +1582,13 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
 
         // Gibbs step: sample H2 | H1
         self.build_hap2_inputs();
-        let fwd = &mut self.fwd[..self.n_states];
-        let fwd_prior = &mut self.fwd_prior[..self.n_states];
-        let ref_alleles = &mut self.ref_alleles[..self.n_states];
+        let fwd = self.fwd.as_mut_slice();
+        let fwd_prior = self.fwd_prior.as_mut_slice();
+        let ref_alleles = self.ref_alleles.as_mut_slice();
         build_fwd_checkpoints(
             &mut self.hap2_checkpoints,
             self.n_markers,
-            self.n_states,
+            self.n_states.get(),
             self.p_recomb,
             self.seq1,
             self.seq2,
@@ -1629,7 +1614,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             &mut self.path2,
             &self.hap2_checkpoints,
             self.n_markers,
-            self.n_states,
+            self.n_states.get(),
             self.p_recomb,
             self.seq1,
             self.seq2,
@@ -1647,8 +1632,8 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             self.p_err,
             &mut self.rng,
             &mut self.fwd_block,
-            &mut self.weights,
-            &mut self.ref_alleles,
+            self.weights.as_mut_slice(),
+            self.ref_alleles.as_mut_slice(),
             &mut self.allele_probs,
             EmissionMode::Hap,
         );
@@ -8071,12 +8056,14 @@ fn sample_swap_bits_mosaic<RefSpace>(
             },
         );
     }
+    let n_states = unsafe { StateCount::new_unchecked(n_states) };
+    let n_states_usize = n_states.get();
 
     let max_block_len = max_block_len_from_starts(&block_starts, n_markers).max(1);
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
-    workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
-    let ref_flat_len = n_markers.saturating_mul(n_states);
+    workspace.ensure_for_window(n_markers, n_states_usize, max_block_len, n_blocks);
+    let ref_flat_len = n_markers.saturating_mul(n_states_usize);
     if ref_flat_len > 0 {
         ref_provider.materialize_into(
             n_markers,
@@ -8092,7 +8079,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut heuristic_paths = if initial_paths.is_none() {
         find_best_constant_pair_with_buffer(
             n_markers,
-            n_states,
+            n_states_usize,
             seq1,
             seq2,
             &mut ref_provider,
@@ -8116,11 +8103,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let p1 = paths.path1[m] as usize;
                 let p2 = paths.path2[m] as usize;
-                if p1 >= n_states || p2 >= n_states {
+                if p1 >= n_states_usize || p2 >= n_states_usize {
                     continue;
                 }
-                let offset = m * n_states;
-                let ref_row = &ref_alleles_flat[offset..offset + n_states];
+                let offset = m * n_states_usize;
+                let ref_row = &ref_alleles_flat[offset..offset + n_states_usize];
                 let r1 = ref_row[p1];
                 let r2 = ref_row[p2];
                 if a1 != 255 {
@@ -8178,11 +8165,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let p1 = paths.path1[m] as usize;
                 let p2 = paths.path2[m] as usize;
-                if p1 >= n_states || p2 >= n_states {
+                if p1 >= n_states_usize || p2 >= n_states_usize {
                     continue;
                 }
-                let offset = m * n_states;
-                let ref_row = &ref_alleles_flat[offset..offset + n_states];
+                let offset = m * n_states_usize;
+                let ref_row = &ref_alleles_flat[offset..offset + n_states_usize];
                 let r1 = ref_row[p1];
                 let r2 = ref_row[p2];
                 if a1 != 255 {
@@ -8228,7 +8215,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Only build combined checkpoints if we don't have a start path
     // This optimization avoids the expensive Combined HMM step when we have a good guess
     let mut combined_checkpoints =
-        FwdCheckpoints::from_buffer(block_starts.clone(), n_states, combined_data);
+        FwdCheckpoints::from_buffer(block_starts.clone(), n_states_usize, combined_data);
 
     if start_paths.is_none() {
         if workspace.dummy_target.len() < n_markers {
@@ -8246,13 +8233,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let dummy_partner = &workspace.dummy_partner[..n_markers];
         let dummy_combined = &workspace.dummy_combined[..n_markers];
         let dummy_hard_match = &workspace.dummy_hard_match[..n_markers];
-        let fwd = &mut workspace.fwd[..n_states];
-        let fwd_prior = &mut workspace.fwd_prior[..n_states];
-        let ref_alleles = &mut workspace.ref_alleles[..n_states];
+        let fwd = &mut workspace.fwd[..n_states_usize];
+        let fwd_prior = &mut workspace.fwd_prior[..n_states_usize];
+        let ref_alleles = &mut workspace.ref_alleles[..n_states_usize];
         build_fwd_checkpoints(
             &mut combined_checkpoints,
             n_markers,
-            n_states,
+            n_states_usize,
             p_recomb,
             seq1,
             seq2,
@@ -8305,24 +8292,22 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         let alloc_like = |tmpl: &MosaicBuffers| -> MosaicBuffers {
             MosaicBuffers {
-                fwd: aligned_vec::AVec::from_iter(32, std::iter::repeat(0.0).take(tmpl.fwd.len())),
-                fwd_prior: aligned_vec::AVec::from_iter(
-                    32,
-                    std::iter::repeat(0.0).take(tmpl.fwd_prior.len()),
-                ),
-                ref_alleles: vec![0u8; tmpl.ref_alleles.len()],
+                n_states: tmpl.n_states,
+                fwd: StateAVec32::new(tmpl.n_states, 0.0),
+                fwd_prior: StateAVec32::new(tmpl.n_states, 0.0),
+                ref_alleles: StateVec::new(tmpl.n_states, 0),
                 ref_alleles_flat: Vec::new(),
-                weights: vec![0.0f32; tmpl.weights.len()],
+                weights: StateVec::new(tmpl.n_states, 0.0),
                 allele_probs: Vec::new(),
                 hap1_checkpoints: FwdCheckpoints::from_buffer(
                     tmpl.hap1_checkpoints.block_starts.clone(),
-                    n_states,
-                    vec![0.0; tmpl.hap1_checkpoints.block_starts.len().max(1) * n_states],
+                    n_states_usize,
+                    vec![0.0; tmpl.hap1_checkpoints.block_starts.len().max(1) * n_states_usize],
                 ),
                 hap2_checkpoints: FwdCheckpoints::from_buffer(
                     tmpl.hap2_checkpoints.block_starts.clone(),
-                    n_states,
-                    vec![0.0; tmpl.hap2_checkpoints.block_starts.len().max(1) * n_states],
+                    n_states_usize,
+                    vec![0.0; tmpl.hap2_checkpoints.block_starts.len().max(1) * n_states_usize],
                 ),
                 hap1_allele: vec![255u8; tmpl.hap1_allele.len()],
                 hap1_partner_allele: vec![255u8; tmpl.hap1_partner_allele.len()],
@@ -8353,7 +8338,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let mut chain = MosaicChain::new_with_buffers(
             seed_i,
             n_markers,
-            n_states,
             p_recomb,
             seq1,
             seq2,
@@ -8372,8 +8356,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let has_valid_lengths =
                 paths.path1.len() == n_markers && paths.path2.len() == n_markers;
             let has_valid_states = has_valid_lengths
-                && paths.path1.iter().all(|&p| (p as usize) < n_states)
-                && paths.path2.iter().all(|&p| (p as usize) < n_states);
+                && paths.path1.iter().all(|&p| (p as usize) < n_states_usize)
+                && paths.path2.iter().all(|&p| (p as usize) < n_states_usize);
             if has_valid_states {
                 chain.path1.resize(n_markers, 0);
                 chain.path2.resize(n_markers, 0);
@@ -8391,7 +8375,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let mut chain = MosaicChain::new_with_buffers(
                 seed_i,
                 n_markers,
-                n_states,
                 p_recomb,
                 seq1,
                 seq2,
@@ -8410,8 +8393,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let has_valid_lengths =
                     paths.path1.len() == n_markers && paths.path2.len() == n_markers;
                 let has_valid_states = has_valid_lengths
-                    && paths.path1.iter().all(|&p| (p as usize) < n_states)
-                    && paths.path2.iter().all(|&p| (p as usize) < n_states);
+                    && paths.path1.iter().all(|&p| (p as usize) < n_states_usize)
+                    && paths.path2.iter().all(|&p| (p as usize) < n_states_usize);
                 if has_valid_states {
                     chain.path1.resize(n_markers, 0);
                     chain.path2.resize(n_markers, 0);
@@ -8458,7 +8441,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                         }
                         let p1 = chain.path1[m] as usize;
                         let p2 = chain.path2[m] as usize;
-                        if p1 >= n_states || p2 >= n_states {
+                        if p1 >= n_states_usize || p2 >= n_states_usize {
                             continue;
                         }
                         let ref_row = chain.ref_row(m);
@@ -8500,7 +8483,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                     let p1 = chain.path1[m] as usize;
                     let p2 = chain.path2[m] as usize;
-                    if p1 >= n_states || p2 >= n_states {
+                    if p1 >= n_states_usize || p2 >= n_states_usize {
                         continue;
                     }
                     let ref_row = chain.ref_row(m);
@@ -8589,7 +8572,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let p1 = chain.path1[m] as usize;
                 let p2 = chain.path2[m] as usize;
-                if p1 >= n_states || p2 >= n_states {
+                if p1 >= n_states_usize || p2 >= n_states_usize {
                     continue;
                 }
                 let ref_row = chain.ref_row(m);
@@ -8623,20 +8606,29 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let threaded_haps = ref_provider.threaded_haps;
 
     let buffers = MosaicBuffers {
-        fwd: std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
-        fwd_prior: std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
-        ref_alleles: std::mem::take(&mut workspace.ref_alleles),
+        n_states,
+        fwd: StateAVec32::from_avec(
+            n_states,
+            std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
+            0.0,
+        ),
+        fwd_prior: StateAVec32::from_avec(
+            n_states,
+            std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
+            0.0,
+        ),
+        ref_alleles: StateVec::from_vec(n_states, std::mem::take(&mut workspace.ref_alleles), 0),
         ref_alleles_flat: Vec::new(),
-        weights: std::mem::take(&mut workspace.weights),
+        weights: StateVec::from_vec(n_states, std::mem::take(&mut workspace.weights), 0.0),
         allele_probs: std::mem::take(&mut workspace.allele_probs),
         hap1_checkpoints: FwdCheckpoints::from_buffer(
             block_starts.clone(),
-            n_states,
+            n_states_usize,
             std::mem::take(&mut workspace.hap1_checkpoint_data),
         ),
         hap2_checkpoints: FwdCheckpoints::from_buffer(
             block_starts.clone(),
-            n_states,
+            n_states_usize,
             std::mem::take(&mut workspace.hap2_checkpoint_data),
         ),
         hap1_allele: std::mem::take(&mut workspace.hap1_allele),
@@ -8808,7 +8800,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
         let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
-        let ref_alleles = &mut buffers.ref_alleles;
+        let ref_alleles = buffers.ref_alleles.as_mut_slice();
         let ref_alleles_flat = shared_ref;
         p_min = 1.0;
         p_max = 0.0;
@@ -8822,17 +8814,17 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
             let p1 = new_paths.path1[m] as usize;
             let p2 = new_paths.path2[m] as usize;
-            if p1 >= n_states || p2 >= n_states {
+            if p1 >= n_states_usize || p2 >= n_states_usize {
                 swap_probs[i] = 0.5;
                 swap_lr[i] = 1.0;
                 continue;
             }
             let ref_row = if !ref_alleles_flat.is_empty() {
-                let offset = m * n_states;
-                &ref_alleles_flat[offset..offset + n_states]
+                let offset = m * n_states_usize;
+                &ref_alleles_flat[offset..offset + n_states_usize]
             } else {
                 path_provider.fill_ref_alleles(m, ref_alleles);
-                &ref_alleles[..n_states]
+                &ref_alleles[..n_states_usize]
             };
             let ref1 = ref_row[p1];
             let ref2 = ref_row[p2];
@@ -8930,13 +8922,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     }
     // Return buffers to workspace for reuse
-    workspace.fwd = buffers.fwd;
-    workspace.fwd_prior = buffers.fwd_prior;
-    workspace.ref_alleles = buffers.ref_alleles;
+    workspace.fwd = buffers.fwd.into_avec();
+    workspace.fwd_prior = buffers.fwd_prior.into_avec();
+    workspace.ref_alleles = buffers.ref_alleles.into_vec();
     if !buffers.ref_alleles_flat.is_empty() {
         workspace.ref_alleles_flat = buffers.ref_alleles_flat;
     }
-    workspace.weights = buffers.weights;
+    workspace.weights = buffers.weights.into_vec();
     workspace.allele_probs = buffers.allele_probs;
     workspace.hap1_checkpoint_data = buffers.hap1_checkpoints.into_buffer();
     workspace.hap2_checkpoint_data = buffers.hap2_checkpoints.into_buffer();
