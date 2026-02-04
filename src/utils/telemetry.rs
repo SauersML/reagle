@@ -410,7 +410,7 @@ fn get_rss_mb() -> Option<u64> {
                 // Second field is RSS in pages
                 parts.get(1)?.parse::<u64>().ok()
             })
-            .map(|pages| pages * 4096 / (1024 * 1024)) // pages to MB
+            .map(|pages| pages * crate::utils::memory::get_page_size() / (1024 * 1024))
     }
     #[cfg(not(target_os = "linux"))]
     {

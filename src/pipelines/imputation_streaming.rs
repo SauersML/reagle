@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 
 use rayon::prelude::*;
-use sysinfo::System;
 use tracing::{info_span, instrument, warn};
 
 use crate::data::alignment::MarkerAlignment;
@@ -96,85 +95,6 @@ const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
-
-fn available_memory_bytes() -> Option<u64> {
-    fn read_cgroup_limit_bytes() -> Option<u64> {
-        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
-        if let Some(s) = v2 {
-            let t = s.trim();
-            if t != "max" {
-                if let Ok(v) = t.parse::<u64>() {
-                    if v > 0 && v < (1u64 << 60) {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
-        if let Some(s) = v1 {
-            let t = s.trim();
-            if let Ok(v) = t.parse::<u64>() {
-                if v > 0 && v < (1u64 << 60) {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    }
-
-    fn read_cgroup_available_bytes(limit: u64) -> Option<u64> {
-        let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok();
-        if let Some(s) = v2 {
-            if let Ok(cur) = s.trim().parse::<u64>() {
-                return Some(limit.saturating_sub(cur));
-            }
-        }
-        let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok();
-        if let Some(s) = v1 {
-            if let Ok(cur) = s.trim().parse::<u64>() {
-                return Some(limit.saturating_sub(cur));
-            }
-        }
-        None
-    }
-
-    let mut sys = System::new();
-    sys.refresh_memory();
-    // sysinfo reports memory values in bytes.
-    let mut avail_bytes = sys.available_memory();
-    let mut total_bytes = sys.total_memory();
-    // Some sysinfo versions report memory in KiB. Detect and normalize.
-    // Heuristic: if total < 1 GiB but total*1024 looks like a plausible RAM size,
-    // treat the values as KiB. This avoids collapsing available memory to ~0.
-    if total_bytes > 0 {
-        let scaled_total = total_bytes.saturating_mul(1024);
-        let looks_like_kib =
-            total_bytes < 1_073_741_824 && scaled_total >= 1_073_741_824 && scaled_total <= (1u64 << 50);
-        if looks_like_kib {
-            avail_bytes = avail_bytes.saturating_mul(1024);
-            total_bytes = scaled_total;
-        }
-    }
-    if let Some(limit) = read_cgroup_limit_bytes() {
-        if limit > 0 {
-            total_bytes = total_bytes.min(limit);
-            if let Some(avail) = read_cgroup_available_bytes(limit) {
-                avail_bytes = avail_bytes.min(avail);
-            } else {
-                avail_bytes = avail_bytes.min(limit);
-            }
-        }
-    }
-
-    if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
-        return Some(avail_bytes);
-    }
-    if total_bytes > 0 {
-        Some(total_bytes)
-    } else {
-        None
-    }
-}
 
 fn estimate_state_budget(
     available_bytes: u64,
@@ -2348,7 +2268,7 @@ impl crate::pipelines::ImputationPipeline {
             .nthreads
             .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
             .unwrap_or(1);
-        let mut avail_bytes = available_memory_bytes().unwrap_or(0);
+        let mut avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
         if avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING {
             // Treat unknown/low memory as "planning disabled" to avoid
             // tiny caps in CI/small test runs.
@@ -5035,19 +4955,27 @@ impl crate::pipelines::ImputationPipeline {
         // Closure to get dosage: marker_idx is window-local ref marker index from VCF writer
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
-            let local_m = marker_idx.saturating_sub(output_start);
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
-            let n_alleles =
-                ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles().max(1);
 
-            // If error correction is enabled, prioritize imputed dosages.
-            // Otherwise, prefer hard calls from input when available.
-            let use_hard_call = !correct_errors && hard_call.is_some();
+            // Prefer hard calls if error correction is disabled
+            if !correct_errors {
+                if let Some((a1, a2)) = hard_call {
+                    let d = (a1 + a2) as f32;
+                    return if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                        d
+                    } else {
+                        d * 0.5
+                    };
+                }
+            }
 
-            let dosage = if use_hard_call {
-                let (a1, a2) = hard_call.unwrap();
-                (a1 + a2) as f32
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+            let n_alleles = ref_markers
+                .marker(MarkerIdx::new(marker_idx as u32))
+                .n_alleles()
+                .max(1);
+            let local_m = marker_idx.saturating_sub(output_start);
+
+            let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
                     let d1 = p1
                         .get(local_m)
@@ -5086,14 +5014,10 @@ impl crate::pipelines::ImputationPipeline {
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                     dosage_from_gp(n_alleles, &gp)
-                } else if let Some((a1, a2)) = hard_call {
-                    // Fallback to hard call if imputation result is missing
-                    (a1 + a2) as f32
                 } else {
                     0.0
                 }
             } else if let Some((a1, a2)) = hard_call {
-                // Fallback to hard call if imputation result is missing
                 (a1 + a2) as f32
             } else {
                 0.0
@@ -5108,23 +5032,28 @@ impl crate::pipelines::ImputationPipeline {
 
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
-            let local_m = marker_idx.saturating_sub(output_start);
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
 
-            let use_hard_call = !correct_errors && hard_call.is_some();
+            // Prefer hard calls if error correction is disabled
+            if !correct_errors {
+                if let Some(gt) = hard_call {
+                    return gt;
+                }
+            }
 
-            if use_hard_call {
-                hard_call.unwrap()
-            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                let n_alleles =
-                    ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles().max(1);
+            let local_m = marker_idx.saturating_sub(output_start);
+
+            if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(marker_idx as u32))
+                    .n_alleles()
+                    .max(1);
                 if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
                     if n_alleles <= 2 {
                         let p1_alt = p1.get(local_m).map(|p| p.prob(1)).unwrap_or(0.0);
                         let p2_alt = p2.get(local_m).map(|p| p.prob(1)).unwrap_or(0.0);
                         let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
-                        let gp01 =
-                            p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
+                        let gp01 = p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
                         let gp11 = p1_alt * p2_alt;
                         if gp01 >= gp00 && gp01 >= gp11 {
                             let p10 = p1_alt * (1.0 - p2_alt);
@@ -5199,11 +5128,10 @@ impl crate::pipelines::ImputationPipeline {
                 }
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                    let n_alleles =
-                        ref_markers.marker(MarkerIdx::new(marker_idx as u32)).n_alleles();
+                    let n_alleles = ref_markers
+                        .marker(MarkerIdx::new(marker_idx as u32))
+                        .n_alleles();
                     best_gt_from_gp(n_alleles, &gp)
-                } else if let Some(gt) = hard_call {
-                    gt
                 } else {
                     (0, 0)
                 }
