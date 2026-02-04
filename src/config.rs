@@ -343,8 +343,18 @@ impl Config {
         let cli = CliArgs::parse_from(args);
         let mut config = Self::default();
 
+        let mut applied_toml = false;
         if let Some(toml_cfg) = load_toml_config(PathBuf::from(DEFAULT_CONFIG_FILE))? {
             config.apply_toml(toml_cfg);
+            applied_toml = true;
+        }
+        if !applied_toml {
+            if let Some(parent) = cli.gt.parent() {
+                let path = parent.join(DEFAULT_CONFIG_FILE);
+                if let Some(toml_cfg) = load_toml_config(path)? {
+                    config.apply_toml(toml_cfg);
+                }
+            }
         }
 
         config.gt = cli.gt;

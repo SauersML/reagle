@@ -528,8 +528,7 @@ impl StreamingVcfReader {
                 .buffer
                 .iter()
                 .position(|m| m.gen_pos >= full_window_gen)
-                .unwrap_or(self.buffer.len())
-                .min(self.config.max_markers);
+                .unwrap_or(self.buffer.len());
 
             let is_last = self.eof && window_end >= self.buffer.len();
 
@@ -883,7 +882,7 @@ impl StreamingVcfReader {
         while !self.eof {
             // Check if we have enough data
             if let Some(last) = self.buffer.back() {
-                if last.gen_pos >= target_gen || self.buffer.len() >= self.config.max_markers {
+                if last.gen_pos >= target_gen {
                     break;
                 }
             }

@@ -220,7 +220,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: metrics-*
-          path: tests/
+          path: .
           merge-multiple: true
 
       - name: Generate genome-wide summary

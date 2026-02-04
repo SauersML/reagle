@@ -821,7 +821,10 @@ impl StreamingBref3WindowReader {
 
         loop {
             if window_size >= config.max_markers {
-                break;
+                // Ensure the core window reaches window_cm before enforcing max_markers.
+                if output_end.is_some() {
+                    break;
+                }
             }
 
             let next_marker = if let Some(m) = carryover.pop_front() {
@@ -1184,7 +1187,10 @@ impl StreamingRefVcfReader {
 
         loop {
             if window_size >= config.max_markers {
-                break;
+                // Ensure the core window reaches window_cm before enforcing max_markers.
+                if output_end.is_some() {
+                    break;
+                }
             }
 
             let next_marker = if let Some(m) = carryover.pop_front() {
