@@ -8738,7 +8738,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        if score > best_score {
+        // We use >= to prefer later candidates (like Heuristic) in case of ties.
+        // This is crucial because Heuristic initializes all parallel chains to the same
+        // aligned mode, avoiding label-switching noise (0.5 avg) that can occur
+        // with Default initialization if chains converge to opposite phases.
+        if score >= best_score {
             best_score = score;
             swap_counts = sc.clone();
             obs_counts = oc.clone();
