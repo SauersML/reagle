@@ -3733,133 +3733,145 @@ impl crate::pipelines::ImputationPipeline {
         let sm_needed: Vec<AtomicBool> =
             (0..n_target_haps).map(|_| AtomicBool::new(false)).collect();
 
-        let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
-        let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
-        let batch_size = 4096usize;
-        let mut batches: Vec<(Vec<usize>, Vec<RankBeam>, Vec<PbwtQueryAllele>, Vec<u32>, Vec<(u32, u32, u32)>)> =
-            Vec::new();
-        let mut start = 0usize;
-        while start < n_target_haps {
-            let end = (start + batch_size).min(n_target_haps);
-            let haps: Vec<usize> = (start..end).collect();
-            let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
-            let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
-            let current_donor = vec![0u32; haps.len()];
-            let scratch = Vec::new();
-            batches.push((haps, beams, query_alleles, current_donor, scratch));
-            start = end;
-        }
-
-        let push_donor_count = |counts: &mut HashMap<RefHapId, u32>, hap: RefHapId| {
-            let entry = counts.entry(hap).or_insert(0);
-            *entry = entry.saturating_add(1);
-        };
-
-        for ref_m in 0..n_ref_markers {
-            let col = &ref_columns[ref_m];
-            fill_ref_alleles(col, &mut ref_alleles);
-            let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles().max(1);
-
-            pbwt.prepare_step(&ref_alleles, n_alleles);
-            for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
-                if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
-                    let target_idx = target_m.as_usize();
-                    let mapping = alignment
-                        .allele_mappings
-                        .get(target_idx)
-                        .and_then(|m| m.as_ref());
-
-                    for (i, &hap_idx) in haps.iter().enumerate() {
-                        let sample_idx = hap_idx / 2;
-                        let local = hap_idx % 2;
-                        let h = HapIdx::new((sample_idx * 2 + local) as u32);
-                        let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
-                        if let Some(missing) = target_missing {
-                            if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                a = 255;
-                            }
-                        }
-                        let a = if a == 255 {
-                            255
-                        } else if let Some(mapping) = mapping {
-                            if (a as usize) < mapping.targ_to_ref.len() {
-                                let r = mapping.targ_to_ref[a as usize];
-                                if r >= 0 { r as u8 } else { 255 }
-                            } else {
-                                255
-                            }
-                        } else {
-                            a
-                        };
-                        query_alleles[i] =
-                            PbwtQueryAllele::allele(a).unwrap_or_else(PbwtQueryAllele::wildcard);
-                    }
-                } else {
-                    for qa in query_alleles.iter_mut() {
-                        *qa = PbwtQueryAllele::wildcard();
-                    }
-                }
-
-                pbwt.update_beams_with_scratch_query(
-                    beams,
-                    query_alleles,
-                    n_alleles,
-                    scratch,
-                );
+        if !plan.full_panel {
+            let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
+            let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+            let batch_size = 4096usize;
+            let mut batches: Vec<(Vec<usize>, Vec<RankBeam>, Vec<PbwtQueryAllele>, Vec<u32>, Vec<(u32, u32, u32)>)> =
+                Vec::new();
+            let mut start = 0usize;
+            while start < n_target_haps {
+                let end = (start + batch_size).min(n_target_haps);
+                let haps: Vec<usize> = (start..end).collect();
+                let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
+                let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+                let current_donor = vec![0u32; haps.len()];
+                let scratch = Vec::new();
+                batches.push((haps, beams, query_alleles, current_donor, scratch));
+                start = end;
             }
-            pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 
-            let store = ref_m >= overlap_start && ref_m < output_end;
-            
-            // Compute per-allele information weights: LLR(match vs mismatch)
-            let allele_info_weights: Vec<f32> = ref_allele_freqs
-                .get(ref_m)
-                .map(|freqs| {
-                    let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
-                    let llr = ((1.0 - theta) / theta).ln();
-                    freqs.iter().map(|_| llr).collect()
-                })
-                .unwrap_or_default();
-            
-            if store {
-                for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
-                    let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
-                    for (i, &hap_idx) in haps.iter().enumerate() {
-                        let beam = &beams[i];
-                        pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
-                        let donor = donor_candidates.first().copied().unwrap_or(current_donor[i]);
-                        current_donor[i] = donor;
+            let push_donor_count = |counts: &mut HashMap<RefHapId, u32>, hap: RefHapId| {
+                let entry = counts.entry(hap).or_insert(0);
+                *entry = entry.saturating_add(1);
+            };
 
-                        let target_allele = query_alleles
-                            .get(i)
-                            .and_then(|qa| qa.as_allele())
-                            .unwrap_or(255);
-                        let info_weight = if target_allele == 255 {
-                            0.0
-                        } else {
-                            allele_info_weights
-                                .get(target_allele as usize)
-                                .copied()
-                                .unwrap_or(0.0)
-                        };
-                        if target_allele != 255 {
-                            sm_total_info[hap_idx] += info_weight;
-                        }
+            for ref_m in 0..n_ref_markers {
+                let col = &ref_columns[ref_m];
+                fill_ref_alleles(col, &mut ref_alleles);
+                let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles().max(1);
 
-                        if info_weight > 0.0 {
-                            let mut match_count: u32 = 0;
-                            for &(l, r) in beam.intervals() {
-                                match_count = match_count.saturating_add(r.saturating_sub(l));
+                pbwt.prepare_step(&ref_alleles, n_alleles);
+                for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
+                    if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
+                        let target_idx = target_m.as_usize();
+                        let mapping = alignment
+                            .allele_mappings
+                            .get(target_idx)
+                            .and_then(|m| m.as_ref());
+
+                        for (i, &hap_idx) in haps.iter().enumerate() {
+                            let sample_idx = hap_idx / 2;
+                            let local = hap_idx % 2;
+                            let h = HapIdx::new((sample_idx * 2 + local) as u32);
+                            let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
+                            if let Some(missing) = target_missing {
+                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
+                                    a = 255;
+                                }
                             }
-                            let n_matches = (match_count.max(1) as f32).ln();
-                            let max_entropy = (plan.n_ref_haps as f32).ln().max(1e-6);
-                            let normalized_entropy = (n_matches / max_entropy).clamp(0.0, 1.0);
-                            sm_low_conf_weighted[hap_idx] += info_weight * normalized_entropy;
+                            let a = if a == 255 {
+                                255
+                            } else if let Some(mapping) = mapping {
+                                if (a as usize) < mapping.targ_to_ref.len() {
+                                    let r = mapping.targ_to_ref[a as usize];
+                                    if r >= 0 { r as u8 } else { 255 }
+                                } else {
+                                    255
+                                }
+                            } else {
+                                a
+                            };
+                            query_alleles[i] =
+                                PbwtQueryAllele::allele(a).unwrap_or_else(PbwtQueryAllele::wildcard);
                         }
-                        push_donor_count(
-                            &mut sm_donor_counts[hap_idx],
-                            RefHapId::new(donor as u32),
-                        );
+                    } else {
+                        for qa in query_alleles.iter_mut() {
+                            *qa = PbwtQueryAllele::wildcard();
+                        }
+                    }
+
+                    pbwt.update_beams_with_scratch_query(
+                        beams,
+                        query_alleles,
+                        n_alleles,
+                        scratch,
+                    );
+                }
+                pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
+
+                let store = ref_m >= overlap_start && ref_m < output_end;
+                
+                // Compute per-allele information weights: LLR(match vs mismatch)
+                let allele_info_weights: Vec<f32> = ref_allele_freqs
+                    .get(ref_m)
+                    .map(|freqs| {
+                        let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
+                        let llr = ((1.0 - theta) / theta).ln();
+                        freqs.iter().map(|_| llr).collect()
+                    })
+                    .unwrap_or_default();
+                
+                if store {
+                    for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
+                        let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                        for (i, &hap_idx) in haps.iter().enumerate() {
+                            let beam = &beams[i];
+                            donor_candidates.clear();
+                            pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                            let donor = donor_candidates.first().copied().unwrap_or(current_donor[i]);
+                            current_donor[i] = donor;
+
+                            let target_allele = query_alleles
+                                .get(i)
+                                .and_then(|qa| qa.as_allele())
+                                .unwrap_or(255);
+                            let info_weight = if target_allele == 255 {
+                                0.0
+                            } else {
+                                allele_info_weights
+                                    .get(target_allele as usize)
+                                    .copied()
+                                    .unwrap_or(0.0)
+                            };
+                            if target_allele != 255 {
+                                sm_total_info[hap_idx] += info_weight;
+                            }
+
+                            if info_weight > 0.0 {
+                                let mut match_count: u32 = 0;
+                                for &(l, r) in beam.intervals() {
+                                    match_count = match_count.saturating_add(r.saturating_sub(l));
+                                }
+                                let n_matches = (match_count.max(1) as f32).ln();
+                                let max_entropy = (plan.n_ref_haps as f32).ln().max(1e-6);
+                                let normalized_entropy = (n_matches / max_entropy).clamp(0.0, 1.0);
+                                sm_low_conf_weighted[hap_idx] += info_weight * normalized_entropy;
+                            }
+                            if donor_candidates.is_empty() {
+                                push_donor_count(
+                                    &mut sm_donor_counts[hap_idx],
+                                    RefHapId::new(donor as u32),
+                                );
+                            } else {
+                                for &cand in &donor_candidates {
+                                    push_donor_count(
+                                        &mut sm_donor_counts[hap_idx],
+                                        RefHapId::new(cand as u32),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3930,14 +3942,14 @@ impl crate::pipelines::ImputationPipeline {
                     build_input_probs_pair(h1_idx, h2_idx, s);
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
-                let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
-                let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
-                let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
-                let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
-                let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
-                let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
-                let no_info_h1 = sm_total_info[h1_idx.as_usize()] <= 0.0;
-                let no_info_h2 = sm_total_info[h2_idx.as_usize()] <= 0.0;
+        let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
+        let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
+        let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
+        let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
+        let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
+        let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
+        let no_info_h1 = !plan.full_panel && sm_total_info[h1_idx.as_usize()] <= 0.0;
+        let no_info_h2 = !plan.full_panel && sm_total_info[h2_idx.as_usize()] <= 0.0;
                 let has_priors_h1 = priors_h1.map(|p| !p.is_empty()).unwrap_or(false);
                 let has_priors_h2 = priors_h2.map(|p| !p.is_empty()).unwrap_or(false);
                 let mut donors_h1: Vec<(RefHapId, u32)> = sm_donor_counts[h1_idx.as_usize()]
@@ -3951,26 +3963,30 @@ impl crate::pipelines::ImputationPipeline {
                 donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
-                let use_hmm_h1 = if has_priors_h1 {
-                    // Priors require HMM propagation even when emissions are uniform.
-                    true
-                } else if no_info_h1 {
-                    false
-                } else {
-                    conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                        || insufficient_info_h1
-                        || donors_h1.len() < SM_MATCH_MIN_DONORS
-                };
-                let use_hmm_h2 = if has_priors_h2 {
-                    // Priors require HMM propagation even when emissions are uniform.
-                    true
-                } else if no_info_h2 {
-                    false
-                } else {
-                    conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                        || insufficient_info_h2
-                        || donors_h2.len() < SM_MATCH_MIN_DONORS
-                };
+        let use_hmm_h1 = if plan.full_panel {
+            true
+        } else if has_priors_h1 {
+            // Priors require HMM propagation even when emissions are uniform.
+            true
+        } else if no_info_h1 {
+            false
+        } else {
+            conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                || insufficient_info_h1
+                || donors_h1.len() < SM_MATCH_MIN_DONORS
+        };
+        let use_hmm_h2 = if plan.full_panel {
+            true
+        } else if has_priors_h2 {
+            // Priors require HMM propagation even when emissions are uniform.
+            true
+        } else if no_info_h2 {
+            false
+        } else {
+            conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                || insufficient_info_h2
+                || donors_h2.len() < SM_MATCH_MIN_DONORS
+        };
 
                 let track_hmm = |use_hmm: bool,
                                  has_priors: bool,
@@ -4125,6 +4141,9 @@ impl crate::pipelines::ImputationPipeline {
                                         priors: Option<&HaplotypePriors>,
                                         donors: &[(RefHapId, u32)]|
                  -> Vec<RefHapId> {
+                    if let Some(full) = full_states.as_ref() {
+                        return full.clone();
+                    }
                     let mut out: Vec<RefHapId> = Vec::new();
                     let mut seen: std::collections::HashSet<RefHapId> = std::collections::HashSet::new();
 
@@ -4161,16 +4180,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
 
                     if out.is_empty() {
-                        if let Some(full) = full_states.as_ref() {
-                            for &hap in full {
-                                if seen.insert(hap) {
-                                    out.push(hap);
-                                    if out.len() >= per_window_cap_local {
-                                        break;
-                                    }
-                                }
-                            }
-                        } else if let Some(states) = state_haps_by_hap.get(hap_idx.as_usize()) {
+                        if let Some(states) = state_haps_by_hap.get(hap_idx.as_usize()) {
                             for &hap in states {
                                 if seen.insert(hap) {
                                     out.push(hap);
