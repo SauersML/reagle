@@ -9541,7 +9541,6 @@ mod tests {
 
         // Check phase confidence values
         let mut total_hets = 0;
-        let mut high_conf_hets = 0;
         let mut sum_conf = 0.0;
         let mut count_conf = 0;
 
@@ -9588,10 +9587,6 @@ mod tests {
                     sum_conf += conf;
                     count_conf += 1;
 
-                    // Count hets with high confidence (>0.7)
-                    if conf > 0.7 {
-                        high_conf_hets += 1;
-                    }
                 }
             }
         }
@@ -9599,7 +9594,6 @@ mod tests {
         // Assert that most heterozygous sites have reasonable confidence
         if total_hets > 0 {
             let mean_conf = sum_conf / count_conf as f32;
-            let high_conf_ratio = high_conf_hets as f32 / total_hets as f32;
 
             // For this unit test with random data and minimal iterations,
             // we just verify confidence values are computed and in valid range.
