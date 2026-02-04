@@ -146,6 +146,7 @@ const INVALID_ALLELE: u8 = 254;
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
+    pub offset: usize,
     state_buf: Vec<CombinedHapId>,
     state_haps: Vec<HapIdx>,
 }
@@ -154,11 +155,13 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
     fn new(
         ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
         threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
+        offset: usize,
     ) -> Self {
         let n_states = threaded_haps.n_states();
         Self {
             ref_gt,
             threaded_haps,
+            offset,
             state_buf: vec![CombinedHapId::from(0u32); n_states],
             state_haps: vec![HapIdx::new(0); n_states],
         }
@@ -176,7 +179,11 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
         self.threaded_haps.materialize_at(marker, &mut self.state_buf);
         let marker_idx = MarkerIdx::new(marker as u32);
         for i in 0..n_states {
-            self.state_haps[i] = HapIdx::new(self.state_buf[i].as_u32());
+            self.state_haps[i] = HapIdx::new(
+                self.state_buf[i]
+                    .as_u32()
+                    .saturating_sub(self.offset as u32),
+            );
         }
         self.ref_gt
             .fill_batch(marker_idx, &self.state_haps[..n_states], &mut out[..n_states]);
