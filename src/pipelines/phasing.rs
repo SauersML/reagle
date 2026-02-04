@@ -7917,6 +7917,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     seq2: &[u8],
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
+    rng: &mut impl rand::Rng,
 ) -> Option<MosaicPaths> {
     if n_states < 2 {
         return None;
@@ -7978,6 +7979,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // Find best pair
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (0, 1);
+    let mut best_pairs_count = 0;
 
     for i in 0..n_states {
         for j in 0..i {
@@ -7985,6 +7987,13 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             if s > best_score {
                 best_score = s;
                 best_pair = (i, j);
+                best_pairs_count = 1;
+            } else if (s - best_score).abs() < 1e-6 {
+                best_pairs_count += 1;
+                // Reservoir sampling: keep with probability 1/count
+                if rng.random_range(0..best_pairs_count) == 0 {
+                    best_pair = (i, j);
+                }
             }
         }
     }
