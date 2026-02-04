@@ -7,11 +7,13 @@ use reagle::pipelines::phasing::PhasingPipeline;
 use ::noodles::bgzf::io as bgzf_io;
 use ::noodles::vcf as noodles_vcf;
 use noodles_vcf::Record;
+use noodles_vcf::variant::record::AlternateBases;
 use noodles_vcf::variant::record::samples::Series;
 use serial_test::serial;
 use std::fs::File;
 use std::io::Write;
 use tempfile::NamedTempFile;
+use std::path::Path;
 
 // --- Helpers ---
 
@@ -22,6 +24,52 @@ struct SyntheticVcfBuilder {
     is_phased: bool,
     allele_generator: Box<dyn Fn(usize, usize) -> u8>, // (marker_idx, hap_idx) -> allele
     positions: Option<Vec<usize>>,
+}
+
+fn write_single_marker_vcf(
+    path: &Path,
+    ref_allele: &str,
+    alt_allele: &str,
+    sample_names: &[&str],
+    gts: &[&str],
+) {
+    assert_eq!(
+        sample_names.len(),
+        gts.len(),
+        "sample_names and gts must align"
+    );
+    let mut file = File::create(path).expect("Create VCF");
+    writeln!(file, "##fileformat=VCFv4.2").unwrap();
+    writeln!(
+        file,
+        "##FILTER=<ID=PASS,Description=\"All filters passed\">"
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+    )
+    .unwrap();
+    writeln!(file, "##contig=<ID=chr1,length=1000000>").unwrap();
+    write!(
+        file,
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
+    )
+    .unwrap();
+    for name in sample_names {
+        write!(file, "\t{}", name).unwrap();
+    }
+    writeln!(file).unwrap();
+    write!(
+        file,
+        "chr1\t1000\t.\t{}\t{}\t.\tPASS\t.\tGT",
+        ref_allele, alt_allele
+    )
+    .unwrap();
+    for gt in gts {
+        write!(file, "\t{}", gt).unwrap();
+    }
+    writeln!(file).unwrap();
 }
 
 impl SyntheticVcfBuilder {
@@ -645,6 +693,99 @@ fn test_synthetic_recombination() {
     let sen = calculate_sen(&truth_vec, &imp_vec);
     println!("Recombination test - SEN: {:.4}", sen);
     assert!(sen > 0.95, "SEN too low for recombination test: {:.4}", sen);
+}
+
+#[test]
+#[serial]
+fn test_private_variant_genotyped_not_imputed() {
+    // Target has a genotyped variant at the same position as the reference,
+    // but with a different allele representation (indel vs SNV). This should
+    // be treated as genotyped, not silently imputed away.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ref_path = temp_dir.path().join("ref.vcf");
+    let target_path = temp_dir.path().join("target.vcf");
+    let out_prefix = temp_dir.path().join("out_private");
+
+    // Reference: simple SNV A>C with two reference samples (phased).
+    write_single_marker_vcf(&ref_path, "A", "C", &["R1", "R2"], &["0|0", "0|0"]);
+    // Target: indel ATTT>A at same position, genotyped as 1|1.
+    write_single_marker_vcf(&target_path, "ATTT", "A", &["T1"], &["1|1"]);
+
+    let mut config = default_test_config();
+    config.target = target_path;
+    config.r#ref = Some(ref_path);
+    config.out = out_prefix.clone();
+    config.nthreads = Some(1);
+    config.ne = 10000.0;
+    config.err = Some(0.0001);
+    config.window = 0.1;
+    config.overlap = 0.01;
+    config.imp_states = 50;
+    config.imp_nsteps = 3;
+
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run().expect("Pipeline run success");
+
+    let out_vcf = temp_dir.path().join("out_private.vcf.gz");
+    let file = File::open(&out_vcf).expect("Open output VCF");
+    let decoder = bgzf_io::Reader::new(file);
+    let mut reader = noodles_vcf::io::Reader::new(decoder);
+    let header = reader.read_header().expect("Read header");
+
+    let mut found_target = false;
+    for result in reader.records() {
+        let record = result.expect("Read record");
+        let pos = record
+            .variant_start()
+            .expect("Missing POS")
+            .expect("Invalid POS")
+            .get() as usize;
+        if pos != 1000 {
+            continue;
+        }
+        let out_ref = record.reference_bases().to_string();
+        let out_alt = record
+            .alternate_bases()
+            .iter()
+            .map(|a| a.expect("ALT").to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if out_ref != "ATTT" || out_alt != "A" {
+            continue;
+        }
+
+        let samples = record.samples();
+        let ds_col = samples.select("DS").expect("DS column missing");
+        let mut ds_val: Option<f32> = None;
+        for value in ds_col.iter(&header) {
+            if let Ok(Some(v)) = value {
+                let s = format!("{:?}", v);
+                if let Some(start) = s.rfind("Some(") {
+                    let after_some = &s[start + 5..];
+                    if let Some(end) = after_some.find(')') {
+                        ds_val = after_some[..end].parse().ok();
+                    }
+                } else {
+                    ds_val = s.parse().ok();
+                }
+                break;
+            }
+        }
+        let ds = ds_val.expect("DS missing");
+        assert!(
+            ds > 1.9,
+            "Genotyped private variant should remain 1|1 (dosage ~2), got {}",
+            ds
+        );
+        found_target = true;
+        break;
+    }
+
+    assert!(
+        found_target,
+        "Expected output record at chr1:1000 with target allele ATTT>A"
+    );
 }
 
 #[test]

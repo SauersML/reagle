@@ -165,7 +165,7 @@ jobs:
           echo "═══════════════════════════════════════════════════════════════"
           set -o pipefail
           ./target/release/reagle \
-            --gt tests/data/input.vcf.gz \
+            --target tests/data/input.vcf.gz \
             --ref tests/data/ref.vcf.gz \
             --out tests/data/profiled_output \
             --profile 2>&1 | tee profiling.log
