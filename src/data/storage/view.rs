@@ -124,6 +124,67 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
             }
         }
     }
+
+    /// Fill a batch of alleles for the provided haplotypes at a marker.
+    #[inline]
+    pub fn fill_batch(&self, marker: MarkerIdx<TargetSpace>, haps: &[HapIdx], out: &mut [u8]) {
+        let n = haps.len().min(out.len());
+        match self {
+            GenotypeView::Matrix(m) => m.fill_batch(marker, &haps[..n], &mut out[..n]),
+            GenotypeView::Mutable(geno) => {
+                geno.fill_batch(marker.as_usize(), &haps[..n], &mut out[..n]);
+            }
+            GenotypeView::MutableSubset { geno, subset } => {
+                let real_idx = subset[marker.as_usize()];
+                geno.fill_batch(real_idx, &haps[..n], &mut out[..n]);
+            }
+            GenotypeView::Composite {
+                target,
+                reference,
+                alignment,
+                n_target_haps,
+            } => {
+                let target_marker = marker.as_usize();
+                let ref_marker = alignment.target_to_ref(MarkerIdx::new(target_marker as u32));
+                for i in 0..n {
+                    let hap_idx = haps[i].as_usize();
+                    if hap_idx < *n_target_haps {
+                        out[i] = target.get(target_marker, haps[i]);
+                    } else if let Some(ref_m) = ref_marker {
+                        let ref_hap = hap_idx - n_target_haps;
+                        let ref_allele =
+                            reference.allele(ref_m, HapIdx::new(ref_hap as u32));
+                        out[i] = alignment.reverse_map_allele(target_marker, ref_allele);
+                    } else {
+                        out[i] = 255;
+                    }
+                }
+            }
+            GenotypeView::CompositeSubset {
+                target,
+                reference,
+                alignment,
+                subset,
+                n_target_haps,
+            } => {
+                let orig_marker = subset[marker.as_usize()];
+                let ref_marker = alignment.target_to_ref(MarkerIdx::new(orig_marker as u32));
+                for i in 0..n {
+                    let hap_idx = haps[i].as_usize();
+                    if hap_idx < *n_target_haps {
+                        out[i] = target.get(orig_marker, haps[i]);
+                    } else if let Some(ref_m) = ref_marker {
+                        let ref_hap = hap_idx - n_target_haps;
+                        let ref_allele =
+                            reference.allele(ref_m, HapIdx::new(ref_hap as u32));
+                        out[i] = alignment.reverse_map_allele(orig_marker, ref_allele);
+                    } else {
+                        out[i] = 255;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Conversion from `&GenotypeMatrix` (Unphased) to `GenotypeView`
@@ -207,6 +268,18 @@ mod tests {
 
         assert_eq!(view.n_markers(), 1);
         assert_eq!(view.allele(MarkerIdx::new(0), HapIdx::new(1)), 1);
+    }
+
+    #[test]
+    fn test_fill_batch_matches_single() {
+        let matrix = make_test_matrix();
+        let view = GenotypeView::from(&matrix);
+        let haps = [HapIdx::new(0), HapIdx::new(1), HapIdx::new(2), HapIdx::new(3)];
+        let mut out = [0u8; 4];
+        view.fill_batch(MarkerIdx::new(0), &haps, &mut out);
+        for (i, hap) in haps.iter().enumerate() {
+            assert_eq!(out[i], view.allele(MarkerIdx::new(0), *hap));
+        }
     }
 
 }

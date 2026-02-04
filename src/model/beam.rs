@@ -557,6 +557,7 @@ struct BeamScratch {
     hap1_allele: Vec<(usize, i32, i32)>,
     hap2_allele: Vec<(usize, i32, i32)>,
     spread: Vec<usize>,
+    pool_alleles: Vec<u8>,
 }
 
 impl BeamScratch {
@@ -567,6 +568,7 @@ impl BeamScratch {
             hap1_allele: Vec::with_capacity(cap),
             hap2_allele: Vec::with_capacity(cap),
             spread: Vec::with_capacity(cap),
+            pool_alleles: Vec::with_capacity(cap),
         }
     }
 }
@@ -1007,6 +1009,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     ) {
         let a1 = call.a1;
         let a2 = call.a2;
+        let marker_idx = call.marker.as_usize();
+        let mut pool_alleles = std::mem::take(&mut scratch.pool_alleles);
+        self.fill_pool_alleles(marker_idx, active_pool, &mut pool_alleles);
 
         if call.fixed {
             self.expand_orientation(
@@ -1017,6 +1022,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 a2,
                 false,
                 active_pool,
+                &pool_alleles,
                 out,
                 logsum_unswapped,
                 logsum_swapped,
@@ -1033,6 +1039,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 a2,
                 false,
                 active_pool,
+                &pool_alleles,
                 out,
                 logsum_unswapped,
                 logsum_swapped,
@@ -1048,6 +1055,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 a1,
                 true,
                 active_pool,
+                &pool_alleles,
                 out,
                 logsum_unswapped,
                 logsum_swapped,
@@ -1056,6 +1064,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 scratch,
             );
         }
+        scratch.pool_alleles = pool_alleles;
     }
 
     fn expand_orientation(
@@ -1067,6 +1076,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         hap2_al: u8,
         swapped: bool,
         active_pool: &ActivePool,
+        pool_alleles: &[u8],
         out: &mut Vec<BeamPath>,
         logsum_unswapped: &mut [f64],
         logsum_swapped: &mut [f64],
@@ -1097,6 +1107,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             pbwt_version as u32,
             call.fixed,
             active_pool,
+            pool_alleles,
             &mut scratch.hap1_allele,
             &mut scratch.spread,
         );
@@ -1111,6 +1122,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             pbwt_version as u32,
             call.fixed,
             active_pool,
+            pool_alleles,
             &mut scratch.hap2_allele,
             &mut scratch.spread,
         );
@@ -1170,6 +1182,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         pbwt_version: u32,
         fixed: bool,
         active_pool: &ActivePool,
+        pool_alleles: &[u8],
         out: &mut Vec<(usize, i32, i32)>,
         spread: &mut Vec<usize>,
     ) {
@@ -1213,11 +1226,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             if matches {
                 out.push((hap, pbwt_stay_cost, effective_match_cost));
             }
-            for &h in active_pool.list().iter().rev() {
+            for (idx, &h) in active_pool.list().iter().rev().enumerate() {
+                let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
+                let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(255);
                 if h == hap && matches {
                     continue;
                 }
-                if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                if pooled == targ_allele {
                     let same_cluster = active_pool
                         .pbwt_meta(allele, h, pbwt_version)
                         .map(|m| m.cluster_id == cluster_id)
@@ -1243,8 +1258,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         if matches {
             out.push((hap, pbwt_stay_cost, effective_match_cost));
             // also allow a limited switch to a strong candidate for future-proofing
-            for &h in active_pool.list().iter().rev().take(1) {
-                if h != hap && self.ref_allele_matches(marker_idx, h, targ_allele) {
+            for (idx, &h) in active_pool.list().iter().rev().take(1).enumerate() {
+                let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
+                let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(255);
+                if h != hap && pooled == targ_allele {
                     let same_cluster = active_pool
                         .pbwt_meta(allele, h, pbwt_version)
                         .map(|m| m.cluster_id == cluster_id)
@@ -1262,8 +1279,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return;
         }
         // Try switching to matching haps
-        for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
-            if self.ref_allele_matches(marker_idx, h, targ_allele) {
+        for (idx, &h) in active_pool.list().iter().rev().take(self.config.switch_candidates).enumerate() {
+            let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
+            let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(255);
+            if pooled == targ_allele {
                 let same_cluster = active_pool
                     .pbwt_meta(allele, h, pbwt_version)
                     .map(|m| m.cluster_id == cluster_id)
@@ -1383,6 +1402,25 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         match self.packed_ref.ref_allele_targ(marker, hap) {
             Some(a) => a == targ_allele,
             None => false,
+        }
+    }
+
+    #[inline]
+    fn fill_pool_alleles(
+        &self,
+        marker: usize,
+        active_pool: &ActivePool,
+        out: &mut Vec<u8>,
+    ) {
+        let list = active_pool.list();
+        if out.len() < list.len() {
+            out.resize(list.len(), 255);
+        }
+        for (i, &h) in list.iter().enumerate() {
+            out[i] = self
+                .packed_ref
+                .ref_allele_targ(marker, h)
+                .unwrap_or(255);
         }
     }
 

@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use clap::Parser;
 use reagle::data::ChromIdx;
 use reagle::model::ibs2::Ibs2;
 use reagle::model::phase_ibs::BidirectionalPhaseIbs;
@@ -39,7 +38,8 @@ fn run_rust_imputation(
         "--seed",
         &seed.to_string(),
         "--gp",
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -65,7 +65,7 @@ fn run_rust_imputation_with_args(
         "--gp".into(),
     ];
     args.extend(extra_args.iter().map(|s| s.to_string()));
-    let config = Config::parse_from(args);
+    let config = Config::parse_from(args).expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -86,7 +86,7 @@ fn run_rust_phasing_with_args(
         seed.to_string(),
     ];
     args.extend(extra_args.iter().map(|s| s.to_string()));
-    let config = Config::parse_from(args);
+    let config = Config::parse_from(args).expect("config");
     let mut pipeline = reagle::PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -224,7 +224,8 @@ fn run_rust_imputation_with_ap(
         &seed.to_string(),
         "--gp",
         "--ap",
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }

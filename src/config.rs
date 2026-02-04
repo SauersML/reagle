@@ -4,19 +4,21 @@
 //! Replaces `main/Par.java`.
 
 use clap::Parser;
+use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::info_span;
 
 use crate::error::{ReagleError, Result};
 
-/// Reagle: High-performance genotype phasing and imputation
+const DEFAULT_CONFIG_FILE: &str = "reagle.toml";
+
+/// Minimal CLI arguments (everything else lives in `reagle.toml`).
 #[derive(Parser, Debug, Clone)]
 #[command(name = "reagle")]
 #[command(author = "Reagle Authors")]
 #[command(version = "0.1.0")]
 #[command(about = "High-performance genotype phasing and imputation", long_about = None)]
-pub struct Config {
-    // ============ Data Parameters ============
+pub struct CliArgs {
     /// Input VCF file with GT FORMAT field (required)
     #[arg(long, value_name = "FILE")]
     pub gt: PathBuf,
@@ -29,129 +31,158 @@ pub struct Config {
     #[arg(long, short, value_name = "PREFIX")]
     pub out: PathBuf,
 
+    /// Enable profiling output (hierarchical timing tree)
+    #[arg(long, default_value = "false")]
+    pub profile: bool,
+}
+
+/// Reagle: High-performance genotype phasing and imputation
+#[derive(Debug, Clone)]
+pub struct Config {
+    // ============ Data Parameters ============
+    /// Input VCF file with GT FORMAT field (required)
+    pub gt: PathBuf,
+
+    /// Reference panel (bref3 or VCF file with phased genotypes)
+    pub r#ref: Option<PathBuf>,
+
+    /// Output file prefix (required)
+    pub out: PathBuf,
+
     /// PLINK map file with cM units
-    #[arg(long, value_name = "FILE")]
     pub map: Option<PathBuf>,
 
     /// Chromosome or region [chrom] or [chrom]:[start]-[end]
-    #[arg(long, value_name = "REGION")]
     pub chrom: Option<String>,
 
     /// File with sample IDs to exclude (one per line)
-    #[arg(long, value_name = "FILE")]
     pub excludesamples: Option<PathBuf>,
 
     /// File with marker IDs to exclude (one per line)
-    #[arg(long, value_name = "FILE")]
     pub excludemarkers: Option<PathBuf>,
 
     // ============ Phasing Parameters ============
     /// Maximum burn-in iterations
-    #[arg(long, default_value = "6")]
     pub burnin: usize,
 
     /// Phasing iterations
-    #[arg(long, default_value = "12")]
     pub iterations: usize,
 
     /// MCMC burn-in sweeps (lets the chain mix before sampling)
-    #[arg(long = "mcmc-burnin", default_value = "2")]
     pub mcmc_burnin: usize,
 
     /// Enable SHAPEIT5-style dynamic MCMC (re-selects states each step)
-    #[arg(long = "dynamic-mcmc", default_value = "false")]
     pub dynamic_mcmc: bool,
 
     /// Number of MCMC steps per outer iteration (for dynamic MCMC)
-    #[arg(long = "mcmc-steps", default_value = "3")]
     pub mcmc_steps: usize,
 
     /// Number of MCMC samples used to estimate phase LR (higher = more stable)
-    #[arg(long = "mcmc-lr-samples", default_value = "32")]
     pub mcmc_lr_samples: usize,
 
     /// Model states for phasing (0 = auto by memory budget)
-    #[arg(long = "phase-states", default_value = "0")]
     pub phase_states: usize,
 
     /// Rare variant frequency threshold
-    #[arg(long, default_value = "0.002")]
     pub rare: f32,
 
 
     // ============ Imputation Parameters ============
     /// Impute ungenotyped markers
-    #[arg(long, default_value = "true")]
     pub impute: bool,
 
     /// Model states for imputation
-    #[arg(long = "imp-states", default_value = "1600")]
     pub imp_states: usize,
 
     /// Imputation segment length in cM
-    #[arg(long = "imp-segment", default_value = "6.0")]
     pub imp_segment: f32,
 
     /// Imputation step size in cM
-    #[arg(long = "imp-step", default_value = "0.1")]
     pub imp_step: f32,
 
     /// Number of imputation steps
-    #[arg(long = "imp-nsteps", default_value = "7")]
     pub imp_nsteps: usize,
 
     /// Maximum cM in a marker cluster
-    #[arg(long, default_value = "0.005")]
     pub cluster: f32,
 
     /// PBWT batch memory budget (MB) for imputation state selection
-    #[arg(long = "pbwt-batch-mb", default_value = "256")]
     pub pbwt_batch_mb: usize,
 
     /// Print posterior allele probabilities
-    #[arg(long, default_value = "false")]
     pub ap: bool,
 
     /// Print posterior genotype probabilities
-    #[arg(long, default_value = "false")]
     pub gp: bool,
 
     // ============ General Parameters ============
     /// Effective population size
-    #[arg(long, default_value = "100000")]
     pub ne: f32,
 
     /// Allele mismatch probability (auto-calculated if not specified)
-    #[arg(long)]
     pub err: Option<f32>,
 
     /// Estimate ne and err parameters
-    #[arg(long, default_value = "true")]
     pub em: bool,
 
     /// Window length in cM
-    #[arg(long, default_value = "40.0")]
     pub window: f32,
 
     /// Maximum markers per window
-    #[arg(long = "window-markers", default_value = "100000")]
     pub window_markers: usize,
 
     /// Window overlap in cM
-    #[arg(long, default_value = "2.0")]
     pub overlap: f32,
 
     /// Random seed for reproducibility
-    #[arg(long, default_value = "-99999")]
     pub seed: i64,
 
     /// Number of threads (default: all available cores)
-    #[arg(long)]
     pub nthreads: Option<usize>,
 
     /// Enable profiling output (hierarchical timing tree)
-    #[arg(long, default_value = "false")]
     pub profile: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TomlConfig {
+    // Data parameters
+    pub map: Option<PathBuf>,
+    pub chrom: Option<String>,
+    pub excludesamples: Option<PathBuf>,
+    pub excludemarkers: Option<PathBuf>,
+
+    // Phasing parameters
+    pub burnin: Option<usize>,
+    pub iterations: Option<usize>,
+    pub mcmc_burnin: Option<usize>,
+    pub dynamic_mcmc: Option<bool>,
+    pub mcmc_steps: Option<usize>,
+    pub mcmc_lr_samples: Option<usize>,
+    pub phase_states: Option<usize>,
+    pub rare: Option<f32>,
+
+    // Imputation parameters
+    pub impute: Option<bool>,
+    pub imp_states: Option<usize>,
+    pub imp_segment: Option<f32>,
+    pub imp_step: Option<f32>,
+    pub imp_nsteps: Option<usize>,
+    pub cluster: Option<f32>,
+    pub pbwt_batch_mb: Option<usize>,
+    pub ap: Option<bool>,
+    pub gp: Option<bool>,
+
+    // General parameters
+    pub ne: Option<f32>,
+    pub err: Option<f32>,
+    pub em: Option<bool>,
+    pub window: Option<f32>,
+    pub window_markers: Option<usize>,
+    pub overlap: Option<f32>,
+    pub seed: Option<i64>,
+    pub nthreads: Option<usize>,
+    pub profile: Option<bool>,
 }
 
 impl Default for Config {
@@ -179,8 +210,8 @@ impl Default for Config {
             imp_nsteps: 7,
             cluster: 0.005,
             pbwt_batch_mb: 256,
-            ap: false,
-            gp: false,
+            ap: true,
+            gp: true,
             ne: 100000.0,
             err: None,
             em: true,
@@ -195,13 +226,132 @@ impl Default for Config {
 }
 
 impl Config {
+    fn apply_toml(&mut self, cfg: TomlConfig) {
+        if let Some(value) = cfg.map {
+            self.map = Some(value);
+        }
+        if let Some(value) = cfg.chrom {
+            self.chrom = Some(value);
+        }
+        if let Some(value) = cfg.excludesamples {
+            self.excludesamples = Some(value);
+        }
+        if let Some(value) = cfg.excludemarkers {
+            self.excludemarkers = Some(value);
+        }
+
+        if let Some(value) = cfg.burnin {
+            self.burnin = value;
+        }
+        if let Some(value) = cfg.iterations {
+            self.iterations = value;
+        }
+        if let Some(value) = cfg.mcmc_burnin {
+            self.mcmc_burnin = value;
+        }
+        if let Some(value) = cfg.dynamic_mcmc {
+            self.dynamic_mcmc = value;
+        }
+        if let Some(value) = cfg.mcmc_steps {
+            self.mcmc_steps = value;
+        }
+        if let Some(value) = cfg.mcmc_lr_samples {
+            self.mcmc_lr_samples = value;
+        }
+        if let Some(value) = cfg.phase_states {
+            self.phase_states = value;
+        }
+        if let Some(value) = cfg.rare {
+            self.rare = value;
+        }
+
+        if let Some(value) = cfg.impute {
+            self.impute = value;
+        }
+        if let Some(value) = cfg.imp_states {
+            self.imp_states = value;
+        }
+        if let Some(value) = cfg.imp_segment {
+            self.imp_segment = value;
+        }
+        if let Some(value) = cfg.imp_step {
+            self.imp_step = value;
+        }
+        if let Some(value) = cfg.imp_nsteps {
+            self.imp_nsteps = value;
+        }
+        if let Some(value) = cfg.cluster {
+            self.cluster = value;
+        }
+        if let Some(value) = cfg.pbwt_batch_mb {
+            self.pbwt_batch_mb = value;
+        }
+        if let Some(value) = cfg.ap {
+            self.ap = value;
+        }
+        if let Some(value) = cfg.gp {
+            self.gp = value;
+        }
+
+        if let Some(value) = cfg.ne {
+            self.ne = value;
+        }
+        if let Some(value) = cfg.err {
+            self.err = Some(value);
+        }
+        if let Some(value) = cfg.em {
+            self.em = value;
+        }
+        if let Some(value) = cfg.window {
+            self.window = value;
+        }
+        if let Some(value) = cfg.window_markers {
+            self.window_markers = value;
+        }
+        if let Some(value) = cfg.overlap {
+            self.overlap = value;
+        }
+        if let Some(value) = cfg.seed {
+            self.seed = value;
+        }
+        if let Some(value) = cfg.nthreads {
+            self.nthreads = Some(value);
+        }
+        if let Some(value) = cfg.profile {
+            self.profile = value;
+        }
+    }
+
     /// Parse command line arguments and validate
     pub fn parse_and_validate() -> Result<Self> {
-        info_span!("config_parse_and_validate").in_scope(|| {
-            let config = Self::parse();
-            config.validate()?;
-            Ok(config)
-        })
+        info_span!("config_parse_and_validate")
+            .in_scope(|| Self::parse_from(std::env::args_os()))
+    }
+
+    /// Parse provided CLI arguments and validate.
+    ///
+    /// Intended for tests and programmatic callers.
+    pub fn parse_from<I, T>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = CliArgs::parse_from(args);
+        let mut config = Self::default();
+
+        if let Some(toml_cfg) = load_toml_config(PathBuf::from(DEFAULT_CONFIG_FILE))? {
+            config.apply_toml(toml_cfg);
+        }
+
+        config.gt = cli.gt;
+        config.r#ref = cli.r#ref;
+        config.out = cli.out;
+        if cli.profile {
+            config.profile = true;
+        }
+
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load sample IDs to exclude from the exclusion file
@@ -327,4 +477,21 @@ impl Config {
     pub fn is_imputation_mode(&self) -> bool {
         self.r#ref.is_some()
     }
+}
+
+fn load_toml_config(path: PathBuf) -> Result<Option<TomlConfig>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&path)?;
+    let config: TomlConfig = toml::from_str(&contents).map_err(|err| {
+        ReagleError::config(format!(
+            "Failed to parse TOML config {}: {}",
+            path.display(),
+            err
+        ))
+    })?;
+
+    Ok(Some(config))
 }

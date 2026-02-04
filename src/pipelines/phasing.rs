@@ -138,6 +138,7 @@ const FAST_BEAM_INJECT_K: usize = 8;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
+const PHASE_STATE_HARD_CAP: usize = 200;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
@@ -146,6 +147,7 @@ struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerS
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
     state_buf: Vec<CombinedHapId>,
+    state_haps: Vec<HapIdx>,
 }
 
 impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
@@ -158,6 +160,7 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
             ref_gt,
             threaded_haps,
             state_buf: vec![CombinedHapId::from(0u32); n_states],
+            state_haps: vec![HapIdx::new(0); n_states],
         }
     }
 
@@ -167,11 +170,33 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
         if self.state_buf.len() < n_states {
             self.state_buf.resize(n_states, CombinedHapId::from(0u32));
         }
+        if self.state_haps.len() < n_states {
+            self.state_haps.resize(n_states, HapIdx::new(0));
+        }
         self.threaded_haps.materialize_at(marker, &mut self.state_buf);
         let marker_idx = MarkerIdx::new(marker as u32);
         for i in 0..n_states {
-            let hap = HapIdx::new(self.state_buf[i].as_u32());
-            out[i] = self.ref_gt.allele(marker_idx, hap);
+            self.state_haps[i] = HapIdx::new(self.state_buf[i].as_u32());
+        }
+        self.ref_gt
+            .fill_batch(marker_idx, &self.state_haps[..n_states], &mut out[..n_states]);
+    }
+
+    fn materialize_into(&mut self, n_markers: usize, out: &mut [u8]) {
+        let n_states = self.threaded_haps.n_states();
+        if n_markers == 0 || n_states == 0 {
+            return;
+        }
+        let needed = n_markers.saturating_mul(n_states);
+        assert!(
+            out.len() >= needed,
+            "materialize_into buffer too small: have {}, need {}",
+            out.len(),
+            needed
+        );
+        for m in 0..n_markers {
+            let offset = m * n_states;
+            self.fill_ref_alleles(m, &mut out[offset..offset + n_states]);
         }
     }
 }
@@ -1034,6 +1059,7 @@ struct MosaicBuffers {
     fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     ref_alleles: Vec<u8>,
+    ref_alleles_flat: Vec<u8>,
     weights: Vec<f32>,
     allele_probs: Vec<f32>,
     hap1_checkpoints: FwdCheckpoints,
@@ -1148,6 +1174,8 @@ struct MosaicChain<'a, RefSpace = crate::data::AnyMarkerSpace> {
     fwd: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     fwd_prior: aligned_vec::AVec<f32, aligned_vec::ConstAlign<32>>,
     ref_alleles: Vec<u8>,
+    ref_alleles_flat: Vec<u8>,
+    ref_alleles_flat_ref: Option<&'a [u8]>,
     weights: Vec<f32>,
     allele_probs: Vec<f32>,
     hap1_checkpoints: FwdCheckpoints,
@@ -1185,6 +1213,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         ref_provider: RefAlleleProvider<'a, AnyMarkerSpace, RefSpace>,
         combined_checkpoints: &'a FwdCheckpoints,
         buffers: MosaicBuffers,
+        ref_alleles_flat_ref: Option<&'a [u8]>,
         p_no_err: f32,
         p_err: f32,
         pl_provider: Option<PlProvider<'a>>,
@@ -1215,6 +1244,8 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             fwd: buffers.fwd,
             fwd_prior: buffers.fwd_prior,
             ref_alleles: buffers.ref_alleles,
+            ref_alleles_flat: buffers.ref_alleles_flat,
+            ref_alleles_flat_ref,
             weights: buffers.weights,
             allele_probs: buffers.allele_probs,
             hap1_checkpoints: buffers.hap1_checkpoints,
@@ -1251,6 +1282,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             fwd: self.fwd,
             fwd_prior: self.fwd_prior,
             ref_alleles: self.ref_alleles,
+            ref_alleles_flat: self.ref_alleles_flat,
             weights: self.weights,
             allele_probs: self.allele_probs,
             hap1_checkpoints: self.hap1_checkpoints,
@@ -1305,13 +1337,28 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         self.trace.log_likelihood = logp;
     }
 
+    #[inline]
+    fn ref_row(&mut self, marker: usize) -> &[u8] {
+        if let Some(flat) = self.ref_alleles_flat_ref {
+            let offset = marker * self.n_states;
+            return &flat[offset..offset + self.n_states];
+        }
+        if !self.ref_alleles_flat.is_empty() {
+            let offset = marker * self.n_states;
+            return &self.ref_alleles_flat[offset..offset + self.n_states];
+        }
+        self.ref_provider
+            .fill_ref_alleles(marker, &mut self.ref_alleles);
+        &self.ref_alleles[..self.n_states]
+    }
+
     fn build_hap2_inputs(&mut self) {
         for m in 0..self.n_markers {
             let a1 = self.seq1[m];
             let a2 = self.seq2[m];
-            self.ref_provider
-                .fill_ref_alleles(m, &mut self.ref_alleles);
-            let ref_al = self.ref_alleles[self.path1[m] as usize];
+            let p1 = self.path1[m] as usize;
+            let ref_row = self.ref_row(m);
+            let ref_al = ref_row[p1];
             // Partner allele is always the other haplotype's current reference allele.
             self.hap2_partner_allele[m] = ref_al;
             self.hap2_hard_match[m] = false;
@@ -1367,9 +1414,9 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         for m in 0..self.n_markers {
             let a1 = self.seq1[m];
             let a2 = self.seq2[m];
-            self.ref_provider
-                .fill_ref_alleles(m, &mut self.ref_alleles);
-            let ref_al = self.ref_alleles[self.path2[m] as usize];
+            let p2 = self.path2[m] as usize;
+            let ref_row = self.ref_row(m);
+            let ref_al = ref_row[p2];
             // Partner allele is always the other haplotype's current reference allele.
             self.hap1_partner_allele[m] = ref_al;
             self.hap1_hard_match[m] = false;
@@ -1456,6 +1503,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                     hard_match: &dummy_hard,
                 },
                 &mut self.ref_provider,
+                (!self.ref_alleles_flat.is_empty()).then_some(&self.ref_alleles_flat[..]),
                 self.pl_provider.as_ref(),
                 self.p_no_err,
                 self.p_err,
@@ -1489,6 +1537,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                     hard_match: &self.hap1_hard_match,
                 },
                 &mut self.ref_provider,
+                (!self.ref_alleles_flat.is_empty()).then_some(&self.ref_alleles_flat[..]),
                 self.pl_provider.as_ref(),
                 &mut self.allele_probs,
                 fwd,
@@ -1514,6 +1563,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                     hard_match: &self.hap1_hard_match,
                 },
                 &mut self.ref_provider,
+                (!self.ref_alleles_flat.is_empty()).then_some(&self.ref_alleles_flat[..]),
                 self.pl_provider.as_ref(),
                 self.p_no_err,
                 self.p_err,
@@ -1546,6 +1596,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 hard_match: &self.hap2_hard_match,
             },
             &mut self.ref_provider,
+            (!self.ref_alleles_flat.is_empty()).then_some(&self.ref_alleles_flat[..]),
             self.pl_provider.as_ref(),
             &mut self.allele_probs,
             fwd,
@@ -1571,6 +1622,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 hard_match: &self.hap2_hard_match,
             },
             &mut self.ref_provider,
+            (!self.ref_alleles_flat.is_empty()).then_some(&self.ref_alleles_flat[..]),
             self.pl_provider.as_ref(),
             self.p_no_err,
             self.p_err,
@@ -2071,6 +2123,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 Some(&hi_freq_to_orig),
             )?;
 
+            const PRESCAN_BEAM_SEED: usize = 8;
             let beam_confidence: Vec<std::sync::Mutex<Vec<(usize, u8, u8, f32)>>> =
                 (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
             let beam_donors: Vec<std::sync::Mutex<Vec<usize>>> =
@@ -2098,28 +2151,19 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         }
                     }
 
-                    let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
-                    for &h in active_pool.list() {
-                        let mut score = 0i32;
-                        for &m in hi_freq_to_orig.iter() {
-                            let a1 = sp.allele1(m);
-                            let a2 = sp.allele2(m);
-                            if a1 == 255 || a2 == 255 {
-                                continue;
-                            }
-                            if let Some(r) = packed_ref.ref_allele_targ(m, h) {
-                                if a1 == a2 {
-                                    score += if r == a1 { 2 } else { -2 };
-                                } else {
-                                    score += if r == a1 || r == a2 { 1 } else { -1 };
-                                }
+                    let mut promoted = 0usize;
+                    for id in tmp.iter().copied() {
+                        if promoted >= PRESCAN_BEAM_SEED {
+                            break;
+                        }
+                        let hid = id.as_u32() as usize;
+                        if hid >= n_target_haps {
+                            let ref_id = hid - n_target_haps;
+                            if ref_id < packed_ref.n_ref_haps() {
+                                active_pool.promote(ref_id);
+                                promoted += 1;
                             }
                         }
-                        scored.push((score, h));
-                    }
-                    scored.sort_by(|a, b| b.0.cmp(&a.0));
-                    for &(_, h) in scored.iter().take(4) {
-                        active_pool.promote(h);
                     }
 
                     let hard_threshold_nats = if beam_config_fast.prune_tolerance > 0 {
@@ -2237,29 +2281,19 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     }
                 }
 
-                // Re-rank: push best matching reference haps to the end so they are prioritized.
-                let mut scored: Vec<(i32, usize)> = Vec::with_capacity(active_pool.list().len());
-                for &h in active_pool.list() {
-                    let mut score = 0i32;
-                    for &m in hi_freq_to_orig.iter() {
-                        let a1 = sp.allele1(m);
-                        let a2 = sp.allele2(m);
-                        if a1 == 255 || a2 == 255 {
-                            continue;
-                        }
-                        if let Some(r) = packed_ref.ref_allele_targ(m, h) {
-                            if a1 == a2 {
-                                score += if r == a1 { 2 } else { -2 };
-                            } else {
-                                score += if r == a1 || r == a2 { 1 } else { -1 };
-                            }
+                let mut promoted = 0usize;
+                for id in tmp.iter().copied() {
+                    if promoted >= PRESCAN_BEAM_SEED {
+                        break;
+                    }
+                    let hid = id.as_u32() as usize;
+                    if hid >= n_target_haps {
+                        let ref_id = hid - n_target_haps;
+                        if ref_id < packed_ref.n_ref_haps() {
+                            active_pool.promote(ref_id);
+                            promoted += 1;
                         }
                     }
-                    scored.push((score, h));
-                }
-                scored.sort_by(|a, b| b.0.cmp(&a.0));
-                for &(_, h) in scored.iter().take(4) {
-                    active_pool.promote(h);
                 }
 
                     let hard_threshold_nats = if beam_config.prune_tolerance > 0 {
@@ -2358,22 +2392,86 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 }
             }
 
-            // Micro-HMM refinement on hi-frequency markers (single pass).
+            // Beam-first, then sparse MCMC refinement on remaining unphased hets.
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
-            let _ = self.run_phase_baum_iteration_stage1(
-                &target_gt,
-                &mut geno,
-                &threaded_haps_vec,
-                &stage1_p_recomb,
-                &stage1_gen_dists,
-                &hi_freq_to_orig,
-                &stage1_blocks,
-                &ibs2,
-                &mut sample_phases,
-                &mut mcmc_paths,
-                None,
-                0,
-            )?;
+            if packed_ref.n_ref_haps() > 0 {
+                let offset = n_target_haps as u32;
+                for s in 0..n_samples {
+                    let Ok(donors) = beam_donors[s].lock() else {
+                        continue;
+                    };
+                    if donors.is_empty() {
+                        continue;
+                    }
+                    let d1 = donors[0];
+                    let d2 = *donors.get(1).unwrap_or(&donors[0]);
+                    let hap1 = CombinedHapId::new(offset + d1 as u32);
+                    let hap2 = CombinedHapId::new(offset + d2 as u32);
+                    let path1 = vec![hap1; n_hi_freq];
+                    let path2 = vec![hap2; n_hi_freq];
+                    mcmc_paths[s] = Some(GlobalMosaicPaths { path1, path2 });
+                }
+            }
+            let n_burnin = self.config.burnin;
+            let n_iterations = self.config.iterations;
+            let total_iterations = n_burnin + n_iterations;
+            let mut stable_main_iters = 0usize;
+            for it in 0..total_iterations {
+                let is_burnin = it < n_burnin;
+                let iter_type = if is_burnin { "burnin" } else { "main" };
+                eprintln!("Iteration {}/{} ({})", it + 1, total_iterations, iter_type);
+                if let Some(bb) = &self.telemetry {
+                    let stage = if is_burnin {
+                        Stage::PhasingBurnin
+                    } else {
+                        Stage::PhasingMain
+                    };
+                    bb.set_stage(stage);
+                    bb.set_producer_stage(stage);
+                    bb.set_current_iteration((it + 1) as u64);
+                    bb.set_samples_processed(0);
+                    bb.set_markers_processed(0);
+                }
+
+                self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+                let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
+                    &target_gt,
+                    &mut geno,
+                    &threaded_haps_vec,
+                    &stage1_p_recomb,
+                    &stage1_gen_dists,
+                    &hi_freq_to_orig,
+                    &stage1_blocks,
+                    &ibs2,
+                    &mut sample_phases,
+                    &mut mcmc_paths,
+                    None,
+                    it,
+                )?;
+                if let Some(bb) = &self.telemetry {
+                    bb.set_samples_processed(n_samples as u64);
+                    bb.set_markers_processed(hi_freq_markers.len() as u64);
+                }
+
+                if !is_burnin {
+                    let remaining_hets =
+                        Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
+                    let change = total_switches + total_phased;
+                    let threshold = (remaining_hets / 100).max(1);
+                    if change <= threshold {
+                        stable_main_iters += 1;
+                        if stable_main_iters >= 2 {
+                            eprintln!(
+                                "Phasing converged (changes {} <= threshold {} for 2 main iterations); stopping early.",
+                                change, threshold
+                            );
+                            break;
+                        }
+                    } else {
+                        stable_main_iters = 0;
+                    }
+                }
+            }
 
             for (s, sp) in sample_phases.iter_mut().enumerate() {
                 if let Ok(slot) = beam_confidence[s].lock() {
@@ -3336,6 +3434,45 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         BidirectionalPhaseIbs::build_for_subset(alleles_by_marker, n_haps, n_subset, marker_indices)
     }
 
+    /// Build bidirectional PBWT for a subset of markers using target+reference (composite).
+    fn build_bidirectional_pbwt_subset_with_ref<RefPanelSpace>(
+        &self,
+        target_geno: &MutableGenotypes,
+        ref_gt: &GenotypeMatrix<crate::data::storage::phase_state::Phased, RefPanelSpace>,
+        alignment: &MarkerAlignment<crate::data::AnyMarkerSpace, RefPanelSpace>,
+        marker_indices: &[usize],
+    ) -> BidirectionalPhaseIbs {
+        let n_subset = marker_indices.len();
+        let n_target_haps = target_geno.n_haps();
+        let n_ref_haps = ref_gt.n_haplotypes();
+        let n_total_haps = n_target_haps + n_ref_haps;
+
+        let view = GenotypeView::CompositeSubset {
+            target: target_geno,
+            reference: ref_gt,
+            alignment,
+            subset: marker_indices,
+            n_target_haps,
+        };
+        let haps: Vec<HapIdx> = (0..n_total_haps)
+            .map(|h| HapIdx::new(h as u32))
+            .collect();
+
+        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
+        for i in 0..n_subset {
+            let mut row = vec![255u8; n_total_haps];
+            view.fill_batch(MarkerIdx::new(i as u32), &haps, &mut row);
+            alleles_by_marker.push(row);
+        }
+
+        BidirectionalPhaseIbs::build_for_subset(
+            alleles_by_marker,
+            n_total_haps,
+            n_subset,
+            marker_indices,
+        )
+    }
+
     fn build_phasing_prescan_states<RefPanelSpace>(
         &self,
         target_gt: &GenotypeMatrix,
@@ -3388,7 +3525,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         } else {
             self.config.phase_states
         };
-        per_window_cap = per_window_cap.min(n_ref_haps).max(1);
+        per_window_cap = per_window_cap.min(PHASE_STATE_HARD_CAP).min(n_ref_haps).max(1);
         if self.config.phase_states == 0 {
             eprintln!(
                 "Phasing prescan: per_window_cap={} threads={} available_mb={} window_markers={}",
@@ -3941,6 +4078,39 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 selected = fallback;
             }
 
+            // Order selected haplotypes by prescan score to seed beam initialization.
+            let mut selected_set: HashSet<u32> =
+                selected.iter().map(|h| h.as_u32()).collect();
+            let mut ranked: Vec<(RefHapId, f32)> = Vec::with_capacity(candidate_haps.len());
+            for (idx, &hap) in candidate_haps.iter().enumerate() {
+                if !selected_set.contains(&(hap as u32)) {
+                    continue;
+                }
+                let scores = scores_by_hap.get(idx);
+                let mut sum = 0.0f32;
+                if let Some(list) = scores {
+                    for &(_, v) in list.iter() {
+                        if v.is_finite() {
+                            sum += v;
+                        }
+                    }
+                }
+                ranked.push((RefHapId::from(hap), sum));
+            }
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut ranked_selected: Vec<RefHapId> = Vec::with_capacity(selected.len());
+            for (h, _) in ranked {
+                if selected_set.remove(&h.as_u32()) {
+                    ranked_selected.push(h);
+                }
+            }
+            for h in selected {
+                if selected_set.remove(&h.as_u32()) {
+                    ranked_selected.push(h);
+                }
+            }
+            selected = ranked_selected;
+
             if s == 0 && n_markers <= 60 {
                 let mut selected_dbg = selected.clone();
                 selected_dbg.sort_unstable();
@@ -4466,9 +4636,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
 
             // 2. Build bidirectional PBWT on high-frequency markers only
-            let use_dynamic_mcmc = self.config.dynamic_mcmc && self.reference_gt.is_none();
+            let use_dynamic_mcmc = self.config.dynamic_mcmc;
             let phase_ibs = if use_dynamic_mcmc {
-                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
+                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                    Some(self.build_bidirectional_pbwt_subset_with_ref(
+                        ref_geno,
+                        ref_gt.as_ref(),
+                        alignment,
+                        hi_freq_to_orig,
+                    ))
+                } else {
+                    Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
+                }
             } else {
                 None
             };
@@ -4524,10 +4703,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
 
-                        // Identify heterozygotes (all) in hi-freq space
+                        // Identify heterozygotes (only UNPHASED) in hi-freq space
                         let mut het_positions: Vec<usize> = Vec::new();
                         let mut het_index_map: Vec<usize> = vec![usize::MAX; n_hi_freq];
                         for i in 0..n_hi_freq {
+                            let m = hi_freq_to_orig[i];
+                            if !sp.is_unphased(m) {
+                                continue;
+                            }
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             if a1 != 255 && a2 != 255 && a1 != a2 {
@@ -4880,19 +5063,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             })
                             .collect();
 
+                        let het_count = het_positions.len() as u64;
                         ws.seq1 = seq1;
                         ws.seq2 = seq2;
                         ws.sample_conf = sample_conf;
                         ws.het_positions = het_positions;
 
                         let sample_total = t0.elapsed();
-                        let done = timing.add_sample(
+                        timing.add_sample(
                             t_seq.as_nanos() as u64,
                             t_anchor.as_nanos() as u64,
                             t_mcmc.as_nanos() as u64,
                             sample_total.as_nanos() as u64,
                             n_states as u64,
-                            het_positions.len() as u64,
+                            het_count,
                             anchor_resets as u64,
                         );
                         let elapsed_ns = timing_start.elapsed().as_nanos() as u64;
@@ -6252,6 +6436,7 @@ fn build_fwd_checkpoints<RefSpace>(
     conf: &[f32],
     inputs: HapEmissionInputs<'_>,
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
+    ref_alleles_flat: Option<&[u8]>,
     pl_provider: Option<&PlProvider>,
     allele_probs: &mut Vec<f32>,
     fwd: &mut [f32],
@@ -6311,7 +6496,13 @@ fn build_fwd_checkpoints<RefSpace>(
         let conf_m = conf[m].clamp(0.0, 1.0);
 
         // Batch lookup: get all ref alleles for this marker at once
-        ref_provider.fill_ref_alleles(m, ref_alleles);
+        let ref_row = if let Some(flat) = ref_alleles_flat {
+            let offset = m * n_states;
+            &flat[offset..offset + n_states]
+        } else {
+            ref_provider.fill_ref_alleles(m, ref_alleles);
+            &ref_alleles[..n_states]
+        };
 
         let use_combined = matches!(mode, EmissionMode::Combined) || inputs.use_combined[m];
         let hard_match = inputs.hard_match[m];
@@ -6346,49 +6537,49 @@ fn build_fwd_checkpoints<RefSpace>(
                 let emit_arr = if pl_n_alleles.is_some() {
                     [
                         emit_from_allele_probs(
-                            ref_alleles[k],
+                            ref_row[k],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 1],
+                            ref_row[k + 1],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 2],
+                            ref_row[k + 2],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 3],
+                            ref_row[k + 3],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 4],
+                            ref_row[k + 4],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 5],
+                            ref_row[k + 5],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 6],
+                            ref_row[k + 6],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
                         ),
                         emit_from_allele_probs(
-                            ref_alleles[k + 7],
+                            ref_row[k + 7],
                             &allele_probs,
                             p_no_err_pl,
                             p_err_pl,
@@ -6396,14 +6587,14 @@ fn build_fwd_checkpoints<RefSpace>(
                     ]
                 } else {
                     [
-                        emit_combined_fast(ref_alleles[k], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 1], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 2], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 3], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 4], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 5], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 6], emit_mode, conf_m, p_no_err, p_err),
-                        emit_combined_fast(ref_alleles[k + 7], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 1], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 2], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 3], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 4], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 5], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 6], emit_mode, conf_m, p_no_err, p_err),
+                        emit_combined_fast(ref_row[k + 7], emit_mode, conf_m, p_no_err, p_err),
                     ]
                 };
                 let emit_vec = f32x8::from(emit_arr);
@@ -6418,9 +6609,9 @@ fn build_fwd_checkpoints<RefSpace>(
             fwd_sum = sum_vec.reduce_add();
             for i in k..n_states {
                 let emit = if pl_n_alleles.is_some() {
-                    emit_from_allele_probs(ref_alleles[i], &allele_probs, p_no_err_pl, p_err_pl)
+                    emit_from_allele_probs(ref_row[i], &allele_probs, p_no_err_pl, p_err_pl)
                 } else {
-                    emit_combined_fast(ref_alleles[i], emit_mode, conf_m, p_no_err, p_err)
+                    emit_combined_fast(ref_row[i], emit_mode, conf_m, p_no_err, p_err)
                 };
                 fwd[i] = fwd_prior[i] * emit;
                 fwd_sum += fwd[i];
@@ -6430,7 +6621,7 @@ fn build_fwd_checkpoints<RefSpace>(
             if hard_match {
                 fwd_sum = 0.0;
                 for i in 0..n_states {
-                    let emit = emit_prob_hard(ref_alleles[i], target_al, conf_m, p_no_err, p_err, true);
+                    let emit = emit_prob_hard(ref_row[i], target_al, conf_m, p_no_err, p_err, true);
                     fwd[i] = fwd_prior[i] * emit;
                     fwd_sum += fwd[i];
                 }
@@ -6443,49 +6634,49 @@ fn build_fwd_checkpoints<RefSpace>(
                     let emit_arr = if pl_n_alleles.is_some() {
                         [
                             emit_from_allele_probs(
-                                ref_alleles[k],
+                                ref_row[k],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 1],
+                                ref_row[k + 1],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 2],
+                                ref_row[k + 2],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 3],
+                                ref_row[k + 3],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 4],
+                                ref_row[k + 4],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 5],
+                                ref_row[k + 5],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 6],
+                                ref_row[k + 6],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 7],
+                                ref_row[k + 7],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
@@ -6493,14 +6684,14 @@ fn build_fwd_checkpoints<RefSpace>(
                         ]
                     } else {
                         [
-                            emit_prob(ref_alleles[k], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 1], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 2], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 3], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 4], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 5], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 6], target_al, conf_m, p_no_err, p_err),
-                            emit_prob(ref_alleles[k + 7], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 1], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 2], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 3], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 4], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 5], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 6], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 7], target_al, conf_m, p_no_err, p_err),
                         ]
                     };
                     let emit_vec = f32x8::from(emit_arr);
@@ -6515,9 +6706,9 @@ fn build_fwd_checkpoints<RefSpace>(
                 fwd_sum = sum_vec.reduce_add();
                 for i in k..n_states {
                     let emit = if pl_n_alleles.is_some() {
-                        emit_from_allele_probs(ref_alleles[i], &allele_probs, p_no_err_pl, p_err_pl)
+                        emit_from_allele_probs(ref_row[i], &allele_probs, p_no_err_pl, p_err_pl)
                     } else {
-                        emit_prob(ref_alleles[i], target_al, conf_m, p_no_err, p_err)
+                        emit_prob(ref_row[i], target_al, conf_m, p_no_err, p_err)
                     };
                     fwd[i] = fwd_prior[i] * emit;
                     fwd_sum += fwd[i];
@@ -6567,6 +6758,7 @@ fn sample_path_from_checkpoints<RefSpace>(
     conf: &[f32],
     inputs: HapEmissionInputs<'_>,
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
+    ref_alleles_flat: Option<&[u8]>,
     pl_provider: Option<&PlProvider>,
     p_no_err: f32,
     p_err: f32,
@@ -6623,7 +6815,13 @@ fn sample_path_from_checkpoints<RefSpace>(
             let prev_row = &prev_part[row_idx - row_stride..];
 
             // Batch lookup ref alleles
-            ref_provider.fill_ref_alleles(m, ref_alleles);
+            let ref_row = if let Some(flat) = ref_alleles_flat {
+                let offset = m * n_states;
+                &flat[offset..offset + n_states]
+            } else {
+                ref_provider.fill_ref_alleles(m, ref_alleles);
+                &ref_alleles[..n_states]
+            };
 
             // SIMD-optimized forward update
             let shift_vec = f32x8::splat(shift);
@@ -6658,49 +6856,49 @@ fn sample_path_from_checkpoints<RefSpace>(
                     let emit_arr = if pl_n_alleles.is_some() {
                         [
                             emit_from_allele_probs(
-                                ref_alleles[k],
+                                ref_row[k],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 1],
+                                ref_row[k + 1],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 2],
+                                ref_row[k + 2],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 3],
+                                ref_row[k + 3],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 4],
+                                ref_row[k + 4],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 5],
+                                ref_row[k + 5],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 6],
+                                ref_row[k + 6],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             ),
                             emit_from_allele_probs(
-                                ref_alleles[k + 7],
+                                ref_row[k + 7],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
@@ -6708,51 +6906,51 @@ fn sample_path_from_checkpoints<RefSpace>(
                         ]
                     } else {
                         [
-                            emit_combined_fast(ref_alleles[k], emit_mode, conf_m, p_no_err, p_err),
+                            emit_combined_fast(ref_row[k], emit_mode, conf_m, p_no_err, p_err),
                             emit_combined_fast(
-                                ref_alleles[k + 1],
+                                ref_row[k + 1],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
                                 p_err,
                             ),
                             emit_combined_fast(
-                                ref_alleles[k + 2],
+                                ref_row[k + 2],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
                                 p_err,
                             ),
                             emit_combined_fast(
-                                ref_alleles[k + 3],
+                                ref_row[k + 3],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
                                 p_err,
                             ),
                             emit_combined_fast(
-                                ref_alleles[k + 4],
+                                ref_row[k + 4],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
                                 p_err,
                             ),
                             emit_combined_fast(
-                                ref_alleles[k + 5],
+                                ref_row[k + 5],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
                                 p_err,
                             ),
                             emit_combined_fast(
-                                ref_alleles[k + 6],
+                                ref_row[k + 6],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
                                 p_err,
                             ),
                             emit_combined_fast(
-                                ref_alleles[k + 7],
+                                ref_row[k + 7],
                                 emit_mode,
                                 conf_m,
                                 p_no_err,
@@ -6772,9 +6970,9 @@ fn sample_path_from_checkpoints<RefSpace>(
                 for i in k..n_states {
                     let prior = scale * prev_row[i] + shift;
                     let emit = if pl_n_alleles.is_some() {
-                        emit_from_allele_probs(ref_alleles[i], &allele_probs, p_no_err_pl, p_err_pl)
+                        emit_from_allele_probs(ref_row[i], &allele_probs, p_no_err_pl, p_err_pl)
                     } else {
-                        emit_combined_fast(ref_alleles[i], emit_mode, conf_m, p_no_err, p_err)
+                        emit_combined_fast(ref_row[i], emit_mode, conf_m, p_no_err, p_err)
                     };
                     curr_part[i] = prior * emit;
                     prev_sum += curr_part[i];
@@ -6785,7 +6983,7 @@ fn sample_path_from_checkpoints<RefSpace>(
                     prev_sum = 0.0;
                     for i in 0..n_states {
                         let prior = scale * prev_row[i] + shift;
-                        let emit = emit_prob_hard(ref_alleles[i], target_al, conf_m, p_no_err, p_err, true);
+                        let emit = emit_prob_hard(ref_row[i], target_al, conf_m, p_no_err, p_err, true);
                         curr_part[i] = prior * emit;
                         prev_sum += curr_part[i];
                     }
@@ -6798,49 +6996,49 @@ fn sample_path_from_checkpoints<RefSpace>(
                         let emit_arr = if pl_n_alleles.is_some() {
                             [
                                 emit_from_allele_probs(
-                                    ref_alleles[k],
+                                    ref_row[k],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 1],
+                                    ref_row[k + 1],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 2],
+                                    ref_row[k + 2],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 3],
+                                    ref_row[k + 3],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 4],
+                                    ref_row[k + 4],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 5],
+                                    ref_row[k + 5],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 6],
+                                    ref_row[k + 6],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
                                 ),
                                 emit_from_allele_probs(
-                                    ref_alleles[k + 7],
+                                    ref_row[k + 7],
                                     &allele_probs,
                                     p_no_err_pl,
                                     p_err_pl,
@@ -6848,51 +7046,51 @@ fn sample_path_from_checkpoints<RefSpace>(
                             ]
                         } else {
                             [
-                                emit_prob(ref_alleles[k], target_al, conf_m, p_no_err, p_err),
+                                emit_prob(ref_row[k], target_al, conf_m, p_no_err, p_err),
                                 emit_prob(
-                                    ref_alleles[k + 1],
+                                    ref_row[k + 1],
                                     target_al,
                                     conf_m,
                                     p_no_err,
                                     p_err,
                                 ),
                                 emit_prob(
-                                    ref_alleles[k + 2],
+                                    ref_row[k + 2],
                                     target_al,
                                     conf_m,
                                     p_no_err,
                                     p_err,
                                 ),
                                 emit_prob(
-                                    ref_alleles[k + 3],
+                                    ref_row[k + 3],
                                     target_al,
                                     conf_m,
                                     p_no_err,
                                     p_err,
                                 ),
                                 emit_prob(
-                                    ref_alleles[k + 4],
+                                    ref_row[k + 4],
                                     target_al,
                                     conf_m,
                                     p_no_err,
                                     p_err,
                                 ),
                                 emit_prob(
-                                    ref_alleles[k + 5],
+                                    ref_row[k + 5],
                                     target_al,
                                     conf_m,
                                     p_no_err,
                                     p_err,
                                 ),
                                 emit_prob(
-                                    ref_alleles[k + 6],
+                                    ref_row[k + 6],
                                     target_al,
                                     conf_m,
                                     p_no_err,
                                     p_err,
                                 ),
                                 emit_prob(
-                                    ref_alleles[k + 7],
+                                    ref_row[k + 7],
                                     target_al,
                                     conf_m,
                                     p_no_err,
@@ -6913,13 +7111,13 @@ fn sample_path_from_checkpoints<RefSpace>(
                         let prior = scale * prev_row[i] + shift;
                         let emit = if pl_n_alleles.is_some() {
                             emit_from_allele_probs(
-                                ref_alleles[i],
+                                ref_row[i],
                                 &allele_probs,
                                 p_no_err_pl,
                                 p_err_pl,
                             )
                         } else {
-                            emit_prob(ref_alleles[i], target_al, conf_m, p_no_err, p_err)
+                            emit_prob(ref_row[i], target_al, conf_m, p_no_err, p_err)
                         };
                         curr_part[i] = prior * emit;
                         prev_sum += curr_part[i];
@@ -7835,6 +8033,14 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let n_blocks = block_starts.len().max(1);
     // Resize workspace if needed for this window
     workspace.ensure_for_window(n_markers, n_states, max_block_len, n_blocks);
+    let ref_flat_len = n_markers.saturating_mul(n_states);
+    if ref_flat_len > 0 {
+        ref_provider.materialize_into(
+            n_markers,
+            &mut workspace.ref_alleles_flat[..ref_flat_len],
+        );
+    }
+    let shared_ref = &workspace.ref_alleles_flat[..ref_flat_len];
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
@@ -7858,21 +8064,22 @@ fn sample_swap_bits_mosaic<RefSpace>(
         if let Some(paths) = heuristic_paths.as_mut() {
             let mut score_direct: i32 = 0;
             let mut score_flip: i32 = 0;
-            let ref_alleles = &mut workspace.ref_alleles;
+            let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
             for m in 0..n_markers {
                 let a1 = anchor_h1.get(m).copied().unwrap_or(255);
                 let a2 = anchor_h2.get(m).copied().unwrap_or(255);
                 if a1 == 255 && a2 == 255 {
                     continue;
                 }
-                ref_provider.fill_ref_alleles(m, ref_alleles);
                 let p1 = paths.path1[m] as usize;
                 let p2 = paths.path2[m] as usize;
                 if p1 >= n_states || p2 >= n_states {
                     continue;
                 }
-                let r1 = ref_alleles[p1];
-                let r2 = ref_alleles[p2];
+                let offset = m * n_states;
+                let ref_row = &ref_alleles_flat[offset..offset + n_states];
+                let r1 = ref_row[p1];
+                let r2 = ref_row[p2];
                 if a1 != 255 {
                     if r1 == a1 {
                         score_direct += 1;
@@ -7919,21 +8126,22 @@ fn sample_swap_bits_mosaic<RefSpace>(
         if let Some(paths) = start_paths {
             let mut score_direct: i32 = 0;
             let mut score_flip: i32 = 0;
-            let ref_alleles = &mut workspace.ref_alleles;
+            let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
             for m in 0..n_markers {
                 let a1 = anchor_h1.get(m).copied().unwrap_or(255);
                 let a2 = anchor_h2.get(m).copied().unwrap_or(255);
                 if a1 == 255 && a2 == 255 {
                     continue;
                 }
-                ref_provider.fill_ref_alleles(m, ref_alleles);
                 let p1 = paths.path1[m] as usize;
                 let p2 = paths.path2[m] as usize;
                 if p1 >= n_states || p2 >= n_states {
                     continue;
                 }
-                let r1 = ref_alleles[p1];
-                let r2 = ref_alleles[p2];
+                let offset = m * n_states;
+                let ref_row = &ref_alleles_flat[offset..offset + n_states];
+                let r1 = ref_row[p1];
+                let r2 = ref_row[p2];
                 if a1 != 255 {
                     if r1 == a1 {
                         score_direct += 1;
@@ -8013,6 +8221,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 hard_match: &dummy_hard_match,
             },
             &mut ref_provider,
+            (!workspace.ref_alleles_flat.is_empty())
+                .then_some(&workspace.ref_alleles_flat[..ref_flat_len]),
             pl_provider.as_ref(),
             &mut workspace.allele_probs,
             fwd,
@@ -8046,26 +8256,78 @@ fn sample_swap_bits_mosaic<RefSpace>(
                      buffers: MosaicBuffers,
                      ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>|
      -> (Vec<f32>, Vec<f32>, MosaicPaths, MosaicBuffers, f64) {
+        const PAR_CHAINS: usize = 4;
+        let ref_view = ref_provider.ref_gt;
+        let threaded_haps = ref_provider.threaded_haps;
+
+        let alloc_like = |tmpl: &MosaicBuffers| -> MosaicBuffers {
+            MosaicBuffers {
+                fwd: aligned_vec::AVec::from_iter(32, std::iter::repeat(0.0).take(tmpl.fwd.len())),
+                fwd_prior: aligned_vec::AVec::from_iter(
+                    32,
+                    std::iter::repeat(0.0).take(tmpl.fwd_prior.len()),
+                ),
+                ref_alleles: vec![0u8; tmpl.ref_alleles.len()],
+                ref_alleles_flat: Vec::new(),
+                weights: vec![0.0f32; tmpl.weights.len()],
+                allele_probs: Vec::new(),
+                hap1_checkpoints: FwdCheckpoints::from_buffer(
+                    tmpl.hap1_checkpoints.block_starts.clone(),
+                    n_states,
+                    vec![0.0; tmpl.hap1_checkpoints.block_starts.len().max(1) * n_states],
+                ),
+                hap2_checkpoints: FwdCheckpoints::from_buffer(
+                    tmpl.hap2_checkpoints.block_starts.clone(),
+                    n_states,
+                    vec![0.0; tmpl.hap2_checkpoints.block_starts.len().max(1) * n_states],
+                ),
+                hap1_allele: vec![255u8; tmpl.hap1_allele.len()],
+                hap1_partner_allele: vec![255u8; tmpl.hap1_partner_allele.len()],
+                hap1_use_combined: vec![true; tmpl.hap1_use_combined.len()],
+                hap1_hard_match: vec![false; tmpl.hap1_hard_match.len()],
+                hap2_allele: vec![255u8; tmpl.hap2_allele.len()],
+                hap2_partner_allele: vec![255u8; tmpl.hap2_partner_allele.len()],
+                hap2_use_combined: vec![true; tmpl.hap2_use_combined.len()],
+                hap2_hard_match: vec![false; tmpl.hap2_hard_match.len()],
+                path1: vec![0u32; tmpl.path1.len()],
+                path2: vec![0u32; tmpl.path2.len()],
+                fwd_block: vec![0.0f32; tmpl.fwd_block.len()],
+            }
+        };
+
+        let mut chains: Vec<MosaicChain<RefSpace>> = Vec::with_capacity(PAR_CHAINS);
+        let mut buffers_vec: Vec<MosaicBuffers> = Vec::with_capacity(PAR_CHAINS);
+        buffers_vec.push(buffers);
+        for _ in 1..PAR_CHAINS {
+            let tmpl = buffers_vec.first().unwrap();
+            buffers_vec.push(alloc_like(tmpl));
+        }
+        let mut buffers_iter = buffers_vec.into_iter();
+        let first_buf = buffers_iter.next().unwrap();
+
+        let seed_i = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let mut chain = MosaicChain::new_with_buffers(
-            seed,
+            seed_i,
             n_markers,
             n_states,
             p_recomb,
             seq1,
             seq2,
             conf,
-            ref_provider,
+            provider,
             combined_checkpoints_ref,
-            buffers,
+            first_buf,
+            Some(shared_ref),
             p_no_err,
             p_err,
             pl_provider,
             chain_anchor_hap1.clone(),
             chain_anchor_hap2.clone(),
         );
-
         if let Some(paths) = init_paths {
-            let has_valid_lengths = paths.path1.len() == n_markers && paths.path2.len() == n_markers;
+            let has_valid_lengths =
+                paths.path1.len() == n_markers && paths.path2.len() == n_markers;
             let has_valid_states = has_valid_lengths
                 && paths.path1.iter().all(|&p| (p as usize) < n_states)
                 && paths.path2.iter().all(|&p| (p as usize) < n_states);
@@ -8077,117 +8339,204 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 chain.first_iteration = false;
             }
         }
+        chains.push(chain);
+
+        for (idx, buf) in buffers_iter.enumerate() {
+            let seed_i =
+                seed.wrapping_add(((idx + 1) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let provider = RefAlleleProvider::new(ref_view, threaded_haps);
+            let mut chain = MosaicChain::new_with_buffers(
+                seed_i,
+                n_markers,
+                n_states,
+                p_recomb,
+                seq1,
+                seq2,
+                conf,
+                provider,
+                combined_checkpoints_ref,
+                buf,
+                Some(shared_ref),
+                p_no_err,
+                p_err,
+                pl_provider,
+                chain_anchor_hap1.clone(),
+                chain_anchor_hap2.clone(),
+            );
+            if let Some(paths) = init_paths {
+                let has_valid_lengths =
+                    paths.path1.len() == n_markers && paths.path2.len() == n_markers;
+                let has_valid_states = has_valid_lengths
+                    && paths.path1.iter().all(|&p| (p as usize) < n_states)
+                    && paths.path2.iter().all(|&p| (p as usize) < n_states);
+                if has_valid_states {
+                    chain.path1.resize(n_markers, 0);
+                    chain.path2.resize(n_markers, 0);
+                    chain.path1.copy_from_slice(&paths.path1);
+                    chain.path2.copy_from_slice(&paths.path2);
+                    chain.first_iteration = false;
+                }
+            }
+            chains.push(chain);
+        }
 
         for _ in 0..burnin {
-            chain.step();
+            for chain in chains.iter_mut() {
+                chain.step();
+            }
         }
 
         let mut swap_counts = vec![0f32; het_positions.len()];
         let mut obs_counts = vec![0f32; het_positions.len()];
-        let mut new_paths = MosaicPaths {
-            path1: Vec::new(),
-            path2: Vec::new(),
-        };
 
-        for sample_idx in 0..lr_samples {
-            chain.step();
-            let is_last = sample_idx + 1 == lr_samples;
+        let mut samples_done = 0usize;
+        let mut prev_bits: Vec<u8> = Vec::new();
+        let mut stable_steps = 0usize;
+        let min_samples = 2usize;
+        let stable_required = 3usize;
+        let delta_threshold = (het_positions.len() / 1000).max(1);
+        let mut early_stop = false;
+        while samples_done < lr_samples && !early_stop {
+            for chain in chains.iter_mut() {
+                if samples_done >= lr_samples {
+                    break;
+                }
+                chain.step();
 
-            let mut sample_flip: Option<bool> = None;
-            if !anchor_indices.is_empty() {
-                let mut direct = 0u32;
-                let mut flipped = 0u32;
-                for &m in &anchor_indices {
-                    let a1 = chain_anchor_hap1.get(m).copied().unwrap_or(255);
-                    let a2 = chain_anchor_hap2.get(m).copied().unwrap_or(255);
-                    if a1 == 255 && a2 == 255 {
+                let mut sample_flip: Option<bool> = None;
+                if !anchor_indices.is_empty() {
+                    let mut direct = 0u32;
+                    let mut flipped = 0u32;
+                    for &m in &anchor_indices {
+                        let a1 = chain_anchor_hap1.get(m).copied().unwrap_or(255);
+                        let a2 = chain_anchor_hap2.get(m).copied().unwrap_or(255);
+                        if a1 == 255 && a2 == 255 {
+                            continue;
+                        }
+                        let p1 = chain.path1[m] as usize;
+                        let p2 = chain.path2[m] as usize;
+                        if p1 >= n_states || p2 >= n_states {
+                            continue;
+                        }
+                        let ref_row = chain.ref_row(m);
+                        let r1 = ref_row[p1];
+                        let r2 = ref_row[p2];
+                        if a1 != 255 && a2 != 255 {
+                            if r1 == a1 && r2 == a2 {
+                                direct += 1;
+                            } else if r1 == a2 && r2 == a1 {
+                                flipped += 1;
+                            }
+                        } else if a1 != 255 {
+                            if r1 == a1 {
+                                direct += 1;
+                            } else if r2 == a1 {
+                                flipped += 1;
+                            }
+                        } else if a2 != 255 {
+                            if r2 == a2 {
+                                direct += 1;
+                            } else if r1 == a2 {
+                                flipped += 1;
+                            }
+                        }
+                    }
+                    if direct > 0 || flipped > 0 {
+                        sample_flip = Some(flipped > direct);
+                    }
+                }
+
+                let mut last_bits: Vec<u8> = vec![0u8; het_positions.len()];
+                let mut last_obs: Vec<u8> = vec![0u8; het_positions.len()];
+                for (i, &m) in het_positions.iter().enumerate() {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
                         continue;
                     }
-                    chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
+
                     let p1 = chain.path1[m] as usize;
                     let p2 = chain.path2[m] as usize;
                     if p1 >= n_states || p2 >= n_states {
                         continue;
                     }
-                    let r1 = chain.ref_alleles[p1];
-                    let r2 = chain.ref_alleles[p2];
-                    if a1 != 255 && a2 != 255 {
-                        if r1 == a1 && r2 == a2 {
-                            direct += 1;
-                        } else if r1 == a2 && r2 == a1 {
-                            flipped += 1;
-                        }
-                    } else if a1 != 255 {
-                        if r1 == a1 {
-                            direct += 1;
-                        } else if r2 == a1 {
-                            flipped += 1;
-                        }
-                    } else if a2 != 255 {
-                        if r2 == a2 {
-                            direct += 1;
-                        } else if r1 == a2 {
-                            flipped += 1;
+                    let ref_row = chain.ref_row(m);
+                    let ref1 = ref_row[p1];
+                    let ref2 = ref_row[p2];
+
+                    let mut orient = if ref1 == a1 && ref2 == a2 {
+                        Some(0u8)
+                    } else if ref1 == a2 && ref2 == a1 {
+                        Some(1u8)
+                    } else if ref1 == 255 && ref2 == a2 {
+                        Some(0u8)
+                    } else if ref1 == 255 && ref2 == a1 {
+                        Some(1u8)
+                    } else if ref2 == 255 && ref1 == a1 {
+                        Some(0u8)
+                    } else if ref2 == 255 && ref1 == a2 {
+                        Some(1u8)
+                    } else {
+                        None
+                    };
+                    if let (Some(flip), Some(val)) = (sample_flip, orient) {
+                        if flip {
+                            orient = Some(1 - val);
                         }
                     }
-                }
-                if direct > 0 || flipped > 0 {
-                    sample_flip = Some(flipped > direct);
-                }
-            }
 
-            for (i, &m) in het_positions.iter().enumerate() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    continue;
+                    if let Some(orient) = orient {
+                        last_bits[i] = orient;
+                        last_obs[i] = 1;
+                        swap_counts[i] += orient as f32;
+                        obs_counts[i] += 1.0;
+                    }
                 }
+                samples_done += 1;
 
-                let p1 = chain.path1[m] as usize;
-                let p2 = chain.path2[m] as usize;
-                if p1 >= n_states || p2 >= n_states {
-                    continue;
-                }
-                chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
-                let ref1 = chain.ref_alleles[p1];
-                let ref2 = chain.ref_alleles[p2];
-
-                let mut orient = if ref1 == a1 && ref2 == a2 {
-                    Some(0u8)
-                } else if ref1 == a2 && ref2 == a1 {
-                    Some(1u8)
-                } else if ref1 == 255 && ref2 == a2 {
-                    Some(0u8)
-                } else if ref1 == 255 && ref2 == a1 {
-                    Some(1u8)
-                } else if ref2 == 255 && ref1 == a1 {
-                    Some(0u8)
-                } else if ref2 == 255 && ref1 == a2 {
-                    Some(1u8)
+                let mut changed = 0usize;
+                if prev_bits.len() == last_bits.len() {
+                    for (a, b) in prev_bits.iter().zip(last_bits.iter()) {
+                        if a != b {
+                            changed += 1;
+                        }
+                    }
                 } else {
-                    None
-                };
-                if let (Some(flip), Some(val)) = (sample_flip, orient) {
-                    if flip {
-                        orient = Some(1 - val);
+                    changed = last_bits.len();
+                }
+                prev_bits = last_bits;
+
+                if samples_done >= min_samples {
+                    if changed <= delta_threshold {
+                        stable_steps += 1;
+                    } else {
+                        stable_steps = 0;
+                    }
+                    if stable_steps >= stable_required {
+                        let remaining = lr_samples.saturating_sub(samples_done);
+                        if remaining > 0 {
+                            for i in 0..prev_bits.len() {
+                                let obs = last_obs[i] as f32;
+                                if obs > 0.0 {
+                                    swap_counts[i] += prev_bits[i] as f32 * remaining as f32;
+                                    obs_counts[i] += remaining as f32;
+                                }
+                            }
+                        }
+                        early_stop = true;
+                        break;
                     }
                 }
-
-                if let Some(orient) = orient {
-                    swap_counts[i] += orient as f32;
-                    obs_counts[i] += 1.0;
-                }
-            }
-
-            if is_last {
-                new_paths = MosaicPaths {
-                    path1: chain.path1.clone(),
-                    path2: chain.path2.clone(),
-                };
             }
         }
 
-        let log_like = {
+        let mut best_log_like = f64::NEG_INFINITY;
+        let mut best_paths = MosaicPaths {
+            path1: Vec::new(),
+            path2: Vec::new(),
+        };
+        let mut best_idx = 0usize;
+        for (idx, chain) in chains.iter_mut().enumerate() {
             let mut ll = 0.0f64;
             for m in 0..n_markers {
                 let a1 = seq1[m];
@@ -8195,23 +8544,36 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 if a1 == 255 || a2 == 255 {
                     continue;
                 }
-                chain.ref_provider.fill_ref_alleles(m, &mut chain.ref_alleles);
                 let p1 = chain.path1[m] as usize;
                 let p2 = chain.path2[m] as usize;
                 if p1 >= n_states || p2 >= n_states {
                     continue;
                 }
-                let ref1 = chain.ref_alleles[p1];
-                let ref2 = chain.ref_alleles[p2];
+                let ref_row = chain.ref_row(m);
+                let ref1 = ref_row[p1];
+                let ref2 = ref_row[p2];
                 let conf_m = conf[m];
                 let emit = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
                     * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
                 ll += (emit as f64).ln();
             }
-            ll
-        };
-        let returned = chain.into_buffers();
-        (swap_counts, obs_counts, new_paths, returned, log_like)
+            if ll > best_log_like {
+                best_log_like = ll;
+                best_idx = idx;
+            }
+        }
+        if let Some(chain) = chains.get(best_idx) {
+            best_paths = MosaicPaths {
+                path1: chain.path1.clone(),
+                path2: chain.path2.clone(),
+            };
+        }
+        let returned = chains
+            .into_iter()
+            .nth(0)
+            .expect("chain 0")
+            .into_buffers();
+        (swap_counts, obs_counts, best_paths, returned, best_log_like)
     };
 
     let ref_view = ref_provider.ref_gt;
@@ -8221,6 +8583,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         fwd: std::mem::replace(&mut workspace.fwd, aligned_vec::AVec::new(32)),
         fwd_prior: std::mem::replace(&mut workspace.fwd_prior, aligned_vec::AVec::new(32)),
         ref_alleles: std::mem::take(&mut workspace.ref_alleles),
+        ref_alleles_flat: Vec::new(),
         weights: std::mem::take(&mut workspace.weights),
         allele_probs: std::mem::take(&mut workspace.allele_probs),
         hap1_checkpoints: FwdCheckpoints::from_buffer(
@@ -8301,10 +8664,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_lr = Vec::with_capacity(het_positions.len());
     let mut swap_probs = Vec::with_capacity(het_positions.len());
     let mut swap_probs_conf = Vec::with_capacity(het_positions.len());
-    let mut obs_zero = 0usize;
     let mut p_min = 1.0f32;
     let mut p_max = 0.0f32;
-    let mut p_sum = 0.0f32;
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
@@ -8313,9 +8674,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             swap_lr.push(1.0);
             swap_probs.push(0.5);
             swap_probs_conf.push(0.5);
-            if obs_counts[i] < 0.5 {
-                obs_zero += 1;
-            }
             continue;
         }
 
@@ -8340,7 +8698,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let p = p_swap.clamp(0.0, 1.0);
         p_min = p_min.min(p);
         p_max = p_max.max(p);
-        p_sum += p;
     }
     // Derive swap emissions from the sampled haplotype paths and run the label
     // HMM on those emissions. This ties swaps to the inferred paths rather than
@@ -8378,9 +8735,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
         let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let ref_alleles = &mut buffers.ref_alleles;
+        let ref_alleles_flat = shared_ref;
         p_min = 1.0;
         p_max = 0.0;
-        p_sum = 0.0;
         for (i, &m) in het_positions.iter().enumerate() {
             let a1 = if flip_to_anchor { seq2[m] } else { seq1[m] };
             let a2 = if flip_to_anchor { seq1[m] } else { seq2[m] };
@@ -8389,7 +8746,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 swap_lr[i] = 1.0;
                 continue;
             }
-            path_provider.fill_ref_alleles(m, ref_alleles);
             let p1 = new_paths.path1[m] as usize;
             let p2 = new_paths.path2[m] as usize;
             if p1 >= n_states || p2 >= n_states {
@@ -8397,8 +8753,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 swap_lr[i] = 1.0;
                 continue;
             }
-            let ref1 = ref_alleles[p1];
-            let ref2 = ref_alleles[p2];
+            let ref_row = if !ref_alleles_flat.is_empty() {
+                let offset = m * n_states;
+                &ref_alleles_flat[offset..offset + n_states]
+            } else {
+                path_provider.fill_ref_alleles(m, ref_alleles);
+                &ref_alleles[..n_states]
+            };
+            let ref1 = ref_row[p1];
+            let ref2 = ref_row[p2];
             let conf_m = conf[m];
             let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
                 * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
@@ -8421,7 +8784,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             swap_lr[i] = lr;
             p_min = p_min.min(p_swap);
             p_max = p_max.max(p_swap);
-            p_sum += p_swap;
         }
     }
     if !het_positions.is_empty() {
@@ -8498,20 +8860,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
 
     }
-    let _ = (
-        obs_zero,
-        p_min,
-        p_sum,
-        p_max,
-        chain_anchor_hap1.len(),
-        n_markers,
-        &obs_counts,
-    );
-
     // Return buffers to workspace for reuse
     workspace.fwd = buffers.fwd;
     workspace.fwd_prior = buffers.fwd_prior;
     workspace.ref_alleles = buffers.ref_alleles;
+    if !buffers.ref_alleles_flat.is_empty() {
+        workspace.ref_alleles_flat = buffers.ref_alleles_flat;
+    }
     workspace.weights = buffers.weights;
     workspace.allele_probs = buffers.allele_probs;
     workspace.hap1_checkpoint_data = buffers.hap1_checkpoints.into_buffer();

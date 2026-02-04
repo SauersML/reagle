@@ -17,6 +17,8 @@ pub struct ThreadWorkspace {
     pub fwd_prior: AVec<f32, ConstAlign<32>>,
     /// Per-marker ref alleles buffer (n_states)
     pub ref_alleles: Vec<u8>,
+    /// Materialized ref alleles buffer (n_markers * n_states)
+    pub ref_alleles_flat: Vec<u8>,
     /// Reusable weights buffer for backward sampling (n_states)
     pub weights: Vec<f32>,
     /// Reusable allele probability scratch (variable length; typically n_alleles)
@@ -76,6 +78,7 @@ impl ThreadWorkspace {
             bwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             fwd_prior: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
             ref_alleles: Vec::new(),
+            ref_alleles_flat: Vec::new(),
             weights: Vec::new(),
             allele_probs: Vec::new(),
             path1: Vec::new(),
@@ -144,6 +147,10 @@ impl ThreadWorkspace {
 
         if self.ref_alleles.len() < n_states {
             self.ref_alleles.resize(n_states, 0);
+        }
+        let flat_len = n_markers.saturating_mul(n_states);
+        if self.ref_alleles_flat.len() < flat_len {
+            self.ref_alleles_flat.resize(flat_len, 0);
         }
 
         if self.weights.len() < n_states {

@@ -59,6 +59,35 @@ impl GenotypeColumn {
         }
     }
 
+    /// Fill a batch of alleles for the provided haplotypes.
+    #[inline]
+    pub fn fill_batch(&self, haps: &[HapIdx], out: &mut [u8]) {
+        let n = haps.len().min(out.len());
+        match self {
+            Self::Dense(col) => {
+                for i in 0..n {
+                    out[i] = col.get(haps[i]);
+                }
+            }
+            Self::Sparse(col) => {
+                for i in 0..n {
+                    out[i] = col.get(haps[i]);
+                }
+            }
+            Self::Dictionary(col, offset) => {
+                let marker_offset = *offset;
+                for i in 0..n {
+                    out[i] = col.get(marker_offset, haps[i]);
+                }
+            }
+            Self::SeqCoded(col) => {
+                for i in 0..n {
+                    out[i] = col.get(haps[i]);
+                }
+            }
+        }
+    }
+
     /// Number of haplotypes in this column
     pub fn n_haplotypes(&self) -> usize {
         match self {

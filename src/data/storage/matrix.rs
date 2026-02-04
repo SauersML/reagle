@@ -196,6 +196,13 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.columns[marker.as_usize()].get(hap)
     }
 
+    /// Fill a batch of alleles for the provided haplotypes at a marker.
+    #[inline]
+    pub fn fill_batch(&self, marker: MarkerIdx<Space>, haps: &[HapIdx], out: &mut [u8]) {
+        let col = &self.columns[marker.as_usize()];
+        col.fill_batch(haps, out);
+    }
+
     /// Total memory usage in bytes (approximate)
     pub fn size_bytes(&self) -> usize {
         let column_bytes: usize = self.columns.iter().map(|c| c.size_bytes()).sum();

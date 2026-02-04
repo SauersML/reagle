@@ -146,6 +146,40 @@ impl MutableGenotypes {
         self.bits[idx] as u8
     }
 
+    /// Fill a batch of alleles for the provided haplotypes at a marker.
+    #[inline]
+    pub fn fill_batch(&self, marker: usize, haps: &[HapIdx], out: &mut [u8]) {
+        let n = haps.len().min(out.len());
+        let base = marker * self.n_haps;
+
+        if self.exc_count == 0 {
+            for i in 0..n {
+                let h = haps[i].as_usize();
+                out[i] = self.bits[base + h] as u8;
+            }
+            return;
+        }
+
+        for i in 0..n {
+            let h = haps[i].as_usize();
+            out[i] = self.bits[base + h] as u8;
+        }
+
+        let (block_idx, offset) = Self::block_index(marker);
+        if let Some(block) = self.exceptions.get(block_idx) {
+            if block.is_empty() {
+                return;
+            }
+            for i in 0..n {
+                let h = haps[i].as_usize();
+                let key = Self::pack_key(offset, h, self.n_haps);
+                if let Ok(pos) = block.binary_search_by_key(&key, |(k, _)| *k) {
+                    out[i] = block[pos].1;
+                }
+            }
+        }
+    }
+
     /// Check if position is missing
     #[inline]
     pub fn is_missing(&self, marker: usize, hap: HapIdx) -> bool {

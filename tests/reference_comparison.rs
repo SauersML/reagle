@@ -11,7 +11,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use clap::Parser;
 use rand::SeedableRng;
 
 // Import Rust implementation for comparison tests
@@ -2817,7 +2816,8 @@ fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Res
         out_prefix.to_str().unwrap(),
         "--seed",
         &seed.to_string(),
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -2845,7 +2845,8 @@ fn run_rust_phasing_with_map(
         &window_cm.to_string(),
         "--overlap",
         &overlap_cm.to_string(),
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -2868,7 +2869,8 @@ fn run_rust_imputation(
         "--seed",
         &seed.to_string(),
         "--gp",
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2894,7 +2896,8 @@ fn run_rust_imputation_with_err(
         "--gp",
         "--err",
         &err.to_string(),
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2920,7 +2923,8 @@ fn run_rust_imputation_with_ne(
         "--gp",
         "--ne",
         &ne.to_string(),
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2946,7 +2950,8 @@ fn run_rust_imputation_with_cluster(
         "--gp",
         "--cluster",
         &cluster.to_string(),
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -2978,7 +2983,8 @@ fn run_rust_imputation_with_map(
         &window_cm.to_string(),
         "--overlap",
         &overlap_cm.to_string(),
-    ]);
+    ])
+    .expect("config");
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
