@@ -7619,32 +7619,29 @@ fn sample_dynamic_mcmc(
                 }
             }
 
-            let threshold = 0.9 * (informative as f32);
-            if best_score >= threshold {
-                let h1_best = neighbors[best_pair.0];
-                let h2_best = neighbors[best_pair.1];
-                path1_ref.fill(h1_best);
-                path2_ref.fill(h2_best);
-                for m in 0..n_markers {
-                    let a1 = seq1[m];
-                    let a2 = seq2[m];
-                    if a1 == 255 || a2 == 255 || a1 == a2 {
-                        continue;
-                    }
-                    let r1 = phase_ibs.allele(m, h1_best);
-                    let r2 = phase_ibs.allele(m, h2_best);
-                    let m1 = r1 == a1 && r2 == a2;
-                    let m2 = r1 == a2 && r2 == a1;
-                    if m1 && !m2 {
-                        h1_alleles[m] = a1;
-                        h2_alleles[m] = a2;
-                    } else if m2 && !m1 {
-                        h1_alleles[m] = a2;
-                        h2_alleles[m] = a1;
-                    }
+            let h1_best = neighbors[best_pair.0];
+            let h2_best = neighbors[best_pair.1];
+            path1_ref.fill(h1_best);
+            path2_ref.fill(h2_best);
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
                 }
-                seeded_from_heuristic = true;
+                let r1 = phase_ibs.allele(m, h1_best);
+                let r2 = phase_ibs.allele(m, h2_best);
+                let m1 = r1 == a1 && r2 == a2;
+                let m2 = r1 == a2 && r2 == a1;
+                if m1 && !m2 {
+                    h1_alleles[m] = a1;
+                    h2_alleles[m] = a2;
+                } else if m2 && !m1 {
+                    h1_alleles[m] = a2;
+                    h2_alleles[m] = a1;
+                }
             }
+            seeded_from_heuristic = true;
         }
     }
 
@@ -7667,6 +7664,11 @@ fn sample_dynamic_mcmc(
         hap1_idx: u32,
         rng: &mut impl rand::Rng,
     ) {
+        if n_haps == 0 {
+            neighbors.clear();
+            return;
+        }
+
         // If there are no other haplotypes to sample from, fall back to self so we can proceed.
         // This avoids an infinite loop for single-sample or haploid inputs.
         if n_haps <= 2 {
@@ -8095,9 +8097,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    let threshold = 0.9 * (informative as f32);
-
-    if best_score < threshold || n_markers > 2000 {
+    if n_markers > 2000 {
         return None;
     }
 
