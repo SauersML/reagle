@@ -8144,7 +8144,10 @@ fn sample_dynamic_mcmc(
             }
         }
 
-        while neighbors.len() < target {
+        let max_attempts = n_haps.saturating_mul(10).max(1000);
+        let mut attempts = 0;
+        while neighbors.len() < target && attempts < max_attempts {
+            attempts += 1;
             let h = rng.random_range(0..n_haps);
             if h == hap1_idx || h == hap1_idx + 1 {
                 continue;
