@@ -839,6 +839,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let n1 = k.min(match_a1.len()).max(1);
         let n2 = k.min(match_a2.len()).max(1);
 
+        // Reverse match lists to prioritize most recently active/promoted haplotypes
+        match_a1.reverse();
+        match_a2.reverse();
+
         let picks_a1 = sample_even(&match_a1, n1);
         let picks_a2 = sample_even(&match_a2, n2);
 

@@ -545,8 +545,8 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
         config.r#ref = Some(ref_path.clone());
         config.out = out_path.clone();
         config.phase_states = 0;
-        config.burnin = 0;
-        config.iterations = 2;
+        config.burnin = 2;
+        config.iterations = 5;
         config.nthreads = Some(1);
         config.ne = 10000.0;
         config.err = Some(0.0001);

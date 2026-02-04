@@ -3666,31 +3666,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
-        if n_markers <= 60 {
-            let sample = 0usize;
-            let mut phased_count = 0usize;
-            let mut unphased_hets = 0usize;
-            for m in 0..n_markers {
-                let phased = phase_mask
-                    .and_then(|mask| mask.get(m).and_then(|row| row.get(sample)))
-                    .copied()
-                    .unwrap_or(0);
-                if phased != 0 {
-                    phased_count += 1;
-                }
-                let a1 = target_geno.get(m, HapIdx::new((sample * 2) as u32));
-                let a2 = target_geno.get(m, HapIdx::new((sample * 2 + 1) as u32));
-                if phased == 0 && a1 != 255 && a2 != 255 && a1 != a2 {
-                    unphased_hets += 1;
-                }
-            }
-            eprintln!(
-                "[prescan debug] mask_unphased_hets[0]={} phased={} unphased_hets={}",
-                mask_unphased_hets.get(sample).copied().unwrap_or(false),
-                phased_count,
-                unphased_hets
-            );
-        }
         let avail = available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
         let batches_per_window = (n_haps + batch_size - 1) / batch_size;
@@ -3817,30 +3792,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
-        if n_markers <= 60 {
-            if let Some(list) = scores_by_window_by_hap.get(0).and_then(|v| v.get(0)) {
-                let mut hero_score = None;
-                let has_hero = list.iter().any(|(h, _)| {
-                    if *h == 98 {
-                        hero_score = list.iter().find(|(hh, _)| *hh == 98).map(|(_, s)| *s);
-                        true
-                    } else {
-                        false
-                    }
-                });
-                eprintln!(
-                    "[prescan debug] window0_top={:?} hero98_in_top={} hero98_score={:?}",
-                    list.iter().take(10).collect::<Vec<_>>(),
-                    has_hero,
-                    hero_score
-                );
-            }
-        }
 
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
         let exclude_self = ref_gt.is_none();
-        let debug_watch = vec![198usize, 199usize];
         let ref_has_panel = ref_gt.is_some();
         let out: Vec<crate::model::states::ThreadedHaps<CombinedHapSpace>> = (0..n_samples)
             .into_par_iter()
@@ -3905,75 +3860,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             let abyss = vec![false; n_ref_haps];
             let (mut candidate_haps, mut scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
-            if s == 0 && n_markers <= 60 {
-                let hero_in_candidates = candidate_haps.iter().any(|&h| h == 98);
-                eprintln!(
-                    "[prescan debug] hero98_in_candidates={}",
-                    hero_in_candidates
-                );
-                if hero_in_candidates {
-                    if let Some(pos) = candidate_haps.iter().position(|&h| h == 98) {
-                        eprintln!(
-                            "[prescan debug] hero98_scores={:?}",
-                            scores_by_hap.get(pos)
-                        );
-                    }
-                }
-                if n_markers <= 12 && ref_has_panel {
-                    let mut all_zero = Vec::new();
-                    let mut all_one = Vec::new();
-                    for h in 0..n_ref_haps {
-                        let hap_idx = HapIdx::new(h as u32);
-                        let mut ok0 = true;
-                        let mut ok1 = true;
-                        for m in 0..n_markers {
-                            let ref_col_idx = ref_col_for_marker[m];
-                            if ref_col_idx == usize::MAX {
-                                continue;
-                            }
-                            let ref_al = ref_columns
-                                .get(ref_col_idx)
-                                .map(|c| c.get(hap_idx))
-                                .unwrap_or(255);
-                            if ref_al != 0 {
-                                ok0 = false;
-                            }
-                            if ref_al != 1 {
-                                ok1 = false;
-                            }
-                            if !ok0 && !ok1 {
-                                break;
-                            }
-                        }
-                        if ok0 {
-                            all_zero.push(h);
-                        }
-                        if ok1 {
-                            all_one.push(h);
-                        }
-                    }
-                    eprintln!("[prescan debug] all_zero_haps={:?}", all_zero);
-                    eprintln!("[prescan debug] all_one_haps={:?}", all_one);
-                    let zero_in_candidates = all_zero.iter().any(|h| candidate_haps.contains(h));
-                    let one_in_candidates = all_one.iter().any(|h| candidate_haps.contains(h));
-                    eprintln!(
-                        "[prescan debug] all_zero_in_candidates={} all_one_in_candidates={}",
-                        zero_in_candidates, one_in_candidates
-                    );
-                }
-            }
-            if s == 0 {
-                eprintln!(
-                    "[prescan] sample={} candidate_haps={} windows={}",
-                    s,
-                    candidate_haps.len(),
-                    num_windows
-                );
-                for &h in &debug_watch {
-                    let found = candidate_haps.iter().any(|&c| c == h);
-                    eprintln!("[prescan] watch_hap={} present={}", h, found);
-                }
-            }
             if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
@@ -4130,15 +4016,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
             selected = ranked_selected;
 
-            if s == 0 && n_markers <= 60 {
-                let mut selected_dbg = selected.clone();
-                selected_dbg.sort_unstable();
-                eprintln!(
-                    "[prescan debug] selected_ref_len={} first={:?}",
-                    selected_dbg.len(),
-                    selected_dbg.iter().take(10).collect::<Vec<_>>()
-                );
-            }
 
             let offset = if ref_has_panel { n_haps } else { 0 };
             let mut th = crate::model::states::ThreadedHaps::<CombinedHapSpace>::new(
@@ -4149,18 +4026,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             for h in selected {
                 let combined = combined_from_ref(h, offset as u32);
                 th.push_new(combined);
-            }
-            if s == 0 && n_markers <= 60 {
-                let mut buf = vec![CombinedHapId::from(0u32); th.n_states()];
-                th.materialize_at(0, &mut buf);
-                let mut selected_dbg: Vec<usize> =
-                    buf.iter().map(|id| id.as_u32() as usize).collect();
-                selected_dbg.sort_unstable();
-                eprintln!(
-                    "[prescan debug] sample=0 selected_combined_len={} first={:?}",
-                    selected_dbg.len(),
-                    selected_dbg.iter().take(10).collect::<Vec<_>>()
-                );
             }
             th
         })
@@ -7714,7 +7579,7 @@ fn sample_dynamic_mcmc(
             } else if is_anchor {
                 fixed_allele[m] = anchor_a2;
             } else {
-                fixed_allele[m] = 255; // Unphased het: no orientation constraint
+                fixed_allele[m] = h2_alleles[m];
             }
         }
 
@@ -7797,7 +7662,7 @@ fn sample_dynamic_mcmc(
             } else if is_anchor {
                 fixed_allele[m] = anchor_a1;
             } else {
-                fixed_allele[m] = 255; // Unphased het: no orientation constraint
+                fixed_allele[m] = h1_alleles[m];
             }
         }
 
@@ -8083,20 +7948,23 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
 
-    // Attempt pairwise initialization if no initial paths provided
-    let mut heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair_with_buffer(
-            n_markers,
-            n_states,
-            seq1,
-            seq2,
-            &mut ref_provider,
-            &mut workspace.scores,
-            &mut rng,
-        )
-    } else {
-        None
-    };
+    // Attempt pairwise initialization to recover long IBD segments.
+    // We do this even if initial_paths are provided (e.g. from Beam Search) because
+    // the heuristic scan is global and can correct fragmentation in the beam path.
+    let mut heuristic_paths = find_best_constant_pair_with_buffer(
+        n_markers,
+        n_states,
+        seq1,
+        seq2,
+        &mut ref_provider,
+        &mut workspace.scores,
+        &mut rng,
+    );
+
+    if initial_paths.is_none() && heuristic_paths.is_none() {
+        // Only log if falling back to combined HMM, as this is the slow path
+        tracing::debug!("[sample_swap] Using combined HMM initialization");
+    }
 
     // Align heuristic orientation to anchors when present.
     if has_anchor {
@@ -8159,7 +8027,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let mut start_paths = initial_paths.or(heuristic_paths.as_ref());
+    let mut start_paths = heuristic_paths.as_ref().or(initial_paths);
     let mut start_paths_owned: Option<MosaicPaths> = None;
     if has_anchor {
         if let Some(paths) = start_paths {
