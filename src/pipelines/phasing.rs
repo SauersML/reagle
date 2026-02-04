@@ -5674,13 +5674,32 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let mut state_haps = vec![CombinedHapId::new(0); n_states];
                             threaded_haps.materialize_at(stage1_idx, &mut state_haps);
 
+                            // Use fwd probabilities only (unidirectional priors) to avoid leakage
+                            // from future data in the overlap region.
+                            let row_start = stage1_idx * n_states;
+                            let fwd1_slice = &fwd1[row_start..row_start + n_states];
+                            let fwd1_sum: f32 = fwd1_slice.iter().sum();
+                            let norm_fwd1: Vec<f32> = if fwd1_sum > 0.0 {
+                                fwd1_slice.iter().map(|&p| p / fwd1_sum).collect()
+                            } else {
+                                vec![1.0 / n_states as f32; n_states]
+                            };
+
+                            let fwd2_slice = &fwd2[row_start..row_start + n_states];
+                            let fwd2_sum: f32 = fwd2_slice.iter().sum();
+                            let norm_fwd2: Vec<f32> = if fwd2_sum > 0.0 {
+                                fwd2_slice.iter().map(|&p| p / fwd2_sum).collect()
+                            } else {
+                                vec![1.0 / n_states as f32; n_states]
+                            };
+
                             let prior1 = build_haplotype_priors_from_state_probs(
-                                &probs1[stage1_idx],
+                                &norm_fwd1,
                                 &state_haps,
                                 PRIOR_EXPORT_MIN_PROB,
                             );
                             let prior2 = build_haplotype_priors_from_state_probs(
-                                &probs2[stage1_idx],
+                                &norm_fwd2,
                                 &state_haps,
                                 PRIOR_EXPORT_MIN_PROB,
                             );
