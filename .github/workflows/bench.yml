@@ -183,8 +183,8 @@ jobs:
               print("No profiling.log found; skipping summary.")
               raise SystemExit(0)
 
-          ansi_re = re.compile(r"\x1b\\[[0-9;]*m")
-          span_re = re.compile(r"^(.*?)\\s+close\\s+time\\.busy=([^\\s]+)\\s+time\\.idle=([^\\s]+)")
+          ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+          span_re = re.compile(r"^(.*?)\s+close\s+time\.busy=([^\s]+)\s+time\.idle=([^\s]+)")
 
           def parse_dur(s):
               m = re.match(r"([0-9.]+)(ns|µs|us|ms|s)$", s)

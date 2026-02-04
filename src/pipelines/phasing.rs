@@ -13,7 +13,9 @@
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bitvec::prelude::*;
 use rand::{Rng, SeedableRng};
@@ -68,6 +70,53 @@ use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
 use crate::model::state_allocator::allocate_lms_sparse;
 use crate::utils::telemetry::{Stage, TelemetryBlackboard};
+
+#[derive(Default)]
+struct Stage1Timing {
+    seq_extract_ns: AtomicU64,
+    anchor_ns: AtomicU64,
+    mcmc_ns: AtomicU64,
+    total_sample_ns: AtomicU64,
+    samples: AtomicU64,
+    n_states_sum: AtomicU64,
+    hets_sum: AtomicU64,
+    anchors_sum: AtomicU64,
+    last_log_ns: AtomicU64,
+}
+
+impl Stage1Timing {
+    fn add_sample(
+        &self,
+        seq_extract: u64,
+        anchor: u64,
+        mcmc: u64,
+        total: u64,
+        n_states: u64,
+        hets: u64,
+        anchors: u64,
+    ) -> u64 {
+        self.seq_extract_ns.fetch_add(seq_extract, Ordering::Relaxed);
+        self.anchor_ns.fetch_add(anchor, Ordering::Relaxed);
+        self.mcmc_ns.fetch_add(mcmc, Ordering::Relaxed);
+        self.total_sample_ns.fetch_add(total, Ordering::Relaxed);
+        self.n_states_sum.fetch_add(n_states, Ordering::Relaxed);
+        self.hets_sum.fetch_add(hets, Ordering::Relaxed);
+        self.anchors_sum.fetch_add(anchors, Ordering::Relaxed);
+        self.samples.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn should_log(&self, elapsed_ns: u64) -> bool {
+        const LOG_EVERY_NS: u64 = 60_000_000_000;
+        let last = self.last_log_ns.load(Ordering::Relaxed);
+        if elapsed_ns.saturating_sub(last) >= LOG_EVERY_NS {
+            self.last_log_ns
+                .store(elapsed_ns, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
 use mini_mcmc::core::{MarkovChain, Trace};
 use sysinfo::System;
 
@@ -4378,6 +4427,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         let n_samples = sample_phases.len();
         let n_hi_freq = hi_freq_to_orig.len();
+        let timing = Arc::new(Stage1Timing::default());
+        let timing_start = Instant::now();
+        const LOG_EVERY_NS: u64 = 60_000_000_000;
+        if let Some(bb) = &self.telemetry {
+            bb.set_op("Stage 1: sampling mosaics");
+        }
 
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
@@ -4446,6 +4501,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let threaded_haps = &threaded_haps_vec[s];
                         let mut threaded_haps = threaded_haps.clone();
 
+                        let t0 = Instant::now();
                         // Extract alleles/confidence for SUBSET of markers using reused buffers
                         ws.seq1.clear();
                         ws.seq2.clear();
@@ -4461,6 +4517,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let seq1 = std::mem::take(&mut ws.seq1);
                         let seq2 = std::mem::take(&mut ws.seq2);
                         let sample_conf = std::mem::take(&mut ws.sample_conf);
+                        let t_seq = t0.elapsed();
 
                         let sample_seed = (self.config.seed as u64)
                             .wrapping_add(s as u64)
@@ -4492,6 +4549,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let p_err = self.params.p_mismatch;
                         let p_no_err = 1.0 - p_err;
 
+                        let t_anchor_start = Instant::now();
                         if self.reference_gt.is_some() {
                             let mut anchors: Vec<(usize, u8, u8)> = Vec::new();
                             for (i, &m) in hi_freq_to_orig.iter().enumerate() {
@@ -4595,6 +4653,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 }
                             }
                         }
+                        let t_anchor = t_anchor_start.elapsed();
 
                         let n_states = threaded_haps.n_states();
 
@@ -4612,6 +4671,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             atomic.add_estimation_data(&local_est);
                         }
 
+                        let t_mcmc_start = Instant::now();
                         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
@@ -4765,6 +4825,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             (result.0, result.1, result.2, result.3, Some(global_paths))
                         };
 
+                        let t_mcmc = t_mcmc_start.elapsed();
                         let mut swap_mask = vec![false; n_hi_freq];
                         let mut anchor_resets = 0usize;
                         let mut p_swap = vec![0.5f32; n_hi_freq];
@@ -4787,46 +4848,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             if is_het && !sp.is_unphased(m) {
                                 anchor_resets += 1;
                             }
-                        }
-
-                        eprintln!(
-                            "[phase anchors] sample={} anchors={} hets={}",
-                            s,
-                            anchor_resets,
-                            het_positions.len()
-                        );
-
-                        if s == 0 && n_hi_freq <= 12 {
-                            let mut rows = Vec::with_capacity(n_hi_freq);
-                            let mut p1_ids = Vec::with_capacity(n_hi_freq);
-                            let mut p2_ids = Vec::with_capacity(n_hi_freq);
-                            for i in 0..n_hi_freq {
-                                let a1 = seq1[i];
-                                let a2 = seq2[i];
-                                let (ref1, ref2) = if let Some(ref paths) = new_paths {
-                                    if paths.path1.len() == n_hi_freq && paths.path2.len() == n_hi_freq
-                                    {
-                                        p1_ids.push(paths.path1[i].as_u32());
-                                        p2_ids.push(paths.path2[i].as_u32());
-                                        let h1 = paths.path1[i].as_u32();
-                                        let h2 = paths.path2[i].as_u32();
-                                        (
-                                            subset_view.allele(MarkerIdx::new(i as u32), HapIdx::new(h1)),
-                                            subset_view.allele(MarkerIdx::new(i as u32), HapIdx::new(h2)),
-                                        )
-                                    } else {
-                                        (255, 255)
-                                    }
-                                } else {
-                                    (255, 255)
-                                };
-                                rows.push((i, a1, a2, ref1, ref2, swap_mask[i]));
-                            }
-                            if !p1_ids.is_empty() {
-                                eprintln!("[swap debug] path1_ids={:?}", p1_ids);
-                                eprintln!("[swap debug] path2_ids={:?}", p2_ids);
-                            }
-                            eprintln!("[swap debug] i a1 a2 ref1 ref2 swap={:?}", rows);
                         }
 
                         let het_lr_values: Vec<(usize, f32)> = het_positions
@@ -4864,23 +4885,47 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ws.sample_conf = sample_conf;
                         ws.het_positions = het_positions;
 
-                        if let Some(ref paths) = new_paths {
-                            let mut p1_switches = 0usize;
-                            let mut p2_switches = 0usize;
-                            for i in 1..paths.path1.len() {
-                                if paths.path1[i] != paths.path1[i - 1] {
-                                    p1_switches += 1;
-                                }
-                                if paths.path2[i] != paths.path2[i - 1] {
-                                    p2_switches += 1;
-                                }
-                            }
+                        let sample_total = t0.elapsed();
+                        let done = timing.add_sample(
+                            t_seq.as_nanos() as u64,
+                            t_anchor.as_nanos() as u64,
+                            t_mcmc.as_nanos() as u64,
+                            sample_total.as_nanos() as u64,
+                            n_states as u64,
+                            het_positions.len() as u64,
+                            anchor_resets as u64,
+                        );
+                        let elapsed_ns = timing_start.elapsed().as_nanos() as u64;
+                        if elapsed_ns >= LOG_EVERY_NS && timing.should_log(elapsed_ns) {
+                            let samples = timing.samples.load(Ordering::Relaxed).max(1);
+                            let total_ns =
+                                timing.total_sample_ns.load(Ordering::Relaxed).max(1);
+                            let mcmc_ns = timing.mcmc_ns.load(Ordering::Relaxed);
+                            let seq_ns = timing.seq_extract_ns.load(Ordering::Relaxed);
+                            let anchor_ns = timing.anchor_ns.load(Ordering::Relaxed);
+                            let avg_total_ms = total_ns as f64 / samples as f64 / 1e6;
+                            let avg_mcmc_ms = mcmc_ns as f64 / samples as f64 / 1e6;
+                            let avg_seq_ms = seq_ns as f64 / samples as f64 / 1e6;
+                            let avg_anchor_ms = anchor_ns as f64 / samples as f64 / 1e6;
+                            let avg_states = timing.n_states_sum.load(Ordering::Relaxed) as f64
+                                / samples as f64;
+                            let avg_hets =
+                                timing.hets_sum.load(Ordering::Relaxed) as f64 / samples as f64;
+                            let avg_anchors = timing.anchors_sum.load(Ordering::Relaxed) as f64
+                                / samples as f64;
+                            let elapsed_s = timing_start.elapsed().as_secs_f64().max(1e-9);
+                            let samp_per_s = samples as f64 / elapsed_s;
                             eprintln!(
-                                "[mosaic paths] sample={} path1_switches={} path2_switches={} markers={}",
-                                s,
-                                p1_switches,
-                                p2_switches,
-                                paths.path1.len()
+                                "[stage1] samples_done={} avg_total_ms={:.2} avg_mcmc_ms={:.2} avg_seq_ms={:.2} avg_anchor_ms={:.2} avg_states={:.1} avg_hets={:.1} avg_anchors={:.1} rate={:.2}/s",
+                                samples,
+                                avg_total_ms,
+                                avg_mcmc_ms,
+                                avg_seq_ms,
+                                avg_anchor_ms,
+                                avg_states,
+                                avg_hets,
+                                avg_anchors,
+                                samp_per_s
                             );
                         }
 
@@ -8453,32 +8498,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
 
     }
-    if !het_positions.is_empty() {
-        let denom = (het_positions.len().saturating_sub(obs_zero)).max(1) as f32;
-        let mean = p_sum / denom;
-        eprintln!(
-            "[swap stats] hets={} obs0={} p_min={:.3} p_mean={:.3} p_max={:.3} anchors={}",
-            het_positions.len(),
-            obs_zero,
-            p_min,
-            mean,
-            p_max,
-            chain_anchor_hap1.iter().filter(|&&a| a != 255).count()
-        );
-        if n_markers <= 60 {
-            let limit = het_positions.len().min(12);
-            for i in 0..limit {
-                let m = het_positions[i];
-                eprintln!(
-                    "[swap stats] m={} obs={} swap_ct={} p={:.3}",
-                    m,
-                    obs_counts[i],
-                    swap_counts[i],
-                    swap_probs[i]
-                );
-            }
-        }
-    }
+    let _ = (
+        obs_zero,
+        p_min,
+        p_sum,
+        p_max,
+        chain_anchor_hap1.len(),
+        n_markers,
+        &obs_counts,
+    );
 
     // Return buffers to workspace for reuse
     workspace.fwd = buffers.fwd;

@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reagle::data::alignment::MarkerAlignment;
 use reagle::data::marker::{AnyMarkerSpace, Nucleotide};
-use reagle::model::types::GlobalId;
+use reagle::model::types::{RefHapId, RefHapSpace};
 use reagle::model::hmm::HmmUpdater;
 use std::hint::black_box;
 
@@ -145,20 +145,21 @@ fn bench_threaded_haps_traversal(c: &mut Criterion) {
     let segments_per_state = 10; // ~1000 markers per segment
 
     // Build threaded haps with realistic segment structure
-    let mut th = ThreadedHaps::new(n_states, n_states * (segments_per_state + 1), n_markers);
+    let mut th: ThreadedHaps<RefHapSpace> =
+        ThreadedHaps::new(n_states, n_states * (segments_per_state + 1), n_markers);
     for state in 0..n_states {
-        th.push_new(GlobalId::new(state as u32));
+        th.push_new(RefHapId::new(state as u32));
         // Add segment transitions at regular intervals
         for seg in 1..segments_per_state {
             let boundary = (n_markers / segments_per_state) * seg;
-            th.add_segment(state, GlobalId::new((state + seg) as u32), boundary);
+            th.add_segment(state, RefHapId::new((state + seg) as u32), boundary);
         }
     }
 
     group.throughput(Throughput::Elements((n_markers * n_states) as u64));
 
     // Direct materialize_at (baseline, per-marker scan)
-    let mut hap_buffer = vec![GlobalId::new(0); n_states];
+    let mut hap_buffer = vec![RefHapId::new(0); n_states];
     group.bench_function("materialize_at", |b| {
         b.iter(|| {
             let mut sum = 0u32;
