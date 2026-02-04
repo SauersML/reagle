@@ -3147,7 +3147,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             };
 
-            let threaded_haps_vec = self.build_phasing_prescan_states(
+            let mut threaded_haps_vec = self.build_phasing_prescan_states(
                 target_gt,
                 &geno,
                 Some(ref_gt.as_ref()),
@@ -3160,6 +3160,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             )?;
 
             let n_target_haps = target_gt.n_haplotypes();
+            let beam_donors: Vec<std::sync::Mutex<Vec<usize>>> =
+                (0..n_samples).map(|_| std::sync::Mutex::new(Vec::new())).collect();
             sample_phases
                 .par_iter_mut()
                 .enumerate()
@@ -3230,7 +3232,76 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             sp.set_phase_confidence(m, conf);
                         }
                     }
+
+                    if let Ok(mut slot) = beam_donors[s].lock() {
+                        slot.clear();
+                        let list = active_pool.list();
+                        let cap = beam_config
+                            .beam_width
+                            .max(beam_config.inject_k.saturating_mul(2))
+                            .max(beam_config.switch_candidates.saturating_mul(4));
+                        if list.len() > cap {
+                            slot.extend_from_slice(&list[list.len() - cap..]);
+                        } else {
+                            slot.extend_from_slice(list);
+                        }
+                    }
                 });
+
+            // Feed beam-selected donors back into the HMM state set.
+            if packed_ref.n_ref_haps() > 0 {
+                let offset = n_target_haps as u32;
+                for s in 0..n_samples {
+                    let Ok(donors) = beam_donors[s].lock() else {
+                        continue;
+                    };
+                    if donors.is_empty() {
+                        continue;
+                    }
+                    let threaded_haps = &mut threaded_haps_vec[s];
+                    let mut existing =
+                        vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
+                    threaded_haps.materialize_at(0, &mut existing);
+                    let mut seen: HashSet<u32> =
+                        HashSet::with_capacity(existing.len() + donors.len());
+                    for id in existing {
+                        seen.insert(id.as_u32());
+                    }
+                    for &h in donors.iter() {
+                        let combined = combined_from_ref(RefHapId::from(h), offset);
+                        let id = combined.as_u32();
+                        if seen.insert(id) {
+                            threaded_haps.push_new(combined);
+                        }
+                    }
+                }
+            }
+
+            let stage1_blocks = partition_markers_by_cm(
+                &hi_freq_gen_positions,
+                stage1_block_cm(&hi_freq_gen_positions),
+            );
+            let ibs2 = Ibs2::new(target_gt, gen_maps, chrom, &maf);
+            let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
+                .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
+                .collect();
+
+            // Micro-HMM refinement on hi-frequency markers (single pass).
+            let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            let _ = self.run_phase_baum_iteration_stage1(
+                target_gt,
+                &mut geno,
+                &threaded_haps_vec,
+                &stage1_p_recomb,
+                &stage1_gen_dists,
+                &hi_freq_to_orig,
+                &stage1_blocks,
+                &ibs2,
+                &mut sample_phases,
+                &mut mcmc_paths,
+                None,
+                0,
+            )?;
         }
 
         // Sync final phase state from SamplePhase to MutableGenotypes
