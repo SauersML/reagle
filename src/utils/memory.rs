@@ -7,18 +7,12 @@ use sysinfo::System;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 
 /// Get the system page size in bytes.
+#[cfg(target_os = "linux")]
 pub fn get_page_size() -> u64 {
-    #[cfg(unix)]
-    {
-        let val = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if val > 0 {
-            val as u64
-        } else {
-            4096
-        }
-    }
-    #[cfg(not(unix))]
-    {
+    let val = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if val > 0 {
+        val as u64
+    } else {
         4096
     }
 }

@@ -8809,9 +8809,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let (
             mut agg_sc,
-            mut agg_oc,
+            agg_oc,
             mut best_sc,
-            mut best_oc,
+            best_oc,
             paths,
             buf,
             score,
@@ -8911,9 +8911,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
                 let (
                     mut agg_sc_f,
-                    mut agg_oc_f,
+                    agg_oc_f,
                     mut best_sc_f,
-                    mut best_oc_f,
+                    best_oc_f,
                     paths_f,
                     buf_f,
                     score_f,
