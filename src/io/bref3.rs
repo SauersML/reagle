@@ -134,6 +134,9 @@ impl Bref3Reader {
                 if n_recs == END_OF_DATA {
                     break;
                 }
+                if n_recs < 0 {
+                    bail!("Invalid record count in BREF3 block: {}", n_recs);
+                }
 
                 self.read_block(n_recs as usize, &mut columns)?;
             }
@@ -614,6 +617,9 @@ impl StreamingBref3Reader {
         if n_recs == END_OF_DATA {
             self.eof = true;
             return Ok(None);
+        }
+        if n_recs < 0 {
+            bail!("Invalid record count in BREF3 block: {}", n_recs);
         }
 
         let n_recs = n_recs as usize;

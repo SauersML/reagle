@@ -934,7 +934,7 @@ impl Sink for ViolationCollector {
     }
 }
 
-const SIMD_ALLOWLIST: &[&str] = &["_mm_prefetch", "_MM_HINT_T0"];
+const SIMD_ALLOWLIST: &[&str] = &["_mm_prefetch", "_MM_HINT_T0", "_SC_PAGESIZE"];
 const SIMD_PREFIX_ALLOWLIST: &[&str] = &["_mm", "_MM", "__m"];
 
 fn is_allowed_simd_token(token: &str) -> bool {
