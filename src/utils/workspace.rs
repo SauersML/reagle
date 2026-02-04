@@ -123,12 +123,16 @@ impl ThreadWorkspace {
     pub fn resize_for_states(&mut self, n_states: usize) {
         if n_states > self.n_states {
             // Only resize if we need more states, not for window size
-            let current_interval = if self.n_states > 0 {
+            let calculated = if self.n_states > 0 {
                 self.fwd.len() / self.n_states
             } else {
+                0
+            };
+            let current_interval = if calculated == 0 {
                 64
-            }
-            .clamp(1, MAX_CHECKPOINT_INTERVAL);
+            } else {
+                calculated.clamp(1, MAX_CHECKPOINT_INTERVAL)
+            };
             let new_size = ElemCount::from(current_interval)
                 .checked_mul(ElemCount::from(n_states), "resized HMM block length")
                 .get();
