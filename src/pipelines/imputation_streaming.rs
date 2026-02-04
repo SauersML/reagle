@@ -17,7 +17,7 @@ use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::storage::phase_state::{Phased, PhaseState};
-use crate::data::{HapIdx, MarkerIdx, SampleIdx};
+use crate::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
 use crate::data::marker::{AnyMarkerSpace, RefWindowSpace};
 use crate::error::ReagleError;
 use crate::error::Result;
@@ -2542,12 +2542,96 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
+                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+                    struct TargetChromIdx(ChromIdx);
+                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+                    struct TargetChromPos {
+                        chrom: TargetChromIdx,
+                        pos: u32,
+                    }
+
+                    let mut target_chroms: std::collections::HashMap<String, TargetChromIdx> =
+                        std::collections::HashMap::new();
+                    for c in 0..target_window.genotypes.markers().chrom_names().len() {
+                        let idx = ChromIdx::new(c as u16);
+                        let name = target_window
+                            .genotypes
+                            .markers()
+                            .chrom_name(idx)
+                            .unwrap_or("");
+                        target_chroms.insert(
+                            normalize_chrom_local(name).to_string(),
+                            TargetChromIdx(idx),
+                        );
+                    }
+
+                    let mut target_positions: std::collections::HashSet<TargetChromPos> =
+                        std::collections::HashSet::with_capacity(
+                            target_window.genotypes.n_markers(),
+                        );
+                    for m in 0..target_window.genotypes.n_markers() {
+                        let marker = target_window
+                            .genotypes
+                            .markers()
+                            .marker(MarkerIdx::new(m as u32));
+                        target_positions
+                            .insert(TargetChromPos { chrom: TargetChromIdx(marker.chrom), pos: marker.pos });
+                    }
+                    let mut dbg_pos_present = 0usize;
+                    let mut dbg_aligned_present = 0usize;
+                    let mut dbg_pos_not_aligned = 0usize;
+                    let mut dbg_pos_not_aligned_sites: Vec<(String, u64)> = Vec::new();
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        // Only treat as genotyped if the marker aligns by allele as well
-                        // as position. Position-only matches can be allele-mismatched and
-                        // must be treated as imputed.
-                        let is_present = target_idx.is_some();
+                        // Position-presence defines genotyped markers here.
+                        // Rationale: a site is genotyped if it exists in the target VCF.
+                        // REF/ALT swaps do not make it "imputed" because genotype is defined
+                        // by the alleles carried, not by their ordering in the VCF.
+                        // We assume strand consistency, but we do NOT require REF/ALT to
+                        // match the reference encoding to classify the site as genotyped.
+                        let ref_marker =
+                            ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
+                        let ref_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_marker.chrom)
+                            .unwrap_or("");
+                        let ref_key = target_chroms
+                            .get(normalize_chrom_local(ref_chrom))
+                            .copied()
+                            .map(|chrom| TargetChromPos { chrom, pos: ref_marker.pos });
+                        let is_present = target_idx.is_some()
+                            || ref_key
+                                .map(|key| target_positions.contains(&key))
+                                .unwrap_or(false);
                         window_quality.set_imputed(ref_m, !is_present);
+                        if is_present {
+                            dbg_pos_present += 1;
+                            if target_idx.is_some() {
+                                dbg_aligned_present += 1;
+                            } else {
+                                dbg_pos_not_aligned += 1;
+                                if dbg_pos_not_aligned_sites.len() < 5 {
+                                    dbg_pos_not_aligned_sites
+                                        .push((ref_chrom.to_string(), ref_marker.pos as u64));
+                                }
+                            }
+                        }
+                    }
+                    if dbg_pos_not_aligned > 0 {
+                        eprintln!(
+                            "    [alignment] genotyped-by-position={} aligned={} pos_not_aligned={}",
+                            dbg_pos_present, dbg_aligned_present, dbg_pos_not_aligned
+                        );
+                        if !dbg_pos_not_aligned_sites.is_empty() {
+                            let sites: Vec<String> = dbg_pos_not_aligned_sites
+                                .iter()
+                                .map(|(c, p)| format!("{}:{}", c, p))
+                                .collect();
+                            eprintln!(
+                                "    [alignment] pos_not_aligned_sites(first{})={}",
+                                sites.len(),
+                                sites.join(",")
+                            );
+                        }
                     }
 
                     let window_results = self.run_imputation_window_streaming(
@@ -2771,11 +2855,59 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
+                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+                    struct TargetChromIdx(ChromIdx);
+                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+                    struct TargetChromPos {
+                        chrom: TargetChromIdx,
+                        pos: u32,
+                    }
+
+                    let mut target_chroms: std::collections::HashMap<String, TargetChromIdx> =
+                        std::collections::HashMap::new();
+                    for c in 0..target_window.genotypes.markers().chrom_names().len() {
+                        let idx = ChromIdx::new(c as u16);
+                        let name = target_window
+                            .genotypes
+                            .markers()
+                            .chrom_name(idx)
+                            .unwrap_or("");
+                        target_chroms.insert(
+                            normalize_chrom_local(name).to_string(),
+                            TargetChromIdx(idx),
+                        );
+                    }
+
+                    let mut target_positions: std::collections::HashSet<TargetChromPos> =
+                        std::collections::HashSet::with_capacity(
+                            target_window.genotypes.n_markers(),
+                        );
+                    for m in 0..target_window.genotypes.n_markers() {
+                        let marker = target_window
+                            .genotypes
+                            .markers()
+                            .marker(MarkerIdx::new(m as u32));
+                        target_positions
+                            .insert(TargetChromPos { chrom: TargetChromIdx(marker.chrom), pos: marker.pos });
+                    }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        // Only treat as genotyped if the marker aligns by allele as well
-                        // as position. Position-only matches can be allele-mismatched and
-                        // must be treated as imputed.
-                        let is_present = target_idx.is_some();
+                        // Position-presence defines genotyped markers here.
+                        // Rationale: inputs are assumed harmonized; allele/strand issues
+                        // are not handled by reclassifying as imputed in this step.
+                        let ref_marker =
+                            ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
+                        let ref_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_marker.chrom)
+                            .unwrap_or("");
+                        let ref_key = target_chroms
+                            .get(normalize_chrom_local(ref_chrom))
+                            .copied()
+                            .map(|chrom| TargetChromPos { chrom, pos: ref_marker.pos });
+                        let is_present = target_idx.is_some()
+                            || ref_key
+                                .map(|key| target_positions.contains(&key))
+                                .unwrap_or(false);
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
@@ -3215,10 +3347,6 @@ impl crate::pipelines::ImputationPipeline {
             offsets2.push(0);
             let mut last_info1: Option<usize> = None;
             let mut last_info2: Option<usize> = None;
-            let mut dbg_genotyped = 0usize;
-            let mut dbg_hard_used = 0usize;
-            let mut dbg_pl_present_with_hard = 0usize;
-            let mut dbg_pl_uniform_with_hard = 0usize;
             let is_uniform = |vals: &[f32]| -> bool {
                 if vals.len() <= 1 {
                     return true;
@@ -3249,8 +3377,10 @@ impl crate::pipelines::ImputationPipeline {
                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx);
                     let mut conf1 = conf_base;
                     let mut conf2 = conf_base;
-                    let mut allele1 = target_win.allele(MarkerIdx::new(target_m as u32), hap1);
-                    let mut allele2 = target_win.allele(MarkerIdx::new(target_m as u32), hap2);
+                    let raw_allele1 = target_win.allele(MarkerIdx::new(target_m as u32), hap1);
+                    let raw_allele2 = target_win.allele(MarkerIdx::new(target_m as u32), hap2);
+                    let mut allele1 = raw_allele1;
+                    let mut allele2 = raw_allele2;
                     if let Some(missing) = target_missing {
                         if missing.allele(MarkerIdx::new(target_m as u32), hap1) == 255 {
                             allele1 = 255;
@@ -3561,26 +3691,6 @@ impl crate::pipelines::ImputationPipeline {
                         use2 = true;
                     }
 
-                    if sample_idx == 0 {
-                        dbg_genotyped += 1;
-                        if has_hard && use1 && use2 {
-                            dbg_hard_used += 1;
-                        }
-                        if has_hard {
-                            if let Some(pl_vals) = pl {
-                                if !pl_vals.is_empty() {
-                                    dbg_pl_present_with_hard += 1;
-                                    let mut pl_probs: Vec<f32> = Vec::new();
-                                    if allele_probs_uncond_from_pl(pl_vals, None, &mut pl_probs)
-                                        .is_some()
-                                        && is_uniform(&pl_probs)
-                                    {
-                                        dbg_pl_uniform_with_hard += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
 
                 if !use1 {
@@ -3601,18 +3711,9 @@ impl crate::pipelines::ImputationPipeline {
 
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
-                offsets1.push(probs1.len());
-                offsets2.push(probs2.len());
-            }
-            if sample_idx == 0 && dbg_genotyped > 0 {
-                eprintln!(
-                    "    [debug] genotyped markers={} hard_used={} pl_present_with_hard={} pl_uniform_with_hard={}",
-                    dbg_genotyped,
-                    dbg_hard_used,
-                    dbg_pl_present_with_hard,
-                    dbg_pl_uniform_with_hard
-                );
-            }
+            offsets1.push(probs1.len());
+            offsets2.push(probs2.len());
+        }
             (
                 TargetAlleleProbs::new(offsets1, probs1),
                 TargetAlleleProbs::new(offsets2, probs2),
@@ -3819,14 +3920,6 @@ impl crate::pipelines::ImputationPipeline {
                     .collect();
                 donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                if (window_idx == 0 || window_idx == 5) && s == 0 {
-                    eprintln!(
-                        "[debug priors] window={} sample={} prior_error_rate_in={:.6}",
-                        window_idx,
-                        s,
-                        *prior_error_rate
-                    );
-                }
                 // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
                 let use_hmm_h1 = if has_priors_h1 {
                     // Priors require HMM propagation even when emissions are uniform.
@@ -3848,28 +3941,6 @@ impl crate::pipelines::ImputationPipeline {
                         || insufficient_info_h2
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
                 };
-                if (window_idx == 0 || window_idx == 5 || window_idx == 6) && s == 0 {
-                    eprintln!(
-                        "[debug priors] window={} sample={} last_info=({:?},{:?}) prior_marker={:?} use_hmm=({}, {}) total_info=({:.4},{:.4}) conf_ratio=({:.4},{:.4}) donors=({}, {}) has_priors=({}, {}) priors_len=({:?},{:?})",
-                        window_idx,
-                        s,
-                        last_info_h1,
-                        last_info_h2,
-                        prior_marker_idx,
-                        use_hmm_h1,
-                        use_hmm_h2,
-                        sm_total_info[h1_idx.as_usize()],
-                        sm_total_info[h2_idx.as_usize()],
-                        conf_ratio_h1,
-                        conf_ratio_h2,
-                        donors_h1.len(),
-                        donors_h2.len(),
-                        has_priors_h1,
-                        has_priors_h2,
-                        priors_h1.map(|p| p.ids().len()),
-                        priors_h2.map(|p| p.ids().len())
-                    );
-                }
 
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
@@ -4051,26 +4122,6 @@ impl crate::pipelines::ImputationPipeline {
                         !state_haps.is_empty(),
                         "State selection produced empty haplotype set"
                     );
-                    if window_idx == 5 && hap_idx.as_usize() == 0 {
-                        if let Some(pm) = prior_marker_idx {
-                            let probs = input_probs.probs_for_marker(pm);
-                            eprintln!(
-                                "[debug priors] window={} hap={} prior_marker={} uniform={} error_rate={:.6} probs={:?}",
-                                window_idx,
-                                hap_idx.as_usize(),
-                                pm,
-                                input_probs.is_uniform_marker(pm),
-                                error_rate,
-                                probs
-                            );
-                        } else {
-                            eprintln!(
-                                "[debug priors] window={} hap={} prior_marker=None",
-                                window_idx,
-                                hap_idx.as_usize()
-                            );
-                        }
-                    }
 
                     let state_priors = priors.and_then(|p| {
                         if p.is_empty() {
@@ -4152,27 +4203,6 @@ impl crate::pipelines::ImputationPipeline {
                                 .unzip();
                             next_priors = HaplotypePriors::new(ids, probs);
                         }
-                    }
-                    if (window_idx == 0 || window_idx == 5) && hap_idx.as_usize() == 0 {
-                        let mut top_id: Option<u32> = None;
-                        let mut top_p = 0.0f32;
-                        for (id, p) in next_priors.ids().iter().zip(next_priors.probs().iter()) {
-                            if *p > top_p {
-                                top_p = *p;
-                                top_id = Some(id.0);
-                            }
-                        }
-                        eprintln!(
-                            "[debug priors] window={} hap={} state_post_present={} next_priors_len={} top_id={:?} top_p={:.4} stats=(mismatch={:.4} info={:.4})",
-                            window_idx,
-                            hap_idx.as_usize(),
-                            state_post.is_some(),
-                            next_priors.ids().len(),
-                            top_id,
-                            top_p,
-                            stats.expected_mismatches,
-                            stats.informative_sites
-                        );
                     }
 
                     (posteriors, next_priors, stats)

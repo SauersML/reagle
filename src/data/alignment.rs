@@ -172,11 +172,14 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
         let mut n_allele_swapped = 0usize;
 
         let mut used_targets = vec![false; n_target_markers];
+        let mut unaligned_with_candidates = 0usize;
+        let mut unaligned_examples: Vec<String> = Vec::new();
         for m in 0..n_ref_markers {
             let ref_marker = ref_markers.marker(MarkerIdx::new(m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
             let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
             if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
+                let mut aligned = false;
                 for &target_idx in target_candidates {
                     if used_targets[target_idx] {
                         continue;
@@ -191,6 +194,7 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                             target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
                             allele_mappings[target_idx] = Some(mapping);
                             used_targets[target_idx] = true;
+                            aligned = true;
 
                             if strand_flipped {
                                 n_strand_flipped += 1;
@@ -224,6 +228,21 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                         }
                     }
                 }
+                if !aligned {
+                    unaligned_with_candidates += 1;
+                    if unaligned_examples.len() < 5 {
+                        let ref_alt = ref_marker
+                            .alt_alleles
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        unaligned_examples.push(format!(
+                            "{}:{} {}>{}",
+                            ref_chrom, ref_marker.pos, ref_marker.ref_allele, ref_alt
+                        ));
+                    }
+                }
             }
         }
 
@@ -232,6 +251,21 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                 "  Allele alignment: {} strand-flipped, {} allele-swapped markers",
                 n_strand_flipped, n_allele_swapped
             );
+        }
+        if unaligned_with_candidates > 0 {
+            if unaligned_examples.is_empty() {
+                eprintln!(
+                    "  Unaligned positions with candidates: {}",
+                    unaligned_with_candidates
+                );
+            } else {
+                eprintln!(
+                    "  Unaligned positions with candidates: {} (first {})",
+                    unaligned_with_candidates,
+                    unaligned_examples.len()
+                );
+                eprintln!("  Examples: {}", unaligned_examples.join(", "));
+            }
         }
 
         Self {

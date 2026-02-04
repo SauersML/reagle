@@ -157,6 +157,7 @@ impl MarkerImputationStats {
         // AF = Total Prob Mass / Total Haplotypes
         self.sum_p[allele] / self.n_haps as f32
     }
+
 }
 
 /// Collection of imputation statistics for all markers
@@ -192,6 +193,7 @@ impl ImputationQuality {
             stats.is_imputed = imputed;
         }
     }
+
 }
 
 /// VCF file reader
