@@ -8137,15 +8137,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
             if score_flip > score_direct {
                 std::mem::swap(&mut paths.path1, &mut paths.path2);
-                eprintln!(
-                    "[anchor init] flipped heuristic paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
-            } else {
-                eprintln!(
-                    "[anchor init] kept heuristic paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
             }
         }
     }
@@ -8201,10 +8192,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let mut owned = paths.clone();
                 std::mem::swap(&mut owned.path1, &mut owned.path2);
                 start_paths_owned = Some(owned);
-                eprintln!(
-                    "[anchor init] flipped start paths (direct={} flip={})",
-                    score_direct, score_flip
-                );
             }
         }
     }
@@ -8680,14 +8667,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             ref_provider_2,
         );
         buffers = buffers2;
-        if paths2.path1.len() != n_markers || paths2.path2.len() != n_markers {
-            eprintln!(
-                "[mosaic paths] secondary chain path lengths: path1={} path2={}",
-                paths2.path1.len(),
-                paths2.path2.len()
-            );
-        }
-
         if log_like2 > best_log_like {
             swap_counts = swap_counts2;
             obs_counts = obs_counts2;
@@ -8740,18 +8719,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let a2 = anchor_h2.get(m).copied().unwrap_or(255);
         a1 != 255 || a2 != 255
     });
-
-    // If everything is an unanchored het, phase labels are unidentifiable.
-    // Prefer a stable orientation (no label switching) in that regime.
-    if !has_anchor && het_positions.len() == n_markers {
-        for i in 0..swap_bits.len() {
-            swap_bits[i] = 0;
-            swap_lr[i] = 1.0;
-            swap_probs[i] = 0.5;
-            swap_probs_conf[i] = 0.5;
-        }
-        return (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths);
-    }
 
     // Derive swap emissions from the sampled haplotype paths and run the label
     // HMM on those emissions. This ties swaps to the inferred paths rather than
@@ -9571,12 +9538,6 @@ mod tests {
         let (phased, _) = result.unwrap();
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
-        println!(
-            "[test_run_phase] phased markers={} haps={} samples={}",
-            phased.n_markers(),
-            phased.n_haplotypes(),
-            phased.n_samples()
-        );
 
         // Check phase confidence values
         let mut total_hets = 0;
@@ -9649,43 +9610,7 @@ mod tests {
                 mean_conf
             );
 
-            println!(
-                "Phase confidence stats: mean={:.3}, high_conf_ratio={:.1}%, n_hets={}",
-                mean_conf,
-                high_conf_ratio * 100.0,
-                total_hets
-            );
-            println!(
-                "Phase confidence range: min={:.3}, max={:.3}, nan={}, oob={}",
-                conf_min, conf_max, any_conf_nan, any_conf_oob
-            );
-            if let Some((m, s, conf)) = first_bad_conf {
-                println!(
-                    "First bad confidence at marker {} sample {} => {}",
-                    m, s, conf
-                );
-            }
-            let max_hets = het_per_marker.iter().copied().max().unwrap_or(0);
-            let min_hets = het_per_marker.iter().copied().min().unwrap_or(0);
-            println!(
-                "Hets per marker: min={}, max={}, sample0_first10={:?}",
-                min_hets,
-                max_hets,
-                (0..10.min(n_markers))
-                    .map(|i| het_per_marker[i])
-                    .collect::<Vec<_>>()
-            );
-            for m in 0..5.min(n_markers) {
-                let marker_idx = MarkerIdx::new(m as u32);
-                let column = phased.column(marker_idx);
-                let a1 = column.get(crate::data::SampleIdx::new(0).hap1());
-                let a2 = column.get(crate::data::SampleIdx::new(0).hap2());
-                let conf = phased.sample_phase_confidence_f32(marker_idx, 0);
-                println!(
-                    "Sample0 marker{} alleles={}{} conf={:.3}",
-                    m, a1, a2, conf
-                );
-            }
+            let _ = (conf_min, conf_max, any_conf_nan, any_conf_oob, first_bad_conf, het_per_marker);
         }
     }
 

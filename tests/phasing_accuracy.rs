@@ -597,28 +597,11 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
             }
         }
 
-        if n_markers <= 20 {
-            println!("[small_panel_ser] seed={} hero_pattern={:?}", seed, hero_pattern);
-            println!("[small_panel_ser] seed={} phased_haps={:?}", seed, phased_haps);
-            let mut match_trace = Vec::with_capacity(n_markers);
-            for m in 0..n_markers {
-                let (h1, h2) = phased_haps[m];
-                match_trace.push((m, h1, h2, hero_pattern[m]));
-            }
-            println!("[small_panel_ser] seed={} match_trace={:?}", seed, match_trace);
-        }
-
         let ser = switch_errors as f32 / (n_markers - 1) as f32;
         ser_sum += ser;
-
-        println!(
-            "[small_panel_ser] seed={} markers={} switch_errors={} ser={:.4}",
-            seed, n_markers, switch_errors, ser
-        );
     }
 
     let ser_avg = ser_sum / seeds.len() as f32;
-    println!("[small_panel_ser] avg_ser={:.4}", ser_avg);
     assert!(
         ser_avg < 0.15,
         "Avg SER too high in small panel: {:.4}",
