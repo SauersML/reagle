@@ -820,11 +820,12 @@ impl StreamingBref3WindowReader {
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
 
         loop {
-            if window_size >= config.max_markers {
-                // Ensure the core window reaches window_cm before enforcing max_markers.
-                if output_end.is_some() {
-                    break;
+            if config.max_markers > 0 && window_size >= config.max_markers {
+                // Hard cap to prevent unbounded windows in dense/low-cM regions.
+                if output_end.is_none() {
+                    output_end = Some(window_size);
                 }
+                break;
             }
 
             let next_marker = if let Some(m) = carryover.pop_front() {
@@ -1186,11 +1187,12 @@ impl StreamingRefVcfReader {
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
 
         loop {
-            if window_size >= config.max_markers {
-                // Ensure the core window reaches window_cm before enforcing max_markers.
-                if output_end.is_some() {
-                    break;
+            if config.max_markers > 0 && window_size >= config.max_markers {
+                // Hard cap to prevent unbounded windows in dense/low-cM regions.
+                if output_end.is_none() {
+                    output_end = Some(window_size);
                 }
+                break;
             }
 
             let next_marker = if let Some(m) = carryover.pop_front() {

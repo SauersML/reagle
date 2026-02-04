@@ -529,6 +529,11 @@ impl StreamingVcfReader {
                 .iter()
                 .position(|m| m.gen_pos >= full_window_gen)
                 .unwrap_or(self.buffer.len());
+            let window_end = if self.config.max_markers > 0 {
+                window_end.min(self.config.max_markers)
+            } else {
+                window_end
+            };
 
             let is_last = self.eof && window_end >= self.buffer.len();
 
@@ -878,6 +883,7 @@ impl StreamingVcfReader {
         let target_cm = self.config.window_cm + self.config.overlap_cm + self.config.buffer_cm;
         let start_gen = self.buffer.front().map(|m| m.gen_pos).unwrap_or(0.0);
         let target_gen = start_gen + target_cm as f64;
+        let max_markers = self.config.max_markers;
 
         while !self.eof {
             // Check if we have enough data
@@ -885,6 +891,9 @@ impl StreamingVcfReader {
                 if last.gen_pos >= target_gen {
                     break;
                 }
+            }
+            if max_markers > 0 && self.buffer.len() >= max_markers {
+                break;
             }
 
             // Read next marker
