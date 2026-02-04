@@ -118,9 +118,9 @@ impl ThreadWorkspace {
     /// Only resizes if needed - doesn't allocate per window size.
     /// The workspace maintains constant memory regardless of window size.
     pub fn resize_for_states(&mut self, n_states: usize) {
-        if n_states > self.n_states {
+        if n_states > self.n_states || (n_states > 0 && self.fwd.len() == 0) {
             // Only resize if we need more states, not for window size
-            let current_interval = if self.n_states > 0 {
+            let current_interval = if self.n_states > 0 && self.fwd.len() > 0 {
                 self.fwd.len() / self.n_states
             } else {
                 64
