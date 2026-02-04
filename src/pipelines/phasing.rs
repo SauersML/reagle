@@ -8033,6 +8033,39 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     Some(MosaicPaths { path1, path2 })
 }
 
+fn calculate_log_prior(
+    path1: &[u32],
+    path2: &[u32],
+    p_recomb: &[f32],
+    n_states: usize,
+) -> f64 {
+    let mut log_p = 0.0;
+    let n_markers = path1.len();
+    if n_markers < 2 {
+        return 0.0;
+    }
+    let inv_n = 1.0 / n_states.max(1) as f64;
+
+    for m in 1..n_markers {
+        let r = p_recomb.get(m).copied().unwrap_or(0.0) as f64;
+        let p_switch = (r * inv_n).max(1e-20);
+        let p_stay = ((1.0 - r) + p_switch).max(1e-20);
+
+        if path1[m] == path1[m - 1] {
+            log_p += p_stay.ln();
+        } else {
+            log_p += p_switch.ln();
+        }
+
+        if path2[m] == path2[m - 1] {
+            log_p += p_stay.ln();
+        } else {
+            log_p += p_switch.ln();
+        }
+    }
+    log_p
+}
+
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
 ///
 /// This implements Forward-Filtering Backward-Sampling (FFBS) with a single
@@ -8171,12 +8204,17 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // 2. Collect candidates
     let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(3);
 
-    // Candidate A: Initial paths provided by caller (e.g. from Beam Search)
+    // Candidate A: Standard/Default initialization (Combined HMM checkpoints).
+    // We prioritize this (put it first) so it wins ties against heuristic/beam if likelihoods are equal.
+    // This helps in ambiguous regions where heuristics might bias towards global modes over local continuity.
+    candidate_inits.push(None);
+
+    // Candidate B: Initial paths provided by caller (e.g. from Beam Search)
     if let Some(p) = initial_paths {
         candidate_inits.push(Some(p.clone()));
     }
 
-    // Candidate B: Heuristic paths (if found and different from initial)
+    // Candidate C: Heuristic paths (if found and different from initial)
     if let Some(p) = heuristic_paths {
         // Only add if distinct from initial_paths to save compute
         let distinct = if let Some(init) = initial_paths {
@@ -8187,14 +8225,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         if distinct {
             candidate_inits.push(Some(p));
         }
-    }
-
-    // Candidate C: Standard/Default initialization (Combined HMM checkpoints)
-    // We always include this if we have no other candidates, but we should also
-    // include it competitively if the others are potentially traps.
-    // To save time, we skip it if we have a strong Beam Search candidate + Heuristic.
-    if candidate_inits.len() < 2 {
-        candidate_inits.push(None);
     }
 
     // Build Combined HMM checkpoints. This is required if ANY candidate is None,
@@ -8545,7 +8575,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        let mut best_log_like = f64::NEG_INFINITY;
+        let mut best_score = f64::NEG_INFINITY;
         let mut best_paths = MosaicPaths {
             path1: Vec::new(),
             path2: Vec::new(),
@@ -8575,8 +8605,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let p_sum = (p1 + p2).max(1e-30);
                 ll += (p_sum as f64).ln();
             }
-            if ll > best_log_like {
-                best_log_like = ll;
+
+            // Add prior to selection score (Posterior = Likelihood + Prior)
+            let prior = calculate_log_prior(&chain.path1, &chain.path2, p_recomb, n_states_usize);
+            let score = ll + prior;
+
+            if score > best_score {
+                best_score = score;
                 best_idx = idx;
             }
         }
@@ -8591,7 +8626,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             .nth(0)
             .expect("chain 0")
             .into_buffers();
-        (swap_counts, obs_counts, best_paths, returned, best_log_like)
+        (swap_counts, obs_counts, best_paths, returned, best_score)
     };
 
     let ref_view = ref_provider.ref_gt;
@@ -8636,7 +8671,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         fwd_block: std::mem::take(&mut workspace.fwd_block),
     };
 
-    let mut best_log_like = f64::NEG_INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
     let mut swap_counts = vec![0.0; het_positions.len()];
     let mut obs_counts = vec![0.0; het_positions.len()];
     let mut new_paths = MosaicPaths {
@@ -8689,7 +8724,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
 
         let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
-        let (mut sc, oc, paths, buf, ll) = run_chain(chain_seed, init.as_ref(), buffers, my_provider, &local_seq1, &local_seq2);
+        let (mut sc, oc, paths, buf, score) = run_chain(chain_seed, init.as_ref(), buffers, my_provider, &local_seq1, &local_seq2);
         buffers = buf;
 
         // Un-align swap counts
@@ -8703,8 +8738,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        if ll > best_log_like {
-            best_log_like = ll;
+        if score > best_score {
+            best_score = score;
             swap_counts = sc.clone();
             obs_counts = oc.clone();
             new_paths = paths.clone();
@@ -8766,7 +8801,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                 let chain_seed_flip = seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
                 let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
-                let (mut sc_f, oc_f, paths_f, buf_f, ll_f) = run_chain(chain_seed_flip, flipped_paths.as_ref(), buffers, my_provider_flip, &local_seq1_f, &local_seq2_f);
+                let (mut sc_f, oc_f, paths_f, buf_f, score_f) = run_chain(chain_seed_flip, flipped_paths.as_ref(), buffers, my_provider_flip, &local_seq1_f, &local_seq2_f);
                 buffers = buf_f;
 
                 // Un-align
@@ -8778,8 +8813,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     }
                 }
 
-                if ll_f > best_log_like {
-                    best_log_like = ll_f;
+                if score_f > best_score {
+                    best_score = score_f;
                     swap_counts = sc_f;
                     obs_counts = oc_f;
                     new_paths = paths_f;
