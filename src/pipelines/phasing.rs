@@ -8075,19 +8075,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
-    // Attempt pairwise initialization if no initial paths provided
-    let mut heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair_with_buffer(
-            n_markers,
-            n_states_usize,
-            seq1,
-            seq2,
-            &mut ref_provider,
-            &mut workspace.scores,
-        )
-    } else {
-        None
-    };
+    // Attempt pairwise initialization (always calculate to recover from potential Beam search failures)
+    let mut heuristic_paths = find_best_constant_pair_with_buffer(
+        n_markers,
+        n_states_usize,
+        seq1,
+        seq2,
+        &mut ref_provider,
+        &mut workspace.scores,
+    );
 
     // Align heuristic orientation to anchors when present.
     if has_anchor {
@@ -8632,12 +8628,35 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let (swap_counts1, obs_counts1, mut new_paths, mut buffers, log_like1) =
-        run_chain(chain_seed, start_paths, buffers, ref_provider);
+    let (mut swap_counts, mut obs_counts, mut new_paths, mut buffers, mut best_log_like) =
+        run_chain(
+            chain_seed,
+            start_paths,
+            buffers,
+            RefAlleleProvider::new(ref_view, threaded_haps),
+        );
 
-    let mut swap_counts = swap_counts1;
-    let mut obs_counts = obs_counts1;
-    let best_log_like = log_like1;
+    // If we had initial paths (e.g. from Beam) but they might be suboptimal,
+    // and we computed a heuristic pairwise solution, try running a competing chain
+    // initialized with the heuristic paths.
+    if initial_paths.is_some() && heuristic_paths.is_some() {
+        let chain_seed_competitor = seed.wrapping_add(0xCAFE_BABE_DEAD_BEEF);
+        let (swap_counts2, obs_counts2, paths2, buffers2, log_like2) = run_chain(
+            chain_seed_competitor,
+            heuristic_paths.as_ref(),
+            buffers,
+            RefAlleleProvider::new(ref_view, threaded_haps),
+        );
+        buffers = buffers2;
+        if log_like2 > best_log_like {
+            swap_counts = swap_counts2;
+            obs_counts = obs_counts2;
+            new_paths = paths2;
+            best_log_like = log_like2;
+            // Update start_paths for the flip check below to ensure we flip against the winning path
+            start_paths = heuristic_paths.as_ref();
+        }
+    }
 
     if !has_anchor {
         let flipped_paths = if let Some(paths) = start_paths {
