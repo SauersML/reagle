@@ -8659,9 +8659,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     // Shuffle candidates to ensure random tie-breaking if likelihoods are identical
     // We use a deterministic shuffle based on seed
-    let mut rng_shuffle = rand::rngs::SmallRng::seed_from_u64(seed.wrapping_add(0x5432_1098_7654_3210));
-    use rand::seq::SliceRandom;
-    unique_candidates.shuffle(&mut rng_shuffle);
+    // But preserve the first candidate if it came from initial_paths (strong prior)
+    let preserve_first = initial_paths.is_some();
+    let shuffle_start = if preserve_first { 1 } else { 0 };
+    if unique_candidates.len() > shuffle_start + 1 {
+        let mut rng_shuffle =
+            rand::rngs::SmallRng::seed_from_u64(seed.wrapping_add(0x5432_1098_7654_3210));
+        use rand::seq::SliceRandom;
+        unique_candidates[shuffle_start..].shuffle(&mut rng_shuffle);
+    }
 
     for candidate in unique_candidates {
         seed_offset = seed_offset.wrapping_add(0x1111_2222_3333_4444);
