@@ -8304,7 +8304,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
                      ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
                      seq1: &[u8],
                      seq2: &[u8]|
-     -> (Vec<f32>, Vec<f32>, MosaicPaths, MosaicBuffers, f64) {
+     -> (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        MosaicPaths,
+        MosaicBuffers,
+        f64,
+    ) {
         const PAR_CHAINS: usize = 4;
         let ref_view = ref_provider.ref_gt;
         let threaded_haps = ref_provider.threaded_haps;
@@ -8431,18 +8439,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        let mut swap_counts = vec![0f32; het_positions.len()];
-        let mut obs_counts = vec![0f32; het_positions.len()];
+        let mut chain_swap_counts = vec![vec![0f32; het_positions.len()]; PAR_CHAINS];
+        let mut chain_obs_counts = vec![vec![0f32; het_positions.len()]; PAR_CHAINS];
 
         let mut samples_done = 0usize;
-        let mut prev_bits: Vec<u8> = Vec::new();
-        let mut stable_steps = 0usize;
-        let min_samples = 2usize;
-        let stable_required = 3usize;
-        let delta_threshold = (het_positions.len() / 1000).max(1);
-        let mut early_stop = false;
-        while samples_done < lr_samples && !early_stop {
-            for chain in chains.iter_mut() {
+        while samples_done < lr_samples {
+            for (c_idx, chain) in chains.iter_mut().enumerate() {
                 if samples_done >= lr_samples {
                     break;
                 }
@@ -8533,45 +8535,14 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     if let Some(orient) = orient {
                         last_bits[i] = orient;
                         last_obs[i] = 1;
-                        swap_counts[i] += orient as f32;
-                        obs_counts[i] += 1.0;
+                        if c_idx < chain_swap_counts.len() {
+                            chain_swap_counts[c_idx][i] += orient as f32;
+                            chain_obs_counts[c_idx][i] += 1.0;
+                        }
                     }
                 }
                 samples_done += 1;
 
-                let mut changed = 0usize;
-                if prev_bits.len() == last_bits.len() {
-                    for (a, b) in prev_bits.iter().zip(last_bits.iter()) {
-                        if a != b {
-                            changed += 1;
-                        }
-                    }
-                } else {
-                    changed = last_bits.len();
-                }
-                prev_bits = last_bits;
-
-                if samples_done >= min_samples {
-                    if changed <= delta_threshold {
-                        stable_steps += 1;
-                    } else {
-                        stable_steps = 0;
-                    }
-                    if stable_steps >= stable_required {
-                        let remaining = lr_samples.saturating_sub(samples_done);
-                        if remaining > 0 {
-                            for i in 0..prev_bits.len() {
-                                let obs = last_obs[i] as f32;
-                                if obs > 0.0 {
-                                    swap_counts[i] += prev_bits[i] as f32 * remaining as f32;
-                                    obs_counts[i] += remaining as f32;
-                                }
-                            }
-                        }
-                        early_stop = true;
-                        break;
-                    }
-                }
             }
         }
 
@@ -8621,12 +8592,35 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 path2: chain.path2.clone(),
             };
         }
+
+        // Aggregate counts from all chains for confidence
+        let mut agg_swap_counts = vec![0f32; het_positions.len()];
+        let mut agg_obs_counts = vec![0f32; het_positions.len()];
+        for i in 0..het_positions.len() {
+            for c in 0..chains.len() {
+                agg_swap_counts[i] += chain_swap_counts[c][i];
+                agg_obs_counts[i] += chain_obs_counts[c][i];
+            }
+        }
+
+        // Best counts for decision
+        let best_swap_counts = chain_swap_counts[best_idx].clone();
+        let best_obs_counts = chain_obs_counts[best_idx].clone();
+
         let returned = chains
             .into_iter()
             .nth(0)
             .expect("chain 0")
             .into_buffers();
-        (swap_counts, obs_counts, best_paths, returned, best_score)
+        (
+            agg_swap_counts,
+            agg_obs_counts,
+            best_swap_counts,
+            best_obs_counts,
+            best_paths,
+            returned,
+            best_score,
+        )
     };
 
     let ref_view = ref_provider.ref_gt;
@@ -8672,8 +8666,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     let mut best_score = f64::NEG_INFINITY;
-    let mut swap_counts = vec![0.0; het_positions.len()];
-    let mut obs_counts = vec![0.0; het_positions.len()];
+    let mut agg_swap_counts = vec![0.0; het_positions.len()];
+    let mut agg_obs_counts = vec![0.0; het_positions.len()];
+    let mut best_swap_counts = vec![0.0; het_positions.len()];
+    let mut best_obs_counts = vec![0.0; het_positions.len()];
     let mut new_paths = MosaicPaths {
         path1: Vec::new(),
         path2: Vec::new(),
@@ -8724,7 +8720,22 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
 
         let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
-        let (mut sc, oc, paths, buf, score) = run_chain(chain_seed, init.as_ref(), buffers, my_provider, &local_seq1, &local_seq2);
+        let (
+            mut agg_sc,
+            mut agg_oc,
+            mut best_sc,
+            mut best_oc,
+            paths,
+            buf,
+            score,
+        ) = run_chain(
+            chain_seed,
+            init.as_ref(),
+            buffers,
+            my_provider,
+            &local_seq1,
+            &local_seq2,
+        );
         buffers = buf;
 
         // Un-align swap counts
@@ -8732,7 +8743,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
         // We must map m -> i or iterate het_positions.
         for (i, &m) in het_positions.iter().enumerate() {
             if alignment_flips[m] {
-                if let (Some(s), Some(o)) = (sc.get_mut(i), oc.get(i)) {
+                if let (Some(s), Some(o)) = (agg_sc.get_mut(i), agg_oc.get(i)) {
+                    *s = *o - *s;
+                }
+                if let (Some(s), Some(o)) = (best_sc.get_mut(i), best_oc.get(i)) {
                     *s = *o - *s;
                 }
             }
@@ -8744,8 +8758,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
         // with Default initialization if chains converge to opposite phases.
         if score >= best_score {
             best_score = score;
-            swap_counts = sc.clone();
-            obs_counts = oc.clone();
+            agg_swap_counts = agg_sc.clone();
+            agg_obs_counts = agg_oc.clone();
+            best_swap_counts = best_sc.clone();
+            best_obs_counts = best_oc.clone();
             new_paths = paths.clone();
         }
 
@@ -8803,15 +8819,34 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     }
                 }
 
-                let chain_seed_flip = seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
+                let chain_seed_flip =
+                    seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
                 let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
-                let (mut sc_f, oc_f, paths_f, buf_f, score_f) = run_chain(chain_seed_flip, flipped_paths.as_ref(), buffers, my_provider_flip, &local_seq1_f, &local_seq2_f);
+                let (
+                    mut agg_sc_f,
+                    mut agg_oc_f,
+                    mut best_sc_f,
+                    mut best_oc_f,
+                    paths_f,
+                    buf_f,
+                    score_f,
+                ) = run_chain(
+                    chain_seed_flip,
+                    flipped_paths.as_ref(),
+                    buffers,
+                    my_provider_flip,
+                    &local_seq1_f,
+                    &local_seq2_f,
+                );
                 buffers = buf_f;
 
                 // Un-align
                 for (i, &m) in het_positions.iter().enumerate() {
                     if alignment_flips_f[m] {
-                        if let (Some(s), Some(o)) = (sc_f.get_mut(i), oc_f.get(i)) {
+                        if let (Some(s), Some(o)) = (agg_sc_f.get_mut(i), agg_oc_f.get(i)) {
+                            *s = *o - *s;
+                        }
+                        if let (Some(s), Some(o)) = (best_sc_f.get_mut(i), best_oc_f.get(i)) {
                             *s = *o - *s;
                         }
                     }
@@ -8819,8 +8854,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                 if score_f > best_score {
                     best_score = score_f;
-                    swap_counts = sc_f;
-                    obs_counts = oc_f;
+                    agg_swap_counts = agg_sc_f;
+                    agg_obs_counts = agg_oc_f;
+                    best_swap_counts = best_sc_f;
+                    best_obs_counts = best_oc_f;
                     new_paths = paths_f;
                 }
             }
@@ -8836,7 +8873,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] < 0.5 {
+        if a1 == 255 || a2 == 255 || a1 == a2 || best_obs_counts[i] < 0.5 {
             swap_bits.push(0);
             swap_lr.push(1.0);
             swap_probs.push(0.5);
@@ -8844,7 +8881,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
             continue;
         }
 
-        let p_swap = (swap_counts[i] + 0.5) / (obs_counts[i] + 1.0);
+        let p_swap = (best_swap_counts[i] + 0.5) / (best_obs_counts[i] + 1.0);
+        let p_swap_conf = if agg_obs_counts[i] > 0.0 {
+            (agg_swap_counts[i] + 0.5) / (agg_obs_counts[i] + 1.0)
+        } else {
+            0.5
+        };
         let p_keep = 1.0 - p_swap;
         let chosen_swap = p_swap > 0.5;
         swap_bits.push(chosen_swap as u8);
@@ -8861,7 +8903,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         swap_lr.push(lr);
         let p = p_swap.clamp(0.0, 1.0);
         swap_probs.push(p);
-        swap_probs_conf.push(p);
+        swap_probs_conf.push(p_swap_conf.clamp(0.0, 1.0));
         let p = p_swap.clamp(0.0, 1.0);
         p_min = p_min.min(p);
         p_max = p_max.max(p);
@@ -8878,13 +8920,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // per-marker orientation counts, which can be unstable.
     //
     // When there are no anchors and the orientation evidence is symmetric,
-    // per-marker path emissions can introduce label noise. In that case, keep
-    // the swap probabilities from the chain counts (typically ~0.5) so the
-    // label HMM stays stable.
-    let has_orientation_signal = swap_probs_conf
-        .iter()
-        .any(|&p| (p - 0.5).abs() > 0.1);
-    let allow_path_emissions = has_anchor || has_orientation_signal;
+    // we rely on the sampled path (best chain last state) to break symmetry
+    // and provide a consistent phasing, while confidence reflects the uncertainty.
+    // Always using path emissions ensures we pick one consistent mode.
+    let allow_path_emissions = true;
     if allow_path_emissions
         && new_paths.path1.len() == n_markers
         && new_paths.path2.len() == n_markers
