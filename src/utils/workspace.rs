@@ -120,11 +120,12 @@ impl ThreadWorkspace {
     pub fn resize_for_states(&mut self, n_states: usize) {
         if n_states > self.n_states {
             // Only resize if we need more states, not for window size
-            let current_interval = if self.n_states > 0 {
+            let calculated = if self.n_states > 0 {
                 self.fwd.len() / self.n_states
             } else {
-                64
+                0
             };
+            let current_interval = if calculated == 0 { 64 } else { calculated };
             let new_size = current_interval * n_states;
 
             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
