@@ -9657,7 +9657,6 @@ mod tests {
         // Assert that most heterozygous sites have reasonable confidence
         if total_hets > 0 {
             let mean_conf = sum_conf / count_conf as f32;
-            let high_conf_ratio = high_conf_hets as f32 / total_hets as f32;
 
             // For this unit test with random data and minimal iterations,
             // we just verify confidence values are computed and in valid range.
@@ -9671,7 +9670,7 @@ mod tests {
             println!(
                 "Phase confidence stats: mean={:.3}, high_conf_ratio={:.1}%, n_hets={}",
                 mean_conf,
-                high_conf_ratio * 100.0,
+                (high_conf_hets as f32 / total_hets as f32) * 100.0,
                 total_hets
             );
             println!(
