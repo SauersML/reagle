@@ -19,6 +19,7 @@ const DEFAULT_CONFIG_FILE: &str = "reagle.toml";
 #[command(version = "0.1.0")]
 #[command(about = "High-performance genotype phasing and imputation", long_about = None)]
 pub struct CliArgs {
+    // ============ Data Parameters ============
     /// Input VCF file with GT FORMAT field (required)
     #[arg(long, value_name = "FILE")]
     pub gt: PathBuf,
@@ -30,6 +31,125 @@ pub struct CliArgs {
     /// Output file prefix (required)
     #[arg(long, short, value_name = "PREFIX")]
     pub out: PathBuf,
+
+    /// PLINK map file with cM units
+    #[arg(long, value_name = "FILE")]
+    pub map: Option<PathBuf>,
+
+    /// Chromosome or region [chrom] or [chrom]:[start]-[end]
+    #[arg(long)]
+    pub chrom: Option<String>,
+
+    /// File with sample IDs to exclude (one per line)
+    #[arg(long, value_name = "FILE")]
+    pub excludesamples: Option<PathBuf>,
+
+    /// File with marker IDs to exclude (one per line)
+    #[arg(long, value_name = "FILE")]
+    pub excludemarkers: Option<PathBuf>,
+
+    // ============ Phasing Parameters ============
+    /// Maximum burn-in iterations
+    #[arg(long)]
+    pub burnin: Option<usize>,
+
+    /// Phasing iterations
+    #[arg(long)]
+    pub iterations: Option<usize>,
+
+    /// MCMC burn-in sweeps (lets the chain mix before sampling)
+    #[arg(long)]
+    pub mcmc_burnin: Option<usize>,
+
+    /// Enable SHAPEIT5-style dynamic MCMC (re-selects states each step)
+    #[arg(long)]
+    pub dynamic_mcmc: bool,
+
+    /// Number of MCMC steps per outer iteration (for dynamic MCMC)
+    #[arg(long)]
+    pub mcmc_steps: Option<usize>,
+
+    /// Number of MCMC samples used to estimate phase LR (higher = more stable)
+    #[arg(long)]
+    pub mcmc_lr_samples: Option<usize>,
+
+    /// Model states for phasing (0 = auto by memory budget)
+    #[arg(long)]
+    pub phase_states: Option<usize>,
+
+    /// Rare variant frequency threshold
+    #[arg(long)]
+    pub rare: Option<f32>,
+
+    // ============ Imputation Parameters ============
+    /// Impute ungenotyped markers
+    #[arg(long)]
+    pub impute: bool,
+
+    /// Model states for imputation
+    #[arg(long)]
+    pub imp_states: Option<usize>,
+
+    /// Imputation segment length in cM
+    #[arg(long)]
+    pub imp_segment: Option<f32>,
+
+    /// Imputation step size in cM
+    #[arg(long)]
+    pub imp_step: Option<f32>,
+
+    /// Number of imputation steps
+    #[arg(long)]
+    pub imp_nsteps: Option<usize>,
+
+    /// Maximum cM in a marker cluster
+    #[arg(long)]
+    pub cluster: Option<f32>,
+
+    /// PBWT batch memory budget (MB) for imputation state selection
+    #[arg(long)]
+    pub pbwt_batch_mb: Option<usize>,
+
+    /// Print posterior allele probabilities
+    #[arg(long)]
+    pub ap: bool,
+
+    /// Print posterior genotype probabilities
+    #[arg(long)]
+    pub gp: bool,
+
+    // ============ General Parameters ============
+    /// Effective population size
+    #[arg(long)]
+    pub ne: Option<f32>,
+
+    /// Allele mismatch probability (auto-calculated if not specified)
+    #[arg(long)]
+    pub err: Option<f32>,
+
+    /// Estimate ne and err parameters
+    #[arg(long)]
+    pub em: bool,
+
+    /// Window length in cM
+    #[arg(long)]
+    pub window: Option<f32>,
+
+    /// Maximum markers per window
+    #[arg(long)]
+    pub window_markers: Option<usize>,
+
+    /// Window overlap in cM
+    #[arg(long)]
+    pub overlap: Option<f32>,
+
+    /// Random seed for reproducibility
+    #[arg(long)]
+    pub seed: Option<i64>,
+
+    /// Number of threads (default: all available cores)
+    #[arg(long)]
+    pub nthreads: Option<usize>,
 
     /// Enable profiling output (hierarchical timing tree)
     #[arg(long, default_value = "false")]
@@ -343,9 +463,44 @@ impl Config {
             config.apply_toml(toml_cfg);
         }
 
+        // Apply CLI args
         config.gt = cli.gt;
         config.r#ref = cli.r#ref;
         config.out = cli.out;
+
+        if let Some(v) = cli.map { config.map = Some(v); }
+        if let Some(v) = cli.chrom { config.chrom = Some(v); }
+        if let Some(v) = cli.excludesamples { config.excludesamples = Some(v); }
+        if let Some(v) = cli.excludemarkers { config.excludemarkers = Some(v); }
+
+        if let Some(v) = cli.burnin { config.burnin = v; }
+        if let Some(v) = cli.iterations { config.iterations = v; }
+        if let Some(v) = cli.mcmc_burnin { config.mcmc_burnin = v; }
+        if cli.dynamic_mcmc { config.dynamic_mcmc = true; }
+        if let Some(v) = cli.mcmc_steps { config.mcmc_steps = v; }
+        if let Some(v) = cli.mcmc_lr_samples { config.mcmc_lr_samples = v; }
+        if let Some(v) = cli.phase_states { config.phase_states = v; }
+        if let Some(v) = cli.rare { config.rare = v; }
+
+        if cli.impute { config.impute = true; }
+        if let Some(v) = cli.imp_states { config.imp_states = v; }
+        if let Some(v) = cli.imp_segment { config.imp_segment = v; }
+        if let Some(v) = cli.imp_step { config.imp_step = v; }
+        if let Some(v) = cli.imp_nsteps { config.imp_nsteps = v; }
+        if let Some(v) = cli.cluster { config.cluster = v; }
+        if let Some(v) = cli.pbwt_batch_mb { config.pbwt_batch_mb = v; }
+        if cli.ap { config.ap = true; }
+        if cli.gp { config.gp = true; }
+
+        if let Some(v) = cli.ne { config.ne = v; }
+        if let Some(v) = cli.err { config.err = Some(v); }
+        if cli.em { config.em = true; }
+        if let Some(v) = cli.window { config.window = v; }
+        if let Some(v) = cli.window_markers { config.window_markers = v; }
+        if let Some(v) = cli.overlap { config.overlap = v; }
+        if let Some(v) = cli.seed { config.seed = v; }
+        if let Some(v) = cli.nthreads { config.nthreads = Some(v); }
+
         if cli.profile {
             config.profile = true;
         }
