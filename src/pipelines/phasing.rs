@@ -7921,6 +7921,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     seq2: &[u8],
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
+    rng: &mut impl rand::Rng,
 ) -> Option<MosaicPaths> {
     if n_states < 2 {
         return None;
@@ -7979,9 +7980,10 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
     }
 
-    // Find best pair
+    // Find best pair using reservoir sampling for ties
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (0, 1);
+    let mut count = 0;
 
     for i in 0..n_states {
         for j in 0..i {
@@ -7989,6 +7991,12 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             if s > best_score {
                 best_score = s;
                 best_pair = (i, j);
+                count = 1;
+            } else if (s - best_score).abs() < 1e-6 {
+                count += 1;
+                if rng.random_range(0..count) == 0 {
+                    best_pair = (i, j);
+                }
             }
         }
     }
@@ -8077,6 +8085,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
     // Attempt pairwise initialization if no initial paths provided
     let mut heuristic_paths = if initial_paths.is_none() {
+        // Use a distinct seed for initialization to avoid correlation with MCMC chain
+        let mut init_rng =
+            rand::rngs::SmallRng::seed_from_u64(seed.wrapping_add(0x496E_6974_5365_6564));
         find_best_constant_pair_with_buffer(
             n_markers,
             n_states_usize,
@@ -8084,6 +8095,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             seq2,
             &mut ref_provider,
             &mut workspace.scores,
+            &mut init_rng,
         )
     } else {
         None
@@ -10618,6 +10630,7 @@ mod tests {
         let seq2 = vec![1, 1, 1];
 
         let mut scores = Vec::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let paths = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
@@ -10625,6 +10638,7 @@ mod tests {
             &seq2,
             &mut ref_provider,
             &mut scores,
+            &mut rng,
         )
         .unwrap();
 
