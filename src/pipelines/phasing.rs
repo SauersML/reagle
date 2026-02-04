@@ -10657,5 +10657,148 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod offset_tests {
+    use super::*;
+    use crate::data::alignment::MarkerAlignment;
+    use crate::data::haplotype::Samples;
+    use crate::data::marker::{Allele, Marker, Markers, Nucleotide, MarkerIdx, AlleleMapping};
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix, GenotypeView, MutableGenotypes};
+    use crate::data::ChromIdx;
+    use std::sync::Arc;
+    use super::CombinedHapId; // Correct import
+
+    fn create_identity_alignment(n: usize) -> MarkerAlignment<crate::data::AnyMarkerSpace, crate::data::AnyMarkerSpace> {
+        let mut ref_to_target = Vec::with_capacity(n);
+        let mut target_to_ref = Vec::with_capacity(n);
+        let mut allele_mappings = Vec::with_capacity(n);
+
+        for i in 0..n {
+            ref_to_target.push(Some(MarkerIdx::new(i as u32)));
+            target_to_ref.push(Some(MarkerIdx::new(i as u32)));
+            // Identity mapping: 0->0, 1->1. No flip.
+            allele_mappings.push(Some(AlleleMapping::new(
+                vec![0, 1], // Target 0->Ref 0, Target 1->Ref 1
+                2,          // 2 reference alleles
+                false,      // strand_flipped
+                false,      // alleles_swapped
+            )));
+        }
+
+        MarkerAlignment {
+            ref_to_target,
+            target_to_ref,
+            allele_mappings,
+        }
+    }
+
+    #[test]
+    fn test_ref_provider_composite_offset() {
+        // Setup:
+        // 1 Target Hap, 1 Reference Hap.
+        // Target Hap (0)
+        // Ref Hap (1)
+        //
+        // ThreadedHaps contains Global IDs: [0, 1]
+        //
+        // Case 1: View is CompositeSubset.
+        //   - Expects Global Index.
+        //   - ThreadedHaps provides Global Index (1).
+        //   - Offset should be 0.
+        //   - Provider -> View(1) -> Ref Matrix(0) -> OK.
+        //
+        // Case 2: View is Matrix (Ref only).
+        //   - Expects Local Ref Index.
+        //   - ThreadedHaps provides Global Index (1).
+        //   - Offset should be n_target_haps (1).
+        //   - Provider -> (1 - 1) = 0 -> View(0) -> Ref Matrix(0) -> OK.
+
+        let n_markers = 1;
+        let n_target_haps = 1;
+        let n_ref_haps = 1;
+        let n_total_haps = n_target_haps + n_ref_haps; // 2
+
+        // 1. Create Reference Matrix (1 hap, 1 marker, allele 1)
+        let samples_ref = Arc::new(Samples::from_ids(vec!["Ref1".to_string()]));
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+        markers.push(Marker::new(
+            ChromIdx::new(0),
+            100,
+            None,
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        let col = GenotypeColumn::from_alleles(&[1], 1); // Ref hap has allele 1
+        let ref_matrix = GenotypeMatrix::new_phased(markers.clone(), vec![col], samples_ref);
+
+        // 2. Create Target Genotypes (1 hap, 1 marker, allele 0)
+        let target_geno = MutableGenotypes::from_fn(n_markers, n_target_haps, |_, _| 0);
+
+        // 3. Create Alignment (Identity)
+        let alignment = create_identity_alignment(n_markers);
+
+        // 4. Create ThreadedHaps (Global IDs: 0 for Target, 1 for Ref)
+        // We only care about the Reference state for this test, which is state 1.
+        let mut threaded =
+            ThreadedHaps::<CombinedHapSpace>::new(n_total_haps, n_total_haps, n_markers);
+        // Add hap 1 (Ref) as a state
+        threaded.push_new(CombinedHapId::new(1));
+
+        // --- Test Case 1: CompositeSubset View ---
+        let subset = vec![0];
+        let view_composite = GenotypeView::CompositeSubset {
+            target: &target_geno,
+            reference: &ref_matrix,
+            alignment: &alignment,
+            subset: &subset,
+            n_target_haps,
+        };
+
+        // Initialize RefAlleleProvider with offset 0 (Correct for Composite)
+        let mut provider_composite = RefAlleleProvider::new(view_composite, &threaded, 0);
+
+        // Materialize at marker 0
+        // We need a dummy output buffer.
+        let mut out = vec![0u8; 1];
+        provider_composite.fill_ref_alleles(0, &mut out);
+
+        // Internal check: state_haps should be 1 (Global ID)
+        // because offset is 0, and threaded gave 1.
+        // GenotypeView::CompositeSubset(1) -> checks 1 >= n_target(1) -> ref index 0 -> Allele 1.
+        assert_eq!(provider_composite.state_haps[0].as_usize(), 1);
+
+        // Verify allele retrieval
+        // The provider stores state_haps internally. When we ask for allele, it delegates to view.
+        // view.allele(marker, hap=1)
+        let allele = provider_composite
+            .ref_gt
+            .allele(MarkerIdx::new(0), provider_composite.state_haps[0]);
+        assert_eq!(
+            allele, 1,
+            "Composite View should return Ref Allele 1 for Global Hap 1"
+        );
+
+        // --- Test Case 2: Matrix View (Ref Only) ---
+        // This simulates how it might be used if we weren't using Composite views (e.g. old behavior)
+        // or if we constructed a view just for the reference.
+        let view_matrix = GenotypeView::from(&ref_matrix);
+
+        // Initialize RefAlleleProvider with offset 1 (n_target_haps)
+        let mut provider_matrix = RefAlleleProvider::new(view_matrix, &threaded, n_target_haps);
+
+        provider_matrix.fill_ref_alleles(0, &mut out);
+
+        // Internal check: state_haps should be 0 (Local Ref ID)
+        // because offset is 1, and threaded gave 1. 1 - 1 = 0.
+        // GenotypeView::Matrix(0) -> Ref Index 0 -> Allele 1.
+        assert_eq!(provider_matrix.state_haps[0].as_usize(), 0);
+
+        let allele_matrix = provider_matrix
+            .ref_gt
+            .allele(MarkerIdx::new(0), provider_matrix.state_haps[0]);
+        assert_eq!(
+            allele_matrix, 1,
+            "Matrix View should return Ref Allele 1 for Local Hap 0"
+        );
+    }
+}
