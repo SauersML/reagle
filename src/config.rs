@@ -21,7 +21,7 @@ const DEFAULT_CONFIG_FILE: &str = "reagle.toml";
 pub struct CliArgs {
     /// Input VCF file with GT FORMAT field (required)
     #[arg(long, value_name = "FILE")]
-    pub gt: PathBuf,
+    pub target: PathBuf,
 
     /// Reference panel (bref3 or VCF file with phased genotypes)
     #[arg(long, value_name = "FILE")]
@@ -45,7 +45,7 @@ pub struct CliArgs {
 pub struct Config {
     // ============ Data Parameters ============
     /// Input VCF file with GT FORMAT field (required)
-    pub gt: PathBuf,
+    pub target: PathBuf,
 
     /// Reference panel (bref3 or VCF file with phased genotypes)
     pub r#ref: Option<PathBuf>,
@@ -192,7 +192,7 @@ struct TomlConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            gt: std::path::PathBuf::from(""),
+            target: std::path::PathBuf::from(""),
             r#ref: None,
             out: std::path::PathBuf::from(""),
             map: None,
@@ -349,7 +349,7 @@ impl Config {
             applied_toml = true;
         }
         if !applied_toml {
-            if let Some(parent) = cli.gt.parent() {
+            if let Some(parent) = cli.target.parent() {
                 let path = parent.join(DEFAULT_CONFIG_FILE);
                 if let Some(toml_cfg) = load_toml_config(path)? {
                     config.apply_toml(toml_cfg);
@@ -357,7 +357,7 @@ impl Config {
             }
         }
 
-        config.gt = cli.gt;
+        config.target = cli.target;
         config.r#ref = cli.r#ref;
         config.out = cli.out;
         if cli.profile {
@@ -426,9 +426,9 @@ impl Config {
     /// Validate configuration parameters
     pub fn validate(&self) -> Result<()> {
         // Check input file exists
-        if !self.gt.exists() {
+        if !self.target.exists() {
             return Err(ReagleError::FileNotFound {
-                path: self.gt.clone(),
+                path: self.target.clone(),
             });
         }
 

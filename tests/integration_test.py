@@ -461,7 +461,7 @@ def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2):
 def run_reagle(ref_vcf, target_vcf, output_prefix, reagle_bin):
     """Run Reagle for imputation."""
     output_vcf = f"{output_prefix}.vcf.gz"
-    cmd = f"{reagle_bin} --ref {ref_vcf} --gt {target_vcf} --out {output_prefix}"
+    cmd = f"{reagle_bin} --ref {ref_vcf} --target {target_vcf} --out {output_prefix}"
     try:
         run(cmd)
         if os.path.exists(output_vcf):
@@ -3025,7 +3025,7 @@ def stage_phasing_compare():
     reagle_vcf = Path(str(reagle_prefix) + ".vcf.gz")
     if not reagle_vcf.exists():
         print("\n--- Running Reagle (phasing-only) ---")
-        run(f"{paths['reagle_bin']} --gt {input_vcf} --out {reagle_prefix}")
+        run(f"{paths['reagle_bin']} --target {input_vcf} --out {reagle_prefix}")
     ensure_index(reagle_vcf)
 
     # Run EagleImp phasing
@@ -3594,7 +3594,7 @@ def run_reagle_chr(chrom, paths):
     """Run Reagle for a chromosome."""
     out = paths['data_dir'] / "reagle_imputed.vcf.gz"
     if paths['reagle_bin'].exists() and not out.exists():
-        run(f"{paths['reagle_bin']} --ref {paths['ref_vcf']} --gt {paths['input_vcf']} --out {paths['data_dir']}/reagle_imputed")
+        run(f"{paths['reagle_bin']} --ref {paths['ref_vcf']} --target {paths['input_vcf']} --out {paths['data_dir']}/reagle_imputed")
         run(f"bcftools index -f {out}")
 
 

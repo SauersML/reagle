@@ -17,7 +17,7 @@ use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::storage::phase_state::{Phased, PhaseState};
-use crate::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
+use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::data::marker::{AnyMarkerSpace, RefWindowSpace};
 use crate::error::ReagleError;
 use crate::error::Result;
@@ -2164,7 +2164,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let (target_positions_map, target_marker_count) =
-            collect_target_positions(&self.config.gt)?;
+            collect_target_positions(&self.config.target)?;
         let target_positions = if target_marker_count == 0 {
             None
         } else {
@@ -2208,7 +2208,7 @@ impl crate::pipelines::ImputationPipeline {
             .ok_or_else(|| ReagleError::config("Reference panel required for imputation"))?;
         let ref_path = ensure_binary_reference(ref_path, &self.config)?;
 
-        let mut input_target_path = self.config.gt.clone();
+        let mut input_target_path = self.config.target.clone();
         let mut input_tmp: Option<tempfile::TempDir> = None;
         if input_target_path.as_os_str() == "-" {
             let tmpdir = tempfile::tempdir()?;
@@ -2246,7 +2246,7 @@ impl crate::pipelines::ImputationPipeline {
             prefix
         };
         let mut phase_config = self.config.clone();
-        phase_config.gt = input_target_path.clone();
+        phase_config.target = input_target_path.clone();
         phase_config.r#ref = Some(ref_path.to_path_buf());
         phase_config.out = phased_prefix.clone();
         let mut phasing = crate::pipelines::phasing::PhasingPipeline::new(
@@ -2542,56 +2542,11 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromIdx(ChromIdx);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromPos {
-                        chrom: TargetChromIdx,
-                        pos: u32,
-                    }
-
-                    let mut target_chroms: std::collections::HashMap<String, TargetChromIdx> =
-                        std::collections::HashMap::new();
-                    for c in 0..target_window.genotypes.markers().chrom_names().len() {
-                        let idx = ChromIdx::new(c as u16);
-                        let name = target_window
-                            .genotypes
-                            .markers()
-                            .chrom_name(idx)
-                            .unwrap_or("");
-                        target_chroms.insert(
-                            normalize_chrom_local(name).to_string(),
-                            TargetChromIdx(idx),
-                        );
-                    }
-
-                    let mut target_positions: std::collections::HashSet<TargetChromPos> =
-                        std::collections::HashSet::with_capacity(
-                            target_window.genotypes.n_markers(),
-                        );
-                    for m in 0..target_window.genotypes.n_markers() {
-                        let marker = target_window
-                            .genotypes
-                            .markers()
-                            .marker(MarkerIdx::new(m as u32));
-                        target_positions
-                            .insert(TargetChromPos { chrom: TargetChromIdx(marker.chrom), pos: marker.pos });
-                    }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        let ref_marker =
-                            ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
-                        let ref_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_marker.chrom)
-                            .unwrap_or("");
-                        let ref_key = target_chroms
-                            .get(normalize_chrom_local(ref_chrom))
-                            .copied()
-                            .map(|chrom| TargetChromPos { chrom, pos: ref_marker.pos });
-                        let is_present = target_idx.is_some()
-                            || ref_key
-                                .map(|key| target_positions.contains(&key))
-                                .unwrap_or(false);
+                        // Only treat as genotyped if the marker aligns by allele as well
+                        // as position. Position-only matches can be allele-mismatched and
+                        // must be treated as imputed.
+                        let is_present = target_idx.is_some();
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
@@ -2816,56 +2771,11 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromIdx(ChromIdx);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromPos {
-                        chrom: TargetChromIdx,
-                        pos: u32,
-                    }
-
-                    let mut target_chroms: std::collections::HashMap<String, TargetChromIdx> =
-                        std::collections::HashMap::new();
-                    for c in 0..target_window.genotypes.markers().chrom_names().len() {
-                        let idx = ChromIdx::new(c as u16);
-                        let name = target_window
-                            .genotypes
-                            .markers()
-                            .chrom_name(idx)
-                            .unwrap_or("");
-                        target_chroms.insert(
-                            normalize_chrom_local(name).to_string(),
-                            TargetChromIdx(idx),
-                        );
-                    }
-
-                    let mut target_positions: std::collections::HashSet<TargetChromPos> =
-                        std::collections::HashSet::with_capacity(
-                            target_window.genotypes.n_markers(),
-                        );
-                    for m in 0..target_window.genotypes.n_markers() {
-                        let marker = target_window
-                            .genotypes
-                            .markers()
-                            .marker(MarkerIdx::new(m as u32));
-                        target_positions
-                            .insert(TargetChromPos { chrom: TargetChromIdx(marker.chrom), pos: marker.pos });
-                    }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        let ref_marker =
-                            ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
-                        let ref_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_marker.chrom)
-                            .unwrap_or("");
-                        let ref_key = target_chroms
-                            .get(normalize_chrom_local(ref_chrom))
-                            .copied()
-                            .map(|chrom| TargetChromPos { chrom, pos: ref_marker.pos });
-                        let is_present = target_idx.is_some()
-                            || ref_key
-                                .map(|key| target_positions.contains(&key))
-                                .unwrap_or(false);
+                        // Only treat as genotyped if the marker aligns by allele as well
+                        // as position. Position-only matches can be allele-mismatched and
+                        // must be treated as imputed.
+                        let is_present = target_idx.is_some();
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 

@@ -5,13 +5,13 @@
 //! ## Usage
 //! ```bash
 //! # Phasing only
-//! reagle --gt input.vcf.gz --out phased
+//! reagle --target input.vcf.gz --out phased
 //!
 //! # Imputation with reference panel
-//! reagle --gt input.vcf.gz --ref reference.vcf.gz --out imputed
+//! reagle --target input.vcf.gz --ref reference.vcf.gz --out imputed
 //!
 //! # With profiling output
-//! reagle --gt input.vcf.gz --ref reference.vcf.gz --out imputed --profile
+//! reagle --target input.vcf.gz --ref reference.vcf.gz --out imputed --profile
 //! ```
 
 use std::time::Instant;
@@ -91,14 +91,14 @@ fn run() -> Result<()> {
     // Run appropriate pipeline
     if config.is_imputation_mode() {
         eprintln!("Mode: Imputation");
-        eprintln!("Target: {:?}", config.gt);
+        eprintln!("Target: {:?}", config.target);
         eprintln!("Reference: {:?}", config.r#ref.as_ref().unwrap());
 
         let mut pipeline = ImputationPipeline::new(config, Some(telemetry.clone()));
         pipeline.run()?;
     } else {
         eprintln!("Mode: Phasing");
-        eprintln!("Input: {:?}", config.gt);
+        eprintln!("Input: {:?}", config.target);
 
         let mut pipeline = PhasingPipeline::new(config, Some(telemetry.clone()));
         pipeline.run_auto()?;

@@ -407,7 +407,7 @@ fn test_dynamic_phasing_continuity_stress() {
     let out_prefix = temp_dir.path().join("output_dynamic_stress");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
 
@@ -470,7 +470,7 @@ fn test_synthetic_slam_dunk() {
     let out_prefix = temp_dir.path().join("output_slam");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -564,7 +564,7 @@ fn test_synthetic_recombination() {
     let out_prefix = temp_dir.path().join("output_rec");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
@@ -682,7 +682,7 @@ fn test_simulated_chip_density() {
     let out_prefix = temp_dir.path().join("output_chip");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -759,7 +759,7 @@ fn test_population_structure() {
     let out_prefix = temp_dir.path().join("output_admix");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -848,7 +848,7 @@ fn test_hotspot_switching() {
     let out_prefix = temp_dir.path().join("output_hotspot");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.map = Some(map_path);
     config.out = out_prefix.clone();
@@ -921,7 +921,7 @@ fn test_phase_switch_torture() {
     let out_prefix = temp_dir.path().join("output_phase_torture");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -991,7 +991,7 @@ fn test_error_injection() {
     let out_prefix = temp_dir.path().join("output_error");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.err = Some(0.01);
@@ -1068,7 +1068,7 @@ fn test_rare_variant() {
     let out_prefix = temp_dir.path().join("output_rare");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -1163,7 +1163,7 @@ fn test_dr2_validation() {
     let out_prefix = temp_dir.path().join("output_dr2");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -1260,7 +1260,7 @@ fn test_phasing_perfect_ld() {
     let out_prefix = temp_dir.path().join("output_phase");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.out = out_prefix.clone();
     config.burnin = 2;
     config.iterations = 5;
@@ -1336,7 +1336,7 @@ fn test_singleton_imputation() {
     let out_prefix = temp_dir.path().join("output_singleton");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
@@ -1412,7 +1412,7 @@ fn test_high_recombination_stress() {
     let out_prefix = temp_dir.path().join("output_high_recomb");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 30;
@@ -1489,7 +1489,7 @@ fn test_ultra_dense_markers() {
     let out_prefix = temp_dir.path().join("output_dense");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
@@ -1580,7 +1580,7 @@ fn test_diverse_reference_with_mismatch() {
     let out_prefix = temp_dir.path().join("output_diverse");
 
     let mut config = default_test_config();
-    config.gt = target_file.path().to_path_buf();
+    config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
@@ -1696,7 +1696,7 @@ fn test_microarray_vs_wgs_imputation() {
     let out_prefix = temp_dir.path().join("output_microarray");
 
     let mut config = default_test_config();
-    config.gt = masked_target_file.path().to_path_buf();
+    config.target = masked_target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
@@ -1898,7 +1898,7 @@ fn test_imputation_polarity_consistency() {
     let out_prefix = temp_dir.path().join("output_polarity");
 
     let mut config = default_test_config();
-    config.gt = masked_target_file.path().to_path_buf();
+    config.target = masked_target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 80;
@@ -2105,7 +2105,7 @@ fn test_phasing_confidence() {
     let out_prefix = temp_dir.path().join("phased_confidence");
 
     let config = Config {
-        gt: out_prefix.clone(),
+        target: out_prefix.clone(),
         r#ref: None,
         out: out_prefix.clone(),
         map: None,

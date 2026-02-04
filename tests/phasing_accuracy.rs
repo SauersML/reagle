@@ -136,7 +136,7 @@ fn test_ser_switching_all0_all1_reference() {
     let out_path = out_file.path().to_path_buf();
 
     let mut config = Config::default();
-    config.gt = target_path.clone();
+    config.target = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone(); // Reagle will likely append .vcf.gz
     config.phase_states = 0; // Auto state budget.
@@ -294,7 +294,7 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
     let out_path = out_file.path().to_path_buf();
 
     let mut config = Config::default();
-    config.gt = target_path.clone();
+    config.target = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
     config.phase_states = 0;
@@ -403,7 +403,7 @@ fn test_ser_not_fixed_by_high_state_count_all0_all1() {
     let out_path = out_file.path().to_path_buf();
 
     let mut config = Config::default();
-    config.gt = target_path.clone();
+    config.target = target_path.clone();
     config.r#ref = Some(ref_path.clone());
     config.out = out_path.clone();
     config.phase_states = 0;
@@ -541,7 +541,7 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
         let out_path = out_file.path().to_path_buf();
 
         let mut config = Config::default();
-        config.gt = target_path.clone();
+        config.target = target_path.clone();
         config.r#ref = Some(ref_path.clone());
         config.out = out_path.clone();
         config.phase_states = 0;

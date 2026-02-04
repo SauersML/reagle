@@ -130,7 +130,6 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for marker sampling")
     parser.add_argument("--chrom", type=str, default=None, help="Optional chrom/region for bcftools -r")
-    parser.add_argument("--threads", type=int, default=0, help="Threads for Reagle (0=all)")
     parser.add_argument(
         "--time-limit",
         type=int,
@@ -265,12 +264,9 @@ def main():
     cmd = [
         str(reagle_bin),
         "--ref", str(ref_for_impute),
-        "--gt", str(target_sparse),
+        "--target", str(target_sparse),
         "--out", str(args.out_dir / "reagle_microarray"),
     ]
-    threads = args.threads if args.threads > 0 else (os.cpu_count() or 1)
-    cmd.extend(["--nthreads", str(threads)])
-
     timed_out = run(cmd, env=env, timeout=args.time_limit)
 
     print("\nDone.")

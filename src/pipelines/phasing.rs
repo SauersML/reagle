@@ -1622,7 +1622,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         }
 
         // Load target VCF with filtering
-        let (mut reader, file_reader) = VcfReader::open(&self.config.gt)?;
+        let (mut reader, file_reader) = VcfReader::open(&self.config.target)?;
         reader.set_exclude_samples(&exclude_samples);
         reader.set_exclude_markers(exclude_markers);
         let target_gt = reader.read_all(file_reader)?;
@@ -2536,7 +2536,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Open streaming reader
         let mut reader =
-            StreamingVcfReader::open(&self.config.gt, gen_maps.clone(), streaming_config)?;
+            StreamingVcfReader::open(&self.config.target, gen_maps.clone(), streaming_config)?;
         let samples = reader.samples_arc();
 
         // Check for haploid samples
@@ -2736,7 +2736,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
     /// Automatically select between in-memory and streaming mode based on data size
     pub fn run_auto(&mut self) -> Result<()> {
-        let file_size = std::fs::metadata(&self.config.gt)
+        let file_size = std::fs::metadata(&self.config.target)
             .map(|m| m.len())
             .unwrap_or(0);
         let estimated_markers = file_size / 100;
@@ -9685,7 +9685,7 @@ mod tests {
     #[test]
     fn test_pipeline_creation() {
         let config = Config {
-            gt: PathBuf::from("test.vcf"),
+            target: PathBuf::from("test.vcf"),
             r#ref: None,
             out: PathBuf::from("out"),
             map: None,
@@ -9773,7 +9773,7 @@ mod tests {
         let gen_maps = GeneticMaps::new();
 
         let config = Config {
-            gt: PathBuf::from("test.vcf"),
+            target: PathBuf::from("test.vcf"),
             r#ref: None,
             out: PathBuf::from("out"),
             map: None,

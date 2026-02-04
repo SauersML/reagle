@@ -115,7 +115,7 @@ def run_benchmark(person, file_path):
         print("ERROR: target.vcf.gz missing after prep!")
         run_cmd(["ls", "-l"])
     
-    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--gt", "target.vcf.gz", "--out", "reagle_out"])
+    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--target", "target.vcf.gz", "--out", "reagle_out"])
 
     # 3. Run Beagle
     print("=== Running Beagle ===")

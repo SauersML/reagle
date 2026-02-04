@@ -13,11 +13,11 @@ software for genotype imputation, and algorithms mostly from [SHAPEIT5](https://
 
 ### Phasing
 
-To phase genotypes, use the `--gt` argument to specify the input VCF file. The
+To phase genotypes, use the `--target` argument to specify the input VCF file. The
 `--out` argument is used to specify the prefix for the output files.
 
 ```bash
-reagle --gt input.vcf.gz --out phased
+reagle --target input.vcf.gz --out phased
 ```
 
 ### Imputation
@@ -26,7 +26,7 @@ For imputation, provide a reference panel using the `--ref` argument, in
 addition to the target genotypes.
 
 ```bash
-reagle --gt input.vcf.gz --ref reference.vcf.gz --out imputed
+reagle --target input.vcf.gz --ref reference.vcf.gz --out imputed
 ```
 
 ## Installation and Building

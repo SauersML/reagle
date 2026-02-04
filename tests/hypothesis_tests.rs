@@ -100,7 +100,7 @@ fn run_rust_imputation(
 ) -> reagle::Result<()> {
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--ref",
         ref_path.to_str().unwrap(),
@@ -131,7 +131,7 @@ fn run_rust_imputation_with_window_toml(
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--ref",
         ref_path.to_str().unwrap(),
@@ -161,7 +161,7 @@ fn run_rust_phasing_with_window_toml(
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--out",
         out_prefix.to_str().unwrap(),
@@ -176,7 +176,7 @@ fn run_rust_phasing_with_window_toml(
 /// Run Rust phasing pipeline (defaults).
 fn run_rust_phasing_default(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
     let mut pipeline = reagle::PhasingPipeline::new(config, None);
@@ -191,7 +191,7 @@ fn run_rust_phasing(
 ) -> reagle::Result<std::path::PathBuf> {
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--ref",
         ref_path.to_str().unwrap(),
@@ -213,7 +213,7 @@ fn run_rust_phasing_with_seed(
 ) -> reagle::Result<std::path::PathBuf> {
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--ref",
         ref_path.to_str().unwrap(),
@@ -238,7 +238,7 @@ fn run_rust_imputation_with_ap(
 ) -> reagle::Result<()> {
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--ref",
         ref_path.to_str().unwrap(),

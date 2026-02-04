@@ -25,10 +25,12 @@ fn bench_fwd_update(c: &mut Criterion) {
                 let p_switch = 0.01f32;
 
                 b.iter(|| {
-                    let sum = HmmUpdater::fwd_update_emissions(
+                    let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
+                    let shift = p_switch / n_states as f32;
+                    let sum = HmmUpdater::fwd_update_emissions_scale(
                         black_box(&mut fwd),
-                        black_box(fwd_sum),
-                        black_box(p_switch),
+                        black_box(scale),
+                        black_box(shift),
                         black_box(&emissions),
                         black_box(n_states),
                     );
@@ -104,10 +106,12 @@ fn bench_forward_backward_scaling(c: &mut Criterion) {
                     // Forward pass
                     let mut fwd_sum = 1.0f32;
                     for m in 0..n_markers {
-                        fwd_sum = HmmUpdater::fwd_update_emissions(
+                        let scale = (1.0 - p_switch) / fwd_sum.max(1e-30);
+                        let shift = p_switch / n_states as f32;
+                        fwd_sum = HmmUpdater::fwd_update_emissions_scale(
                             &mut fwd[m],
-                            fwd_sum,
-                            p_switch,
+                            scale,
+                            shift,
                             &emissions[m],
                             n_states,
                         );

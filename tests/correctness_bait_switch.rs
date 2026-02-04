@@ -188,7 +188,7 @@ fn test_state_index_stability_bait_and_switch() {
     );
 
     let mut config = Config::default();
-    config.gt = target_path;
+    config.target = target_path;
     config.r#ref = Some(ref_path);
     config.out = out_prefix.clone();
 
@@ -271,7 +271,7 @@ fn test_clean_constructed_reference_consistency() {
     );
 
     let mut config = Config::default();
-    config.gt = target_path;
+    config.target = target_path;
     config.r#ref = Some(ref_path);
     config.out = out_prefix.clone();
 

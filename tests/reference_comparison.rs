@@ -2810,7 +2810,7 @@ fn write_linear_map_for_span(
 fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
     let config = Config::parse_from([
         "reagle",
-        "--gt",
+        "--target",
         gt_path.to_str().unwrap(),
         "--out",
         out_prefix.to_str().unwrap(),
@@ -2832,7 +2832,7 @@ fn run_rust_phasing_with_map(
     overlap_cm: f32,
 ) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.map = Some(map_path.to_path_buf());
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
@@ -2850,7 +2850,7 @@ fn run_rust_imputation(
     seed: i64,
 ) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.r#ref = Some(ref_path.to_path_buf());
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
@@ -2867,7 +2867,7 @@ fn run_rust_imputation_with_err(
     err: f32,
 ) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.r#ref = Some(ref_path.to_path_buf());
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
@@ -2885,7 +2885,7 @@ fn run_rust_imputation_with_ne(
     ne: i64,
 ) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.r#ref = Some(ref_path.to_path_buf());
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
@@ -2903,7 +2903,7 @@ fn run_rust_imputation_with_cluster(
     cluster: f32,
 ) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.r#ref = Some(ref_path.to_path_buf());
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
@@ -2923,7 +2923,7 @@ fn run_rust_imputation_with_map(
     overlap_cm: f32,
 ) -> reagle::Result<()> {
     let mut config = Config::default();
-    config.gt = gt_path.to_path_buf();
+    config.target = gt_path.to_path_buf();
     config.r#ref = Some(ref_path.to_path_buf());
     config.map = Some(map_path.to_path_buf());
     config.out = out_prefix.to_path_buf();

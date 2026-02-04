@@ -114,7 +114,7 @@ fn synth_impute_runtime_under_2_min() {
     let mut child = Command::new(bin)
         .arg("--ref")
         .arg(&ref_vcf)
-        .arg("--gt")
+        .arg("--target")
         .arg(&input_vcf)
         .arg("--out")
         .arg(&out_prefix)
