@@ -8110,7 +8110,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    if n_markers > 2000 {
+    if n_markers > 5000 {
         return None;
     }
 
@@ -10919,5 +10919,89 @@ mod tests {
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
         );
+    }
+
+    #[test]
+    fn test_run_phase_auto_states() {
+        let config = Config {
+            target: PathBuf::from("test.vcf"),
+            r#ref: None,
+            out: PathBuf::from("out"),
+            map: None,
+            chrom: None,
+            excludesamples: None,
+            excludemarkers: None,
+            burnin: 2,
+            iterations: 2,
+            mcmc_burnin: 1,
+            dynamic_mcmc: false,
+            mcmc_steps: 3,
+            mcmc_lr_samples: 32,
+            phase_states: 0, // Auto
+            rare: 0.002,
+            impute: true,
+            imp_states: 10,
+            imp_segment: 6.0,
+            imp_step: 0.1,
+            imp_nsteps: 7,
+            cluster: 0.005,
+            pbwt_batch_mb: 256,
+            ap: false,
+            gp: false,
+            ne: 10000.0,
+            err: None,
+            em: false,
+            window: 40.0,
+            window_markers: 100000,
+            overlap: 2.0,
+            seed: 12345,
+            nthreads: Some(1),
+            profile: false,
+        };
+
+        // Create pipeline with phase_states = 0
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+
+        use crate::data::genetic_map::GeneticMaps;
+        use crate::data::haplotype::Samples;
+        use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
+        use crate::data::storage::GenotypeColumn;
+        use crate::data::storage::matrix::GenotypeMatrix;
+        use std::sync::Arc;
+
+        let n_markers = 10;
+        let n_samples = 5;
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+        for i in 0..n_markers {
+            let m = Marker::new(
+                crate::data::ChromIdx::new(0),
+                i as u32 * 1000,
+                Some(format!("m{}", i).into()),
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::T)],
+            );
+            markers.push(m);
+        }
+        let samples = Arc::new(Samples::from_ids(
+            (0..n_samples).map(|i| format!("s{}", i)).collect(),
+        ));
+        let columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|_| {
+                let bytes: Vec<u8> = vec![0; n_samples * 2];
+                GenotypeColumn::from_alleles(&bytes, 2)
+            })
+            .collect();
+        let gt = GenotypeMatrix::new_unphased(markers, columns, samples);
+        let gen_maps = GeneticMaps::new();
+
+        // This should trigger parameter update
+        let _ = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
+
+        // With 10 markers and 10 haplotypes:
+        // n_total_haps = 10.
+        // params.n_states = min(DEFAULT_PHASE_STATES, n_total_haps - 2) = min(280, 8) = 8.
+
+        assert_eq!(pipeline.params.n_states, 8, "Expected n_states to be auto-scaled to n_haps - 2");
     }
 }
