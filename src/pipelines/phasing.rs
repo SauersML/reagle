@@ -1719,8 +1719,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Initialize parameters based on TOTAL haplotype count (target + ref)
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if self.config.phase_states > 0 {
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -2767,8 +2769,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        if self.config.phase_states > 0 {
+            self.params
+                .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -4883,10 +4887,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ws.seq1 = seq1;
                         ws.seq2 = seq2;
                         ws.sample_conf = sample_conf;
-                        ws.het_positions = het_positions;
+                        ws.het_positions = het_positions.clone();
 
                         let sample_total = t0.elapsed();
-                        let done = timing.add_sample(
+                        timing.add_sample(
                             t_seq.as_nanos() as u64,
                             t_anchor.as_nanos() as u64,
                             t_mcmc.as_nanos() as u64,
@@ -10251,5 +10255,98 @@ mod tests {
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
         );
+    }
+
+    #[test]
+    fn test_run_phase_auto_states() {
+        use crate::data::genetic_map::GeneticMaps;
+        use crate::data::haplotype::Samples;
+        use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
+        use crate::data::storage::GenotypeColumn;
+        use crate::data::storage::matrix::GenotypeMatrix;
+        use crate::data::ChromIdx;
+        use std::sync::Arc;
+
+        let n_markers = 50;
+        let n_samples = 10;
+
+        // Mock Markers
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+
+        for i in 0..n_markers {
+            let m = Marker::new(
+                ChromIdx::new(0),
+                i as u32 * 1000,
+                Some(format!("m{}", i).into()),
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::T)],
+            );
+            markers.push(m);
+        }
+
+        // Mock Samples
+        let samples = Arc::new(Samples::from_ids(
+            (0..n_samples).map(|i| format!("s{}", i)).collect(),
+        ));
+
+        // Mock Genotypes (Random)
+        let columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|_| {
+                let bytes: Vec<u8> = (0..n_samples * 2).map(|i| (i % 3) as u8).collect();
+                GenotypeColumn::from_alleles(&bytes, 2)
+            })
+            .collect();
+
+        let gt = GenotypeMatrix::new_unphased(markers, columns, samples);
+        let gen_maps = GeneticMaps::new();
+
+        let config = Config {
+            gt: PathBuf::from("test.vcf"),
+            r#ref: None,
+            out: PathBuf::from("out"),
+            map: None,
+            chrom: None,
+            excludesamples: None,
+            excludemarkers: None,
+            burnin: 2,
+            iterations: 2,
+            mcmc_burnin: 1,
+            dynamic_mcmc: false,
+            mcmc_steps: 3,
+            mcmc_lr_samples: 32,
+            phase_states: 0, // Set to 0 to test auto-calculation
+            rare: 0.002,
+            impute: true,
+            imp_states: 10,
+            imp_segment: 6.0,
+            imp_step: 0.1,
+            imp_nsteps: 7,
+            cluster: 0.005,
+            pbwt_batch_mb: 256,
+            ap: false,
+            gp: false,
+            ne: 10000.0,
+            err: None,
+            em: false,
+            window: 40.0,
+            window_markers: 100000,
+            overlap: 2.0,
+            seed: 12345,
+            nthreads: Some(2),
+            profile: false,
+        };
+
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+
+        // Run phasing
+        let _ = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
+
+        // Check that n_states is positive and wasn't overwritten to 0
+        assert!(pipeline.params.n_states > 0, "n_states should be positive, got {}", pipeline.params.n_states);
+
+        // n_hap = 20. default = 280. min(280, 20-2=18) = 18.
+        // It should be 18.
+        assert_eq!(pipeline.params.n_states, 18, "Expected n_states to be 18 (min(default, n_haps-2)), got {}", pipeline.params.n_states);
     }
 }
