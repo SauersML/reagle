@@ -678,7 +678,7 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/0\t0/0\t1/1\t1/1\t1/1
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    let out_vcf = run_rust_phasing(&target_vcf, &ref_vcf, &out_prefix, 0.2)
+    let out_vcf = run_rust_phasing(&target_vcf, &ref_vcf, &out_prefix)
         .expect("Rust phasing failed");
 
     let records = parse_vcf(&out_vcf);
@@ -1487,10 +1487,10 @@ fn test_phasing_should_vary_under_ambiguous_signal_across_seeds() {
     let out_prefix_b = work_dir.path().join("out_b");
 
     let out_a =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 0.2, 12345)
+        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 12345)
             .expect("Phasing run A failed");
     let out_b =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 0.2, 67890)
+        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 67890)
             .expect("Phasing run B failed");
 
     let records_a = parse_vcf(&out_a);
@@ -1615,10 +1615,10 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1
     let out_prefix_b = work_dir.path().join("out_b");
 
     let out_a =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 0.2, 1111)
+        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 1111)
             .expect("Phasing run A failed");
     let out_b =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 0.2, 2222)
+        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 2222)
             .expect("Phasing run B failed");
 
     let records_a = parse_vcf(&out_a);
@@ -1852,7 +1852,7 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1
     for seed in seeds {
         let out_prefix = work_dir.path().join(format!("out_{}", seed));
         let out_vcf =
-            run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix, 0.2, seed)
+            run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix, seed)
                 .expect("Phasing run failed");
         let records = parse_vcf(&out_vcf);
         let gt = records[1].genotypes[0].gt.clone();
