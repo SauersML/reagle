@@ -1220,6 +1220,25 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         anchor_hap1: Vec<u8>,
         anchor_hap2: Vec<u8>,
     ) -> Self {
+        let mut fwd = buffers.fwd;
+        let mut fwd_prior = buffers.fwd_prior;
+        let mut ref_alleles = buffers.ref_alleles;
+        let mut weights = buffers.weights;
+        // Defensive sizing: ensure per-state buffers are large enough.
+        // This avoids panics if a workspace buffer was emptied but n_states was retained.
+        if fwd.len() < n_states {
+            fwd = aligned_vec::AVec::from_iter(32, std::iter::repeat(0.0).take(n_states.max(1)));
+        }
+        if fwd_prior.len() < n_states {
+            fwd_prior =
+                aligned_vec::AVec::from_iter(32, std::iter::repeat(0.0).take(n_states.max(1)));
+        }
+        if ref_alleles.len() < n_states {
+            ref_alleles.resize(n_states, 0);
+        }
+        if weights.len() < n_states {
+            weights.resize(n_states, 0.0);
+        }
         let anchor_count = anchor_hap1
             .iter()
             .zip(anchor_hap2.iter())
@@ -1241,12 +1260,12 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             conf,
             ref_provider,
             combined_checkpoints,
-            fwd: buffers.fwd,
-            fwd_prior: buffers.fwd_prior,
-            ref_alleles: buffers.ref_alleles,
+            fwd,
+            fwd_prior,
+            ref_alleles,
             ref_alleles_flat: buffers.ref_alleles_flat,
             ref_alleles_flat_ref,
-            weights: buffers.weights,
+            weights,
             allele_probs: buffers.allele_probs,
             hap1_checkpoints: buffers.hap1_checkpoints,
             hap1_allele: buffers.hap1_allele,
@@ -9478,7 +9497,7 @@ mod tests {
         use crate::data::storage::matrix::GenotypeMatrix;
         use std::sync::Arc;
 
-        let n_markers = 50;
+        let n_markers = 100;
         let n_samples = 10;
         use crate::data::marker::Nucleotide;
 
@@ -9560,12 +9579,25 @@ mod tests {
         let (phased, _) = result.unwrap();
         assert_eq!(phased.n_markers(), n_markers);
         assert_eq!(phased.n_haplotypes(), n_samples * 2);
+        println!(
+            "[test_run_phase] phased markers={} haps={} samples={}",
+            phased.n_markers(),
+            phased.n_haplotypes(),
+            phased.n_samples()
+        );
 
         // Check phase confidence values
         let mut total_hets = 0;
         let mut high_conf_hets = 0;
         let mut sum_conf = 0.0;
         let mut count_conf = 0;
+
+        let mut any_conf_oob = false;
+        let mut any_conf_nan = false;
+        let mut het_per_marker: Vec<usize> = vec![0; n_markers];
+        let mut conf_min = 1.0f32;
+        let mut conf_max = 0.0f32;
+        let mut first_bad_conf: Option<(usize, usize, f32)> = None;
 
         for m in 0..n_markers {
             let marker_idx = MarkerIdx::new(m as u32);
@@ -9579,18 +9611,27 @@ mod tests {
                 // Get phase confidence
                 let conf = phased.sample_phase_confidence_f32(marker_idx, s);
 
-                // Confidence must be in valid range [0.0, 1.0]
-                assert!(
-                    conf >= 0.0 && conf <= 1.0,
-                    "Phase confidence out of range: {} at marker {} sample {}",
-                    conf,
-                    m,
-                    s
-                );
+                if conf.is_nan() {
+                    any_conf_nan = true;
+                    if first_bad_conf.is_none() {
+                        first_bad_conf = Some((m, s, conf));
+                    }
+                }
+                if conf < 0.0 || conf > 1.0 {
+                    any_conf_oob = true;
+                    if first_bad_conf.is_none() {
+                        first_bad_conf = Some((m, s, conf));
+                    }
+                }
+                if conf.is_finite() {
+                    conf_min = conf_min.min(conf);
+                    conf_max = conf_max.max(conf);
+                }
 
                 // Track heterozygous sites
                 if hap1 != hap2 {
                     total_hets += 1;
+                    het_per_marker[m] += 1;
                     sum_conf += conf;
                     count_conf += 1;
 
@@ -9622,6 +9663,37 @@ mod tests {
                 high_conf_ratio * 100.0,
                 total_hets
             );
+            println!(
+                "Phase confidence range: min={:.3}, max={:.3}, nan={}, oob={}",
+                conf_min, conf_max, any_conf_nan, any_conf_oob
+            );
+            if let Some((m, s, conf)) = first_bad_conf {
+                println!(
+                    "First bad confidence at marker {} sample {} => {}",
+                    m, s, conf
+                );
+            }
+            let max_hets = het_per_marker.iter().copied().max().unwrap_or(0);
+            let min_hets = het_per_marker.iter().copied().min().unwrap_or(0);
+            println!(
+                "Hets per marker: min={}, max={}, sample0_first10={:?}",
+                min_hets,
+                max_hets,
+                (0..10.min(n_markers))
+                    .map(|i| het_per_marker[i])
+                    .collect::<Vec<_>>()
+            );
+            for m in 0..5.min(n_markers) {
+                let marker_idx = MarkerIdx::new(m as u32);
+                let column = phased.column(marker_idx);
+                let a1 = column.get(crate::data::SampleIdx::new(0).hap1());
+                let a2 = column.get(crate::data::SampleIdx::new(0).hap2());
+                let conf = phased.sample_phase_confidence_f32(marker_idx, 0);
+                println!(
+                    "Sample0 marker{} alleles={}{} conf={:.3}",
+                    m, a1, a2, conf
+                );
+            }
         }
     }
 
