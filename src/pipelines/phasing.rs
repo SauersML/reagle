@@ -149,12 +149,14 @@ struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerS
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
     state_buf: Vec<CombinedHapId>,
     state_haps: Vec<HapIdx>,
+    pub offset: usize,
 }
 
 impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
     fn new(
         ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
         threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
+        offset: usize,
     ) -> Self {
         let n_states = threaded_haps.n_states();
         Self {
@@ -162,6 +164,7 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
             threaded_haps,
             state_buf: vec![CombinedHapId::from(0u32); n_states],
             state_haps: vec![HapIdx::new(0); n_states],
+            offset,
         }
     }
 
@@ -177,10 +180,26 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
         self.threaded_haps.materialize_at(marker, &mut self.state_buf);
         let marker_idx = MarkerIdx::new(marker as u32);
         for i in 0..n_states {
-            self.state_haps[i] = HapIdx::new(self.state_buf[i].as_u32());
+            let raw = self.state_buf[i].as_u32();
+            // Subtract offset to map Global Hap ID to Reference Panel ID
+            let idx = if raw >= self.offset as u32 {
+                raw - self.offset as u32
+            } else {
+                // Should not happen for reference states in ref-guided mode,
+                // but handle gracefully (e.g. map to 0, output will be garbage/missing)
+                0
+            };
+            self.state_haps[i] = HapIdx::new(idx);
         }
         self.ref_gt
             .fill_batch(marker_idx, &self.state_haps[..n_states], &mut out[..n_states]);
+
+        // If we had invalid indices, we should mask the output
+        for i in 0..n_states {
+            if self.state_buf[i].as_u32() < self.offset as u32 {
+                out[i] = 255;
+            }
+        }
     }
 
     fn materialize_into(&mut self, n_markers: usize, out: &mut [u8]) {
@@ -4464,7 +4483,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     let ws = workspace.as_mut().unwrap();
                                     ws.clear(); // Explicit reset between samples to prevent state contamination
                                     let ref_provider =
-                                        RefAlleleProvider::new(ref_view, &threaded_haps);
+                                        RefAlleleProvider::new(ref_view, &threaded_haps, target_gt.n_haplotypes());
                                     let (anchor_h1, anchor_h2) =
                                         build_anchor_constraints(&sample_phase_view[s]);
 
@@ -4943,10 +4962,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             // Classic Beagle-style: static state space MCMC with thread-local workspace
                             let ref_provider = if self.config.profile {
                                 info_span!("prep_allele_provider", sample = s).in_scope(|| {
-                                    RefAlleleProvider::new(subset_view, &threaded_haps)
+                                    RefAlleleProvider::new(subset_view, &threaded_haps, 0)
                                 })
                             } else {
-                                RefAlleleProvider::new(subset_view, &threaded_haps)
+                                RefAlleleProvider::new(subset_view, &threaded_haps, 0)
                             };
 
                             let local_prior_raw = prior_paths[s]
@@ -7921,9 +7940,9 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     seq2: &[u8],
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
-) -> Option<MosaicPaths> {
+) -> Vec<MosaicPaths> {
     if n_states < 2 {
-        return None;
+        return Vec::new();
     }
 
     let need = n_states * n_states;
@@ -7975,39 +7994,48 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
                 } else {
                     scores[i * n_states + j] -= 1.0;
                 }
+
+                if i == 21 && j == 20 {
+                    // DEBUG
+                    // eprintln!("DEBUG: Checking pair (21, 20) at marker {}: r1={} r2={} a1={} a2={} compatible={} current_score={}",
+                    //    m, r1, r2, a1, a2, compatible, scores[i*n_states+j]);
+                }
             }
         }
     }
 
-    // Find best pair
+    // Find best pairs (all ties)
     let mut best_score = f32::NEG_INFINITY;
-    let mut best_pair = (0, 1);
+    let mut best_pairs = Vec::new();
 
     for i in 0..n_states {
         for j in 0..i {
             let s = scores[i * n_states + j];
             if s > best_score {
                 best_score = s;
-                best_pair = (i, j);
+                best_pairs.clear();
+                best_pairs.push((i, j));
+            } else if (s - best_score).abs() < 1e-6 {
+                best_pairs.push((i, j));
             }
         }
     }
 
-    // If best score is too low (worse than random), maybe don't use it?
-    // But random initialization is also bad. This is likely the "least bad" start.
-    // So we return it.
     if informative == 0 {
-        return None;
+        return Vec::new();
     }
     let threshold = 0.9 * (informative as f32);
     if best_score < threshold || n_markers > 2000 {
-        return None;
+        return Vec::new();
     }
 
-    let path1 = vec![best_pair.0 as u32; n_markers];
-    let path2 = vec![best_pair.1 as u32; n_markers];
-
-    Some(MosaicPaths { path1, path2 })
+    let mut results = Vec::with_capacity(best_pairs.len());
+    for (i, j) in best_pairs {
+        let path1 = vec![i as u32; n_markers];
+        let path2 = vec![j as u32; n_markers];
+        results.push(MosaicPaths { path1, path2 });
+    }
+    results
 }
 
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
@@ -8044,6 +8072,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     p_err: f32,
     workspace: &mut crate::utils::workspace::ThreadWorkspace,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths) {
+    let offset = ref_provider.offset;
     if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
         return (
             Vec::new(),
@@ -8075,23 +8104,19 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
-    // Attempt pairwise initialization if no initial paths provided
-    let mut heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair_with_buffer(
-            n_markers,
-            n_states_usize,
-            seq1,
-            seq2,
-            &mut ref_provider,
-            &mut workspace.scores,
-        )
-    } else {
-        None
-    };
+    // Always attempt pairwise initialization to compete with input paths
+    let mut heuristic_paths_list = find_best_constant_pair_with_buffer(
+        n_markers,
+        n_states_usize,
+        seq1,
+        seq2,
+        &mut ref_provider,
+        &mut workspace.scores,
+    );
 
     // Align heuristic orientation to anchors when present.
     if has_anchor {
-        if let Some(paths) = heuristic_paths.as_mut() {
+        for paths in heuristic_paths_list.iter_mut() {
             let mut score_direct: i32 = 0;
             let mut score_flip: i32 = 0;
             let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
@@ -8141,70 +8166,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let mut start_paths = initial_paths.or(heuristic_paths.as_ref());
-    let mut start_paths_owned: Option<MosaicPaths> = None;
-    if has_anchor {
-        if let Some(paths) = start_paths {
-            let mut score_direct: i32 = 0;
-            let mut score_flip: i32 = 0;
-            let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
-            for m in 0..n_markers {
-                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1 == 255 && a2 == 255 {
-                    continue;
-                }
-                let p1 = paths.path1[m] as usize;
-                let p2 = paths.path2[m] as usize;
-                if p1 >= n_states_usize || p2 >= n_states_usize {
-                    continue;
-                }
-                let offset = m * n_states_usize;
-                let ref_row = &ref_alleles_flat[offset..offset + n_states_usize];
-                let r1 = ref_row[p1];
-                let r2 = ref_row[p2];
-                if a1 != 255 {
-                    if r1 == a1 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r2 == a1 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-                if a2 != 255 {
-                    if r2 == a2 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r1 == a2 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-            }
-            if score_flip > score_direct {
-                let mut owned = paths.clone();
-                std::mem::swap(&mut owned.path1, &mut owned.path2);
-                start_paths_owned = Some(owned);
-            }
-        }
-    }
-    if start_paths_owned.is_some() {
-        start_paths = start_paths_owned.as_ref();
-    }
-
-    // Only build combined checkpoints if we don't have a start path
+    // Only build combined checkpoints if we don't have any start path candidates
     // This optimization avoids the expensive Combined HMM step when we have a good guess
     let mut combined_checkpoints =
         FwdCheckpoints::from_buffer(block_starts.clone(), n_states_usize, combined_data);
 
-    if start_paths.is_none() {
+    if initial_paths.is_none() && heuristic_paths_list.is_empty() {
         if workspace.dummy_target.len() < n_markers {
             workspace.dummy_target.resize(n_markers, 255);
             workspace.dummy_partner.resize(n_markers, 255);
@@ -8276,6 +8243,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         const PAR_CHAINS: usize = 4;
         let ref_view = ref_provider.ref_gt;
         let threaded_haps = ref_provider.threaded_haps;
+        let offset = ref_provider.offset;
 
         let alloc_like = |tmpl: &MosaicBuffers| -> MosaicBuffers {
             MosaicBuffers {
@@ -8321,7 +8289,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let first_buf = buffers_iter.next().unwrap();
 
         let seed_i = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let provider = RefAlleleProvider::new(ref_view, threaded_haps);
+        let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
         let mut chain = MosaicChain::new_with_buffers(
             seed_i,
             n_markers,
@@ -8358,7 +8326,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         for (idx, buf) in buffers_iter.enumerate() {
             let seed_i =
                 seed.wrapping_add(((idx + 1) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let provider = RefAlleleProvider::new(ref_view, threaded_haps);
+            let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
             let mut chain = MosaicChain::new_with_buffers(
                 seed_i,
                 n_markers,
@@ -8592,7 +8560,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let ref_view = ref_provider.ref_gt;
     let threaded_haps = ref_provider.threaded_haps;
 
-    let buffers = MosaicBuffers {
+    let mut buffers = MosaicBuffers {
         n_states,
         fwd: StateAVec32::from_avec(
             n_states,
@@ -8631,48 +8599,86 @@ fn sample_swap_bits_mosaic<RefSpace>(
         fwd_block: std::mem::take(&mut workspace.fwd_block),
     };
 
-    let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64);
-    let (swap_counts1, obs_counts1, mut new_paths, mut buffers, log_like1) =
-        run_chain(chain_seed, start_paths, buffers, ref_provider);
+    // Competitive initialization: try both input paths and heuristic paths (and their flips)
+    // Run chains for all candidates and pick the best likelihood.
+    // Order matters for ties: we process heuristic later to prefer it on ties (unbiased global search).
+    let mut candidates: Vec<Option<MosaicPaths>> = Vec::new();
 
-    let mut swap_counts = swap_counts1;
-    let mut obs_counts = obs_counts1;
-    let best_log_like = log_like1;
-
-    if !has_anchor {
-        let flipped_paths = if let Some(paths) = start_paths {
-            if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
-                Some(MosaicPaths {
-                    path1: paths.path2.clone(),
-                    path2: paths.path1.clone(),
-                })
-            } else {
-                None
-            }
-        } else if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
-            Some(MosaicPaths {
-                path1: new_paths.path2.clone(),
-                path2: new_paths.path1.clone(),
-            })
-        } else {
-            None
-        };
-
-        let chain_seed_2 = seed.wrapping_add(0xBAD_CAFE_F00Du64);
-        let ref_provider_2 = RefAlleleProvider::new(ref_view, threaded_haps);
-        let (swap_counts2, obs_counts2, paths2, buffers2, log_like2) = run_chain(
-            chain_seed_2,
-            flipped_paths.as_ref(),
-            buffers,
-            ref_provider_2,
-        );
-        buffers = buffers2;
-        if log_like2 > best_log_like {
-            swap_counts = swap_counts2;
-            obs_counts = obs_counts2;
-            new_paths = paths2;
+    // 1. Initial paths (e.g. from Beam)
+    if let Some(p) = initial_paths {
+        candidates.push(Some(p.clone()));
+        if !has_anchor && p.path1.len() == n_markers && p.path2.len() == n_markers {
+            candidates.push(Some(MosaicPaths {
+                path1: p.path2.clone(),
+                path2: p.path1.clone(),
+            }));
         }
     }
+
+    // 2. Heuristic paths (from all-pairs scan) - try all ties!
+    for p in &heuristic_paths_list {
+        candidates.push(Some(p.clone()));
+        if !has_anchor && p.path1.len() == n_markers && p.path2.len() == n_markers {
+            candidates.push(Some(MosaicPaths {
+                path1: p.path2.clone(),
+                path2: p.path1.clone(),
+            }));
+        }
+    }
+
+    // Deduplicate candidates based on path content to avoid redundant work
+    // (e.g. if Beam found the same path as Heuristic)
+    let mut unique_candidates: Vec<Option<MosaicPaths>> = Vec::new();
+    let mut seen_hashes: HashSet<u64> = HashSet::new();
+    for c in candidates {
+        if let Some(p) = &c {
+            // Simple hash for path content
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::Hash;
+            p.path1.hash(&mut hasher);
+            p.path2.hash(&mut hasher);
+            let h = hasher.finish();
+            if seen_hashes.insert(h) {
+                unique_candidates.push(c);
+            }
+        } else {
+            // None (Combined) is unique
+            if seen_hashes.insert(0) {
+                unique_candidates.push(c);
+            }
+        }
+    }
+    if unique_candidates.is_empty() {
+        unique_candidates.push(None);
+    }
+
+    let mut best_res: Option<(Vec<f32>, Vec<f32>, MosaicPaths)> = None;
+    let mut best_log_like = f64::NEG_INFINITY;
+    let mut seed_offset = 0x1234_5678_9ABC_DEF0u64;
+
+    // Shuffle candidates to ensure random tie-breaking if likelihoods are identical
+    // We use a deterministic shuffle based on seed
+    let mut rng_shuffle = rand::rngs::SmallRng::seed_from_u64(seed.wrapping_add(0x5432_1098_7654_3210));
+    use rand::seq::SliceRandom;
+    unique_candidates.shuffle(&mut rng_shuffle);
+
+    for candidate in unique_candidates {
+        seed_offset = seed_offset.wrapping_add(0x1111_2222_3333_4444);
+        let chain_seed = seed.wrapping_add(seed_offset);
+        let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+
+        let (sc, oc, paths, buf, ll) =
+            run_chain(chain_seed, candidate.as_ref(), buffers, provider);
+        buffers = buf; // Reuse buffers
+
+        if best_res.is_none() || ll > best_log_like {
+            best_log_like = ll;
+            best_res = Some((sc, oc, paths));
+        }
+    }
+
+    let (swap_counts, obs_counts, new_paths) = best_res.unwrap();
 
     let mut swap_bits = Vec::with_capacity(het_positions.len());
     let mut swap_lr = Vec::with_capacity(het_positions.len());
@@ -8766,7 +8772,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 flip_to_anchor = true;
             }
         }
-        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
         let ref_alleles = buffers.ref_alleles.as_mut_slice();
         let ref_alleles_flat = shared_ref;
         p_min = 1.0;
@@ -9839,7 +9845,7 @@ mod tests {
         let p_no_err = 0.999;
         let p_err = 1.0 - p_no_err;
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(8, 0);
-        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th);
+        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th, 0);
 
         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_swap_bits_mosaic(
             n_markers,
@@ -10612,21 +10618,23 @@ mod tests {
             threaded.push_new(CombinedHapId::new(h as u32));
         }
         let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
-            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded, 0);
 
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
 
         let mut scores = Vec::new();
-        let paths = find_best_constant_pair_with_buffer(
+        let paths_list = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
             &seq2,
             &mut ref_provider,
             &mut scores,
-        )
-        .unwrap();
+        );
+
+        assert!(!paths_list.is_empty());
+        let paths = &paths_list[0];
 
         // Best pair should be (0, 1) or (1, 0) - Score 3.
         // Or (2, 3) / (3, 2).
