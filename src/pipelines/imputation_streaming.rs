@@ -7,7 +7,7 @@
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 
 use rayon::prelude::*;
@@ -3865,6 +3865,28 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
 
+        // Diagnostics: donor set size distribution across haplotypes.
+        if n_target_haps > 0 {
+            let mut min_donors = usize::MAX;
+            let mut max_donors = 0usize;
+            let mut sum_donors = 0usize;
+            for counts in &sm_donor_counts {
+                let len = counts.len();
+                if len < min_donors {
+                    min_donors = len;
+                }
+                if len > max_donors {
+                    max_donors = len;
+                }
+                sum_donors += len;
+            }
+            let avg_donors = sum_donors as f64 / n_target_haps as f64;
+            eprintln!(
+                "    [debug donors] hap_donor_counts min={} avg={:.2} max={}",
+                min_donors, avg_donors, max_donors
+            );
+        }
+
         thread_local! {
             static LOCAL_WORKSPACE: std::cell::RefCell<Option<ImputeWorkspace>> =
                 std::cell::RefCell::new(None);
@@ -3882,6 +3904,14 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let telemetry = self.telemetry.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dbg_use_hmm = AtomicUsize::new(0);
+        let dbg_no_hmm = AtomicUsize::new(0);
+        let dbg_no_info = AtomicUsize::new(0);
+        let dbg_insufficient = AtomicUsize::new(0);
+        let dbg_low_conf = AtomicUsize::new(0);
+        let dbg_few_donors = AtomicUsize::new(0);
+        let dbg_fallback_ref_freq = AtomicUsize::new(0);
         let sample_results: Vec<ImputeResult> = sample_error_rates
             .par_iter_mut()
             .enumerate()
@@ -3941,6 +3971,51 @@ impl crate::pipelines::ImputationPipeline {
                         || insufficient_info_h2
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
                 };
+
+                let track_hmm = |use_hmm: bool,
+                                 has_priors: bool,
+                                 no_info: bool,
+                                 insufficient: bool,
+                                 conf_ratio: f32,
+                                 donors_len: usize| {
+                    if use_hmm {
+                        dbg_use_hmm.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        dbg_no_hmm.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if no_info {
+                        dbg_no_info.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if insufficient {
+                        dbg_insufficient.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if conf_ratio > SM_MATCH_LOW_CONF_FRAC {
+                        dbg_low_conf.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if donors_len < SM_MATCH_MIN_DONORS {
+                        dbg_few_donors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !use_hmm && !has_priors {
+                        dbg_fallback_ref_freq.fetch_add(1, Ordering::Relaxed);
+                    }
+                };
+
+                track_hmm(
+                    use_hmm_h1,
+                    has_priors_h1,
+                    no_info_h1,
+                    insufficient_info_h1,
+                    conf_ratio_h1,
+                    donors_h1.len(),
+                );
+                track_hmm(
+                    use_hmm_h2,
+                    has_priors_h2,
+                    no_info_h2,
+                    insufficient_info_h2,
+                    conf_ratio_h2,
+                    donors_h2.len(),
+                );
 
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
@@ -4317,6 +4392,17 @@ impl crate::pipelines::ImputationPipeline {
                 }
             })
             .collect();
+
+        eprintln!(
+            "    [debug hmm] use_hmm={} no_hmm={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
+            dbg_use_hmm.load(Ordering::Relaxed),
+            dbg_no_hmm.load(Ordering::Relaxed),
+            dbg_no_info.load(Ordering::Relaxed),
+            dbg_insufficient.load(Ordering::Relaxed),
+            dbg_low_conf.load(Ordering::Relaxed),
+            dbg_few_donors.load(Ordering::Relaxed),
+            dbg_fallback_ref_freq.load(Ordering::Relaxed)
+        );
 
         let output_markers = output_end.saturating_sub(output_start);
         let mut sm_alt_probs_by_hap: Vec<Option<Vec<f32>>> = vec![None; n_target_haps];

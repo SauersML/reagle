@@ -331,6 +331,156 @@ fn dosage_correlation(ds1: &[f64], ds2: &[f64]) -> f64 {
     r * r // Return r²
 }
 
+#[test]
+#[serial]
+fn test_imputed_dosage_sensitivity_to_err_diagnostic() {
+    // Diagnostic only: compare imputed dosage error and AF collapse under different err.
+    let (sources, test_files) = get_all_data_sources();
+    let _ = test_files;
+    if sources.is_empty() {
+        return;
+    }
+    let source = &sources[0];
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let target_vcf = source.target_sparse_vcf.clone();
+    let ref_vcf = source.ref_vcf.clone();
+    let truth_vcf = source.target_vcf.clone();
+
+    let rust_low_out = work_dir.path().join("rust_err_low");
+    let rust_high_out = work_dir.path().join("rust_err_high");
+
+    run_rust_imputation_with_err(&target_vcf, &ref_vcf, &rust_low_out, 42, 1e-4)
+        .expect("Rust imputation failed (low err)");
+    run_rust_imputation_with_err(&target_vcf, &ref_vcf, &rust_high_out, 42, 1e-2)
+        .expect("Rust imputation failed (high err)");
+
+    let (_, truth_records) = parse_vcf(&truth_vcf);
+    let truth_idx = build_record_index_multi(&truth_records);
+
+    let (_, rust_low_records) = parse_vcf(&work_dir.path().join("rust_err_low.vcf.gz"));
+    let (_, rust_high_records) = parse_vcf(&work_dir.path().join("rust_err_high.vcf.gz"));
+
+    let compute_truth_af = |rec: &ParsedRecord| -> Option<f64> {
+        if rec.genotypes.is_empty() {
+            return None;
+        }
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for g in &rec.genotypes {
+            if let Some(ds) = gt_to_dosage(&g.gt) {
+                sum += ds;
+                n += 2.0;
+            }
+        }
+        if n > 0.0 {
+            Some(sum / n)
+        } else {
+            None
+        }
+    };
+
+    let compute_rust_af = |rec: &ParsedRecord| -> Option<f64> {
+        let af_str = rec.info.get("AF")?;
+        let first = af_str.split(',').next().unwrap_or("");
+        first.parse::<f64>().ok()
+    };
+
+    let mut low_err = 0.0;
+    let mut high_err = 0.0;
+    let mut low_count = 0usize;
+    let mut high_count = 0usize;
+    let mut low_collapse = 0usize;
+    let mut high_collapse = 0usize;
+
+    for (low_rec, high_rec) in rust_low_records.iter().zip(rust_high_records.iter()) {
+        if !low_rec.info.contains_key("IMP") {
+            continue;
+        }
+        if low_rec.alt_alleles.len() != 1 || high_rec.alt_alleles.len() != 1 {
+            continue;
+        }
+        let Some((truth_rec, swapped)) = match_record_by_alleles(
+            &truth_idx,
+            &truth_records,
+            &low_rec.chrom,
+            low_rec.pos,
+            &low_rec.ref_allele,
+            &low_rec.alt_alleles,
+        ) else {
+            continue;
+        };
+
+        let truth_af = match compute_truth_af(truth_rec) {
+            Some(v) => v,
+            None => continue,
+        };
+        let low_af = match compute_rust_af(low_rec) {
+            Some(v) => v,
+            None => continue,
+        };
+        let high_af = match compute_rust_af(high_rec) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let mut low_marker_err = 0.0;
+        let mut high_marker_err = 0.0;
+        let mut n = 0usize;
+        for (i, t_gt) in truth_rec.genotypes.iter().enumerate() {
+            let t_ds = match gt_to_dosage(&t_gt.gt) {
+                Some(v) => v,
+                None => continue,
+            };
+            let low_ds = low_rec
+                .genotypes
+                .get(i)
+                .and_then(|g| g.ds.or_else(|| gt_to_dosage(&g.gt)));
+            let high_ds = high_rec
+                .genotypes
+                .get(i)
+                .and_then(|g| g.ds.or_else(|| gt_to_dosage(&g.gt)));
+            let (Some(mut l), Some(mut h)) = (low_ds, high_ds) else {
+                continue;
+            };
+            if swapped {
+                l = 2.0 - l;
+                h = 2.0 - h;
+            }
+            low_marker_err += (l - t_ds).abs();
+            high_marker_err += (h - t_ds).abs();
+            n += 1;
+        }
+        if n == 0 {
+            continue;
+        }
+        low_err += low_marker_err / n as f64;
+        high_err += high_marker_err / n as f64;
+        low_count += 1;
+        high_count += 1;
+
+        if truth_af > 0.05 && low_af < 0.005 {
+            low_collapse += 1;
+        }
+        if truth_af > 0.05 && high_af < 0.005 {
+            high_collapse += 1;
+        }
+    }
+
+    if low_count > 0 {
+        low_err /= low_count as f64;
+    }
+    if high_count > 0 {
+        high_err /= high_count as f64;
+    }
+
+    println!("[diagnostic] err=1e-4 mean abs imputed error: {:.6}", low_err);
+    println!("[diagnostic] err=1e-2 mean abs imputed error: {:.6}", high_err);
+    println!(
+        "[diagnostic] AF collapse (truth>0.05, AF<0.005): err=1e-4 {} / {}, err=1e-2 {} / {}",
+        low_collapse, low_count, high_collapse, high_count
+    );
+}
+
 /// Normalize a genotype for unphased comparison (0|1 == 1|0)
 fn normalize_gt_unphased(gt: &str) -> String {
     let sep = if gt.contains('|') { '|' } else { '/' };
