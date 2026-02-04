@@ -10655,3 +10655,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[cfg(test)]
+mod offset_tests {
