@@ -1775,7 +1775,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
         }
-
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
             let chrom_names: Vec<&str> = target_gt
@@ -5041,7 +5040,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
                             let p = if swap_bit == 1 { p_orient } else { 1.0 - p_orient };
                             p_swap[pos] = p.clamp(0.0, 1.0);
-                            swap_mask[pos] = p_swap[pos] > 0.5;
+                            swap_mask[pos] = swap_bit == 1;
                         }
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];

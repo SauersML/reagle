@@ -38,6 +38,18 @@ pub struct CliArgs {
     /// Random seed for reproducibility
     #[arg(long, value_name = "INT")]
     pub seed: Option<i64>,
+
+    /// Chromosome or region [chrom] or [chrom]:[start]-[end]
+    #[arg(long, value_name = "REGION")]
+    pub chrom: Option<String>,
+
+    /// Print posterior genotype probabilities
+    #[arg(long)]
+    pub gp: bool,
+
+    /// Print posterior allele probabilities
+    #[arg(long)]
+    pub ap: bool,
 }
 
 /// Reagle: High-performance genotype phasing and imputation
@@ -365,6 +377,15 @@ impl Config {
         }
         if let Some(seed) = cli.seed {
             config.seed = seed;
+        }
+        if let Some(chrom) = cli.chrom {
+            config.chrom = Some(chrom);
+        }
+        if cli.gp {
+            config.gp = true;
+        }
+        if cli.ap {
+            config.ap = true;
         }
 
         config.validate()?;
