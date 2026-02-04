@@ -675,8 +675,15 @@ def _parse_truth_line(line, sample_indices):
     return key, sample_data, is_multiallelic
 
 
-def _parse_imputed_line(line, sample_indices, require_ds_gp=True):
-    """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic, missing_required)."""
+def _parse_imputed_line(line, sample_indices, format_mode="full"):
+    """Parse an imputed VCF line into (key, sample_data_list, is_multiallelic, missing_required).
+
+    format_mode:
+      - "full":   GT:DS:GP
+      - "ds_only": GT:DS
+      - "gp_only": GT:GP
+      - "gt_only": GT
+    """
     parts = line.split('\t')
     if len(parts) < 5:
         return None, None, False, False
@@ -698,7 +705,7 @@ def _parse_imputed_line(line, sample_indices, require_ds_gp=True):
             ds = None
             gp = None
 
-            if require_ds_gp:
+            if format_mode == "full":
                 # Expecting GT:DS:GP from bcftools query
                 if len(fields) > 1 and fields[1] != '.':
                     ds = _parse_ds_field(fields[1])
@@ -711,10 +718,31 @@ def _parse_imputed_line(line, sample_indices, require_ds_gp=True):
                         pass
                 if ds is None or gp is None:
                     missing_required = True
+            elif format_mode == "ds_only":
+                # Expecting GT:DS
+                if len(fields) > 1 and fields[1] != '.':
+                    ds = _parse_ds_field(fields[1])
+            elif format_mode == "gp_only":
+                # Expecting GT:GP
+                if len(fields) > 1 and fields[1] != '.':
+                    try:
+                        gp_parts = fields[1].split(',')
+                        if len(gp_parts) == 3:
+                            gp = (float(gp_parts[0]), float(gp_parts[1]), float(gp_parts[2]))
+                    except:
+                        pass
             else:
-                # Phasing-only comparison: derive dosage from GT, GP unavailable.
+                # GT-only: derive dosage from GT, GP unavailable.
                 if gt is not None:
                     ds = _gt_nonref_dosage(gt)
+
+            # If DS is missing but GP exists, derive DS from GP (biallelic).
+            if ds is None and gp is not None and len(gp) == 3:
+                ds = float(gp[1]) + 2.0 * float(gp[2])
+
+            # If still no DS and GT exists, fallback to hard-call dosage.
+            if ds is None and gt is not None:
+                ds = _gt_nonref_dosage(gt)
 
             sample_data.append((gt, ds, is_phased, gp))
         else:
@@ -1243,7 +1271,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
 
     # 2. Imputed Stream
     # Check VCF header for DS/GP fields before querying
-    # This handles both Beagle (with gp=true) and Reagle (which may not have DS/GP)
+    # This handles both Beagle (with gp=true) and other tools that may not include DS/GP
     imputed_cmd_full = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS:%GP]\\n' {imputed_vcf}"
     
     # Check if DS and GP fields exist in VCF header
@@ -1261,16 +1289,56 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             has_gp = "ID=GP" in header
     except Exception as e:
         print(f"Warning: Could not check VCF header: {e}")
+
+    # If header is missing fields, peek at the first data line's FORMAT column.
+    if not (has_ds and has_gp):
+        try:
+            record_result = subprocess.run(
+                ["bcftools", "view", "-H", "-n", "1", imputed_vcf],
+                capture_output=True, text=True, timeout=30
+            )
+            if record_result.returncode == 0 and record_result.stdout.strip():
+                first_line = record_result.stdout.strip().split('\n')[0]
+                cols = first_line.split('\t')
+                if len(cols) >= 9:
+                    fmt_fields = set(cols[8].split(':'))
+                    if "DS" in fmt_fields:
+                        has_ds = True
+                    if "GP" in fmt_fields:
+                        has_gp = True
+        except Exception as e:
+            print(f"Warning: Could not inspect FORMAT fields from records: {e}")
     
-    if require_ds_gp:
-        if has_ds and has_gp:
-            imputed_cmd = imputed_cmd_full
-            print(f"Using GT:DS:GP format for {imputed_vcf}")
+    # Decide parsing mode based on header availability
+    degraded_required = False
+    if has_ds and has_gp:
+        imputed_format_mode = "full"
+        imputed_cmd = imputed_cmd_full
+        print(f"Using GT:DS:GP format for {imputed_vcf}")
+    elif has_ds and not has_gp:
+        imputed_format_mode = "ds_only"
+        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS]\\n' {imputed_vcf}"
+        if require_ds_gp:
+            print("WARNING: GP missing in header; proceeding with GT:DS only.")
+            degraded_required = True
         else:
-            raise RuntimeError("Imputed VCF must include GT:DS:GP in header (no fallbacks).")
+            print(f"Using GT:DS format for {imputed_vcf}")
+    elif has_gp and not has_ds:
+        imputed_format_mode = "gp_only"
+        imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%GP]\\n' {imputed_vcf}"
+        if require_ds_gp:
+            print("WARNING: DS missing in header; proceeding with GT:GP only.")
+            degraded_required = True
+        else:
+            print(f"Using GT:GP format for {imputed_vcf}")
     else:
+        imputed_format_mode = "gt_only"
         imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
-        print(f"Using GT-only format for {imputed_vcf}")
+        if require_ds_gp:
+            print("WARNING: DS/GP missing in header; proceeding with GT only.")
+            degraded_required = True
+        else:
+            print(f"Using GT-only format for {imputed_vcf}")
     
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
@@ -1285,7 +1353,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     def get_next_imputed():
         try:
             line = next(imputed_iter)
-            return _parse_imputed_line(line, imputed_indices, require_ds_gp=require_ds_gp)
+            return _parse_imputed_line(line, imputed_indices, format_mode=imputed_format_mode)
         except StopIteration:
             return None, None, False, False
 
@@ -2111,6 +2179,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     metrics["sites_skipped_missing_required"] = skipped_missing_required
     metrics["sites_skipped_missing_required_matched"] = skipped_missing_required_matched
     metrics["sites_skipped_missing_required_imputed_only"] = skipped_missing_required_imputed_only
+    metrics["degraded_missing_ds_gp"] = degraded_required
     metrics["ref_af_missing_sites"] = ref_af_missing
     metrics["ref_af_sites"] = ref_af_sites
 
@@ -3089,6 +3158,7 @@ def stage_metrics():
     print("=" * 60)
 
     all_metrics = {}
+    degraded_any = False
     for name, vcf in results.items():
         print(f"\n{'=' * 50}")
         print(f"{name.upper()} RESULTS")
@@ -3101,6 +3171,8 @@ def stage_metrics():
                 reference_vcf=str(paths['ref_vcf']) if paths['ref_vcf'].exists() else None
             )
             all_metrics[name] = metrics
+            if metrics and metrics.get("degraded_missing_ds_gp"):
+                degraded_any = True
         else:
             print(f"{name} output not found")
             all_metrics[name] = None
@@ -3146,6 +3218,9 @@ def stage_metrics():
     # Exit with appropriate code
     if not any(m for m in all_metrics.values()):
         print("\nERROR: All metrics calculations failed!")
+        sys.exit(1)
+    if degraded_any:
+        print("\nERROR: Required DS/GP missing; metrics computed with degraded inputs.")
         sys.exit(1)
 
     print("\nMetrics stage completed successfully.")
@@ -3704,6 +3779,7 @@ def stage_metrics_chr(chrom):
         ("glimpse", "glimpse_imputed.vcf.gz"),
     ]
     
+    degraded_any = False
     for prefix, filename in tools:
         imputed_path = data_dir / filename
         if imputed_path.exists():
@@ -3718,8 +3794,22 @@ def stage_metrics_chr(chrom):
                     input_vcf=str(paths['input_vcf']),
                     reference_vcf=str(paths['ref_vcf']) if paths['ref_vcf'].exists() else None
                 )
+                metrics_path = data_dir / f"{prefix}_metrics.json"
+                if metrics_path.exists():
+                    try:
+                        with open(metrics_path) as f:
+                            m = json.load(f)
+                        if m.get("degraded_missing_ds_gp"):
+                            degraded_any = True
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Error: {e}")
+                degraded_any = True
+
+    if degraded_any:
+        print("ERROR: One or more tools missing DS/GP; metrics computed with degraded inputs.")
+        sys.exit(1)
 
 
 def stage_summary():
