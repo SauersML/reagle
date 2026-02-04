@@ -7931,7 +7931,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
-    rng: &mut impl rand::Rng,
 ) -> Option<MosaicPaths> {
     if n_states < 2 {
         return None;
@@ -8003,7 +8002,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // Find best pair
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (0, 1);
-    let mut count_best = 0;
 
     for i in 0..n_states {
         let bonus_i = state_bonus[i];
@@ -8013,13 +8011,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             if s > best_score {
                 best_score = s;
                 best_pair = (i, j);
-                count_best = 1;
-            } else if (s - best_score).abs() < 1e-5 {
-                count_best += 1;
-                // Reservoir sampling to break ties uniformly
-                if rng.random_ratio(1, count_best) {
-                    best_pair = (i, j);
-                }
             }
         }
     }
@@ -8031,6 +8022,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         return None;
     }
     let threshold = 0.9 * (informative as f32);
+
     if best_score < threshold || n_markers > 2000 {
         return None;
     }
@@ -8111,8 +8103,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Instead of picking one initialization strategy, we collect all valid strategies
     // and run them competitively, selecting the one that yields the best likelihood.
 
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-
     // 1. Heuristic initialization (always try this)
     // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
     // found by the beam search, especially in small windows where aliases exist.
@@ -8124,7 +8114,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         &mut ref_provider,
         &mut workspace.scores,
         None,
-        &mut rng,
     );
 
     // Align heuristic orientation to anchors if present
@@ -8282,7 +8271,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let run_chain = |seed: u64,
                      init_paths: Option<&MosaicPaths>,
                      buffers: MosaicBuffers,
-                     ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>|
+                     ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
+                     seq1: &[u8],
+                     seq2: &[u8]|
      -> (Vec<f32>, Vec<f32>, MosaicPaths, MosaicBuffers, f64) {
         const PAR_CHAINS: usize = 4;
         let ref_view = ref_provider.ref_gt;
@@ -8577,9 +8568,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let ref1 = ref_row[p1];
                 let ref2 = ref_row[p2];
                 let conf_m = conf[m];
-                let emit = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
+                let p1 = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
                     * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-                ll += (emit as f64).ln();
+                let p2 = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
+                    * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
+                let p_sum = (p1 + p2).max(1e-30);
+                ll += (p_sum as f64).ln();
             }
             if ll > best_log_like {
                 best_log_like = ll;
@@ -8649,30 +8643,71 @@ fn sample_swap_bits_mosaic<RefSpace>(
         path1: Vec::new(),
         path2: Vec::new(),
     };
-    let mut count_best = 0;
 
     // Run competitive chains
     for (i, init) in candidate_inits.iter().enumerate() {
         let chain_seed = seed.wrapping_add(0xC0FFEE_BAAD_F00Du64.wrapping_mul((i + 1) as u64));
-        let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
 
-        let (sc, oc, paths, buf, ll) = run_chain(chain_seed, init.as_ref(), buffers, my_provider);
+        // Alignment: Align seq1 to the candidate path to help HMM find the constant path solution.
+        // If we don't align, the HMM might prefer to double-switch to match the unphased seq1
+        // rather than stay on a constant path that mismatches seq1 (if p_recomb penalty < mismatch penalty).
+        let mut local_seq1 = seq1.to_vec();
+        let mut local_seq2 = seq2.to_vec();
+        let mut alignment_flips = vec![false; n_markers];
+
+        if let Some(paths) = init {
+            // Reconstruct provider for alignment check (cheap, just referencing view)
+            let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+            let mut ref_alleles = vec![255u8; n_states_usize];
+            let ref_flat = shared_ref;
+
+            for m in 0..n_markers {
+                let p1 = paths.path1.get(m).copied().unwrap_or(0) as usize;
+                if p1 >= n_states_usize { continue; }
+
+                let ref_row = if !ref_flat.is_empty() {
+                    let offset = m * n_states_usize;
+                    &ref_flat[offset..offset + n_states_usize]
+                } else {
+                    align_provider.fill_ref_alleles(m, &mut ref_alleles);
+                    &ref_alleles[..n_states_usize]
+                };
+
+                let ref1 = ref_row[p1];
+                let a1 = local_seq1[m];
+                let a2 = local_seq2[m];
+
+                if a1 == 255 || a2 == 255 || a1 == a2 { continue; }
+
+                // If ref1 matches a2 (and not a1), flip local seqs to align ref1 to seq1
+                if ref1 == a2 && ref1 != a1 {
+                    local_seq1[m] = a2;
+                    local_seq2[m] = a1;
+                    alignment_flips[m] = true;
+                }
+            }
+        }
+
+        let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+        let (mut sc, oc, paths, buf, ll) = run_chain(chain_seed, init.as_ref(), buffers, my_provider, &local_seq1, &local_seq2);
         buffers = buf;
+
+        // Un-align swap counts
+        // Note: sc/oc are indexed by 'i' (index into het_positions), not 'm' (marker index).
+        // We must map m -> i or iterate het_positions.
+        for (i, &m) in het_positions.iter().enumerate() {
+            if alignment_flips[m] {
+                if let (Some(s), Some(o)) = (sc.get_mut(i), oc.get(i)) {
+                    *s = *o - *s;
+                }
+            }
+        }
 
         if ll > best_log_like {
             best_log_like = ll;
             swap_counts = sc.clone();
             obs_counts = oc.clone();
             new_paths = paths.clone();
-            count_best = 1;
-        } else if (ll - best_log_like).abs() < 1e-5 {
-            count_best += 1;
-            // Reservoir sampling to break ties
-            if rng.random_ratio(1, count_best) {
-                swap_counts = sc.clone();
-                obs_counts = oc.clone();
-                new_paths = paths.clone();
-            }
         }
 
         // Try flipping this candidate if not anchored
@@ -8696,24 +8731,58 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
 
             if flipped_paths.is_some() {
+                // For flipped candidate, we align to the FLIPPED path.
+                // Logic repeats.
+                let mut local_seq1_f = seq1.to_vec();
+                let mut local_seq2_f = seq2.to_vec();
+                let mut alignment_flips_f = vec![false; n_markers];
+                let paths_f_ref = flipped_paths.as_ref().unwrap();
+
+                {
+                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+                    let mut ref_alleles = vec![255u8; n_states_usize];
+                    let ref_flat = shared_ref;
+                    for m in 0..n_markers {
+                        let p1 = paths_f_ref.path1.get(m).copied().unwrap_or(0) as usize;
+                        if p1 >= n_states_usize { continue; }
+                        let ref_row = if !ref_flat.is_empty() {
+                            let offset = m * n_states_usize;
+                            &ref_flat[offset..offset + n_states_usize]
+                        } else {
+                            align_provider.fill_ref_alleles(m, &mut ref_alleles);
+                            &ref_alleles[..n_states_usize]
+                        };
+                        let ref1 = ref_row[p1];
+                        let a1 = local_seq1_f[m];
+                        let a2 = local_seq2_f[m];
+                        if a1 == 255 || a2 == 255 || a1 == a2 { continue; }
+                        if ref1 == a2 && ref1 != a1 {
+                            local_seq1_f[m] = a2;
+                            local_seq2_f[m] = a1;
+                            alignment_flips_f[m] = true;
+                        }
+                    }
+                }
+
                 let chain_seed_flip = seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
                 let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
-                let (sc_f, oc_f, paths_f, buf_f, ll_f) = run_chain(chain_seed_flip, flipped_paths.as_ref(), buffers, my_provider_flip);
+                let (mut sc_f, oc_f, paths_f, buf_f, ll_f) = run_chain(chain_seed_flip, flipped_paths.as_ref(), buffers, my_provider_flip, &local_seq1_f, &local_seq2_f);
                 buffers = buf_f;
+
+                // Un-align
+                for (i, &m) in het_positions.iter().enumerate() {
+                    if alignment_flips_f[m] {
+                        if let (Some(s), Some(o)) = (sc_f.get_mut(i), oc_f.get(i)) {
+                            *s = *o - *s;
+                        }
+                    }
+                }
 
                 if ll_f > best_log_like {
                     best_log_like = ll_f;
                     swap_counts = sc_f;
                     obs_counts = oc_f;
                     new_paths = paths_f;
-                    count_best = 1;
-                } else if (ll_f - best_log_like).abs() < 1e-5 {
-                    count_best += 1;
-                    if rng.random_ratio(1, count_best) {
-                        swap_counts = sc_f;
-                        obs_counts = oc_f;
-                        new_paths = paths_f;
-                    }
                 }
             }
         }
@@ -10663,7 +10732,6 @@ mod tests {
         let seq2 = vec![1, 1, 1];
 
         let mut scores = Vec::new();
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
         let paths = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
@@ -10672,7 +10740,6 @@ mod tests {
             &mut ref_provider,
             &mut scores,
             None,
-            &mut rng,
         )
         .unwrap();
 
