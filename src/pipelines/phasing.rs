@@ -303,7 +303,7 @@ fn build_sampling_points(
     }
     sampling[n - 1] = true;
     let count = sampling.iter().filter(|&&b| b).count();
-    eprintln!(
+    tracing::debug!(
         "[pbwt sampling] markers={} step_cm={:.6} min_step={} sampled={} first_cm={:.6} last_cm={:.6}",
         n,
         step,
