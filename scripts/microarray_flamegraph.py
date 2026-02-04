@@ -267,12 +267,9 @@ def main():
         "--ref", str(ref_for_impute),
         "--gt", str(target_sparse),
         "--out", str(args.out_dir / "reagle_microarray"),
-        "--gp",
     ]
     threads = args.threads if args.threads > 0 else (os.cpu_count() or 1)
     cmd.extend(["--nthreads", str(threads)])
-    if args.chrom:
-        cmd.extend(["--chrom", args.chrom])
 
     timed_out = run(cmd, env=env, timeout=args.time_limit)
 
