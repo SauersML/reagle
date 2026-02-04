@@ -8723,10 +8723,41 @@ fn sample_swap_bits_mosaic<RefSpace>(
         p_min = p_min.min(p);
         p_max = p_max.max(p);
     }
+    // Determine if we have any anchored/phased markers.
+    let has_anchor = het_positions.iter().any(|&m| {
+        let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+        let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+        a1 != 255 || a2 != 255
+    });
+
+    // If everything is an unanchored het, phase labels are unidentifiable.
+    // Prefer a stable orientation (no label switching) in that regime.
+    if !has_anchor && het_positions.len() == n_markers {
+        for i in 0..swap_bits.len() {
+            swap_bits[i] = 0;
+            swap_lr[i] = 1.0;
+            swap_probs[i] = 0.5;
+            swap_probs_conf[i] = 0.5;
+        }
+        return (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths);
+    }
+
     // Derive swap emissions from the sampled haplotype paths and run the label
     // HMM on those emissions. This ties swaps to the inferred paths rather than
     // per-marker orientation counts, which can be unstable.
-    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+    //
+    // When there are no anchors and the orientation evidence is symmetric,
+    // per-marker path emissions can introduce label noise. In that case, keep
+    // the swap probabilities from the chain counts (typically ~0.5) so the
+    // label HMM stays stable.
+    let has_orientation_signal = swap_probs_conf
+        .iter()
+        .any(|&p| (p - 0.5).abs() > 0.1);
+    let allow_path_emissions = has_anchor || has_orientation_signal;
+    if allow_path_emissions
+        && new_paths.path1.len() == n_markers
+        && new_paths.path2.len() == n_markers
+    {
         // Align seq1/seq2 to anchors with a single global flip to avoid
         // per-marker label noise when anchors are sparse.
         let mut flip_to_anchor = false;
@@ -8814,11 +8845,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
         let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
-        let has_anchor = het_positions.iter().any(|&m| {
-            let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            a1 != 255 || a2 != 255
-        });
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];
