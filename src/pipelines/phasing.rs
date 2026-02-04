@@ -1775,8 +1775,13 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Initialize parameters based on TOTAL haplotype count (target + ref)
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        let max_states = n_total_haps.saturating_sub(2);
+        let n_states = if self.config.phase_states > 0 {
+            self.config.phase_states.min(max_states)
+        } else {
+            max_states
+        };
+        self.params.set_n_states(n_states);
 
         // Load genetic map if provided
         let gen_maps = if let Some(ref map_path) = self.config.map {
@@ -2877,8 +2882,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
-        self.params
-            .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        let max_states = n_total_haps.saturating_sub(2);
+        let n_states = if self.config.phase_states > 0 {
+            self.config.phase_states.min(max_states)
+        } else {
+            max_states
+        };
+        self.params.set_n_states(n_states);
 
         // Initialize genotypes preserving actual allele values including missing (255)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -8075,19 +8085,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
     let combined_data = std::mem::take(&mut workspace.combined_checkpoint_data);
-    // Attempt pairwise initialization if no initial paths provided
-    let mut heuristic_paths = if initial_paths.is_none() {
-        find_best_constant_pair_with_buffer(
-            n_markers,
-            n_states_usize,
-            seq1,
-            seq2,
-            &mut ref_provider,
-            &mut workspace.scores,
-        )
-    } else {
-        None
-    };
+    // Attempt pairwise initialization (always try to find a strong constant pair)
+    let mut heuristic_paths = find_best_constant_pair_with_buffer(
+        n_markers,
+        n_states_usize,
+        seq1,
+        seq2,
+        &mut ref_provider,
+        &mut workspace.scores,
+    );
 
     // Align heuristic orientation to anchors when present.
     if has_anchor {
@@ -8141,7 +8147,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let mut start_paths = initial_paths.or(heuristic_paths.as_ref());
+    // Prefer heuristic initialization if available (it only returns Some if score is high),
+    // otherwise fall back to beam paths (initial_paths).
+    let mut start_paths = heuristic_paths.as_ref().or(initial_paths);
     let mut start_paths_owned: Option<MosaicPaths> = None;
     if has_anchor {
         if let Some(paths) = start_paths {
@@ -10639,5 +10647,64 @@ mod tests {
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
         );
+    }
+
+    #[test]
+    fn test_run_phase_auto_states() {
+        use crate::data::ChromIdx;
+        use crate::data::genetic_map::GeneticMaps;
+        use crate::data::haplotype::Samples;
+        use crate::data::marker::{Allele, Marker, Markers};
+        use crate::data::storage::GenotypeColumn;
+        use crate::data::storage::matrix::GenotypeMatrix;
+        use std::sync::Arc;
+
+        let n_markers = 10;
+        let n_samples = 20; // 40 haplotypes
+        use crate::data::marker::Nucleotide;
+
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+        for i in 0..n_markers {
+            let m = Marker::new(
+                ChromIdx::new(0),
+                i as u32 * 1000,
+                Some(format!("m{}", i).into()),
+                Allele::Base(Nucleotide::A),
+                vec![Allele::Base(Nucleotide::T)],
+            );
+            markers.push(m);
+        }
+
+        let samples = Arc::new(Samples::from_ids(
+            (0..n_samples).map(|i| format!("s{}", i)).collect(),
+        ));
+
+        let columns: Vec<GenotypeColumn> = (0..n_markers)
+            .map(|_| {
+                let bytes: Vec<u8> = (0..n_samples * 2).map(|i| (i % 2) as u8).collect();
+                GenotypeColumn::from_alleles(&bytes, 2)
+            })
+            .collect();
+
+        let gt = GenotypeMatrix::new_unphased(markers, columns, samples);
+        let gen_maps = GeneticMaps::new();
+
+        let mut config = Config::default();
+        config.phase_states = 0; // Auto should pick max available
+        config.ne = 10000.0;
+        config.nthreads = Some(1);
+
+        let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
+
+        // Run phasing
+        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
+        assert!(result.is_ok());
+
+        // Check if n_states was set correctly (should be > 0)
+        // With 40 haps, max states = 38.
+        let n_states = pipeline.params.n_states;
+        assert!(n_states > 0, "n_states should be > 0 with auto config");
+        assert_eq!(n_states, 38, "n_states should be n_haps - 2");
     }
 }
