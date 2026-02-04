@@ -8166,7 +8166,7 @@ fn calculate_log_prior(
 /// 2. Run burn-in steps to let the chain mix via Gibbs sampling
 /// 3. Take samples from the posterior
 /// 4. Return swap decisions based on average posterior
-fn sample_swap_bits_mosaic<RefSpace>(
+fn sample_swap_bits_mosaic<RefSpace: Send + Sync>(
     n_markers: usize,
     n_states: usize,
     p_recomb: &[f32],
