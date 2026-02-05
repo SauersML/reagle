@@ -7,9 +7,11 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Write, BufRead};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Stdio, ExitStatus};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::thread;
 
 use rand::SeedableRng;
 
@@ -951,7 +953,7 @@ fn compare_imputation_results(name: &str, truth_vcf: &Path, java_vcf: &Path, rus
 }
 
 /// Run Java BEAGLE with given arguments
-fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::process::ExitStatus {
+fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> ExitStatus {
     let mut cmd = Command::new("java");
     cmd.arg("-jar").arg(jar);
 
@@ -963,12 +965,63 @@ fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::proces
 
     println!("Running: java -jar {} {:?}", jar.display(), args);
 
-    let status = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("Failed to execute Java BEAGLE");
 
+    let saw_exception = Arc::new(AtomicBool::new(false));
+
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let saw_exception_out = Arc::clone(&saw_exception);
+    let out_handle = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(&mut stdout);
+        let mut line = String::new();
+        while reader.read_line(&mut line).ok().filter(|&n| n > 0).is_some() {
+            print!("{}", line);
+            if line.contains("Exception in thread") || line.contains("java.lang.") {
+                saw_exception_out.store(true, Ordering::SeqCst);
+            }
+            line.clear();
+        }
+    });
+
+    let saw_exception_err = Arc::clone(&saw_exception);
+    let err_handle = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(&mut stderr);
+        let mut line = String::new();
+        while reader.read_line(&mut line).ok().filter(|&n| n > 0).is_some() {
+            eprint!("{}", line);
+            if line.contains("Exception in thread") || line.contains("java.lang.") {
+                saw_exception_err.store(true, Ordering::SeqCst);
+            }
+            line.clear();
+        }
+    });
+
+    // If Java crashes but doesn't exit, kill it once we detect an exception.
+    loop {
+        if saw_exception.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return status;
+            }
+            Ok(None) => thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+
+    let status = child.wait().expect("wait on Java BEAGLE");
+    let _ = out_handle.join();
+    let _ = err_handle.join();
     status
 }
 
