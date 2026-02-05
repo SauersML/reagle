@@ -4621,14 +4621,38 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         // No clone needed: the HMM phase is read-only; mutations happen after.
         // We use a scoped immutable borrow that ends before the apply phase.
-        type PhaseDecision = (
-            Vec<bool>,
-            Vec<(usize, f32)>,
-            Vec<(usize, f32)>,
-            Option<GlobalMosaicPaths>,
-            Vec<(usize, u8)>,
-        );
-        let phase_decisions: Vec<PhaseDecision> = {
+        #[derive(Clone, Copy)]
+        struct HiFreqMarkerIdx(usize);
+
+        #[derive(Clone, Copy)]
+        struct RelativeSwapBit(bool);
+
+        #[derive(Clone, Copy)]
+        struct AbsoluteHap1Allele(u8);
+
+        #[derive(Clone, Copy)]
+        struct PhaseLogOdds(f32);
+
+        #[derive(Clone, Copy)]
+        struct PhaseConfidence(f32);
+
+        enum Stage1OrientationUpdate {
+            RelativeSwapMask(Vec<RelativeSwapBit>),
+            AbsoluteHap1(Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)>),
+        }
+
+        struct Stage1HetUpdate {
+            marker: HiFreqMarkerIdx,
+            lr: PhaseLogOdds,
+            confidence: PhaseConfidence,
+        }
+
+        struct Stage1PhaseDecision {
+            orientation: Stage1OrientationUpdate,
+            het_updates: Vec<Stage1HetUpdate>,
+            paths: Option<GlobalMosaicPaths>,
+        }
+        let phase_decisions: Vec<Stage1PhaseDecision> = {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
 
@@ -4673,10 +4697,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 None
             };
 
-            // Collect phase decisions per sample using correct per-het algorithm.
-            // Returns: (swap_mask, het_lr_values) per sample where:
-            //   - swap_mask[i] = true if the sampled phase orientation at marker i is swapped
-            //   - het_lr_values = (hi_freq_idx, lr) for each het, used for phased marking threshold
+            // Collect typed phase decisions per sample. Orientation updates are explicit:
+            // either relative swaps (static MCMC) or absolute hap1 alignment (dynamic MCMC).
             let prior_paths = &mcmc_paths[..];
             let telemetry = self.telemetry.clone();
             let block_starts: Arc<[usize]> = if use_dynamic_mcmc {
@@ -4752,7 +4774,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             ws.seq2 = seq2;
                             ws.sample_conf = sample_conf;
                             ws.het_positions = het_positions;
-                            return (vec![false; n_hi_freq], Vec::new(), Vec::new(), None, Vec::new());
+                            return Stage1PhaseDecision {
+                                orientation: Stage1OrientationUpdate::RelativeSwapMask(
+                                    vec![RelativeSwapBit(false); n_hi_freq],
+                                ),
+                                het_updates: Vec::new(),
+                                paths: None,
+                            };
                         }
 
                         let p_err = self.params.p_mismatch;
@@ -4947,10 +4975,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     }
                                 }
                             }
-                            // Experiment: disable dynamic-MCMC anchor injection to test whether
-                            // pre-locked markers are biasing phase into high-SER traps.
-                            let anchor_h1: Option<&[u8]> = None;
-                            let anchor_h2: Option<&[u8]> = None;
+                            // Do not inject per-marker phase anchors into dynamic MCMC.
+                            // In unanchored/symmetric regimes this can create circular
+                            // self-conditioning against the current phase assignment.
                             if s == 0 && n_hi_freq <= 600 {
                                 let p1 = prior_local
                                     .as_ref()
@@ -4986,8 +5013,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         p_no_err,
                                         p_err,
                                         prior_local.as_ref(),
-                                        anchor_h1,
-                                        anchor_h2,
+                                        None,
+                                        None,
                                         telemetry.as_deref(),
                                         ws,
                                     )
@@ -5009,8 +5036,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     p_no_err,
                                     p_err,
                                     prior_local.as_ref(),
-                                    anchor_h1,
-                                    anchor_h2,
+                                    None,
+                                    None,
                                     telemetry.as_deref(),
                                     ws,
                                 )
@@ -5110,10 +5137,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let t_mcmc = t_mcmc_start.elapsed();
-                        let mut forced_hap1: Vec<(usize, u8)> = Vec::new();
-                        if use_dynamic_mcmc {
+                        let swap_probs_sum: f32 = swap_probs.iter().sum();
+                        assert!(swap_probs_sum.is_finite());
+                        let orientation = if use_dynamic_mcmc {
+                            let mut desired_hap1: Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)> =
+                                Vec::with_capacity(het_positions.len());
                             if let Some(paths) = new_paths.as_ref() {
-                                forced_hap1.reserve(het_positions.len());
                                 for &idx in &het_positions {
                                     let a1 = seq1[idx];
                                     let a2 = seq2[idx];
@@ -5132,45 +5161,46 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         .copied()
                                         .map(|h| h.as_u32())
                                         .unwrap_or(u32::MAX);
-                                    if h1 == u32::MAX || h2 == u32::MAX {
-                                        continue;
-                                    }
-                                    let r1 = subset_view
-                                        .allele(MarkerIdx::new(idx as u32), HapIdx::new(h1));
-                                    let r2 = subset_view
-                                        .allele(MarkerIdx::new(idx as u32), HapIdx::new(h2));
-                                    let desired = if r1 == a1 && r2 == a2 {
-                                        Some(a1)
-                                    } else if r1 == a2 && r2 == a1 {
-                                        Some(a2)
-                                    } else if r1 == a1 || r1 == a2 {
-                                        Some(r1)
-                                    } else if r2 == a1 {
-                                        Some(a2)
-                                    } else if r2 == a2 {
-                                        Some(a1)
+                                    let desired = if h1 == u32::MAX || h2 == u32::MAX {
+                                        // Preserve current orientation if path is unavailable at this marker.
+                                        a1
                                     } else {
-                                        None
+                                        let r1 =
+                                            subset_view.allele(MarkerIdx::new(idx as u32), HapIdx::new(h1));
+                                        let r2 =
+                                            subset_view.allele(MarkerIdx::new(idx as u32), HapIdx::new(h2));
+                                        if r1 == a1 && r2 == a2 {
+                                            a1
+                                        } else if r1 == a2 && r2 == a1 {
+                                            a2
+                                        } else if r1 == a1 || r1 == a2 {
+                                            r1
+                                        } else if r2 == a1 {
+                                            a2
+                                        } else if r2 == a2 {
+                                            a1
+                                        } else {
+                                            a1
+                                        }
                                     };
-                                    if let Some(d) = desired {
-                                        forced_hap1.push((idx, d));
-                                    }
+                                    desired_hap1
+                                        .push((HiFreqMarkerIdx(idx), AbsoluteHap1Allele(desired)));
                                 }
                             }
-                        }
-                        let mut swap_mask = vec![false; n_hi_freq];
-                        let mut anchor_resets = 0usize;
-                        let mut p_swap = vec![0.5f32; n_hi_freq];
-                        for &pos in het_positions.iter() {
-                            let idx = het_index_map[pos];
-                            if idx == usize::MAX {
-                                continue;
+                            Stage1OrientationUpdate::AbsoluteHap1(desired_hap1)
+                        } else {
+                            let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
+                            for &pos in &het_positions {
+                                let idx = het_index_map[pos];
+                                if idx == usize::MAX {
+                                    continue;
+                                }
+                                let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
+                                swap_mask[pos] = RelativeSwapBit(swap_bit == 1);
                             }
-                            let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
-                            let p_swap_raw = swap_probs.get(idx).copied().unwrap_or(0.5);
-                            p_swap[pos] = p_swap_raw.clamp(0.0, 1.0);
-                            swap_mask[pos] = swap_bit == 1;
-                        }
+                            Stage1OrientationUpdate::RelativeSwapMask(swap_mask)
+                        };
+                        let mut anchor_resets = 0usize;
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
@@ -5181,7 +5211,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                         }
 
-                        let het_lr_values: Vec<(usize, f32)> = het_positions
+                        let het_lr_values: Vec<(HiFreqMarkerIdx, PhaseLogOdds)> = het_positions
                             .iter()
                             .copied()
                             .filter_map(|idx| {
@@ -5189,14 +5219,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 if map_idx == usize::MAX {
                                     None
                                 } else {
-                                    Some((idx, *swap_lr.get(map_idx).unwrap_or(&1.0)))
+                                    Some((HiFreqMarkerIdx(idx), PhaseLogOdds(*swap_lr.get(map_idx).unwrap_or(&1.0))))
                                 }
                             })
                             .collect();
                         // Phase confidence should reflect absolute label certainty.
                         // If there are no anchored/phased markers yet, labels are symmetric,
                         // so confidence should remain ~0.5 even if a single chain picks a side.
-                        let het_phase_values: Vec<(usize, f32)> = het_positions
+                        let het_phase_values: Vec<(HiFreqMarkerIdx, PhaseConfidence)> = het_positions
                             .iter()
                             .copied()
                             .filter_map(|idx| {
@@ -5205,14 +5235,26 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     return None;
                                 }
                                 if use_dynamic_mcmc {
-                                    return Some((idx, 0.5));
+                                    return Some((HiFreqMarkerIdx(idx), PhaseConfidence(0.5)));
                                 }
                                 let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
                                 let swap_bit = *swap_bits.get(map_idx).unwrap_or(&0);
                                 let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
-                                Some((idx, p_orient.clamp(0.0, 1.0)))
+                                Some((HiFreqMarkerIdx(idx), PhaseConfidence(p_orient.clamp(0.0, 1.0))))
                             })
                             .collect();
+                        let mut het_updates = Vec::with_capacity(het_lr_values.len());
+                        for (marker, lr) in het_lr_values {
+                            let conf = het_phase_values
+                                .iter()
+                                .find_map(|(m, c)| if m.0 == marker.0 { Some(*c) } else { None })
+                                .unwrap_or(PhaseConfidence(0.5));
+                            het_updates.push(Stage1HetUpdate {
+                                marker,
+                                lr,
+                                confidence: conf,
+                            });
+                        }
 
                         let het_count = het_positions.len() as u64;
                         ws.seq1 = seq1;
@@ -5268,7 +5310,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             bb.add_samples(1);
                         }
 
-                        (swap_mask, het_lr_values, het_phase_values, new_paths, forced_hap1)
+                        Stage1PhaseDecision {
+                            orientation,
+                            het_updates,
+                            paths: new_paths,
+                        }
                     })
                 })
             };
@@ -5289,52 +5335,65 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let is_burnin = iteration < self.config.burnin;
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (swap_mask, het_lr_values, het_phase_values, new_paths, forced_hap1)) in
-            phase_decisions.into_iter().enumerate()
-        {
+        for (s, decision) in phase_decisions.into_iter().enumerate() {
             let sp = &mut sample_phases[s];
 
-            if !forced_hap1.is_empty() {
-                for (hi_freq_idx, desired_h1) in forced_hap1 {
-                    let m = hi_freq_to_orig[hi_freq_idx];
-                    let cur1 = sp.allele1(m);
-                    let cur2 = sp.allele2(m);
-                    if cur1 == desired_h1 {
-                        continue;
-                    }
-                    if cur2 == desired_h1 {
-                        sp.swap_alleles(m);
-                        total_switches += 1;
+            match decision.orientation {
+                Stage1OrientationUpdate::AbsoluteHap1(desired_hap1) => {
+                    for (HiFreqMarkerIdx(hi_freq_idx), AbsoluteHap1Allele(desired_h1)) in desired_hap1
+                    {
+                        let m = hi_freq_to_orig[hi_freq_idx];
+                        let cur1 = sp.allele1(m);
+                        let cur2 = sp.allele2(m);
+                        if cur1 == desired_h1 {
+                            continue;
+                        }
+                        if cur2 == desired_h1 {
+                            sp.swap_alleles(m);
+                            total_switches += 1;
+                        }
                     }
                 }
-            } else {
-                // Fallback: apply sampled swap mask when no absolute dynamic orientation was inferred.
-                for (hi_freq_idx, should_swap) in swap_mask.into_iter().enumerate() {
-                    if should_swap {
-                        let m = hi_freq_to_orig[hi_freq_idx];
-                        sp.swap_alleles(m);
-                        total_switches += 1;
+                Stage1OrientationUpdate::RelativeSwapMask(swap_mask) => {
+                    for (hi_freq_idx, RelativeSwapBit(should_swap)) in
+                        swap_mask.into_iter().enumerate()
+                    {
+                        if should_swap {
+                            let m = hi_freq_to_orig[hi_freq_idx];
+                            sp.swap_alleles(m);
+                            total_switches += 1;
+                        }
                     }
                 }
             }
 
             // Mark hets as phased if LR exceeds threshold (independent of swap decision)
             if !is_burnin {
-                for (hi_freq_idx, lr) in het_lr_values {
-                    if lr >= lr_threshold {
-                        let m = hi_freq_to_orig[hi_freq_idx];
+                for Stage1HetUpdate {
+                    marker: HiFreqMarkerIdx(hi_freq_idx),
+                    lr: PhaseLogOdds(lr),
+                    ..
+                } in &decision.het_updates
+                {
+                    if *lr >= lr_threshold {
+                        let m = hi_freq_to_orig[*hi_freq_idx];
                         sp.mark_phased(m);
                         total_phased += 1;
                     }
                 }
             }
 
-            for (hi_freq_idx, p_orient) in het_phase_values {
-                let m = hi_freq_to_orig[hi_freq_idx];
-                sp.set_phase_confidence(m, p_orient);
+            for Stage1HetUpdate {
+                marker: HiFreqMarkerIdx(hi_freq_idx),
+                confidence: PhaseConfidence(p_orient),
+                ..
+            } in &decision.het_updates
+            {
+                let m = hi_freq_to_orig[*hi_freq_idx];
+                sp.set_phase_confidence(m, *p_orient);
             }
 
-            if let Some(paths) = new_paths {
+            if let Some(paths) = decision.paths {
                 if let Some(slot) = mcmc_paths.get_mut(s) {
                     *slot = Some(paths);
                 }
