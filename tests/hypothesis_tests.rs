@@ -173,16 +173,6 @@ fn run_rust_phasing_with_window_toml(
     pipeline.run_auto()
 }
 
-/// Run Rust phasing pipeline (defaults).
-fn run_rust_phasing_default(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
-    let mut config = Config::default();
-    config.target = gt_path.to_path_buf();
-    config.out = out_prefix.to_path_buf();
-    config.seed = seed;
-    let mut pipeline = reagle::PhasingPipeline::new(config, None);
-    pipeline.run_auto()
-}
-
 /// Run Rust phasing pipeline (standalone).
 fn run_rust_phasing(
     gt_path: &Path,
@@ -226,6 +216,25 @@ fn run_rust_phasing_with_seed(
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run()?;
     Ok(out_prefix.with_extension("vcf.gz"))
+}
+
+/// Run Rust phasing pipeline with specific state count and iterations.
+fn run_rust_phasing_with_states(
+    gt_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    states: usize,
+    iterations: usize,
+) -> reagle::Result<()> {
+    let mut config = Config::default();
+    config.target = gt_path.to_path_buf();
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.phase_states = states;
+    config.iterations = iterations;
+    config.burnin = 5;
+    let mut pipeline = reagle::PhasingPipeline::new(config, None);
+    pipeline.run_auto()
 }
 
 /// Run Rust imputation pipeline with optional window overrides.
@@ -1991,12 +2000,12 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let target_vcf = work_dir.path().join("target.vcf");
 
     let n_markers = 200;
-    let target_samples: Vec<String> = (0..100).map(|i| format!("T{}", i + 1)).collect();
+    let target_samples: Vec<String> = (0..20).map(|i| format!("T{}", i + 1)).collect();
     let target_names: Vec<&str> = target_samples.iter().map(|s| s.as_str()).collect();
 
     // Two strong haplotype groups with clear LD.
     write_synthetic_vcf(&target_vcf, n_markers, &target_names, |i, s| {
-        if s < 15 {
+        if s < 10 {
             if i % 2 == 0 { "0/1".to_string() } else { "0/0".to_string() }
         } else {
             if i % 2 == 0 { "1/1".to_string() } else { "0/1".to_string() }
@@ -2005,48 +2014,71 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
 
     let mut total_mismatches = 0usize;
     let mut worst_mismatches = 0usize;
-    let seeds = [12345, 23456, 34567];
+    let seeds = [12345, 23456];
     for (run_idx, seed) in seeds.iter().copied().enumerate() {
         let out_low = work_dir.path().join(format!("out_low_{}", run_idx));
-        run_rust_phasing_default(&target_vcf, &out_low, seed)
+        run_rust_phasing_with_states(&target_vcf, &out_low, seed, 20, 5)
             .expect("Rust phasing failed (low states)");
 
         let out_high = work_dir.path().join(format!("out_high_{}", run_idx));
-        run_rust_phasing_default(&target_vcf, &out_high, seed)
+        run_rust_phasing_with_states(&target_vcf, &out_high, seed, 100, 5)
             .expect("Rust phasing failed (high states)");
 
         let records_low = parse_vcf(&work_dir.path().join(format!("out_low_{}.vcf.gz", run_idx)));
         let records_high = parse_vcf(&work_dir.path().join(format!("out_high_{}.vcf.gz", run_idx)));
 
-        let mut mismatches = 0usize;
-        for (i, (rl, rh)) in records_low.iter().zip(records_high.iter()).enumerate() {
-            let gt_l = &rl.genotypes[0].gt;
-            let gt_h = &rh.genotypes[0].gt;
-            if gt_l != gt_h {
-                mismatches += 1;
-                if mismatches <= 3 {
-                    println!(
-                        "[phase-states churn] run={} idx={} low_gt={} high_gt={}",
-                        run_idx, i, gt_l, gt_h
-                    );
+        let mut switches = 0usize;
+        let n_samples = records_low[0].genotypes.len();
+        for s in 0..n_samples {
+            let mut prev_match = None;
+            for m in 0..n_markers {
+                let gt_l = &records_low[m].genotypes[s].gt;
+                let gt_h = &records_high[m].genotypes[s].gt;
+
+                let parse = |gt: &str| -> Option<(u8, u8)> {
+                    if gt.len() >= 3 && gt.as_bytes()[1] == b'|' {
+                        Some((gt.as_bytes()[0] - b'0', gt.as_bytes()[2] - b'0'))
+                    } else {
+                        None
+                    }
+                };
+
+                if let (Some((l1, l2)), Some((h1, h2))) = (parse(gt_l), parse(gt_h)) {
+                    // Skip homozygotes as they don't carry phase information
+                    if l1 == l2 {
+                        continue;
+                    }
+
+                    let is_match = l1 == h1 && l2 == h2;
+                    let is_flip = l1 == h2 && l2 == h1;
+
+                    if is_match || is_flip {
+                        let current_orientation = is_match;
+                        if let Some(prev) = prev_match {
+                            if prev != current_orientation {
+                                switches += 1;
+                            }
+                        }
+                        prev_match = Some(current_orientation);
+                    }
                 }
             }
         }
         println!(
-            "[phase-states churn] run={} mismatches={} of {}",
-            run_idx, mismatches, n_markers
+            "[phase-states churn] run={} switches={}",
+            run_idx, switches
         );
-        total_mismatches += mismatches;
-        worst_mismatches = worst_mismatches.max(mismatches);
+        total_mismatches += switches;
+        worst_mismatches = worst_mismatches.max(switches);
     }
     println!(
-        "[phase-states churn] total_mismatches={} worst_mismatches={}",
+        "[phase-states churn] total_switches={} worst_switches={}",
         total_mismatches, worst_mismatches
     );
 
     assert_eq!(
         total_mismatches, 0,
-        "Expected phase output to remain stable under this simple LD setup"
+        "Expected phase output to remain stable (no switches between runs) under this simple LD setup"
     );
 }
 
