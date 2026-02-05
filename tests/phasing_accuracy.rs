@@ -84,7 +84,7 @@ fn make_marker_pos(n_markers: usize, step_bp: u32) -> Vec<u32> {
 
 #[test]
 fn test_ser_switching_all0_all1_reference() {
-    let n_markers = 50;
+    let n_markers = 500;
     let n_ref_haps = 100;
     let hero_idx = 99;
 
@@ -249,7 +249,7 @@ fn test_ser_switching_all0_all1_reference() {
 
 #[test]
 fn test_ser_switching_all0_all1_reference_dense_map() {
-    let n_markers = 50;
+    let n_markers = 500;
     let n_ref_haps = 100;
     let hero_idx = 99;
 
@@ -358,7 +358,7 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
 
 #[test]
 fn test_ser_not_fixed_by_high_state_count_all0_all1() {
-    let n_markers = 50;
+    let n_markers = 500;
     let n_ref_haps = 100;
     let hero_idx = 99;
 
@@ -473,7 +473,7 @@ fn test_ser_not_fixed_by_high_state_count_all0_all1() {
 
 #[test]
 fn test_small_panel_all0_all1_perfect_match_ser() {
-    let n_markers = 10; // Small for readability
+    let n_markers = 100; // 10x markers for stronger uniqueness
     let n_ref_haps = 20; // Small panel
     let hero_idx = 10;
     // Note on expectations (full derivation):

@@ -100,6 +100,10 @@ impl<I: crate::model::pbwt::PbwtIndex> BidirectionalPhaseIbsImpl<I>
 where
     BidirectionalPhaseIbsImpl<I>: PbwtStateCache<I>,
 {
+    pub fn set_reference_start_hap(&mut self, start: u32) {
+        self.reference_start_hap = Some(start);
+    }
+
     /// Build bidirectional PBWT from genotype data
     ///
     /// Uses sparse storage: PPA/div/pos arrays are only stored at checkpoint intervals
@@ -917,6 +921,13 @@ impl BidirectionalPhaseIbs {
         match self {
             Self::U16(inner) => inner.n_haps(),
             Self::U32(inner) => inner.n_haps(),
+        }
+    }
+
+    pub fn set_reference_start_hap(&mut self, start: u32) {
+        match self {
+            Self::U16(inner) => inner.set_reference_start_hap(start),
+            Self::U32(inner) => inner.set_reference_start_hap(start),
         }
     }
 

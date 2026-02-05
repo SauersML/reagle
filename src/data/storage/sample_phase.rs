@@ -43,6 +43,8 @@ pub struct SamplePhase {
     status: Vec<ClusterStatus>,
     /// Count of each status type for quick access
     status_counts: [usize; ClusterStatus::COUNT],
+    /// True if input data contained at least one pre-phased heterozygous anchor.
+    has_input_phase_anchor: bool,
 }
 
 impl SamplePhase {
@@ -80,6 +82,7 @@ impl SamplePhase {
         let mut status = Vec::with_capacity(n_markers);
         let mut phase_confidence = Vec::with_capacity(n_markers);
         let mut status_counts = [0usize; ClusterStatus::COUNT];
+        let mut has_input_phase_anchor = false;
 
         let mut missing_idx = 0;
         let mut unphased_idx = 0;
@@ -112,6 +115,9 @@ impl SamplePhase {
             }
 
             let st = Self::determine_status(is_missing, is_unphased, a1, a2);
+            if st == ClusterStatus::Phased && a1 != 255 && a2 != 255 && a1 != a2 {
+                has_input_phase_anchor = true;
+            }
             status_counts[st as usize] += 1;
             status.push(st);
             let phase_p = if is_missing || a1 == a2 {
@@ -132,6 +138,7 @@ impl SamplePhase {
             phase_confidence,
             status,
             status_counts,
+            has_input_phase_anchor,
         }
     }
 
@@ -253,6 +260,12 @@ impl SamplePhase {
     #[inline]
     pub fn unphased_count(&self) -> usize {
         self.status_counts[ClusterStatus::Unphased as usize]
+    }
+
+    /// Returns true if the original input had at least one pre-phased heterozygous anchor.
+    #[inline]
+    pub fn has_input_phase_anchor(&self) -> bool {
+        self.has_input_phase_anchor
     }
 
     /// Set imputed alleles for a missing marker.
