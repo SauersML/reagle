@@ -78,6 +78,9 @@ pub struct Config {
     /// Enable SHAPEIT5-style dynamic MCMC (re-selects states each step)
     pub dynamic_mcmc: bool,
 
+    /// Dynamic MCMC neighbor cap (K). Only used when dynamic_mcmc = true.
+    pub dynamic_k: usize,
+
     /// Number of MCMC steps per outer iteration (for dynamic MCMC)
     pub mcmc_steps: usize,
 
@@ -161,6 +164,7 @@ struct TomlConfig {
     pub iterations: Option<usize>,
     pub mcmc_burnin: Option<usize>,
     pub dynamic_mcmc: Option<bool>,
+    pub dynamic_k: Option<usize>,
     pub mcmc_steps: Option<usize>,
     pub mcmc_lr_samples: Option<usize>,
     pub phase_states: Option<usize>,
@@ -202,7 +206,8 @@ impl Default for Config {
             burnin: 6,
             iterations: 12,
             mcmc_burnin: 2,
-            dynamic_mcmc: false,
+            dynamic_mcmc: true,
+            dynamic_k: 32,
             mcmc_steps: 3,
             mcmc_lr_samples: 32,
             phase_states: 0,
@@ -255,6 +260,9 @@ impl Config {
         }
         if let Some(value) = cfg.dynamic_mcmc {
             self.dynamic_mcmc = value;
+        }
+        if let Some(value) = cfg.dynamic_k {
+            self.dynamic_k = value;
         }
         if let Some(value) = cfg.mcmc_steps {
             self.mcmc_steps = value;

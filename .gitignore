@@ -45,3 +45,5 @@ scripts/microarray_profile/
 
 # Test data cache (downloaded on demand)
 tests/data/
+# Local agent instructions
+AGENTS.md

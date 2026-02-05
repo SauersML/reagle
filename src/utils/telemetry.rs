@@ -102,6 +102,16 @@ pub struct TelemetryBlackboard {
     // --- Channel Telemetry ---
     channel_depth: AtomicU64,
     channel_capacity: AtomicU64,
+
+    // --- Phasing Observability ---
+    fast_beam_fixed: AtomicU64,
+    fast_beam_total: AtomicU64,
+    dyn_enabled: AtomicU64,
+    dyn_k: AtomicU64,
+    dyn_neighbors_sum: AtomicU64,
+    dyn_neighbors_count: AtomicU64,
+    dyn_neighbors_min: AtomicU64,
+    dyn_neighbors_max: AtomicU64,
 }
 
 impl TelemetryBlackboard {
@@ -127,6 +137,14 @@ impl TelemetryBlackboard {
             consumer_stage: AtomicU64::new(Stage::Initializing as u64),
             channel_depth: AtomicU64::new(0),
             channel_capacity: AtomicU64::new(0),
+            fast_beam_fixed: AtomicU64::new(0),
+            fast_beam_total: AtomicU64::new(0),
+            dyn_enabled: AtomicU64::new(0),
+            dyn_k: AtomicU64::new(0),
+            dyn_neighbors_sum: AtomicU64::new(0),
+            dyn_neighbors_count: AtomicU64::new(0),
+            dyn_neighbors_min: AtomicU64::new(u64::MAX),
+            dyn_neighbors_max: AtomicU64::new(0),
         })
     }
 
@@ -223,6 +241,55 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
+    // === Phasing Observability ===
+    pub fn set_fast_beam_stats(&self, fixed: u64, total: u64) {
+        self.fast_beam_fixed.store(fixed, Ordering::Relaxed);
+        self.fast_beam_total.store(total, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn set_dynamic_mcmc(&self, enabled: bool, k: usize) {
+        self.dyn_enabled.store(enabled as u64, Ordering::Relaxed);
+        self.dyn_k.store(k as u64, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn reset_dyn_neighbors(&self) {
+        self.dyn_neighbors_sum.store(0, Ordering::Relaxed);
+        self.dyn_neighbors_count.store(0, Ordering::Relaxed);
+        self.dyn_neighbors_min.store(u64::MAX, Ordering::Relaxed);
+        self.dyn_neighbors_max.store(0, Ordering::Relaxed);
+        self.touch_progress();
+    }
+
+    pub fn add_dyn_neighbors(&self, n: u64) {
+        self.dyn_neighbors_sum.fetch_add(n, Ordering::Relaxed);
+        self.dyn_neighbors_count.fetch_add(1, Ordering::Relaxed);
+        // min
+        let mut cur = self.dyn_neighbors_min.load(Ordering::Relaxed);
+        while n < cur {
+            match self
+                .dyn_neighbors_min
+                .compare_exchange(cur, n, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+        // max
+        let mut cur = self.dyn_neighbors_max.load(Ordering::Relaxed);
+        while n > cur {
+            match self
+                .dyn_neighbors_max
+                .compare_exchange(cur, n, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+        self.touch_progress();
+    }
+
 
     #[inline]
     pub fn stage(&self) -> Stage {
@@ -244,6 +311,8 @@ impl TelemetryBlackboard {
     // === Snapshot for Heartbeat ===
 
     pub(crate) fn snapshot(&self) -> TelemetrySnapshot {
+        let dyn_neighbors_count = self.dyn_neighbors_count.load(Ordering::Relaxed);
+        let dyn_neighbors_min = self.dyn_neighbors_min.load(Ordering::Relaxed);
         TelemetrySnapshot {
             stage: self.stage(),
             producer_stage: Stage::from_u64(self.producer_stage.load(Ordering::Relaxed)),
@@ -276,6 +345,18 @@ impl TelemetryBlackboard {
                 .unwrap_or_default(),
             channel_depth: self.channel_depth.load(Ordering::Relaxed),
             channel_capacity: self.channel_capacity.load(Ordering::Relaxed),
+            fast_beam_fixed: self.fast_beam_fixed.load(Ordering::Relaxed),
+            fast_beam_total: self.fast_beam_total.load(Ordering::Relaxed),
+            dyn_enabled: self.dyn_enabled.load(Ordering::Relaxed),
+            dyn_k: self.dyn_k.load(Ordering::Relaxed),
+            dyn_neighbors_sum: self.dyn_neighbors_sum.load(Ordering::Relaxed),
+            dyn_neighbors_count,
+            dyn_neighbors_min: if dyn_neighbors_count > 0 {
+                dyn_neighbors_min
+            } else {
+                0
+            },
+            dyn_neighbors_max: self.dyn_neighbors_max.load(Ordering::Relaxed),
         }
     }
 
@@ -311,6 +392,14 @@ impl Default for TelemetryBlackboard {
             consumer_stage: AtomicU64::new(Stage::Initializing as u64),
             channel_depth: AtomicU64::new(0),
             channel_capacity: AtomicU64::new(0),
+            fast_beam_fixed: AtomicU64::new(0),
+            fast_beam_total: AtomicU64::new(0),
+            dyn_enabled: AtomicU64::new(0),
+            dyn_k: AtomicU64::new(0),
+            dyn_neighbors_sum: AtomicU64::new(0),
+            dyn_neighbors_count: AtomicU64::new(0),
+            dyn_neighbors_min: AtomicU64::new(u64::MAX),
+            dyn_neighbors_max: AtomicU64::new(0),
         }
     }
 }
@@ -336,6 +425,16 @@ pub(crate) struct TelemetrySnapshot {
     pub(crate) consumer_op: String,
     pub(crate) channel_depth: u64,
     pub(crate) channel_capacity: u64,
+
+    // Phasing observability
+    pub(crate) fast_beam_fixed: u64,
+    pub(crate) fast_beam_total: u64,
+    pub(crate) dyn_enabled: u64,
+    pub(crate) dyn_k: u64,
+    pub(crate) dyn_neighbors_sum: u64,
+    pub(crate) dyn_neighbors_count: u64,
+    pub(crate) dyn_neighbors_min: u64,
+    pub(crate) dyn_neighbors_max: u64,
 }
 
 /// Heartbeat output configuration
@@ -818,6 +917,28 @@ fn print_tty_progress(
     };
     let stall_str = if is_stalled { " [STALLED]" } else { "" };
 
+    // Phasing observability (compact)
+    let phasing_str = if matches!(
+        snap.stage,
+        Stage::PhasingPrescan | Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
+    ) {
+        let mut s = String::new();
+        if snap.fast_beam_total > 0 {
+            s.push_str(&format!(" FB {}/{}", snap.fast_beam_fixed, snap.fast_beam_total));
+        }
+        if snap.dyn_k > 0 {
+            let avg = if snap.dyn_neighbors_count > 0 {
+                (snap.dyn_neighbors_sum as f64 / snap.dyn_neighbors_count as f64).round() as u64
+            } else {
+                0
+            };
+            s.push_str(&format!(" DK {} DN {}", snap.dyn_k, avg));
+        }
+        s
+    } else {
+        String::new()
+    };
+
     // Combine context strings
     let context_parts: Vec<&str> = [window_str.as_str(), iter_str.as_str(), sample_str.as_str()]
         .into_iter()
@@ -826,7 +947,7 @@ fn print_tty_progress(
     let context = context_parts.join(" ");
 
     eprint!(
-        "\r[{}] {:>5.1}% | {} {} | {:.0} {}/s | {} | ETA: {}{}{}{}{}{}    \x1b[K",
+        "\r[{}] {:>5.1}% | {} {} | {:.0} {}/s | {} | ETA: {}{}{}{}{}{}{}    \x1b[K",
         bar,
         progress_pct,
         snap.stage.as_str(),
@@ -839,7 +960,8 @@ fn print_tty_progress(
         cpu_str,
         op_str,
         channel_str,
-        stall_str
+        stall_str,
+        phasing_str
     );
     match io::stderr().flush() {
         Ok(()) => (),
@@ -885,12 +1007,39 @@ fn print_log_progress(
         } else {
             snap.consumer_op.as_str()
         };
+        let mut phasing_fields = String::new();
+        if matches!(
+            snap.stage,
+            Stage::PhasingPrescan | Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
+        ) {
+            if snap.fast_beam_total > 0 {
+                phasing_fields.push_str(&format!(
+                    " fast_beam_fixed={}/{}",
+                    snap.fast_beam_fixed, snap.fast_beam_total
+                ));
+            }
+            if snap.dyn_k > 0 {
+                let avg = if snap.dyn_neighbors_count > 0 {
+                    snap.dyn_neighbors_sum as f64 / snap.dyn_neighbors_count as f64
+                } else {
+                    0.0
+                };
+                phasing_fields.push_str(&format!(
+                    " dyn_mcmc={} dyn_k={} dyn_nei_avg={:.1} dyn_nei_min={} dyn_nei_max={}",
+                    snap.dyn_enabled,
+                    snap.dyn_k,
+                    avg,
+                    snap.dyn_neighbors_min,
+                    snap.dyn_neighbors_max
+                ));
+            }
+        }
         eprintln!(
             "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
              progress={}/{} progress_unit={} progress_pct={:.1} velocity={:.0}/s velocity_unit={} \
              elapsed={:.0}s eta={} rss_mb={} vsz_mb={} swap_mb={} \
              cpu_pct={} op=\"{}\" producer_stage=\"{}\" consumer_stage=\"{}\" producer_op=\"{}\" \
-             consumer_op=\"{}\" channel={}/{} stalled={}",
+             consumer_op=\"{}\" channel={}/{} stalled={}{}",
             snap.stage.as_str(),
             snap.current_window,
             snap.total_windows,
@@ -926,7 +1075,8 @@ fn print_log_progress(
             consumer_op,
             snap.channel_depth,
             snap.channel_capacity,
-            is_stalled
+            is_stalled,
+            phasing_fields
         );
     } else {
         let producer_stage = snap.producer_stage.as_str();
@@ -941,12 +1091,39 @@ fn print_log_progress(
         } else {
             snap.consumer_op.as_str()
         };
+        let mut phasing_fields = String::new();
+        if matches!(
+            snap.stage,
+            Stage::PhasingPrescan | Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
+        ) {
+            if snap.fast_beam_total > 0 {
+                phasing_fields.push_str(&format!(
+                    " fast_beam_fixed={}/{}",
+                    snap.fast_beam_fixed, snap.fast_beam_total
+                ));
+            }
+            if snap.dyn_k > 0 {
+                let avg = if snap.dyn_neighbors_count > 0 {
+                    snap.dyn_neighbors_sum as f64 / snap.dyn_neighbors_count as f64
+                } else {
+                    0.0
+                };
+                phasing_fields.push_str(&format!(
+                    " dyn_mcmc={} dyn_k={} dyn_nei_avg={:.1} dyn_nei_min={} dyn_nei_max={}",
+                    snap.dyn_enabled,
+                    snap.dyn_k,
+                    avg,
+                    snap.dyn_neighbors_min,
+                    snap.dyn_neighbors_max
+                ));
+            }
+        }
         eprintln!(
             "[HEARTBEAT] stage=\"{}\" window={}/{}{} samples={}/{} markers={}/{} \
              progress={}/{} progress_unit={} progress_pct={:.1} velocity={:.0}/s velocity_unit={} \
              elapsed={:.0}s eta={} rss_mb={} \
              producer_stage=\"{}\" consumer_stage=\"{}\" producer_op=\"{}\" consumer_op=\"{}\" \
-             stalled={}",
+             stalled={}{}",
             snap.stage.as_str(),
             snap.current_window,
             snap.total_windows,
@@ -970,7 +1147,8 @@ fn print_log_progress(
             consumer_stage,
             producer_op,
             consumer_op,
-            is_stalled
+            is_stalled,
+            phasing_fields
         );
     }
 }
