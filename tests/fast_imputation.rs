@@ -983,7 +983,8 @@ fn test_hotspot_switching() {
         } else {
             4.0 + ((m - 40) as f64) * 0.1 // Continue after hotspot
         };
-        writeln!(map_file, "chr1 {} 0.0 {}", phys, gen_pos).unwrap();
+        // Standard PLINK map format: chrom id cM bp
+        writeln!(map_file, "chr1 . {} {}", gen_pos, phys).unwrap();
     }
 
     let out_prefix = temp_dir.path().join("output_hotspot");
