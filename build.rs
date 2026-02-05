@@ -139,20 +139,14 @@ fn update_stage(label: &str) {
 
     if warnings_enabled() {
         println!("cargo:warning=project build stage: {label}");
-        match io::stdout().flush() {
-            Ok(()) => (),
-            Err(_) => (),
-        }
+        let _ = io::stdout().flush();
     }
 }
 
 fn emit_stage_detail(detail: &str) {
     if warnings_enabled() {
         println!("cargo:warning=project build detail: {detail}");
-        match io::stdout().flush() {
-            Ok(()) => (),
-            Err(_) => (),
-        }
+        let _ = io::stdout().flush();
     }
 }
 
@@ -991,26 +985,14 @@ impl Sink for DisallowedLetCollector {
         if trimmed.starts_with("let ") || trimmed.contains('=') {
             return Ok(true);
         }
-        if let Some(first_char) = trimmed.chars().find(|c| !c.is_whitespace()) {
-            if !first_char.is_ascii_alphabetic() && first_char != '_' {
-                return Ok(true);
-            }
-        }
         if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
             return Ok(true);
         }
-        if trimmed.starts_with("let ") || trimmed.contains('=') {
-            return Ok(true);
-        }
-        if let Some(first_char) = trimmed.chars().find(|c| !c.is_whitespace()) {
-            if !first_char.is_ascii_alphabetic() && first_char != '_' {
-                return Ok(true);
-            }
-        }
-        if trimmed.starts_with("return ") || trimmed.starts_with("return(") {
-            return Ok(true);
-        }
-        if trimmed.starts_with("let ") || trimmed.contains('=') {
+        if trimmed
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| !c.is_ascii_alphabetic() && c != '_')
+        {
             return Ok(true);
         }
 
@@ -1093,10 +1075,12 @@ impl Sink for NoopTouchCollector {
         if trimmed.starts_with("let ") || trimmed.contains('=') {
             return Ok(true);
         }
-        if let Some(first_char) = trimmed.chars().find(|c| !c.is_whitespace()) {
-            if !first_char.is_ascii_alphabetic() && first_char != '_' {
-                return Ok(true);
-            }
+        if trimmed
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| !c.is_ascii_alphabetic() && c != '_')
+        {
+            return Ok(true);
         }
 
         self.violations.push(format!("{line_number}:{line_text}"));
@@ -2097,6 +2081,7 @@ fn build_dependencies_directory() -> Option<PathBuf> {
     Some(profile_dir.join("deps"))
 }
 
+#[allow(clippy::collapsible_if)]
 fn locate_build_dependency(deps_dir: &Path, crate_name: &str) -> Option<PathBuf> {
     let prefix = format!("lib{crate_name}-");
     let mut candidate: Option<PathBuf> = None;
@@ -3723,15 +3708,11 @@ fn is_word_boundary(text: &str, idx: usize, len: usize) -> bool {
 
     let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
 
-    if let Some(c) = before {
-        if is_word_char(c) {
-            return false;
-        }
+    if before.is_some_and(is_word_char) {
+        return false;
     }
-    if let Some(c) = after {
-        if is_word_char(c) {
-            return false;
-        }
+    if after.is_some_and(is_word_char) {
+        return false;
     }
     true
 }
