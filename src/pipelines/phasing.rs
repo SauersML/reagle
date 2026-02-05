@@ -8125,6 +8125,11 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
     }
 
+    eprintln!(
+        "[heuristic debug] best_score={:.3} pair=({},{}/{} states) informative={}",
+        best_score, best_pair.0, best_pair.1, n_states, informative
+    );
+
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
@@ -8878,6 +8883,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             );
             buffers = buf;
 
+            eprintln!("[mosaic debug] candidate {} score={:.3}", i, score);
             let mut best_local = score;
 
             if !has_anchor {
