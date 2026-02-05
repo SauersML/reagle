@@ -216,7 +216,7 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
-            ne: 100000.0,
+            ne: 50000.0,
             err: None,
             em: true,
             window: 40.0,
