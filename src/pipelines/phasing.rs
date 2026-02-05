@@ -1587,52 +1587,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         &self.params
     }
 
-    fn compute_maf<P: crate::data::storage::phase_state::PhaseState>(
-        &self,
-        target_gt: &GenotypeMatrix<P, crate::data::AnyMarkerSpace>,
-    ) -> Vec<f32> {
-        let n_markers = target_gt.n_markers();
-        if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-            (0..n_markers)
-                .map(|m| {
-                    let m_idx = MarkerIdx::new(m as u32);
-                    let mut target_alt = target_gt.column(m_idx).alt_count() as usize;
-                    let target_total = target_gt.n_haplotypes();
-                    if let Some(ref_m) = alignment.target_to_ref(m_idx) {
-                        let ref_col = ref_gt.column(ref_m);
-                        let ref_total = ref_gt.n_haplotypes();
-                        let ref_alt = ref_col.alt_count() as usize;
-
-                        if let Some(Some(mapping)) = alignment.allele_mappings.get(m) {
-                            let ref_equiv_of_alt =
-                                mapping.targ_to_ref.get(1).copied().unwrap_or(-1);
-                            if ref_equiv_of_alt == 1 {
-                                target_alt += ref_alt;
-                            } else if ref_equiv_of_alt == 0 {
-                                target_alt += ref_total - ref_alt;
-                            }
-                        }
-
-                        let total = target_total + ref_total;
-                        if total == 0 {
-                            0.0
-                        } else {
-                            let freq = target_alt as f32 / total as f32;
-                            freq.min(1.0 - freq)
-                        }
-                    } else {
-                        let freq = target_alt as f32 / target_total as f32;
-                        freq.min(1.0 - freq)
-                    }
-                })
-                .collect()
-        } else {
-            (0..n_markers)
-                .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
-                .collect()
-        }
-    }
-
     /// Set reference panel for reference-guided phasing
     ///
     /// When a reference panel is provided, the phasing algorithm uses it to:
@@ -1788,7 +1742,46 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
         // Includes reference panel allele counts if available, ensuring homozygous
         // markers in small target panels are correctly classified as high-frequency.
-        let maf: Vec<f32> = self.compute_maf(&target_gt);
+        let maf: Vec<f32> =
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                (0..n_markers)
+                    .map(|m| {
+                        let m_idx = MarkerIdx::new(m as u32);
+                        let mut target_alt = target_gt.column(m_idx).alt_count() as usize;
+                        let target_total = target_gt.n_haplotypes();
+                        if let Some(ref_m) = alignment.target_to_ref(m_idx) {
+                            let ref_col = ref_gt.column(ref_m);
+                            let ref_total = ref_gt.n_haplotypes();
+                            let ref_alt = ref_col.alt_count() as usize;
+
+                            if let Some(Some(mapping)) = alignment.allele_mappings.get(m) {
+                                let ref_equiv_of_alt =
+                                    mapping.targ_to_ref.get(1).copied().unwrap_or(-1);
+                                if ref_equiv_of_alt == 1 {
+                                    target_alt += ref_alt;
+                                } else if ref_equiv_of_alt == 0 {
+                                    target_alt += ref_total - ref_alt;
+                                }
+                            }
+
+                            let total = target_total + ref_total;
+                            if total == 0 {
+                                0.0
+                            } else {
+                                let freq = target_alt as f32 / total as f32;
+                                freq.min(1.0 - freq)
+                            }
+                        } else {
+                            let freq = target_alt as f32 / target_total as f32;
+                            freq.min(1.0 - freq)
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..n_markers)
+                    .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+                    .collect()
+            };
 
         // TWO-STAGE PHASING: Classify markers by frequency
         // Stage 1 (high-frequency): Run full HMM - these markers provide phasing signal
@@ -2840,7 +2833,46 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Compute MAF for each marker (used by IBS2 and two-stage phasing)
         // Includes reference panel allele counts if available, ensuring homozygous
         // markers in small target panels are correctly classified as high-frequency.
-        let maf: Vec<f32> = self.compute_maf(target_gt);
+        let maf: Vec<f32> =
+            if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                (0..n_markers)
+                    .map(|m| {
+                        let m_idx = MarkerIdx::new(m as u32);
+                        let mut target_alt = target_gt.column(m_idx).alt_count() as usize;
+                        let target_total = target_gt.n_haplotypes();
+                        if let Some(ref_m) = alignment.target_to_ref(m_idx) {
+                            let ref_col = ref_gt.column(ref_m);
+                            let ref_total = ref_gt.n_haplotypes();
+                            let ref_alt = ref_col.alt_count() as usize;
+
+                            if let Some(Some(mapping)) = alignment.allele_mappings.get(m) {
+                                let ref_equiv_of_alt =
+                                    mapping.targ_to_ref.get(1).copied().unwrap_or(-1);
+                                if ref_equiv_of_alt == 1 {
+                                    target_alt += ref_alt;
+                                } else if ref_equiv_of_alt == 0 {
+                                    target_alt += ref_total - ref_alt;
+                                }
+                            }
+
+                            let total = target_total + ref_total;
+                            if total == 0 {
+                                0.0
+                            } else {
+                                let freq = target_alt as f32 / total as f32;
+                                freq.min(1.0 - freq)
+                            }
+                        } else {
+                            let freq = target_alt as f32 / target_total as f32;
+                            freq.min(1.0 - freq)
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..n_markers)
+                    .map(|m| target_gt.column(MarkerIdx::new(m as u32)).maf() as f32)
+                    .collect()
+            };
 
         // Build hi-frequency / rare marker sets for Stage 1/2
         let rare_threshold = self.config.rare;
@@ -8978,7 +9010,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // we rely on the sampled path (best chain last state) to break symmetry
     // and provide a consistent phasing, while confidence reflects the uncertainty.
     // Always using path emissions ensures we pick one consistent mode.
-    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
+    let allow_path_emissions = true;
+    if allow_path_emissions
+        && new_paths.path1.len() == n_markers
+        && new_paths.path2.len() == n_markers
+    {
         // Align seq1/seq2 to anchors with a single global flip to avoid
         // per-marker label noise when anchors are sparse.
         let mut flip_to_anchor = false;
