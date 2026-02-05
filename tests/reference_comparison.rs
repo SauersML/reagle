@@ -157,7 +157,7 @@ fn parse_vcf(path: &Path) -> (Vec<String>, Vec<ParsedRecord>) {
         .output()
         .expect("Failed to run gzip");
 
-    if !output.success() {
+    if !output.status.success() {
         panic!("gzip decompression failed for {:?}", path);
     }
 
@@ -1166,10 +1166,10 @@ fn test_java_beagle_bref3_creation() {
         .output()
         .expect("Failed to run bref3");
 
-    if !output.success() {
+    if !output.status.success() {
         eprintln!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
     }
-    assert!(output.success(), "bref3 creation failed");
+    assert!(output.status.success(), "bref3 creation failed");
 
     assert!(bref3_path.exists(), "bref3 file not created");
 
@@ -1208,7 +1208,7 @@ fn test_imputation_bref3_ref_rust_vs_java() {
         .current_dir(work_dir.path())
         .output()
         .expect("Failed to run bref3");
-    assert!(bref3_output.success(), "bref3 creation failed");
+    assert!(bref3_output.status.success(), "bref3 creation failed");
 
     // Run Java BEAGLE with bref3 reference
     let java_out = work_dir.path().join("java_bref3");
@@ -1581,7 +1581,7 @@ fn run_bref3_java_only_test() {
         .current_dir(work_dir.path())
         .output()
         .expect("Failed to run bref3");
-    assert!(bref3_output.success(), "bref3 creation failed");
+    assert!(bref3_output.status.success(), "bref3 creation failed");
 
     // Run imputation with bref3
     let out3 = work_dir.path().join("out.bref3");
@@ -1797,7 +1797,7 @@ fn test_java_beagle_vcf_vs_bref3_consistency() {
         .current_dir(work_dir.path())
         .output()
         .expect("Failed to run bref3");
-    assert!(bref3_output.success(), "bref3 creation failed");
+    assert!(bref3_output.status.success(), "bref3 creation failed");
 
     // Run with bref3 reference (same seed and gp=true)
     let out_bref3_prefix = work_dir.path().join("out_bref3");
@@ -1923,7 +1923,7 @@ fn create_masked_vcf(
         .output()
         .expect("Failed to run gzip");
 
-    if !decompress_output.success() {
+    if !decompress_output.status.success() {
         panic!("gzip decompression failed for {:?}", input_path);
     }
 
@@ -2513,7 +2513,7 @@ pub fn compute_beagle_baseline(
         ],
         work_dir.path(),
     );
-    assert!(output.success());
+    assert!(output.status.success());
 
     // Parse and evaluate
     let (_, ref_records) = parse_vcf(input_vcf);
@@ -2619,7 +2619,7 @@ fn test_comparison_framework_self_check() {
             .args(["-dc", input.to_str().unwrap()])
             .output()
             .expect("gzip");
-        assert!(output.success());
+        assert!(output.status.success());
         let text = String::from_utf8_lossy(&output.stdout);
         let mut out = String::new();
         for line in text.lines() {
@@ -2689,7 +2689,7 @@ fn test_comparison_framework_self_check() {
             .args(["-dc", gt_path.to_str().unwrap()])
             .output()
             .expect("Failed to run gzip");
-        assert!(decompress_output.success());
+        assert!(decompress_output.status.success());
         let content = String::from_utf8_lossy(&decompress_output.stdout);
         let mut output = File::create(&masked_path).expect("Create output file");
         let mut truth_map = HashMap::new();
@@ -2784,7 +2784,7 @@ fn test_comparison_framework_self_check() {
         ],
         work_dir.path(),
     );
-    assert!(output.success());
+    assert!(output.status.success());
 
     let (_, ref_records) = parse_vcf(&ref_path);
     let imputed_vcf = work_dir.path().join("imputed.vcf.gz");
@@ -2874,7 +2874,7 @@ fn decompress_vcf_for_rust(gz_path: &Path, work_dir: &Path) -> PathBuf {
         .output()
         .expect("Failed to decompress VCF");
 
-    assert!(output.success(), "gzip decompression failed");
+    assert!(output.status.success(), "gzip decompression failed");
     fs::write(&vcf_path, &output.stdout).expect("Write decompressed VCF");
     vcf_path
 }
@@ -2885,7 +2885,7 @@ fn write_vcf_with_uniform_gl(src_gz: &Path, dst_vcf: &Path, max_markers: usize) 
         .args(["-dc", src_gz.to_str().unwrap()])
         .output()
         .expect("Failed to decompress VCF");
-    assert!(output.success(), "gzip decompression failed");
+    assert!(output.status.success(), "gzip decompression failed");
     let text = String::from_utf8_lossy(&output.stdout);
     let mut out = String::new();
     let mut has_gl_header = false;
@@ -2949,7 +2949,7 @@ fn vcf_min_max_pos(vcf_gz: &Path) -> (String, u64, u64) {
         .output()
         .expect("Failed to run gzip");
 
-    assert!(output.success(), "gzip decompression failed");
+    assert!(output.status.success(), "gzip decompression failed");
     let text = String::from_utf8_lossy(&output.stdout);
     let mut chrom = String::new();
     let mut min_pos: Option<u64> = None;
@@ -7018,7 +7018,7 @@ fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
 
     // Run Java imputation
     let java_out = work_dir.path().join("java_imp");
-    let java_status = Command::new("java")
+    let java_output = Command::new("java")
         .args([
             "-jar",
             beagle_files.beagle_jar.to_str().unwrap(),
@@ -7029,7 +7029,7 @@ fn run_imputation_vs_ground_truth_comparison(source: &TestDataSource) {
         ])
         .output()
         .expect("Failed to run Java BEAGLE");
-    assert!(java_status.success(), "Java BEAGLE failed");
+    assert!(java_output.status.success(), "Java BEAGLE failed");
     let java_vcf = work_dir.path().join("java_imp.vcf.gz");
     let (_, java_records) = parse_vcf(&java_vcf);
 
