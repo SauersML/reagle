@@ -3810,30 +3810,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
-        if n_markers <= 60 {
-            if let Some(list) = scores_by_window_by_hap.get(0).and_then(|v| v.get(0)) {
-                let mut hero_score = None;
-                let has_hero = list.iter().any(|(h, _)| {
-                    if *h == 98 {
-                        hero_score = list.iter().find(|(hh, _)| *hh == 98).map(|(_, s)| *s);
-                        true
-                    } else {
-                        false
-                    }
-                });
-                eprintln!(
-                    "[prescan debug] window0_top={:?} hero98_in_top={} hero98_score={:?}",
-                    list.iter().take(10).collect::<Vec<_>>(),
-                    has_hero,
-                    hero_score
-                );
-            }
-        }
-
         let per_window_caps = vec![per_window_cap; num_windows];
         let global_slot_budget = per_window_caps.iter().copied().sum::<usize>().max(1);
         let exclude_self = ref_gt.is_none();
-        let debug_watch = vec![198usize, 199usize];
         let ref_has_panel = ref_gt.is_some();
         let out: Vec<crate::model::states::ThreadedHaps<CombinedHapSpace>> = (0..n_samples)
             .into_par_iter()
@@ -3896,77 +3875,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 window_scores.push(list);
             }
 
+            if per_window_cap >= n_ref_haps && !window_scores.is_empty() {
+                let mut present = vec![false; n_ref_haps];
+                for list in &window_scores {
+                    for &(h, _) in list {
+                        if h < n_ref_haps {
+                            present[h] = true;
+                        }
+                    }
+                }
+                let w0 = &mut window_scores[0];
+                for h in 0..n_ref_haps {
+                    if exclude_self && (h == hap1 || h == hap2) {
+                        continue;
+                    }
+                    if !present[h] {
+                        w0.push((h, 1e-9));
+                    }
+                }
+            }
+
             let abyss = vec![false; n_ref_haps];
             let (mut candidate_haps, mut scores_by_hap) = build_sparse_scores(&window_scores, &abyss);
-            if s == 0 && n_markers <= 60 {
-                let hero_in_candidates = candidate_haps.iter().any(|&h| h == 98);
-                eprintln!(
-                    "[prescan debug] hero98_in_candidates={}",
-                    hero_in_candidates
-                );
-                if hero_in_candidates {
-                    if let Some(pos) = candidate_haps.iter().position(|&h| h == 98) {
-                        eprintln!(
-                            "[prescan debug] hero98_scores={:?}",
-                            scores_by_hap.get(pos)
-                        );
-                    }
-                }
-                if n_markers <= 12 && ref_has_panel {
-                    let mut all_zero = Vec::new();
-                    let mut all_one = Vec::new();
-                    for h in 0..n_ref_haps {
-                        let hap_idx = HapIdx::new(h as u32);
-                        let mut ok0 = true;
-                        let mut ok1 = true;
-                        for m in 0..n_markers {
-                            let ref_col_idx = ref_col_for_marker[m];
-                            if ref_col_idx == usize::MAX {
-                                continue;
-                            }
-                            let ref_al = ref_columns
-                                .get(ref_col_idx)
-                                .map(|c| c.get(hap_idx))
-                                .unwrap_or(255);
-                            if ref_al != 0 {
-                                ok0 = false;
-                            }
-                            if ref_al != 1 {
-                                ok1 = false;
-                            }
-                            if !ok0 && !ok1 {
-                                break;
-                            }
-                        }
-                        if ok0 {
-                            all_zero.push(h);
-                        }
-                        if ok1 {
-                            all_one.push(h);
-                        }
-                    }
-                    eprintln!("[prescan debug] all_zero_haps={:?}", all_zero);
-                    eprintln!("[prescan debug] all_one_haps={:?}", all_one);
-                    let zero_in_candidates = all_zero.iter().any(|h| candidate_haps.contains(h));
-                    let one_in_candidates = all_one.iter().any(|h| candidate_haps.contains(h));
-                    eprintln!(
-                        "[prescan debug] all_zero_in_candidates={} all_one_in_candidates={}",
-                        zero_in_candidates, one_in_candidates
-                    );
-                }
-            }
-            if s == 0 {
-                eprintln!(
-                    "[prescan] sample={} candidate_haps={} windows={}",
-                    s,
-                    candidate_haps.len(),
-                    num_windows
-                );
-                for &h in &debug_watch {
-                    let found = candidate_haps.iter().any(|&c| c == h);
-                    eprintln!("[prescan] watch_hap={} present={}", h, found);
-                }
-            }
             if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
                 let hap1 = s * 2;
                 let hap2 = s * 2 + 1;
