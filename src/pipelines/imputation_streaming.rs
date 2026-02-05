@@ -3342,7 +3342,7 @@ impl crate::pipelines::ImputationPipeline {
             / n_ref_markers.max(1) as f32)
             .clamp(0.0, 1.0);
         let err_floor = if genotyped_fraction < 0.01 {
-            0.005f32
+            1e-4f32
         } else {
             self.params.p_mismatch
         };
