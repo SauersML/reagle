@@ -8397,16 +8397,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
 
     let mut ref_alleles = vec![255u8; n_states];
     let mut informative = 0usize;
-
-    // Bitwise optimization: Precompute match masks to avoid O(M*N^2) inner loop
-    let n_words = (n_markers + 63) / 64;
-    let mut match_a1 = vec![vec![0u64; n_words]; n_states];
-    let mut match_a2 = vec![vec![0u64; n_words]; n_states];
-    let mut valid_ref = vec![vec![0u64; n_words]; n_states];
-
-    let mut is_het = vec![0u64; n_words];
-    let mut is_valid = vec![0u64; n_words]; // Target is not missing
-
     for m in 0..n_markers {
         let a1 = seq1[m];
         let a2 = seq2[m];
@@ -8415,47 +8405,37 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
         informative += 1;
 
-        let word_idx = m / 64;
-        let bit_mask = 1u64 << (m % 64);
-
-        is_valid[word_idx] |= bit_mask;
-        if a1 != a2 && a1 != 255 && a2 != 255 {
-            is_het[word_idx] |= bit_mask;
-        }
+        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
 
         ref_provider.fill_ref_alleles(m, &mut ref_alleles);
         for i in 0..n_states {
-            let r = ref_alleles[i];
-            if r != 255 {
-                valid_ref[i][word_idx] |= bit_mask;
-                // If a1 is missing, match_a1 is effectively false (handled by logic below?)
-                // Actually, if target is missing, we skip.
-                // If a1 != 255, we check equality.
-                // If a1 == 255 (but a2 != 255), this path shouldn't happen due to logic?
-                // Wait, informative check says "if a1==255 && a2==255 continue".
-                // So at least one is present.
-                // For Hom logic: "obs = if a1 != 255 { a1 } else { a2 }".
-                // So if a1 is missing, we match against a2.
-                // If a2 is missing, we match against a1.
-                // If both present and equal, match against a1.
-                // My bitwise logic assumes a1/a2 are distinct if Het.
-                // Let's refine:
-                // If Het (a1 != a2, both present): check r==a1, r==a2.
-                // If Hom or partial missing: we want r == obs.
-                // I will set match_a1 to (r == obs) for Hom/Partial case.
+            let r1 = ref_alleles[i];
+            if r1 == 255 {
+                continue;
+            }
 
-                let (t1, t2) = if a1 != 255 && a2 != 255 && a1 != a2 {
-                    (a1, a2)
+            // Symmetric scan: only check j < i (lower triangle)
+            // We can infer upper triangle or just pick best from lower.
+            for j in 0..i {
+                let r2 = ref_alleles[j];
+                if r2 == 255 {
+                    continue;
+                }
+
+                let compatible = if is_het {
+                    // Het: need (r1=a1, r2=a2) OR (r1=a2, r2=a1)
+                    (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
                 } else {
+                    // Hom (or one missing): need r1=obs and r2=obs
+                    // If a1 or a2 is missing, we match the present one.
                     let obs = if a1 != 255 { a1 } else { a2 };
-                    (obs, obs)
+                    r1 == obs && r2 == obs
                 };
 
-                if r == t1 {
-                    match_a1[i][word_idx] |= bit_mask;
-                }
-                if r == t2 {
-                    match_a2[i][word_idx] |= bit_mask;
+                if compatible {
+                    scores[i * n_states + j] += 1.0;
+                } else {
+                    scores[i * n_states + j] -= 1.0;
                 }
             }
         }
@@ -8468,53 +8448,12 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     for i in 0..n_states {
         let bonus_i = state_bonus[i];
         for j in 0..i {
-            let mut score = 0i32;
-            for w in 0..n_words {
-                // If word is completely empty (no valid target sites), skip
-                if is_valid[w] == 0 {
-                    continue;
-                }
-
-                let het = is_het[w];
-                let hom = is_valid[w] & !het;
-
-                let val_i = valid_ref[i][w];
-                let val_j = valid_ref[j][w];
-                let val_pair = val_i & val_j;
-
-                // Only consider sites where both references are valid
-                let valid_mask = val_pair & is_valid[w];
-                if valid_mask == 0 {
-                    continue;
-                }
-
-                let m1_i = match_a1[i][w];
-                let m2_i = match_a2[i][w];
-                let m1_j = match_a1[j][w];
-                let m2_j = match_a2[j][w];
-
-                // Het matches: (r_i == a1 && r_j == a2) || (r_i == a2 && r_j == a1)
-                let het_matches = ((m1_i & m2_j) | (m2_i & m1_j)) & het;
-
-                // Hom matches: (r_i == obs && r_j == obs)
-                // Note: t1==t2==obs for Hom, so match_a1 == match_a2.
-                let hom_matches = (m1_i & m1_j) & hom;
-
-                let matches = (het_matches | hom_matches) & valid_mask;
-                let match_count = matches.count_ones() as i32;
-
-                // Mismatches = valid sites - matches
-                // Score = matches - mismatches = matches - (total - matches) = 2*matches - total
-                let total_count = valid_mask.count_ones() as i32;
-                score += 2 * match_count - total_count;
-            }
-
-            let s = score as f32 + bonus_i + state_bonus[j];
+            let bonus = bonus_i + state_bonus[j];
+            let s = scores[i * n_states + j] + bonus;
             if s > best_score {
                 best_score = s;
                 best_pair = (i, j);
             }
-            scores[i * n_states + j] = s;
         }
     }
 
