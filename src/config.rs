@@ -38,6 +38,10 @@ pub struct CliArgs {
     /// Random seed for reproducibility
     #[arg(long, value_name = "INT")]
     pub seed: Option<i64>,
+
+    /// Allele mismatch probability override
+    #[arg(long, value_name = "FLOAT")]
+    pub err: Option<f32>,
 }
 
 /// Reagle: High-performance genotype phasing and imputation
@@ -365,6 +369,9 @@ impl Config {
         }
         if let Some(seed) = cli.seed {
             config.seed = seed;
+        }
+        if let Some(err) = cli.err {
+            config.err = Some(err);
         }
 
         config.validate()?;

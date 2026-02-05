@@ -114,6 +114,40 @@ fn run_rust_imputation(
     pipeline.run()
 }
 
+/// Run Rust imputation pipeline with explicit window settings and error rate via a local TOML.
+fn run_rust_imputation_with_window_err_toml(
+    work_dir: &Path,
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window: f32,
+    overlap: f32,
+    window_markers: usize,
+    err: f32,
+) -> reagle::Result<()> {
+    let toml = format!(
+        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\nerr = {err}\n"
+    );
+    std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
+    let config = Config::parse_from([
+        "reagle",
+        "--target",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+        "--err",
+        &err.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
 /// Run Rust imputation pipeline with explicit window settings via a local TOML.
 fn run_rust_imputation_with_window_toml(
     work_dir: &Path,
@@ -745,7 +779,9 @@ fn test_streaming_overlap_should_not_shift_genotyped_markers() {
     });
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_window_toml(
+    // Explicitly set err=0.0001 to ensure prior continuity is tested under low-error assumptions,
+    // overriding the Li-Stephens estimate for this small N=4 panel.
+    run_rust_imputation_with_window_err_toml(
         work_dir.path(),
         &target_vcf,
         &ref_vcf,
@@ -754,6 +790,7 @@ fn test_streaming_overlap_should_not_shift_genotyped_markers() {
         1.1,
         1.0,
         200,
+        0.0001,
     )
     .expect("Rust imputation failed");
 
@@ -813,7 +850,9 @@ fn test_priors_use_recent_context_across_window_boundary() {
     });
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_window_toml(
+    // Explicitly set err=0.0001 to ensure prior continuity is tested under low-error assumptions,
+    // overriding the Li-Stephens estimate for this small N=4 panel.
+    run_rust_imputation_with_window_err_toml(
         work_dir.path(),
         &target_vcf,
         &ref_vcf,
@@ -822,6 +861,7 @@ fn test_priors_use_recent_context_across_window_boundary() {
         1.1,
         1.0,
         200,
+        0.0001,
     )
     .expect("Rust imputation failed");
 
