@@ -1,7 +1,7 @@
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
 use std::collections::HashMap;
 
-const MAX_RANK_INTERVALS: usize = 8;
+const MAX_RANK_INTERVALS: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RankBeam {
