@@ -2431,10 +2431,6 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        if self.config.err.is_none() {
-            // For imputation, copy-mismatch reflects mutation rather than panel size.
-            self.params.p_mismatch = crate::model::parameters::ModelParams::new().p_mismatch;
-        }
         self.params.recomb_intensity = self
             .params
             .recomb_intensity
