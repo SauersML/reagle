@@ -8041,6 +8041,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
+    rng: &mut impl rand::Rng,
 ) -> Option<MosaicPaths> {
     if n_states < 2 {
         return None;
@@ -8112,15 +8113,23 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // Find best pair
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (0, 1);
+    let mut tie_count = 0u32;
 
     for i in 0..n_states {
         let bonus_i = state_bonus[i];
         for j in 0..i {
             let bonus = bonus_i + state_bonus[j];
             let s = scores[i * n_states + j] + bonus;
-            if s > best_score {
+            if s > best_score + 1e-5 {
                 best_score = s;
                 best_pair = (i, j);
+                tie_count = 1;
+            } else if (s - best_score).abs() < 1e-5 {
+                tie_count += 1;
+                // Reservoir sampling: keep current with probability 1/tie_count
+                if rng.random_ratio(1, tie_count) {
+                    best_pair = (i, j);
+                }
             }
         }
     }
@@ -8247,6 +8256,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // 1. Heuristic initialization (always try this)
     // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
     // found by the beam search, especially in small windows where aliases exist.
+    let mut heuristic_rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let mut heuristic_paths = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
@@ -8255,6 +8265,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         &mut ref_provider,
         &mut workspace.scores,
         None,
+        &mut heuristic_rng,
     );
 
     // Align heuristic orientation to anchors if present
@@ -11110,6 +11121,7 @@ mod tests {
         let seq2 = vec![1, 1, 1];
 
         let mut scores = Vec::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let paths = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
@@ -11118,6 +11130,7 @@ mod tests {
             &mut ref_provider,
             &mut scores,
             None,
+            &mut rng,
         )
         .unwrap();
 
