@@ -3340,7 +3340,7 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = if genotyped_fraction < 0.01 {
             0.005f32
         } else {
-            self.params.p_mismatch
+            1e-4f32
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let overlap_size = 1000.min(output_end);
