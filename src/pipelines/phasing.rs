@@ -7724,81 +7724,91 @@ fn sample_dynamic_mcmc(
     let n_haps = phase_ibs.n_haps() as u32;
 
     let mut seeded_from_heuristic = false;
-    if initial_paths.is_none() && n_markers <= 2000 && !neighbors.is_empty() {
-        let limit = neighbors.len().min(16);
-        let mut scores = vec![0.0f32; limit * limit];
-        let mut informative = 0usize;
-        for m in 0..n_markers {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 == 255 && a2 == 255 {
-                continue;
-            }
-            informative += 1;
-            let is_het = a1 != a2 && a1 != 255 && a2 != 255;
-            for i in 0..limit {
-                let h1 = neighbors[i];
-                let r1 = phase_ibs.allele(m, h1);
-                if r1 == 255 {
-                    continue;
-                }
-                for j in 0..i {
-                    let h2 = neighbors[j];
-                    let r2 = phase_ibs.allele(m, h2);
-                    if r2 == 255 {
-                        continue;
-                    }
-                    let compatible = if is_het {
-                        (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
-                    } else {
-                        let obs = if a1 != 255 { a1 } else { a2 };
-                        r1 == obs && r2 == obs
-                    };
-                    if compatible {
-                        scores[i * limit + j] += 1.0;
-                    } else {
-                        scores[i * limit + j] -= 1.0;
-                    }
-                }
-            }
+    if initial_paths.is_none() && n_markers <= 2000 {
+        let mut candidates = Vec::new();
+        if n_haps <= 200 {
+            candidates.extend(0..n_haps);
+        } else if !neighbors.is_empty() {
+            let limit = neighbors.len().min(64);
+            candidates.extend_from_slice(&neighbors[..limit]);
         }
 
-        if informative > 0 {
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_pair = (0, 1);
-            for i in 0..limit {
-                for j in 0..i {
-                    let s = scores[i * limit + j];
-                    if s > best_score {
-                        best_score = s;
-                        best_pair = (i, j);
-                    }
-                }
-            }
-
-            let h1_best = neighbors[best_pair.0];
-            let h2_best = neighbors[best_pair.1];
-            path1_ref.fill(h1_best);
-            path2_ref.fill(h2_best);
+        if !candidates.is_empty() {
+            let limit = candidates.len();
+            let mut scores = vec![0.0f32; limit * limit];
+            let mut informative = 0usize;
             for m in 0..n_markers {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
+                if a1 == 255 && a2 == 255 {
                     continue;
                 }
-                let r1 = phase_ibs.allele(m, h1_best);
-                let r2 = phase_ibs.allele(m, h2_best);
-                let m1 = r1 == a1 && r2 == a2;
-                let m2 = r1 == a2 && r2 == a1;
-                if m1 && !m2 {
-                    h1_alleles[m] = a1;
-                    h2_alleles[m] = a2;
-                } else if m2 && !m1 {
-                    h1_alleles[m] = a2;
-                    h2_alleles[m] = a1;
+                informative += 1;
+                let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                for i in 0..limit {
+                    let h1 = candidates[i];
+                    let r1 = phase_ibs.allele(m, h1);
+                    if r1 == 255 {
+                        continue;
+                    }
+                    for j in 0..i {
+                        let h2 = candidates[j];
+                        let r2 = phase_ibs.allele(m, h2);
+                        if r2 == 255 {
+                            continue;
+                        }
+                        let compatible = if is_het {
+                            (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            r1 == obs && r2 == obs
+                        };
+                        if compatible {
+                            scores[i * limit + j] += 1.0;
+                        } else {
+                            scores[i * limit + j] -= 1.0;
+                        }
+                    }
                 }
             }
-            seeded_from_heuristic = true;
+
+            if informative > 0 {
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_pair = (0, 1);
+                for i in 0..limit {
+                    for j in 0..i {
+                        let s = scores[i * limit + j];
+                        if s > best_score {
+                            best_score = s;
+                            best_pair = (i, j);
+                        }
+                    }
+                }
+
+                let h1_best = candidates[best_pair.0];
+                let h2_best = candidates[best_pair.1];
+                path1_ref.fill(h1_best);
+                path2_ref.fill(h2_best);
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                        continue;
+                    }
+                    let r1 = phase_ibs.allele(m, h1_best);
+                    let r2 = phase_ibs.allele(m, h2_best);
+                    let m1 = r1 == a1 && r2 == a2;
+                    let m2 = r1 == a2 && r2 == a1;
+                    if m1 && !m2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if m2 && !m1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
+                }
+                seeded_from_heuristic = true;
+            }
         }
     }
 
