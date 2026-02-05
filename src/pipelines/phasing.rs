@@ -142,6 +142,7 @@ const PHASE_STATE_HARD_CAP: usize = 200;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
+const HEURISTIC_INIT_MARKER_LIMIT: usize = 20_000;
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
@@ -8110,7 +8111,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    if n_markers > 2000 {
+    if n_markers > HEURISTIC_INIT_MARKER_LIMIT {
         return None;
     }
 
