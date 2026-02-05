@@ -1277,7 +1277,7 @@ fn test_low_confidence_vs_missing_emissions_equivalence() {
     let target_missing = work_dir.path().join("target_missing.vcf");
     let target_uniform = work_dir.path().join("target_uniform.vcf");
 
-    let n_markers = 200;
+    let n_markers = 1000;
     let ref_samples = ["R1", "R2"];
 
     // Reference: alternating 0|0 and 1|1 to create a strong signal.
@@ -1991,7 +1991,7 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let target_vcf = work_dir.path().join("target.vcf");
 
     let n_markers = 200;
-    let target_samples: Vec<String> = (0..30).map(|i| format!("T{}", i + 1)).collect();
+    let target_samples: Vec<String> = (0..100).map(|i| format!("T{}", i + 1)).collect();
     let target_names: Vec<&str> = target_samples.iter().map(|s| s.as_str()).collect();
 
     // Two strong haplotype groups with clear LD.
@@ -2003,46 +2003,49 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
         }
     });
 
-    let out_low = work_dir.path().join("out_low");
-run_rust_phasing_default(
-        &target_vcf,
-        &out_low,
-        12345,
-    )
-    .expect("Rust phasing failed (low states)");
+    let mut total_mismatches = 0usize;
+    let mut worst_mismatches = 0usize;
+    let seeds = [12345, 23456, 34567];
+    for (run_idx, seed) in seeds.iter().copied().enumerate() {
+        let out_low = work_dir.path().join(format!("out_low_{}", run_idx));
+        run_rust_phasing_default(&target_vcf, &out_low, seed)
+            .expect("Rust phasing failed (low states)");
 
-    let out_high = work_dir.path().join("out_high");
-run_rust_phasing_default(
-        &target_vcf,
-        &out_high,
-        12345,
-    )
-    .expect("Rust phasing failed (high states)");
+        let out_high = work_dir.path().join(format!("out_high_{}", run_idx));
+        run_rust_phasing_default(&target_vcf, &out_high, seed)
+            .expect("Rust phasing failed (high states)");
 
-    let records_low = parse_vcf(&work_dir.path().join("out_low.vcf.gz"));
-    let records_high = parse_vcf(&work_dir.path().join("out_high.vcf.gz"));
+        let records_low = parse_vcf(&work_dir.path().join(format!("out_low_{}.vcf.gz", run_idx)));
+        let records_high = parse_vcf(&work_dir.path().join(format!("out_high_{}.vcf.gz", run_idx)));
 
-    let mut mismatches = 0usize;
-    for (i, (rl, rh)) in records_low.iter().zip(records_high.iter()).enumerate() {
-        let gt_l = &rl.genotypes[0].gt;
-        let gt_h = &rh.genotypes[0].gt;
-        if gt_l != gt_h {
-            mismatches += 1;
-            if mismatches <= 5 {
-                println!(
-                    "[phase-states churn] idx={} low_gt={} high_gt={}",
-                    i, gt_l, gt_h
-                );
+        let mut mismatches = 0usize;
+        for (i, (rl, rh)) in records_low.iter().zip(records_high.iter()).enumerate() {
+            let gt_l = &rl.genotypes[0].gt;
+            let gt_h = &rh.genotypes[0].gt;
+            if gt_l != gt_h {
+                mismatches += 1;
+                if mismatches <= 3 {
+                    println!(
+                        "[phase-states churn] run={} idx={} low_gt={} high_gt={}",
+                        run_idx, i, gt_l, gt_h
+                    );
+                }
             }
         }
+        println!(
+            "[phase-states churn] run={} mismatches={} of {}",
+            run_idx, mismatches, n_markers
+        );
+        total_mismatches += mismatches;
+        worst_mismatches = worst_mismatches.max(mismatches);
     }
     println!(
-        "[phase-states churn] mismatches={} of {}",
-        mismatches, n_markers
+        "[phase-states churn] total_mismatches={} worst_mismatches={}",
+        total_mismatches, worst_mismatches
     );
 
     assert_eq!(
-        mismatches, 0,
+        total_mismatches, 0,
         "Expected phase output to remain stable under this simple LD setup"
     );
 }
