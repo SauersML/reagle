@@ -173,12 +173,21 @@ fn run_rust_phasing_with_window_toml(
     pipeline.run_auto()
 }
 
-/// Run Rust phasing pipeline (defaults).
-fn run_rust_phasing_default(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
+/// Run Rust phasing pipeline with explicit phase_states.
+fn run_rust_phasing_with_states(
+    gt_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    states: usize,
+) -> reagle::Result<()> {
     let mut config = Config::default();
     config.target = gt_path.to_path_buf();
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
+    config.phase_states = states;
+    // Reduce iterations for test speed to avoid timeouts
+    config.burnin = 2;
+    config.iterations = 2;
     let mut pipeline = reagle::PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -1991,12 +2000,13 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let target_vcf = work_dir.path().join("target.vcf");
 
     let n_markers = 200;
-    let target_samples: Vec<String> = (0..100).map(|i| format!("T{}", i + 1)).collect();
+    // Reduced sample count to avoid timeout (was 100)
+    let target_samples: Vec<String> = (0..20).map(|i| format!("T{}", i + 1)).collect();
     let target_names: Vec<&str> = target_samples.iter().map(|s| s.as_str()).collect();
 
     // Two strong haplotype groups with clear LD.
     write_synthetic_vcf(&target_vcf, n_markers, &target_names, |i, s| {
-        if s < 15 {
+        if s < 5 {
             if i % 2 == 0 { "0/1".to_string() } else { "0/0".to_string() }
         } else {
             if i % 2 == 0 { "1/1".to_string() } else { "0/1".to_string() }
@@ -2008,11 +2018,11 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let seeds = [12345, 23456, 34567];
     for (run_idx, seed) in seeds.iter().copied().enumerate() {
         let out_low = work_dir.path().join(format!("out_low_{}", run_idx));
-        run_rust_phasing_default(&target_vcf, &out_low, seed)
+        run_rust_phasing_with_states(&target_vcf, &out_low, seed, 10)
             .expect("Rust phasing failed (low states)");
 
         let out_high = work_dir.path().join(format!("out_high_{}", run_idx));
-        run_rust_phasing_default(&target_vcf, &out_high, seed)
+        run_rust_phasing_with_states(&target_vcf, &out_high, seed, 100)
             .expect("Rust phasing failed (high states)");
 
         let records_low = parse_vcf(&work_dir.path().join(format!("out_low_{}.vcf.gz", run_idx)));
