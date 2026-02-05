@@ -4883,6 +4883,100 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
                                 path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
                             });
+
+                            let heuristic_paths_local = if iteration == 0 && n_hi_freq <= 2000 {
+                                let mut ref_provider = RefAlleleProvider::new(subset_view, &threaded_haps);
+                                let mut rng = rand::rngs::SmallRng::seed_from_u64(sample_seed);
+                                find_best_constant_pair_with_buffer(
+                                    n_hi_freq,
+                                    n_states,
+                                    &seq1,
+                                    &seq2,
+                                    &mut ref_provider,
+                                    &mut ws.scores,
+                                    None,
+                                    &mut rng,
+                                )
+                            } else {
+                                None
+                            };
+
+                            #[allow(unused_assignments)]
+                            let mut heuristic_paths_global = None;
+                            let mut effective_initial_paths = prior_local.as_ref();
+
+                            // Competitive initialization: Check if Heuristic beats Beam/Prior
+                            if let Some(h_paths) = &heuristic_paths_local {
+                                let mut score_h = 0.0f32;
+                                let mut score_p = if prior_local.is_some() { f32::NEG_INFINITY } else { f32::NEG_INFINITY - 1.0 };
+
+                                let mut ref_alleles = vec![255u8; n_states];
+                                let mut ref_provider = RefAlleleProvider::new(subset_view, &threaded_haps);
+                                for m in 0..n_hi_freq {
+                                    let a1 = seq1[m];
+                                    let a2 = seq2[m];
+                                    if a1 == 255 || a2 == 255 { continue; }
+                                    ref_provider.fill_ref_alleles(m, &mut ref_alleles);
+
+                                    let p1_h = h_paths.path1[m] as usize;
+                                    let p2_h = h_paths.path2[m] as usize;
+                                    if p1_h < n_states && p2_h < n_states {
+                                        let r1 = ref_alleles[p1_h];
+                                        let r2 = ref_alleles[p2_h];
+                                        let p = emit_prob(r1, a1, 1.0, p_no_err, p_err) * emit_prob(r2, a2, 1.0, p_no_err, p_err) +
+                                                emit_prob(r1, a2, 1.0, p_no_err, p_err) * emit_prob(r2, a1, 1.0, p_no_err, p_err);
+                                        score_h += p.ln();
+                                    } else {
+                                        score_h = f32::NEG_INFINITY;
+                                    }
+
+                                    if let Some(p_paths) = &prior_local {
+                                        // Prior paths from mcmc_paths are GLOBAL IDs. We need to map to local states for scoring.
+                                        // This requires checking threaded_haps state list.
+                                        // Since getting local index from global ID is slow (search), we might skip accurate scoring for Prior
+                                        // or assume Prior is better unless Heuristic is VERY good?
+                                        // But wait, we can't easily score Prior here because it's global IDs and we only have local RefAlleleProvider.
+                                        // Actually, we can convert Global -> Local for scoring.
+                                        // Or just compare against "known bad" threshold?
+
+                                        // To score prior correctly:
+                                        // Global paths -> Local paths
+                                        if let Some(local_p) = global_to_local_paths(
+                                            &GlobalMosaicPaths {
+                                                path1: p_paths.path1.iter().map(|&x| CombinedHapId::from(x)).collect(),
+                                                path2: p_paths.path2.iter().map(|&x| CombinedHapId::from(x)).collect()
+                                            },
+                                            &threaded_haps,
+                                            n_hi_freq
+                                        ) {
+                                            if score_p != f32::NEG_INFINITY {
+                                                let p1_p = local_p.path1[m] as usize;
+                                                let p2_p = local_p.path2[m] as usize;
+                                                if p1_p < n_states && p2_p < n_states {
+                                                    let r1 = ref_alleles[p1_p];
+                                                    let r2 = ref_alleles[p2_p];
+                                                    let p = emit_prob(r1, a1, 1.0, p_no_err, p_err) * emit_prob(r2, a2, 1.0, p_no_err, p_err) +
+                                                            emit_prob(r1, a2, 1.0, p_no_err, p_err) * emit_prob(r2, a1, 1.0, p_no_err, p_err);
+                                                    if score_p == f32::NEG_INFINITY { score_p = 0.0; }
+                                                    score_p += p.ln();
+                                                } else {
+                                                    score_p = f32::NEG_INFINITY;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if score_h > score_p {
+                                    let global = local_to_global_paths(h_paths, &threaded_haps, n_hi_freq);
+                                    heuristic_paths_global = Some(MosaicPaths {
+                                        path1: global.path1.iter().map(|id| id.as_u32()).collect(),
+                                        path2: global.path2.iter().map(|id| id.as_u32()).collect(),
+                                    });
+                                    effective_initial_paths = heuristic_paths_global.as_ref();
+                                }
+                            }
+
                             let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
                             let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
                             let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
@@ -4908,7 +5002,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         self.config.mcmc_steps,
                                         p_no_err,
                                         p_err,
-                                        prior_local.as_ref(),
+                                        effective_initial_paths,
                                         Some(&anchor_h1),
                                         Some(&anchor_h2),
                                         telemetry.as_deref(),
@@ -4931,7 +5025,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     self.config.mcmc_steps,
                                     p_no_err,
                                     p_err,
-                                    prior_local.as_ref(),
+                                    effective_initial_paths,
                                     Some(&anchor_h1),
                                     Some(&anchor_h2),
                                     telemetry.as_deref(),
@@ -7583,6 +7677,12 @@ fn sample_dynamic_mcmc(
     // Store reference hap IDs (for persistence) and local state indices (per step)
     let mut path1_ref = vec![0u32; n_markers];
     let mut path2_ref = vec![0u32; n_markers];
+    if let Some(paths) = initial_paths {
+        if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            path1_ref.copy_from_slice(&paths.path1);
+            path2_ref.copy_from_slice(&paths.path2);
+        }
+    }
     let mut path1_idx = vec![0u32; n_markers];
     let mut path2_idx = vec![0u32; n_markers];
     let mut fixed_allele = vec![255u8; n_markers];
