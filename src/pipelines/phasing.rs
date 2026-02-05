@@ -8042,6 +8042,12 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
 ) -> Option<MosaicPaths> {
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/debug_log.txt") {
+            writeln!(f, "[FIND_BEST] Entry n_markers={} n_states={}", n_markers, n_states).ok();
+        }
+    }
     if n_states < 2 {
         return None;
     }
@@ -8129,9 +8135,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
     if informative == 0 {
-        return None;
-    }
-    if n_markers > 2000 {
         return None;
     }
 
@@ -8324,15 +8327,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     // Candidate C: Heuristic paths (if found and different from initial)
     if let Some(p) = heuristic_paths {
-        // Only add if distinct from initial_paths to save compute
-        let distinct = if let Some(init) = initial_paths {
-            init.path1 != p.path1 || init.path2 != p.path2
-        } else {
-            true
-        };
-        if distinct {
-            candidate_inits.push(Some(p));
-        }
+        // Prioritize Heuristic: If we found a constant pair that explains the data,
+        // we should prefer it over the Default (Combined HMM) initialization which
+        // is symmetric and can lead to random switching in the MCMC.
+        // We clear other candidates to force the chain to start from this good state.
+        candidate_inits.clear();
+        candidate_inits.push(Some(p));
     }
 
     // Build Combined HMM checkpoints. This is required if ANY candidate is None,
