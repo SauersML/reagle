@@ -3049,11 +3049,12 @@ fn write_linear_map_for_span(
     // rejects maps where all genetic positions are identical.
     // Use increasing integer positions in both the 3rd and 4th columns.
     let content = format!(
-        "{chrom}\t{min_pos}\t0\t0\n{chrom}\t{max_pos}\t{total_cm}\t{total_cm}\n",
+        "{chrom}\t{min_pos}\t{rate}\t0\n{chrom}\t{max_pos}\t{rate}\t{total_cm}\n",
         chrom = chrom,
         min_pos = min_pos,
         max_pos = max_pos,
-        total_cm = total_cm_int
+        total_cm = total_cm_int,
+        rate = rate
     );
     fs::write(map_path, content).expect("Write map file");
     (chrom, min_pos, max_pos)
