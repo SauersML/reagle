@@ -3033,13 +3033,6 @@ fn write_linear_map_for_span(
     total_cm: f64,
 ) -> (String, u64, u64) {
     let (chrom, min_pos, max_pos) = vcf_min_max_pos(vcf_gz);
-    let span_bp = max_pos.saturating_sub(min_pos).max(1);
-    let span_mb = span_bp as f64 / 1_000_000.0;
-    let rate = if span_mb > 0.0 {
-        total_cm / span_mb
-    } else {
-        1.0
-    };
     let mut total_cm_int = total_cm.round();
     if total_cm_int <= 0.0 {
         total_cm_int = 1.0;
@@ -3049,7 +3042,7 @@ fn write_linear_map_for_span(
     // rejects maps where all genetic positions are identical.
     // Use increasing integer positions in both the 3rd and 4th columns.
     let content = format!(
-        "{chrom}\t{min_pos}\t0\t0\n{chrom}\t{max_pos}\t{total_cm}\t{total_cm}\n",
+        "{chrom}\t{min_pos}\t0\t{min_pos}\n{chrom}\t{max_pos}\t{total_cm}\t{max_pos}\n",
         chrom = chrom,
         min_pos = min_pos,
         max_pos = max_pos,
