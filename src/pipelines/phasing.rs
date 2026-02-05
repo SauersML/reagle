@@ -3659,31 +3659,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
-        if n_markers <= 60 {
-            let sample = 0usize;
-            let mut phased_count = 0usize;
-            let mut unphased_hets = 0usize;
-            for m in 0..n_markers {
-                let phased = phase_mask
-                    .and_then(|mask| mask.get(m).and_then(|row| row.get(sample)))
-                    .copied()
-                    .unwrap_or(0);
-                if phased != 0 {
-                    phased_count += 1;
-                }
-                let a1 = target_geno.get(m, HapIdx::new((sample * 2) as u32));
-                let a2 = target_geno.get(m, HapIdx::new((sample * 2 + 1) as u32));
-                if phased == 0 && a1 != 255 && a2 != 255 && a1 != a2 {
-                    unphased_hets += 1;
-                }
-            }
-            eprintln!(
-                "[prescan debug] mask_unphased_hets[0]={} phased={} unphased_hets={}",
-                mask_unphased_hets.get(sample).copied().unwrap_or(false),
-                phased_count,
-                unphased_hets
-            );
-        }
         let avail = crate::utils::memory::available_memory_bytes().unwrap_or(0);
         let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_haps).max(1);
         let batches_per_window = (n_haps + batch_size - 1) / batch_size;
@@ -4053,16 +4028,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
             selected = ranked_selected;
 
-            if s == 0 && n_markers <= 60 {
-                let mut selected_dbg = selected.clone();
-                selected_dbg.sort_unstable();
-                eprintln!(
-                    "[prescan debug] selected_ref_len={} first={:?}",
-                    selected_dbg.len(),
-                    selected_dbg.iter().take(10).collect::<Vec<_>>()
-                );
-            }
-
             let offset = if ref_has_panel { n_haps } else { 0 };
             let mut th = crate::model::states::ThreadedHaps::<CombinedHapSpace>::new(
                 selected.len(),
@@ -4072,18 +4037,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             for h in selected {
                 let combined = combined_from_ref(h, offset as u32);
                 th.push_new(combined);
-            }
-            if s == 0 && n_markers <= 60 {
-                let mut buf = vec![CombinedHapId::from(0u32); th.n_states()];
-                th.materialize_at(0, &mut buf);
-                let mut selected_dbg: Vec<usize> =
-                    buf.iter().map(|id| id.as_u32() as usize).collect();
-                selected_dbg.sort_unstable();
-                eprintln!(
-                    "[prescan debug] sample=0 selected_combined_len={} first={:?}",
-                    selected_dbg.len(),
-                    selected_dbg.iter().take(10).collect::<Vec<_>>()
-                );
             }
             th
         })
@@ -8260,8 +8213,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         // Prioritize Heuristic: If we found a constant pair that explains the data,
         // we should prefer it over the Default (Combined HMM) initialization which
         // is symmetric and can lead to random switching in the MCMC.
-        // We clear other candidates to force the chain to start from this good state.
-        candidate_inits.clear();
+        // We add it to the candidates list to compete in the sprint tournament.
         candidate_inits.push(Some(p));
     }
 

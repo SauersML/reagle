@@ -2018,7 +2018,9 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let seeds = [12345, 23456, 34567];
     for (run_idx, seed) in seeds.iter().copied().enumerate() {
         let out_low = work_dir.path().join(format!("out_low_{}", run_idx));
-        run_rust_phasing_with_states(&target_vcf, &out_low, seed, 10)
+        // Use 40 states (matching n_haps) to ensure we have capacity for all haplotypes
+        // 10 states is too sparse for stable comparison against 100
+        run_rust_phasing_with_states(&target_vcf, &out_low, seed, 40)
             .expect("Rust phasing failed (low states)");
 
         let out_high = work_dir.path().join(format!("out_high_{}", run_idx));
