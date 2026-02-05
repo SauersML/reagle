@@ -66,14 +66,15 @@ impl GeneticMap {
                 continue;
             }
 
-            let pos: u32 = parts[1]
-                .parse()
-                .map_err(|_| ReagleError::parse(line_num + 1, "Invalid position"))?;
-
-            // Column 3 is rate (ignored), column 4 is genetic position
-            let gen_pos: f64 = parts[3]
+            // Column 3 is genetic position (cM)
+            let gen_pos: f64 = parts[2]
                 .parse()
                 .map_err(|_| ReagleError::parse(line_num + 1, "Invalid genetic position"))?;
+
+            // Column 4 is physical position (bp)
+            let pos: u32 = parts[3]
+                .parse()
+                .map_err(|_| ReagleError::parse(line_num + 1, "Invalid position"))?;
 
             if !gen_pos.is_finite() {
                 return Err(ReagleError::parse(
@@ -400,10 +401,10 @@ mod tests {
     fn create_test_map_file() -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-        // PLINK format: chrom position_bp rate_cM_per_Mb position_cM
-        writeln!(file, "chr1 1000000 1.0 0.0").unwrap();
-        writeln!(file, "chr1 2000000 1.0 1.0").unwrap();
-        writeln!(file, "chr1 3000000 1.5 2.5").unwrap();
+        // PLINK format: chrom id cM bp
+        writeln!(file, "chr1 . 0.0 1000000").unwrap();
+        writeln!(file, "chr1 . 1.0 2000000").unwrap();
+        writeln!(file, "chr1 . 2.5 3000000").unwrap();
         file.flush().unwrap();
         file
     }
