@@ -82,6 +82,3 @@ harness = false
 [lints.rust]
 # Treat all warnings as errors
 warnings = "deny"
-
-[profile.dev]
-opt-level = 2
