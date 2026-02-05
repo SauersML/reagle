@@ -3034,12 +3034,6 @@ fn write_linear_map_for_span(
 ) -> (String, u64, u64) {
     let (chrom, min_pos, max_pos) = vcf_min_max_pos(vcf_gz);
     let span_bp = max_pos.saturating_sub(min_pos).max(1);
-    let span_mb = span_bp as f64 / 1_000_000.0;
-    let rate = if span_mb > 0.0 {
-        total_cm / span_mb
-    } else {
-        1.0
-    };
     let mut total_cm_int = total_cm.round();
     if total_cm_int <= 0.0 {
         total_cm_int = 1.0;
