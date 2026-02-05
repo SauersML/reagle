@@ -2513,7 +2513,7 @@ pub fn compute_beagle_baseline(
         ],
         work_dir.path(),
     );
-    assert!(output.status.success());
+    assert!(output.success());
 
     // Parse and evaluate
     let (_, ref_records) = parse_vcf(input_vcf);
@@ -2784,7 +2784,7 @@ fn test_comparison_framework_self_check() {
         ],
         work_dir.path(),
     );
-    assert!(output.status.success());
+    assert!(output.success());
 
     let (_, ref_records) = parse_vcf(&ref_path);
     let imputed_vcf = work_dir.path().join("imputed.vcf.gz");
