@@ -133,6 +133,8 @@ pub struct ImputeWorkspace {
     pub bwd: Vec<f32>,
     pub emissions: Vec<f32>,
     pub fwd_history: Vec<f32>,
+    pub fwd_checkpoints: Vec<f32>,
+    pub checkpoint_stride: usize,
     pub fwd_scales: Vec<f32>,
     pub weights: Vec<f32>,
     pub state_alleles: Vec<u8>,
@@ -304,7 +306,9 @@ impl ImputeWorkspace {
             fwd: vec![0.0; n_states],
             bwd: vec![1.0; n_states],
             emissions: vec![1.0; n_states],
-            fwd_history: vec![0.0; n_states * n_markers],
+            fwd_history: Vec::new(),
+            fwd_checkpoints: Vec::new(),
+            checkpoint_stride: 1,
             fwd_scales: vec![1.0; n_markers],
             weights: vec![1.0; n_states],
             state_alleles: vec![255u8; n_states],
@@ -328,10 +332,6 @@ impl ImputeWorkspace {
         if self.weights.len() < n_states {
             self.weights.resize(n_states, 1.0);
         }
-        let want = n_states.saturating_mul(n_markers);
-        if self.fwd_history.len() < want {
-            self.fwd_history.resize(want, 0.0);
-        }
         if self.state_alleles.len() < n_states {
             self.state_alleles.resize(n_states, 255);
         }
@@ -343,6 +343,29 @@ impl ImputeWorkspace {
         }
         self.active_states = n_states;
         self.active_markers = n_markers;
+    }
+
+    pub fn configure_checkpoints(&mut self, n_states: usize, n_markers: usize) -> usize {
+        // Keep checkpoint memory bounded while staying exact.
+        const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+        let bytes_per_cp = n_states.max(1).saturating_mul(std::mem::size_of::<f32>());
+        let max_checkpoints = (MAX_CHECKPOINT_BYTES / bytes_per_cp).max(1);
+        let stride = (n_markers.max(1) + max_checkpoints - 1) / max_checkpoints;
+        let stride = stride.max(1);
+        let n_checkpoints = (n_markers + stride - 1) / stride + 1;
+        let want = n_checkpoints.saturating_mul(n_states.max(1));
+        if self.fwd_checkpoints.len() < want {
+            self.fwd_checkpoints.resize(want, 0.0);
+        }
+        self.checkpoint_stride = stride;
+        stride
+    }
+
+    pub fn ensure_block_history(&mut self, n_states: usize, block_len: usize) {
+        let want = n_states.saturating_mul(block_len.max(1));
+        if self.fwd_history.len() < want {
+            self.fwd_history.resize(want, 0.0);
+        }
     }
 
     #[inline]
@@ -775,6 +798,258 @@ fn fill_state_patterns_dict(
     }
 }
 
+#[inline]
+fn forward_update_impl<C: RefColumnLike>(
+    ws: &mut ImputeWorkspace,
+    m: usize,
+    use_prior_weighting: bool,
+    fwd_sum: f32,
+    state_haps: &[RefHapId],
+    ref_columns: &[C],
+    target_probs: &TargetAlleleProbs,
+    p_recomb: &[f32],
+    current_error: f32,
+    active_states: usize,
+    transition_haps: usize,
+) -> f32 {
+    let probs = target_probs.probs_for_marker(m);
+    let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
+    let uniform = target_probs.is_uniform_marker(m);
+
+    let mut next_sum = if uniform {
+        transition_only_forward_update(
+            &mut ws.fwd[..active_states],
+            fwd_sum,
+            recomb_rate,
+            transition_haps,
+        )
+    } else {
+        let ref_alleles = refresh_ref_alleles(
+            &ref_columns[m],
+            state_haps,
+            &mut ws.state_alleles[..active_states],
+            &mut ws.dict_pattern_alleles,
+        );
+        fill_emissions(
+            &ref_alleles,
+            probs,
+            current_error,
+            &mut ws.emission_by_allele,
+            &mut ws.emissions[..active_states],
+        );
+
+        if use_prior_weighting {
+            if recomb_rate > 0.0 {
+                WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    fwd_sum,
+                    recomb_rate,
+                    transition_haps,
+                    &ws.weights,
+                    &ws.emissions,
+                    active_states,
+                )
+            } else {
+                for i in 0..active_states {
+                    ws.fwd[i] *= ws.emissions[i];
+                }
+                ws.fwd[..active_states].iter().sum::<f32>().max(1e-30)
+            }
+        } else {
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                fwd_sum,
+                recomb_rate,
+                transition_haps,
+                &ws.weights,
+                &ws.emissions,
+                active_states,
+            )
+        }
+    };
+
+    if next_sum <= 0.0 {
+        next_sum = 1e-30;
+    }
+    ws.fwd_scales[m] = if uniform { 1.0 } else { next_sum };
+    let inv = 1.0 / next_sum;
+    for i in 0..active_states {
+        ws.fwd[i] *= inv;
+    }
+    1.0
+}
+
+#[inline]
+fn forward_update_seqcoded(
+    ws: &mut ImputeWorkspace,
+    m: usize,
+    use_prior_weighting: bool,
+    fwd_sum: f32,
+    state_haps: &[RefHapId],
+    ref_columns: &[&SeqCodedColumn],
+    target_probs: &TargetAlleleProbs,
+    p_recomb: &[f32],
+    current_error: f32,
+    active_states: usize,
+    transition_haps: usize,
+    last_hap_ptr: &mut *const u16,
+) -> f32 {
+    let probs = target_probs.probs_for_marker(m);
+    let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
+    let uniform = target_probs.is_uniform_marker(m);
+
+    let col = ref_columns[m];
+    let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
+
+    let mut next_sum = if uniform {
+        transition_only_forward_update(
+            &mut ws.fwd[..active_states],
+            fwd_sum,
+            recomb_rate,
+            transition_haps,
+        )
+    } else {
+        fill_pattern_emissions(
+            seq_patterns.seq_alleles,
+            probs,
+            current_error,
+            &mut ws.emission_by_allele,
+            &mut ws.pattern_emissions,
+        );
+        for i in 0..active_states {
+            let pid = seq_patterns.state_patterns[i] as usize;
+            ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
+        }
+
+        if use_prior_weighting {
+            if recomb_rate > 0.0 {
+                WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    fwd_sum,
+                    recomb_rate,
+                    transition_haps,
+                    &ws.weights,
+                    &ws.emissions,
+                    active_states,
+                )
+            } else {
+                for i in 0..active_states {
+                    ws.fwd[i] *= ws.emissions[i];
+                }
+                ws.fwd[..active_states].iter().sum::<f32>().max(1e-30)
+            }
+        } else {
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                fwd_sum,
+                recomb_rate,
+                transition_haps,
+                &ws.weights,
+                &ws.emissions,
+                active_states,
+            )
+        }
+    };
+
+    if next_sum <= 0.0 {
+        next_sum = 1e-30;
+    }
+    ws.fwd_scales[m] = if uniform { 1.0 } else { next_sum };
+    let inv = 1.0 / next_sum;
+    for i in 0..active_states {
+        ws.fwd[i] *= inv;
+    }
+    1.0
+}
+
+#[inline]
+fn forward_update_dict(
+    ws: &mut ImputeWorkspace,
+    m: usize,
+    use_prior_weighting: bool,
+    fwd_sum: f32,
+    state_haps: &[RefHapId],
+    ref_columns: &[DictColRef<'_>],
+    target_probs: &TargetAlleleProbs,
+    p_recomb: &[f32],
+    current_error: f32,
+    active_states: usize,
+    transition_haps: usize,
+    last_dict_ptr: &mut *const DictionaryColumn,
+) -> f32 {
+    let probs = target_probs.probs_for_marker(m);
+    let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
+    let uniform = target_probs.is_uniform_marker(m);
+
+    let mut next_sum = if uniform {
+        transition_only_forward_update(
+            &mut ws.fwd[..active_states],
+            fwd_sum,
+            recomb_rate,
+            transition_haps,
+        )
+    } else {
+        let col = &ref_columns[m];
+        let dict_patterns = refresh_dict_patterns(
+            col,
+            last_dict_ptr,
+            state_haps,
+            &mut ws.state_patterns,
+            &mut ws.dict_pattern_alleles,
+        );
+        fill_pattern_emissions(
+            dict_patterns.pattern_alleles,
+            probs,
+            current_error,
+            &mut ws.emission_by_allele,
+            &mut ws.pattern_emissions,
+        );
+        for i in 0..active_states {
+            let pid = dict_patterns.state_patterns[i] as usize;
+            ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
+        }
+
+        if use_prior_weighting {
+            if recomb_rate > 0.0 {
+                WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    fwd_sum,
+                    recomb_rate,
+                    transition_haps,
+                    &ws.weights,
+                    &ws.emissions,
+                    active_states,
+                )
+            } else {
+                for i in 0..active_states {
+                    ws.fwd[i] *= ws.emissions[i];
+                }
+                ws.fwd[..active_states].iter().sum::<f32>().max(1e-30)
+            }
+        } else {
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                fwd_sum,
+                recomb_rate,
+                transition_haps,
+                &ws.weights,
+                &ws.emissions,
+                active_states,
+            )
+        }
+    };
+
+    if next_sum <= 0.0 {
+        next_sum = 1e-30;
+    }
+    ws.fwd_scales[m] = if uniform { 1.0 } else { next_sum };
+    let inv = 1.0 / next_sum;
+    for i in 0..active_states {
+        ws.fwd[i] *= inv;
+    }
+    1.0
+}
+
 /// Monomorphized HMM core over a concrete genotype column type.
 fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     state_haps: &[RefHapId],
@@ -792,6 +1067,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let transition_haps = active_states.max(1);
     if active_states > 0 {
         // Li-Stephens transition for full panel:
@@ -844,85 +1120,29 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
             fwd_sum = 1.0;
         }
 
-        const TILE_SIZE: usize = 256;
-        let mut tile_start = 0usize;
-        while tile_start < active_markers {
-            let tile_end = (tile_start + TILE_SIZE).min(active_markers);
-            for m in tile_start..tile_end {
-                let probs = target_probs.probs_for_marker(m);
-                let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
-                let uniform = target_probs.is_uniform_marker(m);
-
-                if uniform {
-                    fwd_sum = transition_only_forward_update(
-                        &mut ws.fwd[..active_states],
-                        fwd_sum,
-                        recomb_rate,
-                        transition_haps,
-                    );
-                } else {
-                    let ref_alleles = refresh_ref_alleles(
-                        &ref_columns[m],
-                        state_haps,
-                        &mut ws.state_alleles[..active_states],
-                        &mut ws.dict_pattern_alleles,
-                    );
-                    fill_emissions(
-                        &ref_alleles,
-                        probs,
-                        current_error,
-                        &mut ws.emission_by_allele,
-                        &mut ws.emissions[..active_states],
-                    );
-
-                    if m == 0 && state_priors.is_some() {
-                        if recomb_rate > 0.0 {
-                            fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
-                                &mut ws.fwd,
-                                fwd_sum,
-                                recomb_rate,
-                                transition_haps,
-                                &ws.weights,
-                                &ws.emissions,
-                                active_states,
-                            );
-                        } else {
-                            for i in 0..active_states {
-                                ws.fwd[i] *= ws.emissions[i];
-                            }
-                            fwd_sum = ws.fwd[..active_states].iter().sum::<f32>().max(1e-30);
-                        }
-                    } else {
-                        fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
-                            &mut ws.fwd,
-                            fwd_sum,
-                            recomb_rate,
-                            transition_haps,
-                            &ws.weights,
-                            &ws.emissions,
-                            active_states,
-                        );
-                    }
-                }
-
-                if fwd_sum <= 0.0 {
-                    fwd_sum = 1e-30;
-                }
-                ws.fwd_scales[m] = if uniform { 1.0 } else { fwd_sum };
-                let inv = 1.0 / fwd_sum;
-                for i in 0..active_states {
-                    ws.fwd[i] *= inv;
-                }
-                // After scaling, sum(fwd) == 1.0
-                fwd_sum = 1.0;
-                let start = m * active_states;
-                ws.fwd_history[start..start + active_states]
+        for m in 0..active_markers {
+            let use_prior_weighting = m == 0 && state_priors.is_some();
+            fwd_sum = forward_update_impl(
+                ws,
+                m,
+                use_prior_weighting,
+                fwd_sum,
+                state_haps,
+                ref_columns,
+                target_probs,
+                p_recomb,
+                current_error,
+                active_states,
+                transition_haps,
+            );
+            if m % checkpoint_stride == 0 {
+                let cp = (m / checkpoint_stride) * active_states;
+                ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
-                if prior_marker_idx == Some(m) {
-                    final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
-                }
             }
-            tile_start = tile_end;
+            if prior_marker_idx == Some(m) {
+                final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+            }
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -932,16 +1152,48 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
         }
 
         ws.bwd.fill(1.0);
-        let mut tile_end = active_markers;
-        while tile_end > 0 {
-            let tile_start = tile_end.saturating_sub(TILE_SIZE);
-            for m_rev in (tile_start..tile_end).rev() {
-                let probs = target_probs.probs_for_marker(m_rev);
-                let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
-                let uniform = target_probs.is_uniform_marker(m_rev);
+        if active_markers > 0 {
+            let stride = checkpoint_stride.max(1);
+            let mut block_start = ((active_markers - 1) / stride) * stride;
+            loop {
+                let block_end = (block_start + stride).min(active_markers);
+                let block_len = block_end.saturating_sub(block_start);
+                ws.ensure_block_history(active_states, block_len);
 
-            let start = m_rev * active_states;
-            let fwd_slice = &ws.fwd_history[start..start + active_states];
+                let cp = (block_start / stride) * active_states;
+                ws.fwd[..active_states]
+                    .copy_from_slice(&ws.fwd_checkpoints[cp..cp + active_states]);
+                ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
+
+                if block_start + 1 < block_end {
+                    let mut local_sum = 1.0f32;
+                    for m in (block_start + 1)..block_end {
+                        local_sum = forward_update_impl(
+                            ws,
+                            m,
+                            false,
+                            local_sum,
+                            state_haps,
+                            ref_columns,
+                            target_probs,
+                            p_recomb,
+                            current_error,
+                            active_states,
+                            transition_haps,
+                        );
+                        let local_idx = (m - block_start) * active_states;
+                        ws.fwd_history[local_idx..local_idx + active_states]
+                            .copy_from_slice(&ws.fwd[..active_states]);
+                    }
+                }
+
+                for m_rev in (block_start..block_end).rev() {
+                    let probs = target_probs.probs_for_marker(m_rev);
+                    let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
+                    let uniform = target_probs.is_uniform_marker(m_rev);
+
+                    let start = (m_rev - block_start) * active_states;
+                    let fwd_slice = &ws.fwd_history[start..start + active_states];
             // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
             let ref_alleles = refresh_ref_alleles(
                 &ref_columns[m_rev],
@@ -1079,8 +1331,12 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                     }
                 }
+                }
+                if block_start == 0 {
+                    break;
+                }
+                block_start = block_start.saturating_sub(stride);
             }
-            tile_end = tile_start;
         }
 
         if is_final {
@@ -1112,6 +1368,7 @@ fn run_impute_hmm_seqcoded<Space>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let transition_haps = active_states.max(1);
     if active_states > 0 {
         ws.weights.fill(1.0);
@@ -1142,87 +1399,27 @@ fn run_impute_hmm_seqcoded<Space>(
         }
 
         let mut last_hap_ptr: *const u16 = std::ptr::null();
-        const TILE_SIZE: usize = 256;
-        let mut tile_start = 0usize;
-        while tile_start < active_markers {
-            let tile_end = (tile_start + TILE_SIZE).min(active_markers);
-            for m in tile_start..tile_end {
-                let probs = target_probs.probs_for_marker(m);
-                let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
-                let uniform = target_probs.is_uniform_marker(m);
-
-                let col = ref_columns[m];
-                let seq_patterns = refresh_seq_patterns(
-                    col,
-                    &mut last_hap_ptr,
-                    state_haps,
-                    &mut ws.state_patterns,
-                );
-
-                if uniform {
-                    fwd_sum = transition_only_forward_update(
-                        &mut ws.fwd[..active_states],
-                        fwd_sum,
-                        recomb_rate,
-                        transition_haps,
-                    );
-                } else {
-                    fill_pattern_emissions(
-                        seq_patterns.seq_alleles,
-                        probs,
-                        current_error,
-                        &mut ws.emission_by_allele,
-                        &mut ws.pattern_emissions,
-                    );
-                    for i in 0..active_states {
-                        let pid = seq_patterns.state_patterns[i] as usize;
-                        ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
-                    }
-
-                    if m == 0 && state_priors.is_some() {
-                        if recomb_rate > 0.0 {
-                            fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
-                                &mut ws.fwd,
-                                fwd_sum,
-                                recomb_rate,
-                                transition_haps,
-                                &ws.weights,
-                                &ws.emissions,
-                                active_states,
-                            );
-                        } else {
-                            for i in 0..active_states {
-                                ws.fwd[i] *= ws.emissions[i];
-                            }
-                            fwd_sum = ws.fwd[..active_states].iter().sum::<f32>().max(1e-30);
-                        }
-                    } else {
-                        fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
-                            &mut ws.fwd,
-                            fwd_sum,
-                            recomb_rate,
-                            transition_haps,
-                            &ws.weights,
-                            &ws.emissions,
-                            active_states,
-                        );
-                    }
-                }
-
-                if fwd_sum <= 0.0 {
-                    fwd_sum = 1e-30;
-                }
-                ws.fwd_scales[m] = if uniform { 1.0 } else { fwd_sum };
-                let inv = 1.0 / fwd_sum;
-                for i in 0..active_states {
-                    ws.fwd[i] *= inv;
-                }
-                fwd_sum = 1.0;
-                let start = m * active_states;
-                ws.fwd_history[start..start + active_states]
+        for m in 0..active_markers {
+            let use_prior_weighting = m == 0 && state_priors.is_some();
+            fwd_sum = forward_update_seqcoded(
+                ws,
+                m,
+                use_prior_weighting,
+                fwd_sum,
+                state_haps,
+                ref_columns,
+                target_probs,
+                p_recomb,
+                current_error,
+                active_states,
+                transition_haps,
+                &mut last_hap_ptr,
+            );
+            if m % checkpoint_stride == 0 {
+                let cp = (m / checkpoint_stride) * active_states;
+                ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
-            tile_start = tile_end;
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1234,25 +1431,59 @@ fn run_impute_hmm_seqcoded<Space>(
         ws.bwd.fill(1.0);
         let mut prior_state_post: Option<Vec<f32>> = None;
 
-        let mut last_hap_ptr: *const u16 = std::ptr::null();
-        let mut tile_end = active_markers;
-        while tile_end > 0 {
-            let tile_start = tile_end.saturating_sub(TILE_SIZE);
-            for m_rev in (tile_start..tile_end).rev() {
-                let probs = target_probs.probs_for_marker(m_rev);
-                let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
-                let uniform = target_probs.is_uniform_marker(m_rev);
+        if active_markers > 0 {
+            let stride = checkpoint_stride.max(1);
+            let mut block_start = ((active_markers - 1) / stride) * stride;
+            let mut last_hap_ptr: *const u16 = std::ptr::null();
+            loop {
+                let block_end = (block_start + stride).min(active_markers);
+                let block_len = block_end.saturating_sub(block_start);
+                ws.ensure_block_history(active_states, block_len);
 
-                let col = ref_columns[m_rev];
-                let seq_patterns = refresh_seq_patterns(
-                    col,
-                    &mut last_hap_ptr,
-                    state_haps,
-                    &mut ws.state_patterns,
-                );
+                let cp = (block_start / stride) * active_states;
+                ws.fwd[..active_states]
+                    .copy_from_slice(&ws.fwd_checkpoints[cp..cp + active_states]);
+                ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
 
-                let start = m_rev * active_states;
-                let fwd_slice = &ws.fwd_history[start..start + active_states];
+                if block_start + 1 < block_end {
+                    let mut local_sum = 1.0f32;
+                    let mut last_hap_ptr_re: *const u16 = std::ptr::null();
+                    for m in (block_start + 1)..block_end {
+                        local_sum = forward_update_seqcoded(
+                            ws,
+                            m,
+                            false,
+                            local_sum,
+                            state_haps,
+                            ref_columns,
+                            target_probs,
+                            p_recomb,
+                            current_error,
+                            active_states,
+                            transition_haps,
+                            &mut last_hap_ptr_re,
+                        );
+                        let local_idx = (m - block_start) * active_states;
+                        ws.fwd_history[local_idx..local_idx + active_states]
+                            .copy_from_slice(&ws.fwd[..active_states]);
+                    }
+                }
+
+                for m_rev in (block_start..block_end).rev() {
+                    let probs = target_probs.probs_for_marker(m_rev);
+                    let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
+                    let uniform = target_probs.is_uniform_marker(m_rev);
+
+                    let col = ref_columns[m_rev];
+                    let seq_patterns = refresh_seq_patterns(
+                        col,
+                        &mut last_hap_ptr,
+                        state_haps,
+                        &mut ws.state_patterns,
+                    );
+
+                    let start = (m_rev - block_start) * active_states;
+                    let fwd_slice = &ws.fwd_history[start..start + active_states];
 
             if is_final {
                 ws.allele_probs.clear();
@@ -1394,8 +1625,12 @@ fn run_impute_hmm_seqcoded<Space>(
                         ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                     }
                 }
+                }
+                if block_start == 0 {
+                    break;
+                }
+                block_start = block_start.saturating_sub(stride);
             }
-            tile_end = tile_start;
         }
 
         if is_final {
@@ -1428,6 +1663,7 @@ fn run_impute_hmm_dict<Space>(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let transition_haps = active_states.max(1);
     if active_states > 0 {
         ws.weights.fill(1.0);
@@ -1457,88 +1693,28 @@ fn run_impute_hmm_dict<Space>(
             fwd_sum = 1.0;
         }
 
-        const TILE_SIZE: usize = 256;
         let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
-        let mut tile_start = 0usize;
-        while tile_start < active_markers {
-            let tile_end = (tile_start + TILE_SIZE).min(active_markers);
-            for m in tile_start..tile_end {
-                let probs = target_probs.probs_for_marker(m);
-                let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
-                let uniform = target_probs.is_uniform_marker(m);
-
-                if uniform {
-                    fwd_sum = transition_only_forward_update(
-                        &mut ws.fwd[..active_states],
-                        fwd_sum,
-                        recomb_rate,
-                        transition_haps,
-                    );
-                } else {
-                    let col = &ref_columns[m];
-                    let dict_patterns = refresh_dict_patterns(
-                        col,
-                        &mut last_dict_ptr,
-                        state_haps,
-                        &mut ws.state_patterns,
-                        &mut ws.dict_pattern_alleles,
-                    );
-                    fill_pattern_emissions(
-                        dict_patterns.pattern_alleles,
-                        probs,
-                        current_error,
-                        &mut ws.emission_by_allele,
-                        &mut ws.pattern_emissions,
-                    );
-                    for i in 0..active_states {
-                        let pid = dict_patterns.state_patterns[i] as usize;
-                        ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
-                    }
-
-                    if m == 0 && state_priors.is_some() {
-                        if recomb_rate > 0.0 {
-                            fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
-                                &mut ws.fwd,
-                                fwd_sum,
-                                recomb_rate,
-                                transition_haps,
-                                &ws.weights,
-                                &ws.emissions,
-                                active_states,
-                            );
-                        } else {
-                            for i in 0..active_states {
-                                ws.fwd[i] *= ws.emissions[i];
-                            }
-                            fwd_sum = ws.fwd[..active_states].iter().sum::<f32>().max(1e-30);
-                        }
-                    } else {
-                        fwd_sum = WeightedHmmUpdater::fwd_update_weighted(
-                            &mut ws.fwd,
-                            fwd_sum,
-                            recomb_rate,
-                            transition_haps,
-                            &ws.weights,
-                            &ws.emissions,
-                            active_states,
-                        );
-                    }
-                }
-
-                if fwd_sum <= 0.0 {
-                    fwd_sum = 1e-30;
-                }
-                ws.fwd_scales[m] = if uniform { 1.0 } else { fwd_sum };
-                let inv = 1.0 / fwd_sum;
-                for i in 0..active_states {
-                    ws.fwd[i] *= inv;
-                }
-                fwd_sum = 1.0;
-                let start = m * active_states;
-                ws.fwd_history[start..start + active_states]
+        for m in 0..active_markers {
+            let use_prior_weighting = m == 0 && state_priors.is_some();
+            fwd_sum = forward_update_dict(
+                ws,
+                m,
+                use_prior_weighting,
+                fwd_sum,
+                state_haps,
+                ref_columns,
+                target_probs,
+                p_recomb,
+                current_error,
+                active_states,
+                transition_haps,
+                &mut last_dict_ptr,
+            );
+            if m % checkpoint_stride == 0 {
+                let cp = (m / checkpoint_stride) * active_states;
+                ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
-            tile_start = tile_end;
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1550,26 +1726,60 @@ fn run_impute_hmm_dict<Space>(
         ws.bwd.fill(1.0);
         let mut prior_state_post: Option<Vec<f32>> = None;
 
-        let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
-        let mut tile_end = active_markers;
-        while tile_end > 0 {
-            let tile_start = tile_end.saturating_sub(TILE_SIZE);
-            for m_rev in (tile_start..tile_end).rev() {
-                let probs = target_probs.probs_for_marker(m_rev);
-                let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
-                let uniform = target_probs.is_uniform_marker(m_rev);
+        if active_markers > 0 {
+            let stride = checkpoint_stride.max(1);
+            let mut block_start = ((active_markers - 1) / stride) * stride;
+            let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
+            loop {
+                let block_end = (block_start + stride).min(active_markers);
+                let block_len = block_end.saturating_sub(block_start);
+                ws.ensure_block_history(active_states, block_len);
 
-                let col = &ref_columns[m_rev];
-                let dict_patterns = refresh_dict_patterns(
-                    col,
-                    &mut last_dict_ptr,
-                    state_haps,
-                    &mut ws.state_patterns,
-                    &mut ws.dict_pattern_alleles,
-                );
+                let cp = (block_start / stride) * active_states;
+                ws.fwd[..active_states]
+                    .copy_from_slice(&ws.fwd_checkpoints[cp..cp + active_states]);
+                ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
 
-                let start = m_rev * active_states;
-                let fwd_slice = &ws.fwd_history[start..start + active_states];
+                if block_start + 1 < block_end {
+                    let mut local_sum = 1.0f32;
+                    let mut last_dict_ptr_re: *const DictionaryColumn = std::ptr::null();
+                    for m in (block_start + 1)..block_end {
+                        local_sum = forward_update_dict(
+                            ws,
+                            m,
+                            false,
+                            local_sum,
+                            state_haps,
+                            ref_columns,
+                            target_probs,
+                            p_recomb,
+                            current_error,
+                            active_states,
+                            transition_haps,
+                            &mut last_dict_ptr_re,
+                        );
+                        let local_idx = (m - block_start) * active_states;
+                        ws.fwd_history[local_idx..local_idx + active_states]
+                            .copy_from_slice(&ws.fwd[..active_states]);
+                    }
+                }
+
+                for m_rev in (block_start..block_end).rev() {
+                    let probs = target_probs.probs_for_marker(m_rev);
+                    let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
+                    let uniform = target_probs.is_uniform_marker(m_rev);
+
+                    let col = &ref_columns[m_rev];
+                    let dict_patterns = refresh_dict_patterns(
+                        col,
+                        &mut last_dict_ptr,
+                        state_haps,
+                        &mut ws.state_patterns,
+                        &mut ws.dict_pattern_alleles,
+                    );
+
+                    let start = (m_rev - block_start) * active_states;
+                    let fwd_slice = &ws.fwd_history[start..start + active_states];
 
             if is_final {
                     ws.allele_probs.clear();
@@ -1711,8 +1921,12 @@ fn run_impute_hmm_dict<Space>(
                         ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                     }
                 }
+                }
+                if block_start == 0 {
+                    break;
+                }
+                block_start = block_start.saturating_sub(stride);
             }
-            tile_end = tile_start;
         }
 
         if is_final {

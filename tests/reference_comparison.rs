@@ -1336,21 +1336,40 @@ fn test_phasing_multi_window_long_map_vs_java() {
 #[test]
 #[serial]
 fn test_imputation_multi_window_long_map_vs_java() {
+    println!("\n[long-map] START test_imputation_multi_window_long_map_vs_java");
     let files = setup_test_files();
     let work_dir = tempfile::tempdir().expect("Create temp dir");
+    println!(
+        "[long-map] work_dir={}",
+        work_dir.path().display()
+    );
 
     // Copy files to work dir
     let ref_path = work_dir.path().join("ref.vcf.gz");
     let gt_path = work_dir.path().join("target_sparse.vcf.gz");
+    println!("[long-map] copy ref_vcf -> {}", ref_path.display());
     fs::copy(&files.ref_vcf, &ref_path).expect("Copy ref VCF");
+    println!("[long-map] copy target_sparse_vcf -> {}", gt_path.display());
     fs::copy(&files.target_sparse_vcf, &gt_path).expect("Copy target VCF");
 
     // Create a linear genetic map with a modest span to keep runtime bounded.
     let map_path = work_dir.path().join("long_span.map");
+    println!(
+        "[long-map] write_linear_map_for_span input={} output={} span_cm=10.0",
+        ref_path.display(),
+        map_path.display()
+    );
     write_linear_map_for_span(&ref_path, &map_path, 10.0);
 
     // Run Java BEAGLE with map
     let java_out = work_dir.path().join("java_imputed_long");
+    println!(
+        "[long-map] JAVA START ref={} gt={} map={} out={} window=2.0 overlap=1.0 seed=42 gp=true",
+        ref_path.display(),
+        gt_path.display(),
+        map_path.display(),
+        java_out.display()
+    );
     let java_output = run_beagle(
         &files.beagle_jar,
         &[
@@ -1365,14 +1384,31 @@ fn test_imputation_multi_window_long_map_vs_java() {
         ],
         work_dir.path(),
     );
+    println!(
+        "[long-map] JAVA END status={}",
+        java_output.status.success()
+    );
     assert!(java_output.status.success(), "Java imputation failed");
 
     let java_vcf = work_dir.path().join("java_imputed_long.vcf.gz");
+    println!("[long-map] java_vcf={}", java_vcf.display());
 
     // Run Rust with the same map and explicit window sizing.
+    println!(
+        "[long-map] RUST decompress input gt={} ref={}",
+        gt_path.display(),
+        ref_path.display()
+    );
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_imputed_long");
+    println!(
+        "[long-map] RUST START gt={} ref={} map={} out={} window=2.0 overlap=1.0 seed=42",
+        gt_vcf.display(),
+        ref_vcf.display(),
+        map_path.display(),
+        rust_out.display()
+    );
     let rust_result = run_rust_imputation_with_map(
         &gt_vcf,
         &ref_vcf,
@@ -1382,6 +1418,10 @@ fn test_imputation_multi_window_long_map_vs_java() {
         2.0,
         1.0,
     );
+    println!(
+        "[long-map] RUST END ok={}",
+        rust_result.is_ok()
+    );
     assert!(
         rust_result.is_ok(),
         "Rust imputation failed: {:?}",
@@ -1389,12 +1429,16 @@ fn test_imputation_multi_window_long_map_vs_java() {
     );
 
     let rust_vcf = work_dir.path().join("rust_imputed_long.vcf.gz");
+    println!("[long-map] rust_vcf={}", rust_vcf.display());
+    println!("[long-map] compare_imputation_results START");
     compare_imputation_results(
         "long-map multi-window",
         &gt_path,
         &java_vcf,
         &rust_vcf,
     );
+    println!("[long-map] compare_imputation_results END");
+    println!("[long-map] END test_imputation_multi_window_long_map_vs_java");
 }
 
 #[test]

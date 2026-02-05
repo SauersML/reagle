@@ -1,0 +1,12 @@
+[profile.default]
+# Keep good parallelism for most tests.
+threads = "num-cpus"
+failure-output = "immediate"
+
+[test-groups.serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+# Serialize the heavy integration tests that otherwise contend across binaries.
+filter = "test(reference_comparison::)"
+test-group = "serial"

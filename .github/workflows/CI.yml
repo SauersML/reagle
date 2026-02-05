@@ -73,6 +73,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y bcftools tabix curl
 
-    - name: Run Rust Tests
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+
+    - name: Run Rust Tests (nextest)
       run: |
-        cargo test --release --verbose
+        cargo nextest run --release --verbose --failure-output=immediate

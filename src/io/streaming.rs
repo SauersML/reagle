@@ -337,6 +337,8 @@ pub struct StreamingVcfReader {
     sample_ploidy: Option<Vec<bool>>,
     /// Whether any confidence scores were seen
     has_any_confidence: bool,
+    /// One-marker lookahead when a region read crosses chromosomes.
+    pending_marker: Option<BufferedMarker>,
 }
 
 impl StreamingVcfReader {
@@ -471,6 +473,7 @@ impl StreamingVcfReader {
                 all_phased: true,
                 sample_ploidy: None,
                 has_any_confidence: false,
+                pending_marker: None,
             };
 
             if let Err(e) = reader.prefetch_first_marker() {
@@ -717,6 +720,16 @@ impl StreamingVcfReader {
                 break;
             }
             if let Some(bm) = self.read_next_marker()? {
+                let chrom_name = self
+                    .markers_meta
+                    .chrom_name(bm.marker.chrom)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                if !candidates.iter().any(|c| c.as_str() == chrom_name.as_str()) {
+                    // Stash lookahead marker for the next region/chromosome.
+                    self.pending_marker = Some(bm);
+                    break;
+                }
                 self.buffer.push_back(bm);
             } else {
                 break;
@@ -898,6 +911,10 @@ impl StreamingVcfReader {
 
     /// Read the next marker from the VCF
     fn read_next_marker(&mut self) -> Result<Option<BufferedMarker>> {
+        if let Some(bm) = self.pending_marker.take() {
+            self.current_chrom = Some(bm.marker.chrom);
+            return Ok(Some(bm));
+        }
         loop {
             self.line_buf.clear();
             let bytes_read = self.reader.read_until(b'\n', &mut self.line_buf)?;
