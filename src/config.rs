@@ -107,7 +107,7 @@ pub struct Config {
     /// Number of imputation steps
     pub imp_nsteps: usize,
 
-    /// Maximum cM in a marker cluster
+    /// Maximum cM in a marker cluster (currently unused for merging)
     pub cluster: f32,
 
     /// PBWT batch memory budget (MB) for imputation state selection

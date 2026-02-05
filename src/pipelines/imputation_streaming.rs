@@ -3159,7 +3159,11 @@ impl crate::pipelines::ImputationPipeline {
             let chrom = ref_markers
                 .marker(MarkerIdx::new(0))
                 .chrom;
-            let min_cluster_cm = (self.config.cluster as f64).max(1e-8);
+            // Use a negligible minimum distance (1e-8) to avoid inflating the genetic map.
+            // Beagle's "cluster" parameter merges markers, whereas this logic enforces
+            // separation. Using the config.cluster value (default 0.005) here breaks
+            // short-range LD by forcing markers to be too far apart.
+            let min_cluster_cm = 1e-8;
             if let Some(gen_map) = gen_maps.get(chrom) {
                 // External map: enforce a minimum distance based on the cluster
                 // parameter to avoid near-zero recombination in dense regions.
