@@ -95,6 +95,9 @@ const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
+// When memory detection fails, use a conservative fallback budget for prescan
+// batching/caching to avoid pathological re-reads of the target VCF.
+const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
 
 fn estimate_state_budget(
     available_bytes: u64,
@@ -1314,6 +1317,11 @@ fn build_imputation_plan(
     };
 
     let avail = available_bytes;
+    let prescan_avail = if avail == 0 {
+        PRESCAN_FALLBACK_AVAIL_BYTES
+    } else {
+        avail
+    };
     let n_ref_haps = ref_data.n_ref_haps();
     if n_ref_haps == 0 {
         return Err(ReagleError::vcf(
@@ -1323,7 +1331,13 @@ fn build_imputation_plan(
     plan.n_ref_haps = n_ref_haps;
     let window_handoff = ref_data.window_handoff().to_vec();
     let per_window_caps = ref_data.per_window_caps().to_vec();
-    let batch_size = estimate_scan_batch_size(avail, n_ref_haps, n_target_haps);
+    if avail == 0 {
+        eprintln!(
+            "Pre-scan: available memory unknown; using fallback={} MB for batching/cache",
+            prescan_avail / (1024 * 1024)
+        );
+    }
+    let batch_size = estimate_scan_batch_size(prescan_avail, n_ref_haps, n_target_haps);
     let mut batch_start = 0usize;
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();
@@ -1388,7 +1402,7 @@ fn build_imputation_plan(
     }
 
     let target_cache_budget = if avail == 0 {
-        0u64
+        (prescan_avail as f64 * TARGET_CACHE_RAM_FRACTION) as u64
     } else {
         (avail as f64 * TARGET_CACHE_RAM_FRACTION) as u64
     };

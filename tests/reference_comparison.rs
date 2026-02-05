@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use rand::SeedableRng;
 
@@ -951,7 +951,7 @@ fn compare_imputation_results(name: &str, truth_vcf: &Path, java_vcf: &Path, rus
 }
 
 /// Run Java BEAGLE with given arguments
-fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::process::Output {
+fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::process::ExitStatus {
     let mut cmd = Command::new("java");
     cmd.arg("-jar").arg(jar);
 
@@ -963,14 +963,13 @@ fn run_beagle(jar: &Path, args: &[(&str, &str)], work_dir: &Path) -> std::proces
 
     println!("Running: java -jar {} {:?}", jar.display(), args);
 
-    let output = cmd.output().expect("Failed to execute Java BEAGLE");
+    let status = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("Failed to execute Java BEAGLE");
 
-    if !output.status.success() {
-        eprintln!("STDOUT: {}", String::from_utf8_lossy(&output.stdout));
-        eprintln!("STDERR: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    output
+    status
 }
 
 #[test]
@@ -1000,7 +999,7 @@ fn run_phasing_comparison(source: &TestDataSource) {
 
     // Run Java BEAGLE
     let java_out = work_dir.path().join("java_phased");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("gt", gt_path.to_str().unwrap()),
@@ -1010,7 +1009,7 @@ fn run_phasing_comparison(source: &TestDataSource) {
         work_dir.path(),
     );
     assert!(
-        java_output.status.success(),
+        java_status.success(),
         "{}: Java phasing failed",
         source.name
     );
@@ -1105,7 +1104,7 @@ fn run_imputation_comparison(source: &TestDataSource) {
 
     // Run Java BEAGLE
     let java_out = work_dir.path().join("java_imputed");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -1117,7 +1116,7 @@ fn run_imputation_comparison(source: &TestDataSource) {
         work_dir.path(),
     );
     assert!(
-        java_output.status.success(),
+        java_status.success(),
         "{}: Java imputation failed",
         source.name
     );
@@ -1213,7 +1212,7 @@ fn test_imputation_bref3_ref_rust_vs_java() {
 
     // Run Java BEAGLE with bref3 reference
     let java_out = work_dir.path().join("java_bref3");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", bref3_path.to_str().unwrap()),
@@ -1225,7 +1224,7 @@ fn test_imputation_bref3_ref_rust_vs_java() {
         work_dir.path(),
     );
     assert!(
-        java_output.status.success(),
+        java_status.success(),
         "Java BEAGLE with bref3 failed"
     );
 
@@ -1265,7 +1264,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
 
     // Run Java BEAGLE phasing with map
     let java_out = work_dir.path().join("java_phased_long");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("gt", gt_path.to_str().unwrap()),
@@ -1276,7 +1275,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java phasing failed");
+    assert!(java_status.success(), "Java phasing failed");
 
     let java_vcf = work_dir.path().join("java_phased_long.vcf.gz");
 
@@ -1370,7 +1369,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
         map_path.display(),
         java_out.display()
     );
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -1386,9 +1385,9 @@ fn test_imputation_multi_window_long_map_vs_java() {
     );
     println!(
         "[long-map] JAVA END status={}",
-        java_output.status.success()
+        java_status.success()
     );
-    assert!(java_output.status.success(), "Java imputation failed");
+    assert!(java_status.success(), "Java imputation failed");
 
     let java_vcf = work_dir.path().join("java_imputed_long.vcf.gz");
     println!("[long-map] java_vcf={}", java_vcf.display());
@@ -1633,7 +1632,7 @@ fn run_output_structure_comparison(source: &TestDataSource) {
 
     // Run Java BEAGLE
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -1645,7 +1644,7 @@ fn run_output_structure_comparison(source: &TestDataSource) {
         work_dir.path(),
     );
     assert!(
-        java_output.status.success(),
+        java_status.success(),
         "{}: Java BEAGLE imputation failed",
         source.name
     );
@@ -2290,7 +2289,7 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
 
     // Run Java BEAGLE
     let java_out = work_dir.path().join("java_imputed");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -2302,7 +2301,7 @@ fn run_mask_and_recover_comparison(source: &TestDataSource) {
         work_dir.path(),
     );
     assert!(
-        java_output.status.success(),
+        java_status.success(),
         "{}: Java BEAGLE imputation failed",
         source.name
     );
@@ -2988,13 +2987,14 @@ fn write_linear_map_for_span(
     } else {
         1.0
     };
+    let total_cm_int = total_cm.round();
     let content = format!(
-        "{chrom}\t{min_pos}\t{rate}\t0.0\n{chrom}\t{max_pos}\t{rate}\t{total_cm}\n",
+        "{chrom}\t{min_pos}\t{rate}\t0\n{chrom}\t{max_pos}\t{rate}\t{total_cm}\n",
         chrom = chrom,
         min_pos = min_pos,
         max_pos = max_pos,
         rate = rate,
-        total_cm = total_cm
+        total_cm = total_cm_int
     );
     fs::write(map_path, content).expect("Write map file");
     (chrom, min_pos, max_pos)
@@ -3585,7 +3585,7 @@ fn test_genotyped_dosage_correlation_with_truth() {
 
         // Run Java
         let java_out = work_dir.path().join("java_out");
-        let java_output = run_beagle(
+        let java_status = run_beagle(
             &files.beagle_jar,
             &[
                 ("ref", ref_path.to_str().unwrap()),
@@ -3596,7 +3596,7 @@ fn test_genotyped_dosage_correlation_with_truth() {
             ],
             work_dir.path(),
         );
-        assert!(java_output.status.success(), "Java BEAGLE failed");
+        assert!(java_status.success(), "Java BEAGLE failed");
 
         // Run Rust imputation
         let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
@@ -3652,7 +3652,7 @@ fn test_strict_dr2_and_dosage_comparison() {
 
         // Run Java BEAGLE
         let java_out = work_dir.path().join("java_out");
-        let java_output = run_beagle(
+        let java_status = run_beagle(
             &files.beagle_jar,
             &[
                 ("ref", ref_path.to_str().unwrap()),
@@ -3664,7 +3664,7 @@ fn test_strict_dr2_and_dosage_comparison() {
             work_dir.path(),
         );
         assert!(
-            java_output.status.success(),
+            java_status.success(),
             "{}: Java BEAGLE failed",
             source.name
         );
@@ -3747,7 +3747,7 @@ fn test_diverse_mask_scenarios() {
 
         // Run Java BEAGLE
         let java_out = work_dir.path().join("java_imputed");
-        let java_output = run_beagle(
+        let java_status = run_beagle(
             &files.beagle_jar,
             &[
                 ("ref", ref_path.to_str().unwrap()),
@@ -3759,7 +3759,7 @@ fn test_diverse_mask_scenarios() {
             work_dir.path(),
         );
         assert!(
-            java_output.status.success(),
+            java_status.success(),
             "Java BEAGLE failed for {}",
             scenario_name
         );
@@ -3974,7 +3974,7 @@ fn test_multiple_seeds_consistency() {
 
         // Run Java
         let java_out = work_dir.path().join("java_out");
-        let java_output = run_beagle(
+        let java_status = run_beagle(
             &files.beagle_jar,
             &[
                 ("ref", ref_path.to_str().unwrap()),
@@ -3986,7 +3986,7 @@ fn test_multiple_seeds_consistency() {
             work_dir.path(),
         );
         assert!(
-            java_output.status.success(),
+            java_status.success(),
             "Java failed for seed {}",
             seed
         );
@@ -4123,7 +4123,7 @@ fn test_per_sample_imputation_accuracy() {
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -4134,7 +4134,7 @@ fn test_per_sample_imputation_accuracy() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     // Run Rust
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
@@ -4315,7 +4315,7 @@ fn test_dosage_genotyped_vs_imputed() {
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -4326,7 +4326,7 @@ fn test_dosage_genotyped_vs_imputed() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     // Run Rust
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
@@ -4759,7 +4759,7 @@ fn test_dosage_by_distance_from_genotyped() {
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -4770,7 +4770,7 @@ fn test_dosage_by_distance_from_genotyped() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     // Run Rust
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
@@ -5015,7 +5015,7 @@ fn test_posterior_probability_calibration() {
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -5026,7 +5026,7 @@ fn test_posterior_probability_calibration() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     // Run Rust imputation
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
@@ -5216,7 +5216,7 @@ fn test_genotyped_dosage_matches_hard_call() {
 
     // Run Java
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -5227,7 +5227,7 @@ fn test_genotyped_dosage_matches_hard_call() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     // Run Rust
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
@@ -5538,7 +5538,7 @@ fn test_phasing_sanity_checks() {
 
         // Run Java phasing
         let java_out = work_dir.path().join("java_phased");
-        let java_output = run_beagle(
+        let java_status = run_beagle(
             &files.beagle_jar,
             &[
                 ("gt", gt_path.to_str().unwrap()),
@@ -5548,7 +5548,7 @@ fn test_phasing_sanity_checks() {
             work_dir.path(),
         );
         assert!(
-            java_output.status.success(),
+            java_status.success(),
             "{}: Java phasing failed",
             source.name
         );
@@ -5693,7 +5693,7 @@ fn test_phasing_switch_error_rate() {
 
         // Run Java BEAGLE
         let java_out = work_dir.path().join("java_phased");
-        let java_output = run_beagle(
+        let java_status = run_beagle(
             &files.beagle_jar,
             &[
                 ("gt", gt_path.to_str().unwrap()),
@@ -5703,7 +5703,7 @@ fn test_phasing_switch_error_rate() {
             work_dir.path(),
         );
         assert!(
-            java_output.status.success(),
+            java_status.success(),
             "{}: Java phasing failed",
             source.name
         );
@@ -6073,7 +6073,7 @@ fn test_perfect_ld_trap_rare_variants_aggregate() {
 
     // Run Java BEAGLE
     let java_out = work_dir.path().join("java_imp");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &beagle.beagle_jar,
         &[
             ("ref", beagle.ref_vcf.to_str().unwrap()),
@@ -6084,7 +6084,7 @@ fn test_perfect_ld_trap_rare_variants_aggregate() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     // Run Rust imputation
     let rust_out = work_dir.path().join("rust_imp");
@@ -6437,7 +6437,7 @@ fn test_imputed_af_collapse_against_java() {
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
 
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -6448,7 +6448,7 @@ fn test_imputed_af_collapse_against_java() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
@@ -6530,7 +6530,7 @@ fn test_imputed_af_collapse_sensitivity_to_err() {
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
 
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -6541,7 +6541,7 @@ fn test_imputed_af_collapse_sensitivity_to_err() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
@@ -6644,7 +6644,7 @@ fn test_imputed_af_collapse_sensitivity_to_ne() {
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
 
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -6655,7 +6655,7 @@ fn test_imputed_af_collapse_sensitivity_to_ne() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
@@ -6758,7 +6758,7 @@ fn test_imputed_af_collapse_sensitivity_to_cluster() {
     fs::copy(&source.target_sparse_vcf, &target_path).expect("Copy sparse target VCF");
 
     let java_out = work_dir.path().join("java_out");
-    let java_output = run_beagle(
+    let java_status = run_beagle(
         &test_files.beagle_jar,
         &[
             ("ref", ref_path.to_str().unwrap()),
@@ -6769,7 +6769,7 @@ fn test_imputed_af_collapse_sensitivity_to_cluster() {
         ],
         work_dir.path(),
     );
-    assert!(java_output.status.success(), "Java BEAGLE failed");
+    assert!(java_status.success(), "Java BEAGLE failed");
 
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let target_vcf = decompress_vcf_for_rust(&target_path, work_dir.path());
