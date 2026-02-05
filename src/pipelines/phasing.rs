@@ -8955,8 +8955,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_lr = Vec::with_capacity(het_positions.len());
     let mut swap_probs = Vec::with_capacity(het_positions.len());
     let mut swap_probs_conf = Vec::with_capacity(het_positions.len());
-    let mut p_min = 1.0f32;
-    let mut p_max = 0.0f32;
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
@@ -8991,9 +8989,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let p = p_swap.clamp(0.0, 1.0);
         swap_probs.push(p);
         swap_probs_conf.push(p_swap_conf.clamp(0.0, 1.0));
-        let p = p_swap.clamp(0.0, 1.0);
-        p_min = p_min.min(p);
-        p_max = p_max.max(p);
     }
     // Determine if we have any anchored/phased markers.
     let has_anchor = het_positions.iter().any(|&m| {
@@ -9048,8 +9043,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let ref_alleles = buffers.ref_alleles.as_mut_slice();
         let ref_alleles_flat = shared_ref;
-        p_min = 1.0;
-        p_max = 0.0;
         for (i, &m) in het_positions.iter().enumerate() {
             let a1 = if flip_to_anchor { seq2[m] } else { seq1[m] };
             let a2 = if flip_to_anchor { seq1[m] } else { seq2[m] };
@@ -9094,8 +9087,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
             swap_probs[i] = p_swap.clamp(0.0, 1.0);
             swap_lr[i] = lr;
-            p_min = p_min.min(p_swap);
-            p_max = p_max.max(p_swap);
         }
     }
     if !het_positions.is_empty() {
