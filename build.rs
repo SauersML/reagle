@@ -139,20 +139,14 @@ fn update_stage(label: &str) {
 
     if warnings_enabled() {
         println!("cargo:warning=project build stage: {label}");
-        match io::stdout().flush() {
-            Ok(()) => (),
-            Err(_) => (),
-        }
+        let _ = io::stdout().flush();
     }
 }
 
 fn emit_stage_detail(detail: &str) {
     if warnings_enabled() {
         println!("cargo:warning=project build detail: {detail}");
-        match io::stdout().flush() {
-            Ok(()) => (),
-            Err(_) => (),
-        }
+        let _ = io::stdout().flush();
     }
 }
 
