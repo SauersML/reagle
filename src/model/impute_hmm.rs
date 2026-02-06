@@ -712,6 +712,37 @@ fn normalize_probs(probs: &mut [f32]) {
 }
 
 #[inline]
+fn smooth_allele_posteriors<Space>(
+    allele_probs: &mut [f32],
+    marker_idx: usize,
+    total_mass: f32,
+    state_prob_sq_sum: f32,
+    ref_allele_freqs: &RefAlleleFreqs<Space>,
+) {
+    if allele_probs.is_empty() || total_mass <= 0.0 || state_prob_sq_sum <= 0.0 {
+        return;
+    }
+    let Some(freqs) = ref_allele_freqs.get(marker_idx) else {
+        return;
+    };
+
+    // Weak Bayesian shrinkage toward panel AF to prevent overconfident 0/1
+    // allele posteriors when effective donor support is tiny.
+    let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
+    let prior_mass = (0.25f32 / effective_states).clamp(0.0, 0.5);
+    if prior_mass <= 0.0 {
+        return;
+    }
+
+    let denom = 1.0 + prior_mass;
+    for (i, p) in allele_probs.iter_mut().enumerate() {
+        let af = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
+        *p = (*p + prior_mass * af) / denom;
+    }
+    normalize_probs(allele_probs);
+}
+
+#[inline]
 fn is_uniform_probs(probs: &[f32]) -> bool {
     if probs.len() <= 1 {
         return true;
@@ -1224,6 +1255,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let mut total = 0.0f32;
+                            let mut sq_sum = 0.0f32;
                             for i in 0..active_states {
                                 let ref_allele = ref_alleles.get(i);
                                 if ref_allele == 255 {
@@ -1231,6 +1263,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                                 }
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
+                                sq_sum += state_prob * state_prob;
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
@@ -1240,6 +1273,13 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
+                                smooth_allele_posteriors(
+                                    &mut ws.allele_probs,
+                                    m_rev,
+                                    total,
+                                    sq_sum,
+                                    ref_allele_freqs,
+                                );
                             } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
                                 let mut sum = 0.0f32;
                                 for (i, p) in ws.allele_probs.iter_mut().enumerate() {
@@ -1502,6 +1542,7 @@ fn run_impute_hmm_seqcoded<Space>(
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let mut total = 0.0f32;
+                            let mut sq_sum = 0.0f32;
                             for i in 0..active_states {
                                 let ref_allele = seq_patterns.allele_for_state(i);
                                 if ref_allele == 255 {
@@ -1509,6 +1550,7 @@ fn run_impute_hmm_seqcoded<Space>(
                                 }
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
+                                sq_sum += state_prob * state_prob;
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
@@ -1518,6 +1560,13 @@ fn run_impute_hmm_seqcoded<Space>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
+                                smooth_allele_posteriors(
+                                    &mut ws.allele_probs,
+                                    m_rev,
+                                    total,
+                                    sq_sum,
+                                    ref_allele_freqs,
+                                );
                             } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
                                 let mut sum = 0.0f32;
                                 for (i, p) in ws.allele_probs.iter_mut().enumerate() {
@@ -1779,6 +1828,7 @@ fn run_impute_hmm_dict<Space>(
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let mut total = 0.0f32;
+                            let mut sq_sum = 0.0f32;
                             for i in 0..active_states {
                                 let ref_allele = dict_patterns.allele_for_state(i);
                                 if ref_allele == 255 {
@@ -1786,6 +1836,7 @@ fn run_impute_hmm_dict<Space>(
                                 }
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
+                                sq_sum += state_prob * state_prob;
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
@@ -1795,6 +1846,13 @@ fn run_impute_hmm_dict<Space>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
+                                smooth_allele_posteriors(
+                                    &mut ws.allele_probs,
+                                    m_rev,
+                                    total,
+                                    sq_sum,
+                                    ref_allele_freqs,
+                                );
                             } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
                                 let mut sum = 0.0f32;
                                 for (i, p) in ws.allele_probs.iter_mut().enumerate() {
