@@ -93,6 +93,7 @@ const STATE_MIX_WINDOW_FRAC_NUM: usize = 35;
 const STATE_MIX_DONOR_FRAC_NUM: usize = 25;
 const STATE_MIX_CORE_FRAC_NUM: usize = 20;
 const STATE_MIX_FRAC_DEN: usize = 100;
+const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
@@ -1015,6 +1016,9 @@ fn compute_per_window_cap(
     force_full_panel: bool,
     desired_cap: Option<usize>,
 ) -> usize {
+    if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS {
+        return n_ref_haps.max(1);
+    }
     let mut per_window_cap_window = if force_full_panel {
         n_ref_haps.max(1)
     } else {
@@ -1353,8 +1357,10 @@ fn build_imputation_plan(
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();
 
-    let can_full_panel =
-        !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps);
+    // Always run LMS prescan allocation for imputation.
+    // Even when full panel fits in RAM, sparse-target scenarios benefit from
+    // ancestry/locality-constrained state selection instead of uniform full-panel HMM.
+    let can_full_panel = false;
     if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
@@ -3779,7 +3785,7 @@ impl crate::pipelines::ImputationPipeline {
         let sm_needed: Vec<AtomicBool> =
             (0..n_target_haps).map(|_| AtomicBool::new(false)).collect();
 
-        if !plan.full_panel {
+        {
             let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
             let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
             let batch_size = 4096usize;
@@ -3993,8 +3999,8 @@ impl crate::pipelines::ImputationPipeline {
         let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
         let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
         let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
-        let no_info_h1 = !plan.full_panel && sm_total_info[h1_idx.as_usize()] <= 0.0;
-        let no_info_h2 = !plan.full_panel && sm_total_info[h2_idx.as_usize()] <= 0.0;
+        let no_info_h1 = sm_total_info[h1_idx.as_usize()] <= 0.0;
+        let no_info_h2 = sm_total_info[h2_idx.as_usize()] <= 0.0;
                 let has_priors_h1 = priors_h1.map(|p| !p.is_empty()).unwrap_or(false);
                 let has_priors_h2 = priors_h2.map(|p| !p.is_empty()).unwrap_or(false);
                 let mut donors_h1: Vec<(RefHapId, u32)> = sm_donor_counts[h1_idx.as_usize()]
@@ -4364,6 +4370,31 @@ impl crate::pipelines::ImputationPipeline {
                                     .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
                                     .collect::<Vec<f32>>(),
                             )
+                        }
+                    } else if !donors.is_empty() {
+                        let mut mapped = vec![0.0f32; state_haps.len()];
+                        let mut donor_total = 0.0f32;
+                        for (hap, count) in donors.iter() {
+                            donor_total += *count as f32;
+                            if let Ok(idx) = state_haps.binary_search(hap) {
+                                mapped[idx] += *count as f32;
+                            }
+                        }
+                        if donor_total > 0.0 && !mapped.is_empty() {
+                            let inv = 1.0f32 / donor_total;
+                            for v in mapped.iter_mut() {
+                                *v *= inv;
+                            }
+                            // Donor-guided initialization for first-window/no-handoff cases.
+                            // Blend with uniform to preserve coverage while anchoring to local matches.
+                            let lambda = 0.30f32;
+                            let uniform = 1.0f32 / mapped.len() as f32;
+                            for v in mapped.iter_mut() {
+                                *v = (1.0 - lambda) * uniform + lambda * *v;
+                            }
+                            Some(mapped)
+                        } else {
+                            None
                         }
                     } else {
                         None
