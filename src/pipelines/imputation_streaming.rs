@@ -3241,7 +3241,7 @@ impl crate::pipelines::ImputationPipeline {
             .copied()
             .unwrap_or(plan.per_window_cap)
             .max(1);
-        let full_states = if plan.full_panel {
+        let full_states = if plan.full_panel || per_window_cap_local >= plan.n_ref_haps {
             let mut full: Vec<RefHapId> = Vec::with_capacity(plan.n_ref_haps);
             for h in 0..plan.n_ref_haps {
                 full.push(RefHapId::new(h as u32));
@@ -4019,8 +4019,6 @@ impl crate::pipelines::ImputationPipeline {
         } else if has_priors_h1 {
             // Priors require HMM propagation even when emissions are uniform.
             true
-        } else if no_info_h1 {
-            false
         } else {
             conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                 || insufficient_info_h1
@@ -4031,8 +4029,6 @@ impl crate::pipelines::ImputationPipeline {
         } else if has_priors_h2 {
             // Priors require HMM propagation even when emissions are uniform.
             true
-        } else if no_info_h2 {
-            false
         } else {
             conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
                 || insufficient_info_h2
@@ -4371,7 +4367,7 @@ impl crate::pipelines::ImputationPipeline {
                                     .collect::<Vec<f32>>(),
                             )
                         }
-                    } else if !donors.is_empty() {
+                    } else if !plan.full_panel && plan.n_ref_haps > 16 && !donors.is_empty() {
                         let mut mapped = vec![0.0f32; state_haps.len()];
                         let mut donor_total = 0.0f32;
                         for (hap, count) in donors.iter() {
@@ -4387,7 +4383,7 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             // Donor-guided initialization for first-window/no-handoff cases.
                             // Blend with uniform to preserve coverage while anchoring to local matches.
-                            let lambda = 0.30f32;
+                            let lambda = 0.10f32;
                             let uniform = 1.0f32 / mapped.len() as f32;
                             for v in mapped.iter_mut() {
                                 *v = (1.0 - lambda) * uniform + lambda * *v;
