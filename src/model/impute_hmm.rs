@@ -212,6 +212,11 @@ impl<'a, Space> RefAlleleFreqs<'a, Space> {
     }
 
     #[inline]
+    pub fn n_ref_haps(&self) -> usize {
+        self.n_ref_haps
+    }
+
+    #[inline]
     pub fn n_alleles(&self, marker_idx: usize) -> usize {
         self.ref_markers
             .marker(MarkerIdx::new(marker_idx as u32))
@@ -1063,12 +1068,10 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
-    let transition_haps = active_states.max(1);
+    let transition_haps = ref_allele_freqs.n_ref_haps().max(1);
     if active_states > 0 {
-        // Li-Stephens transition for full panel:
-        //   P(switch to h_j) = r / K
-        // We condition the HMM on the active subset, so recombination mass is
-        // fully distributed inside K (closed-universe).
+        // Li-Stephens transition denominator should be full reference-panel size.
+        // Subsequent normalization conditions probabilities onto active states.
         ws.weights.fill(1.0);
     }
 
@@ -1363,7 +1366,7 @@ fn run_impute_hmm_seqcoded<Space>(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
-    let transition_haps = active_states.max(1);
+    let transition_haps = ref_allele_freqs.n_ref_haps().max(1);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1658,7 +1661,7 @@ fn run_impute_hmm_dict<Space>(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
-    let transition_haps = active_states.max(1);
+    let transition_haps = ref_allele_freqs.n_ref_haps().max(1);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }

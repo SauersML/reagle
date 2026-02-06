@@ -1088,6 +1088,7 @@ struct MosaicChain<'a, RefSpace = crate::data::AnyMarkerSpace> {
     rng: rand::rngs::SmallRng,
     n_markers: usize,
     n_states: StateCount,
+    panel_haps: usize,
     p_recomb: &'a [f32],
     seq1: &'a [u8],
     seq2: &'a [u8],
@@ -1158,6 +1159,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             rng: rand::rngs::SmallRng::seed_from_u64(seed),
             n_markers,
             n_states,
+            panel_haps: ref_provider.ref_gt.n_haps(),
             p_recomb,
             seq1,
             seq2,
@@ -1415,6 +1417,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 &self.combined_checkpoints,
                 self.n_markers,
                 self.n_states.get(),
+                self.panel_haps,
                 self.p_recomb,
                 self.seq1,
                 self.seq2,
@@ -1449,6 +1452,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 &mut self.hap1_checkpoints,
                 self.n_markers,
                 self.n_states.get(),
+                self.panel_haps,
                 self.p_recomb,
                 self.seq1,
                 self.seq2,
@@ -1475,6 +1479,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
                 &self.hap1_checkpoints,
                 self.n_markers,
                 self.n_states.get(),
+                self.panel_haps,
                 self.p_recomb,
                 self.seq1,
                 self.seq2,
@@ -1508,6 +1513,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             &mut self.hap2_checkpoints,
             self.n_markers,
             self.n_states.get(),
+            self.panel_haps,
             self.p_recomb,
             self.seq1,
             self.seq2,
@@ -1534,6 +1540,7 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             &self.hap2_checkpoints,
             self.n_markers,
             self.n_states.get(),
+            self.panel_haps,
             self.p_recomb,
             self.seq1,
             self.seq2,
@@ -6383,21 +6390,11 @@ fn project_haplotype_priors_to_states(
         covered_mass += p;
     }
 
-    // Any prior mass that is not represented in the new state set becomes
-    // background uncertainty rather than being silently dropped.
-    let leftover = (1.0 - covered_mass).max(0.0);
-    if leftover > 0.0 {
-        let background = leftover / n_states as f32;
+    // Conditional projection onto the active set: renormalize covered mass.
+    // This is the exact projection under P(h | h in active_set).
+    if covered_mass > 1e-6 {
         for p in &mut out {
-            *p += background;
-        }
-    }
-
-    let total: f32 = out.iter().sum();
-    // Use a small epsilon
-    if total > 1e-6 {
-        for p in &mut out {
-            *p /= total;
+            *p /= covered_mass;
         }
     } else {
         let uniform = 1.0 / n_states as f32;
@@ -6579,11 +6576,33 @@ fn emit_prob_hard(
 ) -> f32 {
     if hard && targ_al != 255 {
         if targ_al == INVALID_ALLELE {
-            return 0.0;
+            return p_err.max(1e-8);
         }
-        return if ref_al == targ_al { p_no_err } else { 0.0 };
+        return if ref_al == targ_al {
+            p_no_err
+        } else {
+            p_err.max(1e-8)
+        };
     }
     emit_prob(ref_al, targ_al, conf, p_no_err, p_err)
+}
+
+#[inline(always)]
+fn subset_transition_params(r: f32, n_states: usize, panel_haps: usize) -> (f32, f32, f32) {
+    if n_states == 0 {
+        return (0.0, 0.0, 1.0);
+    }
+    let r = r.clamp(0.0, 1.0);
+    let k = n_states as f32;
+    let n_total = panel_haps.max(n_states) as f32;
+
+    // Condition full Li-Stephens transitions on remaining inside active states.
+    let switch_full = r / n_total;
+    let z = ((1.0 - r) + k * switch_full).max(1e-12);
+    let shift = switch_full / z;
+    let stay_gap = (1.0 - r) / z;
+    let stay = ((1.0 - r) + switch_full) / z;
+    (stay_gap, shift, stay)
 }
 
 /// Emission mode for combined diploid genotype
@@ -6737,10 +6756,43 @@ fn refresh_path_ref_from_states(path_ref: &mut [u32], path_idx: &[u32], neighbor
     }
 }
 
+fn estimate_label_switch_prior(p_recomb: &[f32], het_positions: &[usize]) -> f32 {
+    if het_positions.len() < 2 {
+        return 0.01;
+    }
+    let mut interval_switch = Vec::with_capacity(het_positions.len() - 1);
+    for w in het_positions.windows(2) {
+        let prev = w[0];
+        let curr = w[1];
+        if curr <= prev {
+            continue;
+        }
+        let mut log_stay = 0.0f64;
+        for m in (prev + 1)..=curr {
+            let r = p_recomb
+                .get(m)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0 - 1e-12);
+            log_stay += (1.0f64 - r as f64).ln();
+        }
+        let stay = log_stay.exp();
+        let switch_p = (1.0 - stay) as f32;
+        interval_switch.push(switch_p);
+    }
+    if interval_switch.is_empty() {
+        return 0.01;
+    }
+    interval_switch.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = interval_switch[interval_switch.len() / 2];
+    median.clamp(1e-4, 0.25)
+}
+
 fn build_fwd_checkpoints<RefSpace>(
     checkpoints: &mut FwdCheckpoints,
     n_markers: usize,
     n_states: usize,
+    panel_haps: usize,
     p_recomb: &[f32],
     seq1: &[u8],
     seq2: &[u8],
@@ -6779,8 +6831,10 @@ fn build_fwd_checkpoints<RefSpace>(
     for m in 0..n_markers {
         if m > 0 {
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
-            let shift = r / n_states as f32;
-            let scale = (1.0 - r) / fwd_sum.max(1e-30);
+            let params = subset_transition_params(r, n_states, panel_haps);
+            let stay_gap = params.0;
+            let shift = params.1;
+            let scale = stay_gap / fwd_sum.max(1e-30);
 
             // SIMD-optimized fwd_prior = scale * fwd + shift
             let shift_vec = f32x8::splat(shift);
@@ -7058,6 +7112,7 @@ fn sample_path_from_checkpoints<RefSpace>(
     checkpoints: &FwdCheckpoints,
     n_markers: usize,
     n_states: usize,
+    panel_haps: usize,
     p_recomb: &[f32],
     seq1: &[u8],
     seq2: &[u8],
@@ -7110,8 +7165,10 @@ fn sample_path_from_checkpoints<RefSpace>(
 
         for m in (start + 1)..end {
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
-            let shift = r / n_states as f32;
-            let scale = (1.0 - r) / prev_sum;
+            let params = subset_transition_params(r, n_states, panel_haps);
+            let stay_gap = params.0;
+            let shift = params.1;
+            let scale = stay_gap / prev_sum;
 
             let a1 = seq1[m];
             let a2 = seq2[m];
@@ -7355,8 +7412,9 @@ fn sample_path_from_checkpoints<RefSpace>(
         let last_row = &fwd_buf[(block_len - 1) * row_stride..block_len * row_stride];
         if let Some(ns) = next_state {
             let r = p_recomb.get(end).copied().unwrap_or(0.0);
-            let shift = r / n_states as f32;
-            let stay = (1.0 - r) + shift;
+            let params = subset_transition_params(r, n_states, panel_haps);
+            let shift = params.1;
+            let stay = params.2;
             for i in 0..n_states {
                 let t = if i == ns { stay } else { shift };
                 weights[i] = last_row[i] * t;
@@ -7371,9 +7429,9 @@ fn sample_path_from_checkpoints<RefSpace>(
         for m in (start + 1..end).rev() {
             let next_state = path[m] as usize;
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
-            let shift = r / n_states as f32;
-            // Li-Stephens: P(stay) = (1-r) + r/K, P(switch) = r/K
-            let stay = (1.0 - r) + shift;
+            let params = subset_transition_params(r, n_states, panel_haps);
+            let shift = params.1;
+            let stay = params.2;
             let row_idx = (m - 1 - start) * row_stride;
             let prev_row = &fwd_buf[row_idx..row_idx + row_stride];
 
@@ -7462,12 +7520,15 @@ fn ffbs_haploid_constrained(
     fwd_at_marker[0..actual_n_states].copy_from_slice(&fwd_curr[..actual_n_states]);
 
     // Forward pass
+    let panel_haps = phase_ibs.n_haps().max(actual_n_states);
     for m in 1..n_markers {
         std::mem::swap(fwd_prev, fwd_curr);
 
         let r = p_recomb.get(m).copied().unwrap_or(0.0);
-        let shift = r / actual_n_states as f32;
-        let scale = (1.0 - r) / fwd_sum;
+        let params = subset_transition_params(r, actual_n_states, panel_haps);
+        let stay_gap = params.0;
+        let shift = params.1;
+        let scale = stay_gap / fwd_sum;
 
         // SIMD-optimized transition + emission
         let shift_vec = f32x8::splat(shift);
@@ -7594,8 +7655,9 @@ fn ffbs_haploid_constrained(
     for m in (1..n_markers).rev() {
         let next_state = path[m] as usize;
         let r = p_recomb.get(m).copied().unwrap_or(0.0);
-        let shift = r / actual_n_states as f32;
-        let stay = (1.0 - r) + shift;
+        let params = subset_transition_params(r, actual_n_states, panel_haps);
+        let shift = params.1;
+        let stay = params.2;
 
         let prev_start = (m - 1) * actual_n_states;
         let prev_fwd = &fwd_at_marker[prev_start..prev_start + actual_n_states];
@@ -7924,72 +7986,123 @@ fn sample_dynamic_mcmc(
     mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
     record_neighbors(&neighbors);
 
-    let collect_dynamic_neighbors = |path_ref: &[u32], sample_idx: u32| -> Vec<u32> {
-        let stride = (n_markers / 8).max(1);
-        // Prefer informative anchors: within each stride window, choose the best marker.
-        let anchor_score = |m: usize| -> f32 {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            let non_missing = a1 != 255 && a2 != 255;
-            let is_het = non_missing && a1 != a2;
-            let conf_score = conf[m].clamp(0.0, 1.0);
-            // Non-missing anchors dominate, then confidence, then a small het bonus.
-            (if non_missing { 4.0 } else { 0.0 }) + conf_score + if is_het { 0.25 } else { 0.0 }
-        };
+    let collect_dynamic_neighbors =
+        |path_ref: &[u32], query_hap: &[u8], sample_idx: u32| -> Vec<u32> {
+            let stride = (n_markers / 8).max(1);
+            // Prefer informative anchors: within each stride window, choose the best marker.
+            let anchor_score = |m: usize| -> f32 {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                let non_missing = a1 != 255 && a2 != 255;
+                let is_het = non_missing && a1 != a2;
+                let conf_score = conf[m].clamp(0.0, 1.0);
+                // Non-missing anchors dominate, then confidence, then a small het bonus.
+                (if non_missing { 4.0 } else { 0.0 }) + conf_score + if is_het { 0.25 } else { 0.0 }
+            };
 
-        let mut anchors: Vec<usize> = Vec::new();
-        let mut start = 0usize;
-        while start < n_markers {
-            let end = (start + stride).min(n_markers);
-            let mut best_m = start;
-            let mut best_score = f32::NEG_INFINITY;
-            for m in start..end {
-                let score = anchor_score(m);
-                if score > best_score {
-                    best_score = score;
-                    best_m = m;
+            let mut anchors: Vec<usize> = Vec::new();
+            let mut start = 0usize;
+            while start < n_markers {
+                let end = (start + stride).min(n_markers);
+                let mut best_m = start;
+                let mut best_score = f32::NEG_INFINITY;
+                for m in start..end {
+                    let score = anchor_score(m);
+                    if score > best_score {
+                        best_score = score;
+                        best_m = m;
+                    }
+                }
+                anchors.push(best_m);
+                start = end;
+            }
+            if anchors.last().copied() != Some(n_markers.saturating_sub(1)) {
+                anchors.push(n_markers.saturating_sub(1));
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut candidates: Vec<u32> = Vec::new();
+
+            for &m in &anchors {
+                let ref_hap = path_ref.get(m).copied().unwrap_or(0);
+                if (ref_hap as usize) < phase_ibs.n_haps() {
+                    let mut local =
+                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, n_states);
+                    local.push(ref_hap);
+                    for h in local {
+                        if h == hap1_idx || h == hap1_idx + 1 {
+                            continue;
+                        }
+                        if seen.insert(h) {
+                            candidates.push(h);
+                        }
+                    }
                 }
             }
-            anchors.push(best_m);
-            start = end;
-        }
-        if anchors.last().copied() != Some(n_markers.saturating_sub(1)) {
-            anchors.push(n_markers.saturating_sub(1));
-        }
-        let mut seen = std::collections::HashSet::new();
-        let mut out: Vec<u32> = Vec::new();
 
-        for &m in &anchors {
-            let ref_hap = path_ref.get(m).copied().unwrap_or(0);
-            if (ref_hap as usize) < phase_ibs.n_haps() {
-                let mut local = phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, n_states);
-                local.push(ref_hap);
-                for h in local {
-                    if h == hap1_idx || h == hap1_idx + 1 {
+            if candidates.is_empty() {
+                return candidates;
+            }
+
+            // Phase-conditioned scoring:
+            // score each donor haplotype by local log-likelihood under current sampled
+            // haplotype sequence (query_hap), using confidence-weighted mismatch model.
+            let radius = (n_markers / 32).clamp(16, 256);
+            let mut score_markers: Vec<usize> = Vec::new();
+            for &anchor in &anchors {
+                let start = anchor.saturating_sub(radius);
+                let end = (anchor + radius + 1).min(n_markers);
+                for m in start..end {
+                    // Light subsampling in dense windows for speed; always keep anchor.
+                    if m == anchor || ((m - start) % 2 == 0) {
+                        score_markers.push(m);
+                    }
+                }
+            }
+            score_markers.sort_unstable();
+            score_markers.dedup();
+
+            let mut scored: Vec<(u32, f32)> = Vec::with_capacity(candidates.len());
+            for &h in &candidates {
+                let mut ll = 0.0f32;
+                for &m in &score_markers {
+                    let obs = query_hap[m];
+                    if obs == 255 {
                         continue;
                     }
-                    if seen.insert(h) {
-                        out.push(h);
+                    let ref_al = phase_ibs.allele(m, h);
+                    if ref_al == 255 {
+                        continue;
                     }
+                    let conf_m = conf[m].clamp(0.0, 1.0);
+                    let emit = if ref_al == obs {
+                        p_no_err * conf_m + 0.5 * (1.0 - conf_m)
+                    } else {
+                        p_err * conf_m + 0.5 * (1.0 - conf_m)
+                    };
+                    ll += emit.max(1e-30).ln();
                 }
+                scored.push((h, ll));
             }
-        }
-        out
-    };
+
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let keep = n_states.min(scored.len()).max(1);
+            scored.truncate(keep);
+            scored.into_iter().map(|(h, _)| h).collect()
+        };
 
     // MCMC loop: Gibbs sampling alternating between H1 and H2
     for step in 0..n_mcmc_steps {
         // === Sample H1 | (G, H2_fixed) ===
 
-        // 1. Select neighbors using "Latent State" approach:
-        //    Use H1's previously sampled state at a marker to find neighbors
-        //    Vary the marker position across steps for robustness
+        // 1. Select neighbors with phase-conditioned scoring:
+        //    candidates come from latent-state PBWT neighborhoods, then we rank
+        //    by local likelihood under the current sampled H1 allele sequence.
         let center_marker = if n_mcmc_steps > 1 {
             n_markers / 4 + step * n_markers / (2 * n_mcmc_steps)
         } else {
             n_markers / 2
         };
-        neighbors = collect_dynamic_neighbors(&path1_ref, sample_idx);
+        neighbors = collect_dynamic_neighbors(&path1_ref, &h1_alleles, sample_idx);
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps() && !neighbors.contains(&ref_hap) {
             neighbors.push(ref_hap);
@@ -8072,8 +8185,8 @@ fn sample_dynamic_mcmc(
 
         // === Sample H2 | (G, H1_new) ===
 
-        // 1. Select neighbors for H2 using H2's own latent state (not H1's!)
-        neighbors = collect_dynamic_neighbors(&path2_ref, sample_idx);
+        // 1. Select neighbors for H2 with H2-conditioned scoring (not H1's sequence).
+        neighbors = collect_dynamic_neighbors(&path2_ref, &h2_alleles, sample_idx);
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps() && !neighbors.contains(&ref_hap) {
             neighbors.push(ref_hap);
@@ -8204,7 +8317,7 @@ fn sample_dynamic_mcmc(
         swap_probs.push(p_swap.clamp(0.0, 1.0));
     }
     if !swap_probs.is_empty() {
-        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
+        let label_switch = estimate_label_switch_prior(p_recomb, het_positions);
         let stay = (1.0 - label_switch).ln();
         let sw = label_switch.ln();
         let mut dp0 = vec![f32::NEG_INFINITY; swap_probs.len()];
@@ -8681,6 +8794,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             &mut combined_checkpoints,
             n_markers,
             n_states_usize,
+            ref_provider.ref_gt.n_haps(),
             p_recomb,
             seq1,
             seq2,
@@ -9670,9 +9784,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        // Phase label switches are NOT recombination events. Use a tiny, fixed
-        // switch prior to avoid artificial oscillations when evidence is symmetric.
-        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
+        let label_switch = estimate_label_switch_prior(p_recomb, het_positions);
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];

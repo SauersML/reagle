@@ -3517,15 +3517,35 @@ fn compare_genotyped_dosages_to_truth(
         .iter()
         .map(|r| ((r.chrom.clone(), r.pos), r))
         .collect();
+    let java_map: HashMap<(String, u64), &ParsedRecord> = java_records
+        .iter()
+        .map(|r| ((r.chrom.clone(), r.pos), r))
+        .collect();
 
-    for (rust_rec, java_rec) in rust_records.iter().zip(java_records.iter()) {
+    for rust_rec in rust_records.iter() {
         // Skip imputed markers - only check genotyped ones
         if rust_rec.info.contains_key("IMP") {
             continue;
         }
 
-        // Find matching truth record
+        // Only compare sites that are present and also non-imputed in Java output.
+        // This excludes target-only/private sites absent from the reference overlap.
         let key = (rust_rec.chrom.clone(), rust_rec.pos);
+        let java_rec = match java_map.get(&key) {
+            Some(r) => *r,
+            None => continue,
+        };
+        if java_rec.info.contains_key("IMP") {
+            continue;
+        }
+        // Strictly require the same marker identity in both outputs.
+        // This skips positional collisions / representation mismatches
+        // (e.g. complex indel normalization differences) from this metric.
+        if rust_rec.ref_allele != java_rec.ref_allele || rust_rec.alt_alleles != java_rec.alt_alleles {
+            continue;
+        }
+
+        // Find matching truth record
         let truth_rec = match truth_map.get(&key) {
             Some(r) => *r,
             None => continue,

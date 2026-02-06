@@ -61,6 +61,22 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
         }
     }
 
+    /// Get the number of haplotypes represented by this view.
+    #[inline]
+    pub fn n_haps(&self) -> usize {
+        match self {
+            GenotypeView::Matrix(m) => m.samples_arc().n_haps(),
+            GenotypeView::Mutable(geno) => geno.n_haps(),
+            GenotypeView::MutableSubset { geno, .. } => geno.n_haps(),
+            GenotypeView::Composite {
+                target, reference, ..
+            } => target.n_haps() + reference.samples_arc().n_haps(),
+            GenotypeView::CompositeSubset {
+                target, reference, ..
+            } => target.n_haps() + reference.samples_arc().n_haps(),
+        }
+    }
+
     /// Get an allele at a specific marker and haplotype index
     #[inline]
     pub fn allele(&self, marker: MarkerIdx<TargetSpace>, hap: HapIdx) -> u8 {

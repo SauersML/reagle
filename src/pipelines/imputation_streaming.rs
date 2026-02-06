@@ -2583,22 +2583,26 @@ impl crate::pipelines::ImputationPipeline {
                                         .first()
                                         .map(|a| a.to_string())
                                         .unwrap_or_default();
-                                    candidates.iter().any(|&t_idx| {
-                                        let t_marker = target_window
-                                            .genotypes
-                                            .markers()
-                                            .marker(MarkerIdx::new(t_idx as u32));
-                                        if t_marker.n_alleles() != 2 {
-                                            return false;
-                                        }
-                                        let t0 = t_marker.ref_allele.to_string();
-                                        let t1 = t_marker
-                                            .alt_alleles
-                                            .first()
-                                            .map(|a| a.to_string())
-                                            .unwrap_or_default();
-                                        (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
-                                    })
+                                    let n_matches = candidates
+                                        .iter()
+                                        .filter(|&&t_idx| {
+                                            let t_marker = target_window
+                                                .genotypes
+                                                .markers()
+                                                .marker(MarkerIdx::new(t_idx as u32));
+                                            if t_marker.n_alleles() != 2 {
+                                                return false;
+                                            }
+                                            let t0 = t_marker.ref_allele.to_string();
+                                            let t1 = t_marker
+                                                .alt_alleles
+                                                .first()
+                                                .map(|a| a.to_string())
+                                                .unwrap_or_default();
+                                            (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
+                                        })
+                                        .count();
+                                    n_matches > 0
                                 } else {
                                     false
                                 }
@@ -2896,22 +2900,26 @@ impl crate::pipelines::ImputationPipeline {
                                         .first()
                                         .map(|a| a.to_string())
                                         .unwrap_or_default();
-                                    candidates.iter().any(|&t_idx| {
-                                        let t_marker = target_window
-                                            .genotypes
-                                            .markers()
-                                            .marker(MarkerIdx::new(t_idx as u32));
-                                        if t_marker.n_alleles() != 2 {
-                                            return false;
-                                        }
-                                        let t0 = t_marker.ref_allele.to_string();
-                                        let t1 = t_marker
-                                            .alt_alleles
-                                            .first()
-                                            .map(|a| a.to_string())
-                                            .unwrap_or_default();
-                                        (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
-                                    })
+                                    let n_matches = candidates
+                                        .iter()
+                                        .filter(|&&t_idx| {
+                                            let t_marker = target_window
+                                                .genotypes
+                                                .markers()
+                                                .marker(MarkerIdx::new(t_idx as u32));
+                                            if t_marker.n_alleles() != 2 {
+                                                return false;
+                                            }
+                                            let t0 = t_marker.ref_allele.to_string();
+                                            let t1 = t_marker
+                                                .alt_alleles
+                                                .first()
+                                                .map(|a| a.to_string())
+                                                .unwrap_or_default();
+                                            (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
+                                        })
+                                        .count();
+                                    n_matches > 0
                                 } else {
                                     false
                                 }
@@ -3667,7 +3675,9 @@ impl crate::pipelines::ImputationPipeline {
 
                     if !use1 && has_hard {
                         if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
-                            conf1 = conf1.min(1.0 - err_rate);
+                            // GT-only input (no PL/GL): enforce a high-confidence floor for
+                            // observed typed alleles so sparse chips still anchor the HMM.
+                            conf1 = conf1.max(1.0 - err_rate);
                         }
                         aligned1.resize(n_alleles, 0.0);
                         if is_diploid && mapped2 != 255 && mapped2 != mapped1 {
@@ -3692,7 +3702,9 @@ impl crate::pipelines::ImputationPipeline {
 
                     if !use2 && has_hard {
                         if pl.is_none() || pl.as_ref().map_or(true, |v| v.is_empty()) {
-                            conf2 = conf2.min(1.0 - err_rate);
+                            // GT-only input (no PL/GL): enforce a high-confidence floor for
+                            // observed typed alleles so sparse chips still anchor the HMM.
+                            conf2 = conf2.max(1.0 - err_rate);
                         }
                         aligned2.resize(n_alleles, 0.0);
                         if is_diploid && mapped1 != 255 && mapped1 != mapped2 {
@@ -4863,6 +4875,10 @@ impl crate::pipelines::ImputationPipeline {
             }
             if matches.len() == 1 {
                 Some(matches[0])
+            } else if candidates.len() == 1 {
+                // Preserve target-private genotyped records at unique positions
+                // even when REF/ALT representation does not align to reference.
+                Some(candidates[0])
             } else {
                 None
             }
