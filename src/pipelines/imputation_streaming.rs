@@ -88,6 +88,11 @@ const STATE_BUDGET_SAFETY: f64 = 0.6;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
+const STATE_MIX_PRIOR_FRAC_NUM: usize = 20;
+const STATE_MIX_WINDOW_FRAC_NUM: usize = 35;
+const STATE_MIX_DONOR_FRAC_NUM: usize = 25;
+const STATE_MIX_CORE_FRAC_NUM: usize = 20;
+const STATE_MIX_FRAC_DEN: usize = 100;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
@@ -4171,51 +4176,100 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(full) = full_states.as_ref() {
                         return full.clone();
                     }
-                    let mut out: Vec<RefHapId> = Vec::new();
-                    let mut seen: std::collections::HashSet<RefHapId> = std::collections::HashSet::new();
+                    let k = per_window_cap_local.max(1);
+                    let mut out: Vec<RefHapId> = Vec::with_capacity(k);
+                    let mut seen: std::collections::HashSet<RefHapId> =
+                        std::collections::HashSet::with_capacity(k * 2);
 
+                    let mut prior_haps: Vec<RefHapId> = Vec::new();
                     if let Some(p) = priors {
-                        for id in p.ids() {
-                            let hap = RefHapId::new(id.0);
+                        let mut weighted: Vec<(RefHapId, f32)> = p
+                            .ids()
+                            .iter()
+                            .zip(p.probs().iter())
+                            .map(|(id, prob)| (RefHapId::new(id.0), *prob))
+                            .collect();
+                        weighted.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        prior_haps.extend(weighted.into_iter().map(|(hap, _)| hap));
+                    }
+
+                    let window_haps: Vec<RefHapId> = state_haps_by_hap
+                        .get(hap_idx.as_usize())
+                        .cloned()
+                        .unwrap_or_default();
+                    let donor_haps: Vec<RefHapId> = donors.iter().map(|(hap, _)| *hap).collect();
+                    let core_haps: Vec<RefHapId> = plan
+                        .core_states
+                        .get(hap_idx.as_usize())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let fill_from = |out: &mut Vec<RefHapId>,
+                                     seen: &mut std::collections::HashSet<RefHapId>,
+                                     source: &[RefHapId],
+                                     want: usize,
+                                     k: usize|
+                     -> usize {
+                        if want == 0 || out.len() >= k {
+                            return 0;
+                        }
+                        let mut added = 0usize;
+                        for &hap in source {
+                            if out.len() >= k || added >= want {
+                                break;
+                            }
                             if seen.insert(hap) {
                                 out.push(hap);
-                                if out.len() >= per_window_cap_local {
-                                    return out;
-                                }
+                                added += 1;
                             }
                         }
-                    }
+                        added
+                    };
 
-                    for (hap, _) in donors.iter() {
-                        if seen.insert(*hap) {
-                            out.push(*hap);
-                            if out.len() >= per_window_cap_local {
-                                return out;
-                            }
+                    let mut q_prior = k * STATE_MIX_PRIOR_FRAC_NUM / STATE_MIX_FRAC_DEN;
+                    let mut q_window = k * STATE_MIX_WINDOW_FRAC_NUM / STATE_MIX_FRAC_DEN;
+                    let mut q_donor = k * STATE_MIX_DONOR_FRAC_NUM / STATE_MIX_FRAC_DEN;
+                    let mut q_core = k * STATE_MIX_CORE_FRAC_NUM / STATE_MIX_FRAC_DEN;
+                    let mut used_q = q_prior + q_window + q_donor + q_core;
+                    while used_q < k {
+                        q_prior += 1;
+                        used_q += 1;
+                        if used_q >= k {
+                            break;
                         }
-                    }
-
-                    if let Some(core) = plan.core_states.get(hap_idx.as_usize()) {
-                        for &hap in core {
-                            if seen.insert(hap) {
-                                out.push(hap);
-                                if out.len() >= per_window_cap_local {
-                                    return out;
-                                }
-                            }
+                        q_window += 1;
+                        used_q += 1;
+                        if used_q >= k {
+                            break;
                         }
+                        q_donor += 1;
+                        used_q += 1;
+                        if used_q >= k {
+                            break;
+                        }
+                        q_core += 1;
+                        used_q += 1;
                     }
 
-                    if out.is_empty() {
-                        if let Some(states) = state_haps_by_hap.get(hap_idx.as_usize()) {
-                            for &hap in states {
-                                if seen.insert(hap) {
-                                    out.push(hap);
-                                    if out.len() >= per_window_cap_local {
-                                        break;
-                                    }
-                                }
-                            }
+                    fill_from(&mut out, &mut seen, &prior_haps, q_prior, k);
+                    fill_from(&mut out, &mut seen, &window_haps, q_window, k);
+                    fill_from(&mut out, &mut seen, &donor_haps, q_donor, k);
+                    fill_from(&mut out, &mut seen, &core_haps, q_core, k);
+
+                    while out.len() < k {
+                        let before = out.len();
+                        let remaining = k - out.len();
+                        fill_from(&mut out, &mut seen, &prior_haps, remaining, k);
+                        let remaining = k - out.len();
+                        fill_from(&mut out, &mut seen, &window_haps, remaining, k);
+                        let remaining = k - out.len();
+                        fill_from(&mut out, &mut seen, &donor_haps, remaining, k);
+                        let remaining = k - out.len();
+                        fill_from(&mut out, &mut seen, &core_haps, remaining, k);
+                        if out.len() == before {
+                            break;
                         }
                     }
 
