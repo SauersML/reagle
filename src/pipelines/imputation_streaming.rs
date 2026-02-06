@@ -3165,44 +3165,16 @@ impl crate::pipelines::ImputationPipeline {
 
         let ref_allele_freqs = RefAlleleFreqs::new(ref_columns, ref_markers);
 
-        let min_cluster_cm = (self.config.cluster as f64).max(1e-8);
         let gen_positions: Vec<f64> = {
             let chrom = ref_markers.marker(MarkerIdx::new(0)).chrom;
             if let Some(gen_map) = gen_maps.get(chrom) {
-                crate::data::genetic_map::MarkerMap::from_gen_map_with_min_dist(
-                    ref_markers,
-                    gen_map,
-                    min_cluster_cm,
-                )
-                .gen_positions()
-                .to_vec()
+                crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
+                    .gen_positions()
+                    .to_vec()
             } else {
-                // Keep the no-map path numerically stable in dense windows by enforcing
-                // a minimum cM step between adjacent markers.
-                let n = ref_markers.len();
-                if n == 0 {
-                    Vec::new()
-                } else {
-                    let pos_map = crate::data::genetic_map::PositionMap::new();
-                    let mut out = Vec::with_capacity(n);
-                    let first_pos = ref_markers
-                        .get(MarkerIdx::from(0usize))
-                        .map(|m| m.pos)
-                        .unwrap_or(0);
-                    let mut last_map_pos = pos_map.gen_pos(first_pos);
-                    out.push(last_map_pos);
-                    for i in 1..n {
-                        let pos = ref_markers
-                            .get(MarkerIdx::from(i))
-                            .map(|m| m.pos)
-                            .unwrap_or(0);
-                        let map_pos = pos_map.gen_pos(pos);
-                        let dist = (map_pos - last_map_pos).max(min_cluster_cm);
-                        out.push(out[i - 1] + dist);
-                        last_map_pos = map_pos;
-                    }
-                    out
-                }
+                crate::data::genetic_map::MarkerMap::from_positions(ref_markers)
+                    .gen_positions()
+                    .to_vec()
             }
         };
         if let (Some(first), Some(last)) = (gen_positions.first(), gen_positions.last()) {
