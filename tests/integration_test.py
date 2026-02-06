@@ -324,10 +324,21 @@ def ensure_eagleimp_qref(ref_vcf, eagleimp_bin):
 
 
 def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):
-    """Create a simple genetic map from VCF positions (1 cM per Mb)."""
+    """Create an EagleImp-compatible simple genetic map from VCF positions."""
     map_path = Path(map_path)
     if map_path.exists() and map_path.stat().st_size > 0:
-        return map_path
+        with open(map_path) as f:
+            for line in f:
+                header = line.strip()
+                if not header:
+                    continue
+                header_ok = header in {
+                    "chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)",
+                    "position COMBINED_rate(cM/Mb) Genetic_Map(cM)",
+                }
+                if header_ok:
+                    return map_path
+                break
 
     chrom_label = find_chrom_label(ref_vcf, chrom) or f"chr{chrom}"
     positions = []
@@ -352,12 +363,30 @@ def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):
     positions = sorted(set(positions))
     map_path.parent.mkdir(parents=True, exist_ok=True)
     with open(map_path, "w") as f:
-        f.write("position\trate\tmap\n")
+        # EagleImp requires one of:
+        #   chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)
+        #   position COMBINED_rate(cM/Mb) Genetic_Map(cM)
+        f.write("chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)\n")
         for pos in positions:
             cm = pos / 1_000_000.0
-            f.write(f"{pos}\t1.0\t{cm:.6f}\n")
+            f.write(f"{chrom_label} {pos} 1.0 {cm:.6f}\n")
 
     return map_path
+
+def eagleimp_map_header_ok(map_path):
+    map_path = Path(map_path)
+    if not map_path.exists() or map_path.stat().st_size == 0:
+        return False
+    with open(map_path) as f:
+        for line in f:
+            header = line.strip()
+            if not header:
+                continue
+            return header in {
+                "chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)",
+                "position COMBINED_rate(cM/Mb) Genetic_Map(cM)",
+            }
+    return False
 
 
 def find_eagleimp_phased_output(output_prefix, data_dir):
@@ -3005,6 +3034,14 @@ def stage_phasing_compare():
     gen_map_env = os.environ.get("EAGLEIMP_GENMAP")
     if gen_map_env:
         gen_map = Path(gen_map_env)
+        if not eagleimp_map_header_ok(gen_map):
+            print(
+                f"WARNING: EAGLEIMP_GENMAP has incompatible header: {gen_map}. "
+                "Falling back to generated simple map."
+            )
+            gen_map = ensure_simple_genetic_map(
+                paths["ref_vcf"], paths["data_dir"] / "chr22.simple.map.txt", chrom="22"
+            )
     else:
         gen_map = ensure_simple_genetic_map(paths["ref_vcf"], paths["data_dir"] / "chr22.simple.map.txt", chrom="22")
 
