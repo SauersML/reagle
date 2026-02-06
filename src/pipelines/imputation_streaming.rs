@@ -4956,13 +4956,13 @@ impl crate::pipelines::ImputationPipeline {
                 return None;
             }
 
-            let target_m =
-                if let Some(tm) = alignment.target_marker(MarkerIdx::new(marker_idx as u32)) {
-                    tm
-                } else {
-                    let target_idx = pick_target_marker_by_alleles(marker_idx)?;
-                    MarkerIdx::new(target_idx as u32)
-                };
+            let aligned_target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32));
+            let target_m = if let Some(tm) = aligned_target_m {
+                tm
+            } else {
+                let target_idx = pick_target_marker_by_alleles(marker_idx)?;
+                MarkerIdx::new(target_idx as u32)
+            };
 
             if let Some(missing) = target_missing {
                 if missing.allele(target_m, h1) == 255 || missing.allele(target_m, h2) == 255 {
@@ -4976,7 +4976,35 @@ impl crate::pipelines::ImputationPipeline {
                 return None;
             }
 
-            let d = ((a1 > 0) as u8 + (a2 > 0) as u8) as f32;
+            let d = if let Some(tm) = aligned_target_m {
+                let mapping = alignment
+                    .allele_mappings
+                    .get(tm.as_usize())
+                    .and_then(|m| m.as_ref());
+                let map_allele = |a: u8| -> u8 {
+                    if a == 255 {
+                        return 255;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 { r as u8 } else { 255 }
+                        } else {
+                            255
+                        }
+                    } else {
+                        a
+                    }
+                };
+                let ra1 = map_allele(a1);
+                let ra2 = map_allele(a2);
+                if ra1 == 255 || ra2 == 255 {
+                    return None;
+                }
+                ((ra1 > 0) as u8 + (ra2 > 0) as u8) as f32
+            } else {
+                ((a1 > 0) as u8 + (a2 > 0) as u8) as f32
+            };
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
                 Some(d)
             } else {
