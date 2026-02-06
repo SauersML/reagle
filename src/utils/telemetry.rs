@@ -654,7 +654,13 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
     let mut last_cpu_ticks = get_cpu_ticks();
 
     loop {
-        thread::sleep(interval);
+        let start_sleep = Instant::now();
+        while start_sleep.elapsed() < interval {
+            if bb.is_shutdown() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
 
         if bb.is_shutdown() {
             break;
