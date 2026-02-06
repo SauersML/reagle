@@ -4288,15 +4288,12 @@ impl crate::pipelines::ImputationPipeline {
                             return None;
                         }
                         let inv = 1.0 / sum;
-                        let prior_floor = 1e-3f32;
-                        let uniform = 1.0 / state_haps.len().max(1) as f32;
-                        let mut blended = Vec::with_capacity(mapped.len());
-                        for v in mapped {
-                            let mut p = v * inv;
-                            p = (1.0 - prior_floor) * p + prior_floor * uniform;
-                            blended.push(p);
-                        }
-                        Some(blended)
+                        Some(
+                            mapped
+                                .into_iter()
+                                .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
+                                .collect(),
+                        )
                     });
 
                     let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
