@@ -2433,7 +2433,9 @@ impl crate::pipelines::ImputationPipeline {
         );
         if self.config.err.is_none() {
             // For imputation, copy-mismatch reflects mutation rather than panel size.
-            self.params.p_mismatch = crate::model::parameters::ModelParams::new().p_mismatch;
+            // Use 0.001 as a starting point for EM estimation on sparse data, which often has
+            // higher effective error rates than sequence data.
+            self.params.p_mismatch = 0.001;
         }
         self.params.recomb_intensity = self
             .params
