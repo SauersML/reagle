@@ -1929,6 +1929,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             )?;
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
             let mut stable_main_iters = 0usize;
+            let mut prev_remaining_hets: Option<usize> = None;
+            let mut frozen_samples = vec![false; n_samples];
+            let mut frozen_streaks = vec![0usize; n_samples];
 
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
@@ -1954,7 +1957,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     None
                 };
 
-                let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
+                let (total_switches, total_phased, sample_changed) = self.run_phase_baum_iteration_stage1(
                     &target_gt,
                     &mut geno,
                     &threaded_haps_vec,
@@ -1965,6 +1968,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     &ibs2,
                     &mut sample_phases,
                     &mut mcmc_paths,
+                    if is_burnin { None } else { Some(&frozen_samples) },
                     atomic_estimates.as_ref(),
                     it,
                 )?;
@@ -1994,20 +1998,45 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 if !is_burnin {
                     let remaining_hets =
                         Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
-                    let change = total_switches + total_phased;
-                    let threshold = (remaining_hets / 100).max(1);
-                    if change <= threshold {
+                    let mut newly_frozen = 0usize;
+                    for s in 0..n_samples {
+                        if frozen_samples[s] {
+                            continue;
+                        }
+                        if sample_changed[s] {
+                            frozen_streaks[s] = 0;
+                        } else {
+                            frozen_streaks[s] += 1;
+                            if frozen_streaks[s] >= 2 {
+                                frozen_samples[s] = true;
+                                newly_frozen += 1;
+                            }
+                        }
+                    }
+                    if newly_frozen > 0 {
+                        let frozen_total = frozen_samples.iter().filter(|&&v| v).count();
+                        eprintln!(
+                            "Stage 1 freezing: {} newly frozen samples ({} / {} total)",
+                            newly_frozen, frozen_total, n_samples
+                        );
+                    }
+
+                    let no_progress = total_switches == 0 && total_phased == 0;
+                    let unresolved_unchanged = prev_remaining_hets
+                        .map(|prev| prev == remaining_hets)
+                        .unwrap_or(false);
+                    if no_progress && unresolved_unchanged {
                         stable_main_iters += 1;
                         if stable_main_iters >= 2 {
                             eprintln!(
-                                "Phasing converged (changes {} <= threshold {} for 2 main iterations); stopping early.",
-                                change, threshold
+                                "Phasing converged (exact fixed point: no new switches/locks and unresolved hets unchanged for 2 main iterations); stopping early."
                             );
                             break;
                         }
                     } else {
                         stable_main_iters = 0;
                     }
+                    prev_remaining_hets = Some(remaining_hets);
                 }
             }
         } else {
@@ -2426,6 +2455,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let n_iterations = self.config.iterations;
             let total_iterations = n_burnin + n_iterations;
             let mut stable_main_iters = 0usize;
+            let mut prev_remaining_hets: Option<usize> = None;
+            let mut frozen_samples = vec![false; n_samples];
+            let mut frozen_streaks = vec![0usize; n_samples];
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
                 let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -2444,7 +2476,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 }
 
                 self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
-                let (total_switches, total_phased) = self.run_phase_baum_iteration_stage1(
+                let (total_switches, total_phased, sample_changed) = self.run_phase_baum_iteration_stage1(
                     &target_gt,
                     &mut geno,
                     &threaded_haps_vec,
@@ -2455,6 +2487,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     &ibs2,
                     &mut sample_phases,
                     &mut mcmc_paths,
+                    if is_burnin { None } else { Some(&frozen_samples) },
                     None,
                     it,
                 )?;
@@ -2466,20 +2499,45 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 if !is_burnin {
                     let remaining_hets =
                         Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
-                    let change = total_switches + total_phased;
-                    let threshold = (remaining_hets / 100).max(1);
-                    if change <= threshold {
+                    let mut newly_frozen = 0usize;
+                    for s in 0..n_samples {
+                        if frozen_samples[s] {
+                            continue;
+                        }
+                        if sample_changed[s] {
+                            frozen_streaks[s] = 0;
+                        } else {
+                            frozen_streaks[s] += 1;
+                            if frozen_streaks[s] >= 2 {
+                                frozen_samples[s] = true;
+                                newly_frozen += 1;
+                            }
+                        }
+                    }
+                    if newly_frozen > 0 {
+                        let frozen_total = frozen_samples.iter().filter(|&&v| v).count();
+                        eprintln!(
+                            "Stage 1 freezing: {} newly frozen samples ({} / {} total)",
+                            newly_frozen, frozen_total, n_samples
+                        );
+                    }
+
+                    let no_progress = total_switches == 0 && total_phased == 0;
+                    let unresolved_unchanged = prev_remaining_hets
+                        .map(|prev| prev == remaining_hets)
+                        .unwrap_or(false);
+                    if no_progress && unresolved_unchanged {
                         stable_main_iters += 1;
                         if stable_main_iters >= 2 {
                             eprintln!(
-                                "Phasing converged (changes {} <= threshold {} for 2 main iterations); stopping early.",
-                                change, threshold
+                                "Phasing converged (exact fixed point: no new switches/locks and unresolved hets unchanged for 2 main iterations); stopping early."
                             );
                             break;
                         }
                     } else {
                         stable_main_iters = 0;
                     }
+                    prev_remaining_hets = Some(remaining_hets);
                 }
             }
 
@@ -3309,6 +3367,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &ibs2,
                 &mut sample_phases,
                 &mut mcmc_paths,
+                None,
                 None,
                 0,
             )?;
@@ -4686,12 +4745,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         ibs2: &Ibs2,
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
+        frozen_samples: Option<&[bool]>,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, Vec<bool>)> {
         let n_stage1_blocks = stage1_blocks.len();
         if n_stage1_blocks == 0 {
-            return Ok((0, 0));
+            return Ok((0, 0, vec![false; sample_phases.len()]));
         }
         let n_haps = geno.n_haps();
 
@@ -4803,6 +4863,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
             let sample_iter = || {
                 sample_phases.par_iter().enumerate().map(|(s, sp)| {
+                    if frozen_samples
+                        .and_then(|frozen| frozen.get(s))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return Stage1PhaseDecision {
+                            orientation: Stage1OrientationUpdate::NoChange,
+                            het_updates: Vec::new(),
+                            paths: None,
+                        };
+                    }
                     THREAD_WORKSPACE.with(|ws| {
                         let mut workspace = ws.borrow_mut();
                         if workspace.is_none() {
@@ -5438,6 +5509,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Apply phase decisions to SamplePhase
         let mut total_switches = 0;
         let mut total_phased = 0;
+        let mut sample_changed = vec![false; n_samples];
 
         // Determine if we're in burn-in (don't mark as phased during burn-in)
         let is_burnin = iteration < self.config.burnin;
@@ -5461,6 +5533,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         if cur2 == desired_h1 {
                             sp.swap_alleles(m);
                             total_switches += 1;
+                            sample_changed[s] = true;
                         }
                     }
                 }
@@ -5472,6 +5545,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let m = hi_freq_to_orig[hi_freq_idx];
                             sp.swap_alleles(m);
                             total_switches += 1;
+                            sample_changed[s] = true;
                         }
                     }
                 }
@@ -5487,8 +5561,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 {
                     if *lr >= lr_threshold {
                         let m = hi_freq_to_orig[*hi_freq_idx];
-                        sp.mark_phased(m);
-                        total_phased += 1;
+                        if sp.is_unphased(m) {
+                            sp.mark_phased(m);
+                            total_phased += 1;
+                            sample_changed[s] = true;
+                        }
                     }
                 }
             }
@@ -5535,7 +5612,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             "  Completion: {:.1}% ({}/{} heterozygous markers locked)",
             pct_locked, total_locked, total_phasable
         );
-        Ok((total_switches, total_phased))
+        Ok((total_switches, total_phased, sample_changed))
     }
 
     /// Build final GenotypeMatrix from mutable genotypes
