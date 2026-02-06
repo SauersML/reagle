@@ -1634,6 +1634,7 @@ fn test_ultra_dense_markers() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 20;
+    config.err = Some(0.0001);
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
