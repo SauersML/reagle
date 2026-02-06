@@ -2431,7 +2431,9 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32).max(1e-6);
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+            .min(ModelParams::MAX_RECOMB_INTENSITY)
+            .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
         if let Some(recomb_intensity) = phased_recomb_intensity {
             if recomb_intensity.is_finite() && recomb_intensity > 0.0 {

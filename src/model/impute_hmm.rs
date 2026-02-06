@@ -1122,6 +1122,17 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
 
         for m in 0..active_markers {
             let use_prior_weighting = m == 0 && state_priors.is_some();
+            if m == 500 {
+                // Debug logging for marker 500
+                eprintln!("[DEBUG-HMM] Processing marker m=500. target_probs len={} uniform={}", 
+                    target_probs.probs_for_marker(m).len(),
+                    target_probs.is_uniform_marker(m)
+                );
+                if !target_probs.is_uniform_marker(m) {
+                    let probs = target_probs.probs_for_marker(m);
+                    eprintln!("[DEBUG-HMM] m=500 target_probs={:?}", probs);
+                }
+            }
             fwd_sum = forward_update_impl(
                 ws,
                 m,
@@ -1135,6 +1146,10 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                 active_states,
                 transition_haps,
             );
+            if m == 500 {
+                eprintln!("[DEBUG-HMM] m=500 fwd_sum={} fwd[0..4]={:?}", fwd_sum, &ws.fwd[..4.min(active_states)]);
+                eprintln!("[DEBUG-HMM] m=500 emissions[0..4]={:?}", &ws.emissions[..4.min(active_states)]);
+            }
             if m % checkpoint_stride == 0 {
                 let cp = (m / checkpoint_stride) * active_states;
                 ws.fwd_checkpoints[cp..cp + active_states]
