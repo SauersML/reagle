@@ -286,18 +286,16 @@ mod tests {
             n_patterns,
         );
 
-        // Manual verification logic
-        // Transition:
-        // P(t | t-1) = (1-r)*P(t-1) + r*count(t)/N
-        // Fwd[i] before emit = (1-r)*Fwd_old[i]/Sum + r*count[i]/N
-        // Since Fwd_old sum is 1.0 (normalized), (1-r)/Sum * Fwd_old sum = 1-r
-        // Sum of second term = Sum(r*count[i]/N) = r/N * Sum(count) = r/N * N = r
-        // Total sum should be (1-r) + r = 1.0
-        // Let's compute expected pre-emission values
+        // Manual verification logic with conditioning on active subset:
+        //   z = (1-r) + K * r/N
+        //   P'(i) = ((1-r)*P(i) + (r/N)*count[i]) / z
+        let active_haps: f32 = pattern_counts.iter().sum();
+        let z = (1.0 - recomb_rate) + active_haps * (recomb_rate / n_ref_haps as f32);
         let mut expected_pre_emit = vec![0.0; n_patterns];
         for i in 0..n_patterns {
-            expected_pre_emit[i] =
-                (1.0 - recomb_rate) * 0.25 + recomb_rate * pattern_counts[i] / n_ref_haps as f32;
+            expected_pre_emit[i] = ((1.0 - recomb_rate) * 0.25
+                + recomb_rate * pattern_counts[i] / n_ref_haps as f32)
+                / z;
         }
         let expected_total_mass: f32 = expected_pre_emit.iter().sum();
         assert!(
