@@ -5598,9 +5598,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .unwrap_or(0);
         let n_total_haps = n_haps + n_ref_haps;
         let n_stage1 = hi_freq_markers.len();
-        let seed = self.config.seed;
         let n_haps_f = target_gt.n_haplotypes() as f32;
-        let has_ref = self.reference_gt.is_some() && self.alignment.is_some();
         let alt_freqs: Vec<f32> = if let (Some(ref_gt), Some(alignment)) =
             (&self.reference_gt, &self.alignment)
         {
@@ -5726,11 +5724,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let phase_results: Vec<PhaseResult> = {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
-            let phase_ibs = if has_ref {
-                None
-            } else {
-                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps))
-            };
 
             let has_missing = |m: usize| -> bool {
                 let m_idx = MarkerIdx::new(m as u32);
@@ -5794,14 +5787,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .par_iter()
                 .enumerate()
                 .map(|(s, sp)| {
-                    // Create deterministic RNG for this sample for random tie-breaking
-                    // Seed combines global seed + sample index + constant for Stage 2 distinction
-                    use rand::{Rng, SeedableRng};
-                    let sample_seed = (seed as u64)
-                        .wrapping_add(s as u64)
-                        .wrapping_add(0xDEAD_BEEF_CAFE_u64); // Stage 2 distinction constant
-                    let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
-
                     let threaded_haps = &threaded_haps_vec[s];
                     let n_states = threaded_haps.n_states();
 
@@ -6031,6 +6016,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     };
 
                     let mut decisions: Vec<Stage2Decision> = Vec::new();
+                    let mut phase_evidence: Vec<PhaseEvidence> = Vec::new();
 
                     // Inline helper macro for imputing a single allele
                     // Matches Java Stage2Baum.imputeAllele()
@@ -6074,36 +6060,54 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }};
                     }
 
-                    // Inline helper macro for carrier score calculation
-                    macro_rules! carrier_score {
-                        ($m:expr, $probs:expr, $carrier_set:expr) => {{
-                            let m = $m;
-                            let probs = $probs;
-                            let carrier_set = $carrier_set;
-                            let mkr_a = stage2_phaser.prev_stage1_marker[m];
-                            let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                            let state_haps_a = get_haps!(mkr_a);
-                            let state_haps_b = get_haps!(mkr_b);
-                            let bridge_probs = stage2_phaser
-                                .bridge_hap_probs(m, probs, &state_haps_a, &state_haps_b);
-                            let mut score = 0.0f32;
-                            for (&hap, &prob) in bridge_probs.iter() {
-                                if carrier_set.contains(&hap) {
-                                    score += prob;
-                                }
-                            }
-                            score
-                        }};
-                    }
-
                     for &m in &rare_markers {
                         let a1 = sp.allele1(m);
                         let a2 = sp.allele2(m);
+                        let mkr_a = stage2_phaser.prev_stage1_marker[m];
+                        let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
+                        let state_haps_for_interp_a = get_haps!(mkr_a);
+                        let state_haps_for_interp_b = get_haps!(mkr_b);
+                        let bridge_probs1 = stage2_phaser.bridge_hap_probs(
+                            m,
+                            &probs1,
+                            &state_haps_for_interp_a,
+                            &state_haps_for_interp_b,
+                        );
+                        let bridge_probs2 = stage2_phaser.bridge_hap_probs(
+                            m,
+                            &probs2,
+                            &state_haps_for_interp_a,
+                            &state_haps_for_interp_b,
+                        );
 
                         // Handle missing genotypes by imputation
                         if sp.is_missing(m) || a1 == 255 || a2 == 255 {
-                            let imp_a1 = impute_allele!(m, &probs1);
-                            let imp_a2 = impute_allele!(m, &probs2);
+                            let scaffold_conf_min = 0.80f32;
+                            let scaffold_gap_min = 0.15f32;
+                            let imp_a1 = if let Some((h, top, second)) =
+                                top_bridge_haplotype(&bridge_probs1)
+                            {
+                                let al = get_allele(m, h as usize);
+                                if top >= scaffold_conf_min && (top - second) >= scaffold_gap_min && al != 255 {
+                                    al
+                                } else {
+                                    impute_allele!(m, &probs1)
+                                }
+                            } else {
+                                impute_allele!(m, &probs1)
+                            };
+                            let imp_a2 = if let Some((h, top, second)) =
+                                top_bridge_haplotype(&bridge_probs2)
+                            {
+                                let al = get_allele(m, h as usize);
+                                if top >= scaffold_conf_min && (top - second) >= scaffold_gap_min && al != 255 {
+                                    al
+                                } else {
+                                    impute_allele!(m, &probs2)
+                                }
+                            } else {
+                                impute_allele!(m, &probs2)
+                            };
                             decisions.push(Stage2Decision::Impute {
                                 marker: m,
                                 a1: imp_a1,
@@ -6125,84 +6129,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let marker_maf = maf[m];
                         let is_rare_marker = marker_maf < rare_threshold;
                         let carriers = &carrier_haps[m];
+                        let mut log_same = 0.0f32;
+                        let mut log_swap = 0.0f32;
 
                         if is_rare_marker && !carriers.is_empty() {
                             let carrier_set: std::collections::HashSet<u32> =
                                 carriers.iter().copied().collect();
-                            let score1 = carrier_score!(m, &probs1, &carrier_set);
-                            let score2 = carrier_score!(m, &probs2, &carrier_set);
-
-                            if carriers.len() == 1 || (score1 == 0.0 && score2 == 0.0) {
-                                let stage1_idx = stage2_phaser.prev_stage1_marker[m];
-                                let hap1_idx = (s * 2) as u32;
-                                let hap2_idx = (s * 2 + 1) as u32;
-                                let shorter_is_hap1 = if has_ref {
-                                    let max1 = probs1
-                                        .get(stage1_idx)
-                                        .and_then(|v| v.iter().copied().reduce(f32::max))
-                                        .unwrap_or(0.0);
-                                    let max2 = probs2
-                                        .get(stage1_idx)
-                                        .and_then(|v| v.iter().copied().reduce(f32::max))
-                                        .unwrap_or(0.0);
-                                    max1 < max2
-                                } else if let Some(phase_ibs) = phase_ibs.as_ref() {
-                                    let span1 = phase_ibs.best_match_span(hap1_idx, stage1_idx);
-                                    let span2 = phase_ibs.best_match_span(hap2_idx, stage1_idx);
-                                    span1 < span2
-                                } else {
-                                    rng.random_bool(0.5)
-                                };
-                                let alt_on_hap1 = a1 > 0 && a1 != 255;
-                                let alt_on_hap2 = a2 > 0 && a2 != 255;
-                                if alt_on_hap1 ^ alt_on_hap2 {
-                                    let should_swap = if alt_on_hap1 {
-                                        !shorter_is_hap1
-                                    } else {
-                                        shorter_is_hap1
-                                    };
-                                    decisions.push(Stage2Decision::Phase {
-                                        marker: m,
-                                        should_swap,
-                                        lr: 1.0,
-                                    });
-                                    continue;
+                            let mut score1 = 0.0f32;
+                            let mut score2 = 0.0f32;
+                            for (&hap, &prob) in &bridge_probs1 {
+                                if carrier_set.contains(&hap) {
+                                    score1 += prob;
                                 }
                             }
-
-                            let mut lr = if score2 > score1 {
-                                (score2 / score1.max(1e-30)) as f32
-                            } else {
-                                (score1 / score2.max(1e-30)) as f32
-                            };
-                            let eps = 1e-6f64;
-                            let s1 = (score1 as f64 + eps).max(eps);
-                            let s2 = (score2 as f64 + eps).max(eps);
-                            let denom = s1 + s2;
-                            let mut p_swap = if denom > 0.0 {
-                                (s2 / denom).clamp(0.0, 1.0)
-                            } else {
-                                0.5
-                            };
-                            let mut p_conf = (lr / (1.0 + lr)).clamp(0.0, 1.0);
-                            p_conf = 0.5 + (p_conf - 0.5) * 0.5;
-                            lr = (p_conf / (1.0 - p_conf)).max(1e-6);
-                            let alpha = ((lr - 1.0) / (lr + 1.0)).clamp(0.0, 1.0) as f64;
-                            p_swap = 0.5 * (1.0 - alpha) + alpha * p_swap;
-                            let should_swap = rng.random_bool(p_swap as f64);
-                            decisions.push(Stage2Decision::Phase {
-                                marker: m,
-                                should_swap,
-                                lr,
-                            });
-                            continue;
+                            for (&hap, &prob) in &bridge_probs2 {
+                                if carrier_set.contains(&hap) {
+                                    score2 += prob;
+                                }
+                            }
+                            log_same += score1.max(1e-30).ln();
+                            log_swap += score2.max(1e-30).ln();
                         }
 
-                        // Fallback to interpolated allele probabilities
-                        let mkr_a = stage2_phaser.prev_stage1_marker[m];
-                        let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                        let state_haps_for_interp_a = get_haps!(mkr_a);
-                        let state_haps_for_interp_b = get_haps!(mkr_b);
                         let al_probs1 = stage2_phaser.interpolated_allele_probs(
                             m,
                             &probs1,
@@ -6224,29 +6172,50 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         let p1 = al_probs1[0] * al_probs2[1];
                         let p2 = al_probs1[1] * al_probs2[0];
+                        log_same += p1.max(1e-30).ln();
+                        log_swap += p2.max(1e-30).ln();
 
-                        let mut lr = if p2 > p1 {
-                            (p2 / p1.max(1e-30)) as f32
-                        } else {
-                            (p1 / p2.max(1e-30)) as f32
-                        };
-                        let eps = 1e-6f64;
-                        let pp1 = (p1 as f64 + eps).max(eps);
-                        let pp2 = (p2 as f64 + eps).max(eps);
-                        let denom = pp1 + pp2;
-                        let mut p_swap = if denom > 0.0 {
-                            (pp2 / denom).clamp(0.0, 1.0)
-                        } else {
-                            0.5
-                        };
-                        let mut p_conf = (lr / (1.0 + lr)).clamp(0.0, 1.0);
-                        p_conf = 0.5 + (p_conf - 0.5) * 0.5;
-                        lr = (p_conf / (1.0 - p_conf)).max(1e-6);
-                        let alpha = ((lr - 1.0) / (lr + 1.0)).clamp(0.0, 1.0) as f64;
-                        p_swap = 0.5 * (1.0 - alpha) + alpha * p_swap;
-                        let should_swap = rng.random_bool(p_swap as f64);
-                        decisions.push(Stage2Decision::Phase {
+                        // Scaffold orientation evidence from dominant copied donors.
+                        let scaffold_conf_min = 0.80f32;
+                        let scaffold_gap_min = 0.15f32;
+                        if let (Some((h1, top1, second1)), Some((h2, top2, second2))) = (
+                            top_bridge_haplotype(&bridge_probs1),
+                            top_bridge_haplotype(&bridge_probs2),
+                        ) {
+                            if top1 >= scaffold_conf_min
+                                && top2 >= scaffold_conf_min
+                                && (top1 - second1) >= scaffold_gap_min
+                                && (top2 - second2) >= scaffold_gap_min
+                            {
+                                let d1 = get_allele(m, h1 as usize);
+                                let d2 = get_allele(m, h2 as usize);
+                                let w1 = top1.max(1e-6).ln();
+                                let w2 = top2.max(1e-6).ln();
+                                if d1 == a1 {
+                                    log_same += w1;
+                                } else if d1 == a2 {
+                                    log_swap += w1;
+                                }
+                                if d2 == a2 {
+                                    log_same += w2;
+                                } else if d2 == a1 {
+                                    log_swap += w2;
+                                }
+                            }
+                        }
+
+                        phase_evidence.push(PhaseEvidence {
                             marker: m,
+                            log_same,
+                            log_swap,
+                        });
+                    }
+
+                    for (marker, should_swap, lr) in
+                        decode_phase_evidence_path(&phase_evidence, gen_positions, self.params.recomb_intensity)
+                    {
+                        decisions.push(Stage2Decision::Phase {
+                            marker,
                             should_swap,
                             lr,
                         });
@@ -9914,6 +9883,100 @@ enum Stage2Decision {
     },
     /// Impute a missing genotype
     Impute { marker: usize, a1: u8, a2: u8 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhaseEvidence {
+    marker: usize,
+    log_same: f32,
+    log_swap: f32,
+}
+
+fn decode_phase_evidence_path(
+    evidence: &[PhaseEvidence],
+    gen_positions: &[f64],
+    recomb_intensity: f32,
+) -> Vec<(usize, bool, f32)> {
+    if evidence.is_empty() {
+        return Vec::new();
+    }
+    let n = evidence.len();
+    let mut dp_same = vec![f32::NEG_INFINITY; n];
+    let mut dp_swap = vec![f32::NEG_INFINITY; n];
+    let mut prev_same = vec![0u8; n];
+    let mut prev_swap = vec![0u8; n];
+
+    dp_same[0] = evidence[0].log_same;
+    dp_swap[0] = evidence[0].log_swap;
+    prev_same[0] = 0;
+    prev_swap[0] = 1;
+
+    for i in 1..n {
+        let m_prev = evidence[i - 1].marker;
+        let m_cur = evidence[i].marker;
+        let pos_prev = *gen_positions.get(m_prev).unwrap_or(&0.0);
+        let pos_cur = *gen_positions.get(m_cur).unwrap_or(&pos_prev);
+        let d_cm = (pos_cur - pos_prev).max(0.0);
+        let d_m = d_cm / 100.0;
+        let r = (-f64::exp_m1(-(recomb_intensity as f64) * d_m) as f32).clamp(1e-5, 0.25);
+        let stay = (1.0 - r).ln();
+        let sw = r.ln();
+
+        let same_from_same = dp_same[i - 1] + stay;
+        let same_from_swap = dp_swap[i - 1] + sw;
+        if same_from_same >= same_from_swap {
+            dp_same[i] = same_from_same + evidence[i].log_same;
+            prev_same[i] = 0;
+        } else {
+            dp_same[i] = same_from_swap + evidence[i].log_same;
+            prev_same[i] = 1;
+        }
+
+        let swap_from_swap = dp_swap[i - 1] + stay;
+        let swap_from_same = dp_same[i - 1] + sw;
+        if swap_from_swap >= swap_from_same {
+            dp_swap[i] = swap_from_swap + evidence[i].log_swap;
+            prev_swap[i] = 1;
+        } else {
+            dp_swap[i] = swap_from_same + evidence[i].log_swap;
+            prev_swap[i] = 0;
+        }
+    }
+
+    let mut states = vec![0u8; n];
+    let mut st = if dp_swap[n - 1] > dp_same[n - 1] { 1u8 } else { 0u8 };
+    for i in (0..n).rev() {
+        states[i] = st;
+        st = if st == 0 { prev_same[i] } else { prev_swap[i] };
+    }
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let log_lr = (evidence[i].log_swap - evidence[i].log_same).abs();
+        let lr = log_lr.exp().clamp(1.0, 1.0e6);
+        out.push((evidence[i].marker, states[i] == 1, lr));
+    }
+    out
+}
+
+fn top_bridge_haplotype(bridge_probs: &std::collections::HashMap<u32, f32>) -> Option<(u32, f32, f32)> {
+    let mut top_h = 0u32;
+    let mut top_p = -1.0f32;
+    let mut second_p = 0.0f32;
+    for (&h, &p) in bridge_probs {
+        if p > top_p {
+            second_p = top_p.max(0.0);
+            top_p = p;
+            top_h = h;
+        } else if p > second_p {
+            second_p = p;
+        }
+    }
+    if top_p > 0.0 {
+        Some((top_h, top_p, second_p.max(0.0)))
+    } else {
+        None
+    }
 }
 
 /// Stage 2 phaser with HMM state probability interpolation
