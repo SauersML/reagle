@@ -13,6 +13,22 @@ use std::arch::x86_64::*;
 pub struct WeightedHmmUpdater;
 
 impl WeightedHmmUpdater {
+    #[inline]
+    fn conditioned_transition_params(
+        recomb_rate: f32,
+        n_ref_haps: usize,
+        active_haps: f32,
+        fwd_sum: f32,
+    ) -> (f32, f32) {
+        let r = recomb_rate.clamp(0.0, 1.0);
+        let n = n_ref_haps.max(1) as f32;
+        let k = active_haps.max(1.0);
+        let switch_full = r / n;
+        let z = ((1.0 - r) + k * switch_full).max(1e-30);
+        let scale = (1.0 - r) / (z * fwd_sum.max(1e-30));
+        let base_shift = switch_full / z;
+        (scale, base_shift)
+    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx512f")]
     unsafe fn fwd_update_weighted_avx512(
@@ -27,8 +43,12 @@ impl WeightedHmmUpdater {
         // Safety: caller guarantees slices have at least `n_patterns` elements and are valid
         // for AVX-512 loads/stores (unaligned is permitted by loadu/storeu).
         unsafe {
-            let base_shift = recomb_rate / n_ref_haps as f32;
-            let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+            let mut active_haps = 0.0f32;
+            for &c in pattern_counts.iter().take(n_patterns) {
+                active_haps += c.max(0.0);
+            }
+            let (scale, base_shift) =
+                Self::conditioned_transition_params(recomb_rate, n_ref_haps, active_haps, fwd_sum);
 
             let base_shift_vec = _mm512_set1_ps(base_shift);
             let scale_vec = _mm512_set1_ps(scale);
@@ -84,8 +104,12 @@ impl WeightedHmmUpdater {
         // Safety: caller guarantees slices have at least `n_patterns` elements and are valid
         // for AVX-512 loads/stores (unaligned is permitted by loadu/storeu).
         unsafe {
-            let base_shift = recomb_rate / n_ref_haps as f32;
-            let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+            let mut active_haps = 0.0f32;
+            for &c in pattern_counts.iter().take(n_patterns) {
+                active_haps += c.max(0.0);
+            }
+            let (scale, base_shift) =
+                Self::conditioned_transition_params(recomb_rate, n_ref_haps, active_haps, fwd_sum);
 
             let base_shift_vec = _mm512_set1_ps(base_shift);
             let scale_vec = _mm512_set1_ps(scale);
@@ -169,8 +193,12 @@ impl WeightedHmmUpdater {
             }
         }
 
-        let base_shift = recomb_rate / n_ref_haps as f32;
-        let scale = (1.0 - recomb_rate) / fwd_sum.max(1e-30);
+        let mut active_haps = 0.0f32;
+        for &c in pattern_counts.iter().take(n_patterns) {
+            active_haps += c.max(0.0);
+        }
+        let (scale, base_shift) =
+            Self::conditioned_transition_params(recomb_rate, n_ref_haps, active_haps, fwd_sum);
 
         let base_shift_vec = f32x8::splat(base_shift);
         let scale_vec = f32x8::splat(scale);
