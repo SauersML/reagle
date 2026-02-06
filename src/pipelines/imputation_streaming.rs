@@ -17,7 +17,7 @@ use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::storage::phase_state::{Phased, PhaseState};
-use crate::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
+use crate::data::{HapIdx, MarkerIdx, SampleIdx};
 use crate::data::marker::{AnyMarkerSpace, RefWindowSpace};
 use crate::error::ReagleError;
 use crate::error::Result;
@@ -1344,7 +1344,7 @@ fn build_imputation_plan(
 
     let can_full_panel =
         !per_window_caps.is_empty() && per_window_caps.iter().all(|&c| c >= n_ref_haps);
-    if can_full_panel {
+    if false && can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
             return Err(ReagleError::vcf(
@@ -2431,19 +2431,11 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        if self.config.err.is_none() {
-            // For imputation, copy-mismatch reflects mutation rather than panel size.
-            self.params.p_mismatch = crate::model::parameters::ModelParams::new().p_mismatch;
-        }
-        self.params.recomb_intensity = self
-            .params
-            .recomb_intensity
-            .min(crate::model::parameters::ModelParams::MAX_RECOMB_INTENSITY);
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32).max(1e-6);
+        self.params.recomb_intensity = impute_recomb_intensity;
         if let Some(recomb_intensity) = phased_recomb_intensity {
             if recomb_intensity.is_finite() && recomb_intensity > 0.0 {
-                self.params.recomb_intensity = recomb_intensity.min(
-                    crate::model::parameters::ModelParams::MAX_RECOMB_INTENSITY,
-                );
+                self.params.recomb_intensity = recomb_intensity;
             }
         }
         // Do not inherit phasing mismatch estimates for imputation. Imputation
@@ -2556,66 +2548,67 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromIdx(ChromIdx);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromPos {
-                        chrom: TargetChromIdx,
-                        pos: u32,
-                    }
-
-                    let mut target_chroms: std::collections::HashMap<String, TargetChromIdx> =
+                    let mut target_pos_to_indices: std::collections::HashMap<(String, u32), Vec<usize>> =
                         std::collections::HashMap::new();
-                    for c in 0..target_window.genotypes.markers().chrom_names().len() {
-                        let idx = ChromIdx::new(c as u16);
-                        let name = target_window
+                    for t_idx in 0..target_window.genotypes.n_markers() {
+                        let t_marker = target_window
                             .genotypes
                             .markers()
-                            .chrom_name(idx)
+                            .marker(MarkerIdx::new(t_idx as u32));
+                        let t_chrom = target_window
+                            .genotypes
+                            .markers()
+                            .chrom_name(t_marker.chrom)
                             .unwrap_or("");
-                        target_chroms.insert(
-                            normalize_chrom_local(name).to_string(),
-                            TargetChromIdx(idx),
-                        );
-                    }
-
-                    let mut target_positions: std::collections::HashSet<TargetChromPos> =
-                        std::collections::HashSet::with_capacity(
-                            target_window.genotypes.n_markers(),
-                        );
-                    for m in 0..target_window.genotypes.n_markers() {
-                        let marker = target_window
-                            .genotypes
-                            .markers()
-                            .marker(MarkerIdx::new(m as u32));
-                        target_positions
-                            .insert(TargetChromPos { chrom: TargetChromIdx(marker.chrom), pos: marker.pos });
+                        let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+                        target_pos_to_indices.entry(key).or_default().push(t_idx);
                     }
                     let mut dbg_pos_present = 0usize;
                     let mut dbg_aligned_present = 0usize;
                     let mut dbg_pos_not_aligned = 0usize;
                     let mut dbg_pos_not_aligned_sites: Vec<(String, u64)> = Vec::new();
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        // Position-presence defines genotyped markers here.
-                        // Rationale: a site is genotyped if it exists in the target VCF.
-                        // REF/ALT swaps do not make it "imputed" because genotype is defined
-                        // by the alleles carried, not by their ordering in the VCF.
-                        // We assume strand consistency, but we do NOT require REF/ALT to
-                        // match the reference encoding to classify the site as genotyped.
                         let ref_marker =
                             ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
                         let ref_chrom = ref_window
                             .markers
                             .chrom_name(ref_marker.chrom)
                             .unwrap_or("");
-                        let ref_key = target_chroms
-                            .get(normalize_chrom_local(ref_chrom))
-                            .copied()
-                            .map(|chrom| TargetChromPos { chrom, pos: ref_marker.pos });
-                        let is_present = target_idx.is_some()
-                            || ref_key
-                                .map(|key| target_positions.contains(&key))
-                                .unwrap_or(false);
+                        let has_biallelic_swap_or_match = if target_idx.is_none()
+                            && ref_marker.n_alleles() == 2
+                        {
+                            let key =
+                                (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+                            if let Some(candidates) = target_pos_to_indices.get(&key) {
+                                let ref0 = ref_marker.ref_allele.to_string();
+                                let ref1 = ref_marker
+                                    .alt_alleles
+                                    .first()
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_default();
+                                candidates.iter().any(|&t_idx| {
+                                    let t_marker = target_window
+                                        .genotypes
+                                        .markers()
+                                        .marker(MarkerIdx::new(t_idx as u32));
+                                    if t_marker.n_alleles() != 2 {
+                                        return false;
+                                    }
+                                    let t0 = t_marker.ref_allele.to_string();
+                                    let t1 = t_marker
+                                        .alt_alleles
+                                        .first()
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_default();
+                                    (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
+                                })
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        let is_present = target_idx.is_some() || has_biallelic_swap_or_match;
                         window_quality.set_imputed(ref_m, !is_present);
                         if is_present {
                             dbg_pos_present += 1;
@@ -2869,59 +2862,63 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromIdx(ChromIdx);
-                    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-                    struct TargetChromPos {
-                        chrom: TargetChromIdx,
-                        pos: u32,
-                    }
-
-                    let mut target_chroms: std::collections::HashMap<String, TargetChromIdx> =
+                    let mut target_pos_to_indices: std::collections::HashMap<(String, u32), Vec<usize>> =
                         std::collections::HashMap::new();
-                    for c in 0..target_window.genotypes.markers().chrom_names().len() {
-                        let idx = ChromIdx::new(c as u16);
-                        let name = target_window
+                    for t_idx in 0..target_window.genotypes.n_markers() {
+                        let t_marker = target_window
                             .genotypes
                             .markers()
-                            .chrom_name(idx)
+                            .marker(MarkerIdx::new(t_idx as u32));
+                        let t_chrom = target_window
+                            .genotypes
+                            .markers()
+                            .chrom_name(t_marker.chrom)
                             .unwrap_or("");
-                        target_chroms.insert(
-                            normalize_chrom_local(name).to_string(),
-                            TargetChromIdx(idx),
-                        );
-                    }
-
-                    let mut target_positions: std::collections::HashSet<TargetChromPos> =
-                        std::collections::HashSet::with_capacity(
-                            target_window.genotypes.n_markers(),
-                        );
-                    for m in 0..target_window.genotypes.n_markers() {
-                        let marker = target_window
-                            .genotypes
-                            .markers()
-                            .marker(MarkerIdx::new(m as u32));
-                        target_positions
-                            .insert(TargetChromPos { chrom: TargetChromIdx(marker.chrom), pos: marker.pos });
+                        let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+                        target_pos_to_indices.entry(key).or_default().push(t_idx);
                     }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        // Position-presence defines genotyped markers here.
-                        // Rationale: inputs are assumed harmonized; allele/strand issues
-                        // are not handled by reclassifying as imputed in this step.
                         let ref_marker =
                             ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
                         let ref_chrom = ref_window
                             .markers
                             .chrom_name(ref_marker.chrom)
                             .unwrap_or("");
-                        let ref_key = target_chroms
-                            .get(normalize_chrom_local(ref_chrom))
-                            .copied()
-                            .map(|chrom| TargetChromPos { chrom, pos: ref_marker.pos });
-                        let is_present = target_idx.is_some()
-                            || ref_key
-                                .map(|key| target_positions.contains(&key))
-                                .unwrap_or(false);
+                        let has_biallelic_swap_or_match = if target_idx.is_none()
+                            && ref_marker.n_alleles() == 2
+                        {
+                            let key =
+                                (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+                            if let Some(candidates) = target_pos_to_indices.get(&key) {
+                                let ref0 = ref_marker.ref_allele.to_string();
+                                let ref1 = ref_marker
+                                    .alt_alleles
+                                    .first()
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_default();
+                                candidates.iter().any(|&t_idx| {
+                                    let t_marker = target_window
+                                        .genotypes
+                                        .markers()
+                                        .marker(MarkerIdx::new(t_idx as u32));
+                                    if t_marker.n_alleles() != 2 {
+                                        return false;
+                                    }
+                                    let t0 = t_marker.ref_allele.to_string();
+                                    let t1 = t_marker
+                                        .alt_alleles
+                                        .first()
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_default();
+                                    (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
+                                })
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        let is_present = target_idx.is_some() || has_biallelic_swap_or_match;
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
@@ -3163,22 +3160,10 @@ impl crate::pipelines::ImputationPipeline {
             let chrom = ref_markers
                 .marker(MarkerIdx::new(0))
                 .chrom;
-            let min_cluster_cm = (self.config.cluster as f64).max(1e-8);
             if let Some(gen_map) = gen_maps.get(chrom) {
-                // External map: enforce a minimum distance based on the cluster
-                // parameter to avoid near-zero recombination in dense regions.
-                crate::data::genetic_map::MarkerMap::from_gen_map_with_min_dist(
-                    ref_markers,
-                    gen_map,
-                    min_cluster_cm,
-                )
+                crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
             } else {
-                // No external map: use linear map (1 cM per Mb) with a minimum
-                // distance derived from the cluster parameter.
-                crate::data::genetic_map::MarkerMap::from_positions_with_min_dist(
-                    ref_markers,
-                    min_cluster_cm,
-                )
+                crate::data::genetic_map::MarkerMap::from_positions(ref_markers)
             }
         };
         let gen_positions: Vec<f64> = marker_map.gen_positions().to_vec();
@@ -4789,11 +4774,101 @@ impl crate::pipelines::ImputationPipeline {
 
         let samples = target_win.samples_arc();
         let target_pl = target_pl.unwrap_or(target_win);
+        let mut target_pos_to_indices: std::collections::HashMap<(String, u32), Vec<usize>> =
+            std::collections::HashMap::new();
+        for t_idx in 0..target_win.n_markers() {
+            let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
+            let t_chrom = target_win
+                .markers()
+                .chrom_name(t_marker.chrom)
+                .unwrap_or("");
+            let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+            target_pos_to_indices.entry(key).or_default().push(t_idx);
+        }
+
+        let pick_target_marker_by_alleles = |ref_marker_idx: usize| -> Option<usize> {
+            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
+            if ref_marker.n_alleles() != 2 {
+                return None;
+            }
+            let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
+            let key = (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+            let candidates = target_pos_to_indices.get(&key)?;
+
+            let ref0 = ref_marker.ref_allele.to_string();
+            let ref1 = ref_marker.alt_alleles.first()?.to_string();
+            let mut matches: Vec<usize> = Vec::new();
+            for &t_idx in candidates {
+                let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
+                if t_marker.n_alleles() != 2 {
+                    continue;
+                }
+                let t0 = t_marker.ref_allele.to_string();
+                let t1 = t_marker.alt_alleles.first().map(|a| a.to_string());
+                if let Some(t1) = t1 {
+                    let same = ref0 == t0 && ref1 == t1;
+                    let swapped = ref0 == t1 && ref1 == t0;
+                    if same || swapped {
+                        matches.push(t_idx);
+                    }
+                }
+            }
+            if matches.len() == 1 {
+                Some(matches[0])
+            } else if candidates.len() == 1 {
+                Some(candidates[0])
+            } else {
+                None
+            }
+        };
 
         let get_genotyped_alleles = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
-            let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
             let h1 = HapIdx::new((sample_idx * 2) as u32);
             let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+            if let Some(target_m) = alignment.target_marker(MarkerIdx::new(marker_idx as u32)) {
+                if let Some(missing) = target_missing {
+                    let miss_a1 = missing.allele(target_m, h1);
+                    let miss_a2 = missing.allele(target_m, h2);
+                    if miss_a1 == 255 || miss_a2 == 255 {
+                        return None;
+                    }
+                }
+                let raw_a1 = target_win.allele(target_m, h1);
+                let raw_a2 = target_win.allele(target_m, h2);
+                if raw_a1 == 255 || raw_a2 == 255 {
+                    return None;
+                }
+                let mapping = alignment
+                    .allele_mappings
+                    .get(target_m.as_usize())
+                    .and_then(|m| m.as_ref());
+                let map_allele = |a: u8| -> u8 {
+                    if a == 255 {
+                        return 255;
+                    }
+                    if let Some(m) = mapping {
+                        if (a as usize) < m.targ_to_ref.len() {
+                            let r = m.targ_to_ref[a as usize];
+                            if r >= 0 { r as u8 } else { 255 }
+                        } else {
+                            255
+                        }
+                    } else {
+                        a
+                    }
+                };
+                let a1 = map_allele(raw_a1);
+                let a2 = map_allele(raw_a2);
+                if a1 == 255 || a2 == 255 {
+                    return None;
+                }
+                return Some((a1, a2));
+            }
+
+            // Position-only fallback for unaligned markers: preserve target hard calls
+            // when there is a unique marker at the same position.
+            let target_idx = pick_target_marker_by_alleles(marker_idx)?;
+            let target_m = MarkerIdx::new(target_idx as u32);
             if let Some(missing) = target_missing {
                 let miss_a1 = missing.allele(target_m, h1);
                 let miss_a2 = missing.allele(target_m, h2);
@@ -4806,31 +4881,40 @@ impl crate::pipelines::ImputationPipeline {
             if raw_a1 == 255 || raw_a2 == 255 {
                 return None;
             }
-            let mapping = alignment
-                .allele_mappings
-                .get(target_m.as_usize())
-                .and_then(|m| m.as_ref());
-            let map_allele = |a: u8| -> u8 {
-                if a == 255 {
-                    return 255;
-                }
-                if let Some(m) = mapping {
-                    if (a as usize) < m.targ_to_ref.len() {
-                        let r = m.targ_to_ref[a as usize];
-                        if r >= 0 { r as u8 } else { 255 }
-                    } else {
-                        255
-                    }
-                } else {
-                    a
-                }
-            };
-            let a1 = map_allele(raw_a1);
-            let a2 = map_allele(raw_a2);
-            if a1 == 255 || a2 == 255 {
-                None
+            let a1 = if raw_a1 == 0 { 0 } else { 1 };
+            let a2 = if raw_a2 == 0 { 0 } else { 1 };
+            Some((a1, a2))
+            }
+        ;
+
+        let get_target_raw_dosage = |marker_idx: usize, sample_idx: usize| -> Option<f32> {
+            let h1 = HapIdx::new((sample_idx * 2) as u32);
+            let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+
+            let target_m = if let Some(tm) = alignment.target_marker(MarkerIdx::new(marker_idx as u32)) {
+                tm
             } else {
-                Some((a1, a2))
+                let target_idx = pick_target_marker_by_alleles(marker_idx)?;
+                MarkerIdx::new(target_idx as u32)
+            };
+
+            if let Some(missing) = target_missing {
+                if missing.allele(target_m, h1) == 255 || missing.allele(target_m, h2) == 255 {
+                    return None;
+                }
+            }
+
+            let a1 = target_win.allele(target_m, h1);
+            let a2 = target_win.allele(target_m, h2);
+            if a1 == 255 || a2 == 255 {
+                return None;
+            }
+
+            let d = ((a1 > 0) as u8 + (a2 > 0) as u8) as f32;
+            if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                Some(d)
+            } else {
+                Some(d * 0.5)
             }
         };
 
@@ -5009,6 +5093,9 @@ impl crate::pipelines::ImputationPipeline {
 
             // Prefer hard calls if error correction is disabled
             if !correct_errors {
+                if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
+                    return d;
+                }
                 if let Some((a1, a2)) = hard_call {
                     let d = (a1 + a2) as f32;
                     return if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
@@ -5273,255 +5360,15 @@ impl crate::pipelines::ImputationPipeline {
             None
         };
 
-        // Preserve genotyped target-only markers that share positions with ref markers
-        // but do not align by alleles. These should not be silently imputed away.
-        let mut ref_pos_set: std::collections::HashSet<(String, u32)> =
-            std::collections::HashSet::new();
-        for ref_m in output_start..output_end {
-            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
-            let ref_chrom = ref_markers
-                .chrom_name(ref_marker.chrom)
-                .unwrap_or("");
-            ref_pos_set.insert((normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos));
-        }
-
-        let mut target_only_by_pos: std::collections::HashMap<(String, u32), Vec<usize>> =
-            std::collections::HashMap::new();
-        for t_idx in 0..target_win.n_markers() {
-            let target_m = MarkerIdx::new(t_idx as u32);
-            if alignment.target_to_ref(target_m).is_some() {
-                continue;
-            }
-            let t_marker = target_win.marker(target_m);
-            let t_chrom = target_win
-                .markers()
-                .chrom_name(t_marker.chrom)
-                .unwrap_or("");
-            let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
-            if ref_pos_set.contains(&key) {
-                target_only_by_pos.entry(key).or_default().push(t_idx);
-            }
-        }
-
-        if target_only_by_pos.is_empty() {
-            return writer.write_imputed_streaming(
-                ref_markers,
-                get_dosage,
-                get_best_gt,
-                get_posteriors_for_writer,
-                get_genotype_posteriors_for_writer,
-                quality,
-                output_start,
-                output_end,
-                include_gp,
-                include_ap,
-                self.telemetry.as_ref(),
-            );
-        }
-
-        #[derive(Clone, Copy)]
-        enum OutputMarker {
-            Ref(usize),
-            Target(usize),
-        }
-
-        let mut output_markers: Vec<OutputMarker> = Vec::new();
-        for ref_m in output_start..output_end {
-            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
-            let ref_chrom = ref_markers
-                .chrom_name(ref_marker.chrom)
-                .unwrap_or("");
-            let key = (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
-            if let Some(targets) = target_only_by_pos.get(&key) {
-                for &t_idx in targets {
-                    output_markers.push(OutputMarker::Target(t_idx));
-                }
-            }
-            output_markers.push(OutputMarker::Ref(ref_m));
-        }
-
-        let mut out_markers = crate::data::marker::Markers::<RefMarkerSpace>::new();
-        let mut out_chroms: std::collections::HashMap<String, ChromIdx> =
-            std::collections::HashMap::new();
-        for name in ref_markers.chrom_names() {
-            out_markers.add_chrom(name.as_ref());
-            let idx = ChromIdx::new((out_markers.chrom_names().len() - 1) as u16);
-            out_chroms.insert(normalize_chrom_local(name.as_ref()).to_string(), idx);
-        }
-
-        let mut n_alleles_per_marker: Vec<usize> = Vec::with_capacity(output_markers.len());
-        for om in &output_markers {
-            match *om {
-                OutputMarker::Ref(ref_m) => {
-                    let marker = ref_markers.marker(MarkerIdx::new(ref_m as u32)).clone();
-                    n_alleles_per_marker.push(marker.n_alleles());
-                    out_markers.push(marker);
-                }
-                OutputMarker::Target(t_idx) => {
-                    let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32)).clone();
-                    let t_chrom = target_win
-                        .markers()
-                        .chrom_name(t_marker.chrom)
-                        .unwrap_or("");
-                    let key = normalize_chrom_local(t_chrom).to_string();
-                    let out_idx = if let Some(idx) = out_chroms.get(&key).copied() {
-                        idx
-                    } else {
-                        out_markers.add_chrom(t_chrom);
-                        let idx = ChromIdx::new((out_markers.chrom_names().len() - 1) as u16);
-                        out_chroms.insert(key, idx);
-                        idx
-                    };
-                    let mut marker = t_marker;
-                    marker.chrom = out_idx;
-                    n_alleles_per_marker.push(marker.n_alleles());
-                    out_markers.push(marker);
-                }
-            }
-        }
-
-        let mut merged_quality = ImputationQuality::new(&n_alleles_per_marker);
-        let target_samples = target_win.samples_arc();
-        let get_target_alleles = |t_idx: usize, s: usize| -> Option<(u8, u8)> {
-            let h1 = HapIdx::new((s * 2) as u32);
-            let h2 = HapIdx::new((s * 2 + 1) as u32);
-            let m = MarkerIdx::new(t_idx as u32);
-            if let Some(missing) = target_missing {
-                if missing.allele(m, h1) == 255 || missing.allele(m, h2) == 255 {
-                    return None;
-                }
-            }
-            let a1 = target_win.allele(m, h1);
-            let a2 = target_win.allele(m, h2);
-            if a1 == 255 || a2 == 255 {
-                None
-            } else {
-                Some((a1, a2))
-            }
-        };
-
-        for (out_idx, om) in output_markers.iter().enumerate() {
-            match *om {
-                OutputMarker::Ref(ref_m) => {
-                    if let Some(stats) = quality.get(ref_m) {
-                        merged_quality.marker_stats[out_idx] = stats.clone();
-                    }
-                }
-                OutputMarker::Target(t_idx) => {
-                    let n_alleles = n_alleles_per_marker[out_idx];
-                    let mut stats = crate::io::vcf::MarkerImputationStats::new(n_alleles);
-                    stats.is_imputed = false;
-                    if n_alleles == 2 {
-                        for s in 0..target_win.n_samples() {
-                            if let Some((a1, a2)) = get_target_alleles(t_idx, s) {
-                                let p1 = if a1 == 1 { 1.0 } else { 0.0 };
-                                let p2 = if a2 == 1 { 1.0 } else { 0.0 };
-                                stats.add_sample_biallelic(p1, p2);
-                            }
-                        }
-                    }
-                    merged_quality.marker_stats[out_idx] = stats;
-                }
-            }
-        }
-
-        let output_markers = std::sync::Arc::new(output_markers);
-        let n_alleles_per_marker = std::sync::Arc::new(n_alleles_per_marker);
-
-        let get_dosage_merged = {
-            let output_markers = output_markers.clone();
-            move |out_idx: usize, s: usize| -> f32 {
-                match output_markers[out_idx] {
-                OutputMarker::Ref(ref_m) => get_dosage(ref_m, s),
-                OutputMarker::Target(t_idx) => {
-                    if let Some((a1, a2)) = get_target_alleles(t_idx, s) {
-                        let is_diploid = target_samples.is_diploid(SampleIdx::new(s as u32));
-                        let d = (a1 > 0) as u8 + (a2 > 0) as u8;
-                        if is_diploid {
-                            d as f32
-                        } else {
-                            (d as f32) * 0.5
-                        }
-                    } else {
-                        0.0
-                    }
-                }
-                }
-            }
-        };
-
-        let get_best_gt_merged = {
-            let output_markers = output_markers.clone();
-            move |out_idx: usize, s: usize| -> (u8, u8) {
-                match output_markers[out_idx] {
-                    OutputMarker::Ref(ref_m) => get_best_gt(ref_m, s),
-                    OutputMarker::Target(t_idx) => get_target_alleles(t_idx, s).unwrap_or((255, 255)),
-                }
-            }
-        };
-
-        let get_posteriors_merged = get_posteriors_for_writer.as_ref().map(|base| {
-            let output_markers = output_markers.clone();
-            let n_alleles_per_marker = n_alleles_per_marker.clone();
-            move |out_idx: usize, s: usize| match output_markers[out_idx] {
-                OutputMarker::Ref(ref_m) => base(ref_m, s),
-                OutputMarker::Target(_) => {
-                    let n_alleles = n_alleles_per_marker[out_idx].max(1);
-                    if n_alleles == 2 {
-                        (
-                            AllelePosteriors::Biallelic(0.0),
-                            AllelePosteriors::Biallelic(0.0),
-                        )
-                    } else {
-                        let zeros = vec![0.0f32; n_alleles];
-                        (
-                            AllelePosteriors::Multiallelic(zeros.clone()),
-                            AllelePosteriors::Multiallelic(zeros),
-                        )
-                    }
-                }
-            }
-        });
-
-        let genotype_index = |a: usize, b: usize| -> usize {
-            let (i, j) = if a <= b { (a, b) } else { (b, a) };
-            j * (j + 1) / 2 + i
-        };
-
-        let get_genotype_posteriors_merged =
-            if include_gp && !correct_errors {
-                let output_markers = output_markers.clone();
-                let n_alleles_per_marker = n_alleles_per_marker.clone();
-                Some(move |out_idx: usize, s: usize| {
-                    match output_markers[out_idx] {
-                        OutputMarker::Ref(ref_m) => get_genotype_posteriors(ref_m, s),
-                        OutputMarker::Target(t_idx) => {
-                            let n_alleles = n_alleles_per_marker[out_idx].max(1);
-                            let n_genotypes = n_alleles * (n_alleles + 1) / 2;
-                            let mut gp = vec![0.0f32; n_genotypes];
-                            if let Some((a1, a2)) = get_target_alleles(t_idx, s) {
-                                let idx = genotype_index(a1 as usize, a2 as usize);
-                                if idx < gp.len() {
-                                    gp[idx] = 1.0;
-                                }
-                            }
-                            Some(gp)
-                        }
-                    }
-                })
-            } else {
-                None
-            };
-
         writer.write_imputed_streaming(
-            &out_markers,
-            get_dosage_merged,
-            get_best_gt_merged,
-            get_posteriors_merged,
-            get_genotype_posteriors_merged,
-            &merged_quality,
-            0,
-            out_markers.len(),
+            ref_markers,
+            get_dosage,
+            get_best_gt,
+            get_posteriors_for_writer,
+            get_genotype_posteriors_for_writer,
+            quality,
+            output_start,
+            output_end,
             include_gp,
             include_ap,
             self.telemetry.as_ref(),

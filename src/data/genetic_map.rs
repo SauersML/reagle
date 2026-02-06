@@ -269,41 +269,6 @@ impl MarkerMap {
         Self { gen_pos }
     }
 
-    /// Create using default position-based map (1 cM per Mb) with a minimum
-    /// genetic distance between adjacent markers.
-    ///
-    /// This mirrors Beagle's clustering behavior when no external map is provided:
-    /// even with a linear map, enforce a minimum cM per step so recombination
-    /// probabilities do not collapse in dense regions.
-    pub fn from_positions_with_min_dist<Space>(
-        markers: &Markers<Space>,
-        min_gen_dist: f64,
-    ) -> Self {
-        let n = markers.len();
-        if n == 0 {
-            return Self {
-                gen_pos: Vec::new(),
-            };
-        }
-
-        let pos_map = PositionMap::new();
-        let mut gen_pos = Vec::with_capacity(n);
-
-        let mut last_map_pos =
-            pos_map.gen_pos(markers.get(MarkerIdx::new(0)).map(|m| m.pos).unwrap_or(0));
-        gen_pos.push(last_map_pos);
-
-        for i in 1..n {
-            let pos = markers.get(MarkerIdx::from(i)).map(|m| m.pos).unwrap_or(0);
-            let map_pos = pos_map.gen_pos(pos);
-            let dist = (map_pos - last_map_pos).max(min_gen_dist);
-            gen_pos.push(gen_pos[i - 1] + dist);
-            last_map_pos = map_pos;
-        }
-
-        Self { gen_pos }
-    }
-
     /// Mean single-base genetic distance
     ///
     /// From Java `MarkerMap.meanSingleBaseGenDist`
