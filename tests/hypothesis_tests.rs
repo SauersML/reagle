@@ -114,6 +114,38 @@ fn run_rust_imputation(
     pipeline.run()
 }
 
+/// Run Rust imputation pipeline with explicit window settings and error rate via a local TOML.
+fn run_rust_imputation_with_window_err_toml(
+    work_dir: &Path,
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window: f32,
+    overlap: f32,
+    window_markers: usize,
+    err: f32,
+) -> reagle::Result<()> {
+    let toml = format!(
+        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\nerr = {err}\n"
+    );
+    std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
+    let config = Config::parse_from([
+        "reagle",
+        "--target",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
 /// Run Rust imputation pipeline with explicit window settings via a local TOML.
 fn run_rust_imputation_with_window_toml(
     work_dir: &Path,
@@ -1316,7 +1348,7 @@ fn test_low_confidence_vs_missing_emissions_equivalence() {
     write_vcf(&target_uniform, &content);
 
     let out_missing = work_dir.path().join("out_missing");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_missing,
         &ref_vcf,
@@ -1329,7 +1361,7 @@ run_rust_imputation_with_window_toml(
     .expect("Rust imputation failed (missing)");
 
     let out_uniform = work_dir.path().join("out_uniform");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_uniform,
         &ref_vcf,
@@ -1598,7 +1630,7 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
     });
 
     let out_prefix = work_dir.path().join("out");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_err_toml(
         work_dir.path(),
         &target_vcf,
         &ref_vcf,
@@ -1607,6 +1639,7 @@ run_rust_imputation_with_window_toml(
         1.1,
         1.0,
         2500,
+        0.0001,
     )
     .expect("Rust imputation failed");
 
@@ -1625,7 +1658,7 @@ run_rust_imputation_with_window_toml(
     let params = reagle::model::parameters::ModelParams::for_phasing(
         ref_samples.len() * 2,
         Config::default().ne,
-        Config::default().err,
+        Some(0.0001),
     );
     let recomb_intensity = params
         .recomb_intensity
