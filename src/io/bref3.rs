@@ -1102,11 +1102,17 @@ impl StreamingRefVcfReader {
                 if !detect_bgzf(&mut file)? {
                     anyhow::bail!("Expected BGZF file for extension .{}", ext);
                 }
-                Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)))
+                Box::new(BufReader::with_capacity(
+                    128 * 1024,
+                    bgzf_io::Reader::new(file),
+                ))
             }
             "gz" => {
                 if detect_bgzf(&mut file)? {
-                    Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)))
+                    Box::new(BufReader::with_capacity(
+                        128 * 1024,
+                        bgzf_io::Reader::new(file),
+                    ))
                 } else {
                     Box::new(BufReader::with_capacity(128 * 1024, GzDecoder::new(file)))
                 }
@@ -1379,8 +1385,7 @@ impl StreamingRefVcfReader {
         let alt_field = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("VCF line missing ALT"))?;
-        let alt_alleles: Vec<Allele> =
-            alt_field.split(',').map(|a| Allele::from_str(a)).collect();
+        let alt_alleles: Vec<Allele> = alt_field.split(',').map(|a| Allele::from_str(a)).collect();
 
         for _ in 0..3 {
             fields
@@ -1406,9 +1411,7 @@ impl StreamingRefVcfReader {
             .ok_or_else(|| anyhow::anyhow!("No GT field in FORMAT"))?;
 
         for (idx, sample_field) in fields.take(n_samples).enumerate() {
-            let gt_field = self
-                .field_at_colon(sample_field, gt_idx)
-                .unwrap_or("./.");
+            let gt_field = self.field_at_colon(sample_field, gt_idx).unwrap_or("./.");
             let (a1, a2) = self.parse_gt_local(gt_field);
             alleles.push(a1);
             alleles.push(a2);

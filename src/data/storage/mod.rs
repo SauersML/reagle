@@ -180,7 +180,6 @@ impl GenotypeColumn {
             ))
         }
     }
-
 }
 
 impl Default for GenotypeColumn {

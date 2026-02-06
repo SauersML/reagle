@@ -4,8 +4,8 @@
 //! and stores packed reference columns for fast mask construction.
 
 use crate::data::alignment::MarkerAlignment;
-use crate::data::marker::AnyMarkerSpace;
 use crate::data::marker::AlleleMapping;
+use crate::data::marker::AnyMarkerSpace;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 use crate::io::prescan_cache::PackedRefColumn;
@@ -29,11 +29,7 @@ impl<RefSpace> PackedRefView<RefSpace> {
     fn map_targ_to_ref(&self, marker: usize, targ_allele: u8) -> Option<u8> {
         let mapping = self.allele_maps.get(marker)?.as_ref()?;
         let idx = *mapping.targ_to_ref.get(targ_allele as usize)?;
-        if idx < 0 {
-            None
-        } else {
-            Some(idx as u8)
-        }
+        if idx < 0 { None } else { Some(idx as u8) }
     }
 
     /// Check whether a target allele can be mapped at this marker.
@@ -49,7 +45,6 @@ impl<RefSpace> PackedRefView<RefSpace> {
         mapping.reverse_map_allele(ref_allele)
     }
 
-
     /// Get the reference allele (mapped to target allele space) for a given hap at marker.
     pub fn ref_allele_targ(&self, marker: usize, hap: usize) -> Option<u8> {
         let col = self.columns.get(marker).and_then(|v| v.as_ref())?;
@@ -59,7 +54,6 @@ impl<RefSpace> PackedRefView<RefSpace> {
         }
         self.map_ref_to_targ(marker, ref_al)
     }
-
 }
 
 impl<RefSpace: Send + Sync> PackedRefView<RefSpace> {

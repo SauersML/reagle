@@ -303,17 +303,11 @@ fn test_clean_constructed_reference_consistency() {
 
     // T0 should stay near 0 across all markers, including after Ref2 switches to 1s.
     for (m, ds) in ds_t0.iter().copied().enumerate() {
-        assert!(
-            ds < 0.05,
-            "T0 expected DS ~0.0 at marker {m}, got {ds}"
-        );
+        assert!(ds < 0.05, "T0 expected DS ~0.0 at marker {m}, got {ds}");
     }
 
     // T1 should stay near 2 across all markers.
     for (m, ds) in ds_t1.iter().copied().enumerate() {
-        assert!(
-            ds > 1.95,
-            "T1 expected DS ~2.0 at marker {m}, got {ds}"
-        );
+        assert!(ds > 1.95, "T1 expected DS ~2.0 at marker {m}, got {ds}");
     }
 }

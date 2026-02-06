@@ -138,7 +138,6 @@ impl<Space> ThreadedHaps<Space> {
             out[state_idx] = self.segments_hap[cur];
         }
     }
-
 }
 
 // ============================================================================
@@ -313,8 +312,7 @@ impl AlleleScratch {
         cursor: &MosaicCursor<Space>,
         marker: usize,
         mut allele_of: F,
-    )
-    where
+    ) where
         F: FnMut(usize, HapId<Space>) -> u8,
     {
         let active = cursor.active_haps();

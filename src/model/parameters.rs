@@ -32,7 +32,6 @@ pub struct ModelParams {
 
     /// Initial likelihood ratio threshold
     pub initial_lr: f32,
-
 }
 
 impl ModelParams {
@@ -89,7 +88,6 @@ impl ModelParams {
             initial_lr: Self::DEFAULT_INITIAL_LR,
         }
     }
-
 
     /// Li-Stephens approximation for allele mismatch probability
     ///
@@ -172,7 +170,6 @@ impl ModelParams {
     pub fn set_n_states(&mut self, n_states: usize) {
         self.n_states = n_states;
     }
-
 }
 
 impl Default for ModelParams {
@@ -396,6 +393,10 @@ mod tests {
         e.add_switch(1.0, 1.0);
 
         let intensity = e.recomb_intensity().unwrap();
-        assert!((intensity - 100.0).abs() < 0.001, "Expected 100.0, got {}", intensity);
+        assert!(
+            (intensity - 100.0).abs() < 0.001,
+            "Expected 100.0, got {}",
+            intensity
+        );
     }
 }

@@ -269,6 +269,37 @@ impl MarkerMap {
         Self { gen_pos }
     }
 
+    /// Create using default position-based map (1 cM per Mb) with a minimum
+    /// genetic distance between adjacent markers.
+    pub fn from_positions_with_min_dist<Space>(
+        markers: &Markers<Space>,
+        min_gen_dist: f64,
+    ) -> Self {
+        let n = markers.len();
+        if n == 0 {
+            return Self {
+                gen_pos: Vec::new(),
+            };
+        }
+
+        let pos_map = PositionMap::new();
+        let mut gen_pos = Vec::with_capacity(n);
+
+        let mut last_map_pos =
+            pos_map.gen_pos(markers.get(MarkerIdx::new(0)).map(|m| m.pos).unwrap_or(0));
+        gen_pos.push(last_map_pos);
+
+        for i in 1..n {
+            let pos = markers.get(MarkerIdx::from(i)).map(|m| m.pos).unwrap_or(0);
+            let map_pos = pos_map.gen_pos(pos);
+            let dist = (map_pos - last_map_pos).max(min_gen_dist);
+            gen_pos.push(gen_pos[i - 1] + dist);
+            last_map_pos = map_pos;
+        }
+
+        Self { gen_pos }
+    }
+
     /// Mean single-base genetic distance
     ///
     /// From Java `MarkerMap.meanSingleBaseGenDist`
@@ -394,8 +425,8 @@ mod tests {
     #[test]
     fn test_interpolation() {
         let map_file = create_test_map_file();
-        let map = GeneticMap::from_plink_file(map_file.path(), "chr1")
-            .expect("Failed to load PLINK map");
+        let map =
+            GeneticMap::from_plink_file(map_file.path(), "chr1").expect("Failed to load PLINK map");
 
         // Exact positions (1Mb=0.0, 2Mb=1.0, 3Mb=2.5)
         assert!((map.gen_pos(1_000_000) - 0.0).abs() < 0.001);
@@ -410,8 +441,8 @@ mod tests {
     #[test]
     fn test_extrapolation() {
         let map_file = create_test_map_file();
-        let map = GeneticMap::from_plink_file(map_file.path(), "chr1")
-            .expect("Failed to load PLINK map");
+        let map =
+            GeneticMap::from_plink_file(map_file.path(), "chr1").expect("Failed to load PLINK map");
 
         // Before first position (should extrapolate)
         let before = map.gen_pos(500_000);
@@ -441,8 +472,8 @@ mod tests {
     #[test]
     fn test_gen_dist() {
         let map_file = create_test_map_file();
-        let map = GeneticMap::from_plink_file(map_file.path(), "chr1")
-            .expect("Failed to load PLINK map");
+        let map =
+            GeneticMap::from_plink_file(map_file.path(), "chr1").expect("Failed to load PLINK map");
 
         // Distance from 1Mb (0.0 cM) to 2Mb (1.0 cM) = 1.0 cM
         assert!((map.gen_dist(1_000_000, 2_000_000) - 1.0).abs() < 0.001);

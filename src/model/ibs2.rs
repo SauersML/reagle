@@ -358,7 +358,6 @@ impl Ibs2 {
             .collect()
     }
 
-
     /// Check if two samples are IBS2 at a marker position.
     ///
     /// IBS2 means the samples share BOTH haplotypes (identical diploid genotype).
@@ -543,7 +542,6 @@ impl PackedGenotypes {
     }
 }
 
-
 /// Identifies informative markers and partitions them into steps for IBS2 detection.
 ///
 /// Not all markers are useful for IBS2 detection:
@@ -718,7 +716,8 @@ impl Ibs2Sets {
                             step_results[s_idx] = Some(Arc::clone(&arc_samples));
                         } else {
                             // Clone the inner Vec from the existing Arc
-                            let mut merged: Vec<u32> = (**step_results[s_idx].as_ref().unwrap()).clone();
+                            let mut merged: Vec<u32> =
+                                (**step_results[s_idx].as_ref().unwrap()).clone();
                             merged.extend(arc_samples.iter().copied());
                             merged.sort_unstable();
                             merged.dedup();

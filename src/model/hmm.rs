@@ -15,6 +15,7 @@ use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
 use crate::model::parameters::ModelParams;
 use aligned_vec::{AVec, ConstAlign};
+use std::sync::OnceLock;
 use wide::f32x8;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -27,6 +28,108 @@ const PREFETCH_DISTANCE: usize = 16;
 pub struct HmmUpdater;
 
 impl HmmUpdater {
+    const LOG8_LEVELS: f32 = 255.0;
+    const LOG8_RANGE_NATS: f32 = 24.0;
+    const LOG8_EPS: f32 = 1e-30;
+    const LOG8_SWITCH_STATES: usize = 1024;
+    const LOG8_RANGE_LOG2: f32 = Self::LOG8_RANGE_NATS / std::f32::consts::LN_2;
+    const LOG8_STEP_LOG2: f32 = Self::LOG8_RANGE_LOG2 / Self::LOG8_LEVELS;
+    const LOG8_INV_STEP_LOG2: f32 = 1.0 / Self::LOG8_STEP_LOG2;
+
+    #[inline]
+    fn log8_decode_lut() -> &'static [f32; 256] {
+        static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+        LUT.get_or_init(|| {
+            let mut arr = [0.0f32; 256];
+            for (q, v) in arr.iter_mut().enumerate() {
+                *v = 2f32.powf(-(q as f32) * Self::LOG8_STEP_LOG2);
+            }
+            arr
+        })
+    }
+
+    #[inline]
+    fn log2_mantissa_lut() -> &'static [f32; 256] {
+        static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+        LUT.get_or_init(|| {
+            let mut arr = [0.0f32; 256];
+            for (i, v) in arr.iter_mut().enumerate() {
+                let m = 1.0 + ((i as f32) + 0.5) / 256.0;
+                *v = m.log2();
+            }
+            arr
+        })
+    }
+
+    #[inline]
+    fn fast_log2_approx(x: f32) -> f32 {
+        let bits = x.max(Self::LOG8_EPS).to_bits();
+        let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+        let mant_idx = ((bits >> 15) & 0xFF) as usize;
+        exp as f32 + Self::log2_mantissa_lut()[mant_idx]
+    }
+
+    #[inline]
+    fn quantize_row_log8(values: &mut [f32], n_states: usize) -> f32 {
+        let mut max_val = 0.0f32;
+        for &v in values.iter().take(n_states) {
+            if v > max_val {
+                max_val = v;
+            }
+        }
+        if max_val <= Self::LOG8_EPS {
+            let floor = Self::LOG8_EPS;
+            for x in values.iter_mut().take(n_states) {
+                *x = floor;
+            }
+            return floor * n_states as f32;
+        }
+
+        let max_log2 = Self::fast_log2_approx(max_val);
+        let decode = Self::log8_decode_lut();
+        let mut sum = 0.0f32;
+        for x in values.iter_mut().take(n_states) {
+            let log2_x = Self::fast_log2_approx(*x);
+            let qf = ((max_log2 - log2_x) * Self::LOG8_INV_STEP_LOG2)
+                .round()
+                .clamp(0.0, Self::LOG8_LEVELS);
+            let q = qf as usize;
+            let recon = max_val * decode[q];
+            *x = recon;
+            sum += recon;
+        }
+        sum.max(Self::LOG8_EPS)
+    }
+
+    #[inline]
+    fn fwd_update_emissions_scale_log8(
+        fwd: &mut [f32],
+        scale: f32,
+        shift: f32,
+        emissions: &[f32],
+        n_states: usize,
+    ) -> f32 {
+        for i in 0..n_states {
+            let v = emissions[i] * scale.mul_add(fwd[i], shift);
+            fwd[i] = v;
+        }
+        Self::quantize_row_log8(fwd, n_states)
+    }
+
+    #[inline]
+    fn bwd_update_constant_scale_log8(
+        bwd: &mut [f32],
+        scale: f32,
+        shift: f32,
+        emissions: &[f32],
+        n_states: usize,
+    ) {
+        for i in 0..n_states {
+            bwd[i] = scale * emissions[i] * bwd[i] + shift;
+        }
+        let _ = Self::quantize_row_log8(bwd, n_states);
+    }
+
     /// Forward update specialized for homozygous markers: compute emissions on the fly
     /// from `ref_alleles` vs `req`, then apply transition + emission in one pass.
     #[inline]
@@ -40,6 +143,18 @@ impl HmmUpdater {
         p_mismatch: f32,
         n_states: usize,
     ) -> f32 {
+        if n_states >= Self::LOG8_SWITCH_STATES {
+            for i in 0..n_states {
+                let em = if ref_alleles[i] == req {
+                    p_match
+                } else {
+                    p_mismatch
+                };
+                fwd[i] = em * scale.mul_add(fwd[i], shift);
+            }
+            return Self::quantize_row_log8(fwd, n_states);
+        }
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if n_states >= 64
@@ -100,7 +215,11 @@ impl HmmUpdater {
                     let mut new_sum: f32 = sum_arr.iter().sum();
                     for i in k..n_states {
                         let f = *fwd_ptr.add(i);
-                        let em = if *ref_ptr.add(i) == req { p_match } else { p_mismatch };
+                        let em = if *ref_ptr.add(i) == req {
+                            p_match
+                        } else {
+                            p_mismatch
+                        };
                         let t = scale.mul_add(f, shift);
                         let v = em * t;
                         *fwd_ptr.add(i) = v;
@@ -114,7 +233,11 @@ impl HmmUpdater {
         let mut new_sum = 0.0f32;
         for i in 0..n_states {
             let f = fwd[i];
-            let em = if ref_alleles[i] == req { p_match } else { p_mismatch };
+            let em = if ref_alleles[i] == req {
+                p_match
+            } else {
+                p_mismatch
+            };
             let t = scale.mul_add(f, shift);
             let v = em * t;
             fwd[i] = v;
@@ -132,6 +255,10 @@ impl HmmUpdater {
         emissions: &[f32],
         n_states: usize,
     ) -> f32 {
+        if n_states >= Self::LOG8_SWITCH_STATES {
+            return Self::fwd_update_emissions_scale_log8(fwd, scale, shift, emissions, n_states);
+        }
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if n_states >= 16 && is_x86_feature_detected!("avx512f") {
@@ -219,6 +346,26 @@ impl HmmUpdater {
         mismatches: &[u8],
         n_states: usize,
     ) {
+        if n_states >= Self::LOG8_SWITCH_STATES {
+            let p0 = emit_probs[0];
+            let p1 = emit_probs[1];
+            let diff = p1 - p0;
+
+            let mut sum = 0.0f32;
+            for i in 0..n_states {
+                let em = p0 + (mismatches[i] as f32) * diff;
+                bwd[i] *= em;
+                sum += bwd[i];
+            }
+            let shift = p_switch / n_states as f32;
+            let scale = (1.0 - p_switch) / sum.max(Self::LOG8_EPS);
+            for x in bwd.iter_mut().take(n_states) {
+                *x = scale * *x + shift;
+            }
+            let _ = Self::quantize_row_log8(bwd, n_states);
+            return;
+        }
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if n_states >= 16
@@ -233,7 +380,9 @@ impl HmmUpdater {
                     }
                 }
                 unsafe {
-                    return Self::bwd_update_avx512(bwd, p_switch, emit_probs, mismatches, n_states);
+                    return Self::bwd_update_avx512(
+                        bwd, p_switch, emit_probs, mismatches, n_states,
+                    );
                 }
             }
         }
@@ -313,6 +462,11 @@ impl HmmUpdater {
         emissions: &[f32],
         n_states: usize,
     ) {
+        if n_states >= Self::LOG8_SWITCH_STATES {
+            Self::bwd_update_constant_scale_log8(bwd, scale, shift, emissions, n_states);
+            return;
+        }
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if n_states >= 16 && is_x86_feature_detected!("avx512f") {
@@ -492,7 +646,6 @@ impl HmmUpdater {
             }
         }
     }
-
 }
 
 // ============================================================================
@@ -503,7 +656,7 @@ use crate::model::pl_emission::{
     PlProvider, allele_probs_cond_from_pl, allele_probs_uncond_from_pl,
 };
 use crate::model::states::{MosaicCursor, StateSwitch, ThreadedHaps};
-use crate::model::types::{HapId, CombinedHapSpace};
+use crate::model::types::{CombinedHapSpace, HapId};
 
 /// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
 ///
@@ -590,8 +743,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             AVec::<f32, ConstAlign<64>>::from_iter(64, std::iter::repeat(0.0f32).take(total_size));
         let mut bwd_aligned =
             AVec::<f32, ConstAlign<64>>::from_iter(64, std::iter::repeat(0.0f32).take(total_size));
-        let mut emissions =
-            AVec::<f32, ConstAlign<64>>::from_iter(64, std::iter::repeat(0.0f32).take(n_states_padded));
+        let mut emissions = AVec::<f32, ConstAlign<64>>::from_iter(
+            64,
+            std::iter::repeat(0.0f32).take(n_states_padded),
+        );
         let mut fwd_sum = 1.0f32;
 
         let mut allele_probs: Vec<f32> = Vec::new();
@@ -660,66 +815,60 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             }
         }
 
-        let fill_conf_emissions_fast =
-            |m: usize, emissions: &mut [f32], ref_alleles: &[u8]| {
-                let req = req_allele[m];
-                if req != 255 {
-                    let p_no_err = p_match[m];
-                    let p_err = p_mismatch[m];
-                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let fill_conf_emissions_fast = |m: usize, emissions: &mut [f32], ref_alleles: &[u8]| {
+            let req = req_allele[m];
+            if req != 255 {
+                let p_no_err = p_match[m];
+                let p_err = p_mismatch[m];
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    if ref_alleles.len() >= 64
+                        && is_x86_feature_detected!("avx512f")
+                        && is_x86_feature_detected!("avx512bw")
                     {
-                        if ref_alleles.len() >= 64
-                            && is_x86_feature_detected!("avx512f")
-                            && is_x86_feature_detected!("avx512bw")
-                        {
-                            unsafe {
-                                let req_vec = _mm512_set1_epi8(req as i8);
-                                let match_vec = _mm512_set1_ps(p_no_err);
-                                let mismatch_vec = _mm512_set1_ps(p_err);
-                                let mut k = 0usize;
-                                let out_ptr = emissions.as_mut_ptr();
-                                let in_ptr = ref_alleles.as_ptr();
-                                while k + 64 <= ref_alleles.len() && k + 64 <= emissions.len() {
-                                    let bytes =
-                                        _mm512_load_si512(in_ptr.add(k) as *const __m512i);
-                                    let mask = _mm512_cmpeq_epi8_mask(bytes, req_vec);
-                                    let mask0 = (mask & 0xFFFF) as u16;
-                                    let mask1 = ((mask >> 16) & 0xFFFF) as u16;
-                                    let mask2 = ((mask >> 32) & 0xFFFF) as u16;
-                                    let mask3 = ((mask >> 48) & 0xFFFF) as u16;
-                                    let res0 =
-                                        _mm512_mask_blend_ps(mask0, mismatch_vec, match_vec);
-                                    let res1 =
-                                        _mm512_mask_blend_ps(mask1, mismatch_vec, match_vec);
-                                    let res2 =
-                                        _mm512_mask_blend_ps(mask2, mismatch_vec, match_vec);
-                                    let res3 =
-                                        _mm512_mask_blend_ps(mask3, mismatch_vec, match_vec);
-                                    _mm512_storeu_ps(out_ptr.add(k), res0);
-                                    _mm512_storeu_ps(out_ptr.add(k + 16), res1);
-                                    _mm512_storeu_ps(out_ptr.add(k + 32), res2);
-                                    _mm512_storeu_ps(out_ptr.add(k + 48), res3);
-                                    k += 64;
-                                }
-                                for i in k..emissions.len() {
-                                    let ra = *ref_alleles.get_unchecked(i);
-                                    *emissions.get_unchecked_mut(i) =
-                                        if ra == req { p_no_err } else { p_err };
-                                }
+                        unsafe {
+                            let req_vec = _mm512_set1_epi8(req as i8);
+                            let match_vec = _mm512_set1_ps(p_no_err);
+                            let mismatch_vec = _mm512_set1_ps(p_err);
+                            let mut k = 0usize;
+                            let out_ptr = emissions.as_mut_ptr();
+                            let in_ptr = ref_alleles.as_ptr();
+                            while k + 64 <= ref_alleles.len() && k + 64 <= emissions.len() {
+                                let bytes = _mm512_load_si512(in_ptr.add(k) as *const __m512i);
+                                let mask = _mm512_cmpeq_epi8_mask(bytes, req_vec);
+                                let mask0 = (mask & 0xFFFF) as u16;
+                                let mask1 = ((mask >> 16) & 0xFFFF) as u16;
+                                let mask2 = ((mask >> 32) & 0xFFFF) as u16;
+                                let mask3 = ((mask >> 48) & 0xFFFF) as u16;
+                                let res0 = _mm512_mask_blend_ps(mask0, mismatch_vec, match_vec);
+                                let res1 = _mm512_mask_blend_ps(mask1, mismatch_vec, match_vec);
+                                let res2 = _mm512_mask_blend_ps(mask2, mismatch_vec, match_vec);
+                                let res3 = _mm512_mask_blend_ps(mask3, mismatch_vec, match_vec);
+                                _mm512_storeu_ps(out_ptr.add(k), res0);
+                                _mm512_storeu_ps(out_ptr.add(k + 16), res1);
+                                _mm512_storeu_ps(out_ptr.add(k + 32), res2);
+                                _mm512_storeu_ps(out_ptr.add(k + 48), res3);
+                                k += 64;
                             }
-                            return;
+                            for i in k..emissions.len() {
+                                let ra = *ref_alleles.get_unchecked(i);
+                                *emissions.get_unchecked_mut(i) =
+                                    if ra == req { p_no_err } else { p_err };
+                            }
                         }
+                        return;
                     }
-                    let mut lut = [0.0f32; 256];
-                    lut.fill(p_err);
-                    lut[req as usize] = p_no_err;
-                    for (k, &ra) in ref_alleles.iter().enumerate() {
-                        emissions[k] = lut[ra as usize];
-                    }
-                } else {
-                    emissions.fill(1.0);
                 }
-            };
+                let mut lut = [0.0f32; 256];
+                lut.fill(p_err);
+                lut[req as usize] = p_no_err;
+                for (k, &ra) in ref_alleles.iter().enumerate() {
+                    emissions[k] = lut[ra as usize];
+                }
+            } else {
+                emissions.fill(1.0);
+            }
+        };
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum MarkerKind {
@@ -784,13 +933,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         }
 
         let try_fill_pattern_emissions =
-            |_: usize,
-             _: u8,
-             _: Option<&[f32]>,
-             _: &mut [f32],
-             _: &[HapId<HapSpace>]| {
-                false
-            };
+            |_: usize, _: u8, _: Option<&[f32]>, _: &mut [f32], _: &[HapId<HapSpace>]| false;
 
         let mut process_marker = |m: usize, kind: MarkerKind| {
             let row_offset = m * n_states_padded;
@@ -808,7 +951,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                         ref_alleles_flat.as_ptr().add(prefetch_ref) as *const i8,
                         _MM_HINT_T0,
                     );
-                    _mm_prefetch(fwd_aligned.as_ptr().add(prefetch_fwd) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(
+                        fwd_aligned.as_ptr().add(prefetch_fwd) as *const i8,
+                        _MM_HINT_T0,
+                    );
                 }
             }
 
@@ -881,9 +1027,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 lut[255] = 1.0;
                                 for a in 0..255usize {
                                     let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
-                                    lut[a] =
-                                        (p_no_err * p_true + p_err_other * (1.0 - p_true))
-                                            .max(1e-30);
+                                    lut[a] = (p_no_err * p_true + p_err_other * (1.0 - p_true))
+                                        .max(1e-30);
                                 }
                                 let used_pattern = try_fill_pattern_emissions(
                                     m,
@@ -969,14 +1114,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let p_no_err = p_match[m];
                 let p_err = p_mismatch[m];
                 fwd_sum = HmmUpdater::fwd_update_homo_emissions_scale(
-                    curr_row,
-                    scale,
-                    shift,
-                    ref_row,
-                    req,
-                    p_no_err,
-                    p_err,
-                    n_states,
+                    curr_row, scale, shift, ref_row, req, p_no_err, p_err, n_states,
                 )
                 .max(1e-30);
             } else {
@@ -1059,79 +1197,94 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                             ref_alleles_flat.as_ptr().add(prefetch_row) as *const i8,
                             _MM_HINT_T0,
                         );
-                        _mm_prefetch(bwd_aligned.as_ptr().add(prefetch_bwd) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(
+                            bwd_aligned.as_ptr().add(prefetch_bwd) as *const i8,
+                            _MM_HINT_T0,
+                        );
                     }
                 }
 
-            match marker_kinds[m_next] {
-                MarkerKind::Missing => {
-                    // Missing data: emission is the identity (all ones), so the backward
-                    // update is purely the transition operator. We keep the exact per-marker
-                    // transition (no aggregation) and skip any allele-based emission work.
-                    emissions_row[..n_states].fill(1.0);
-                }
-                MarkerKind::HomoSimple => {
-                    fill_conf_emissions_fast(m_next, emissions_row, ref_row);
-                }
-                MarkerKind::Generic => {
-                    if let Some(plp) = pl_provider {
-                        let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
-                        let pl = plp.pl(m_next).filter(|v| !v.is_empty());
-                        if let Some(pl) = pl {
-                            let biallelic_freqs = allele_freqs
-                                .and_then(|f| f.get(m_next).copied())
-                                .and_then(|f| {
-                                    if (0.0..=1.0).contains(&f) {
-                                        Some([1.0 - f, f])
-                                    } else {
-                                        None
-                                    }
-                                });
-                            let n = if partner != 255 {
-                                allele_probs_cond_from_pl(
-                                    pl,
-                                    partner,
-                                    biallelic_freqs.as_ref().map(|f| f.as_slice()),
-                                    &mut allele_probs,
-                                )
-                                .or_else(|| {
+                match marker_kinds[m_next] {
+                    MarkerKind::Missing => {
+                        // Missing data: emission is the identity (all ones), so the backward
+                        // update is purely the transition operator. We keep the exact per-marker
+                        // transition (no aggregation) and skip any allele-based emission work.
+                        emissions_row[..n_states].fill(1.0);
+                    }
+                    MarkerKind::HomoSimple => {
+                        fill_conf_emissions_fast(m_next, emissions_row, ref_row);
+                    }
+                    MarkerKind::Generic => {
+                        if let Some(plp) = pl_provider {
+                            let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
+                            let pl = plp.pl(m_next).filter(|v| !v.is_empty());
+                            if let Some(pl) = pl {
+                                let biallelic_freqs = allele_freqs
+                                    .and_then(|f| f.get(m_next).copied())
+                                    .and_then(|f| {
+                                        if (0.0..=1.0).contains(&f) {
+                                            Some([1.0 - f, f])
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                let n = if partner != 255 {
+                                    allele_probs_cond_from_pl(
+                                        pl,
+                                        partner,
+                                        biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                                        &mut allele_probs,
+                                    )
+                                    .or_else(|| {
+                                        allele_probs_uncond_from_pl(
+                                            pl,
+                                            biallelic_freqs.as_ref().map(|f| f.as_slice()),
+                                            &mut allele_probs,
+                                        )
+                                    })
+                                } else {
                                     allele_probs_uncond_from_pl(
                                         pl,
                                         biallelic_freqs.as_ref().map(|f| f.as_slice()),
                                         &mut allele_probs,
                                     )
-                                })
-                            } else {
-                                allele_probs_uncond_from_pl(
-                                    pl,
-                                    biallelic_freqs.as_ref().map(|f| f.as_slice()),
-                                    &mut allele_probs,
-                                )
-                            };
-                            if let Some(n_alleles) = n {
-                                let p_no_err = p_no_err_base;
-                                let p_err_other = if n_alleles > 1 {
-                                    p_err_base / (n_alleles as f32 - 1.0)
-                                } else {
-                                    0.0
                                 };
-                                let mut lut = [0.0f32; 256];
-                                lut[255] = 1.0;
-                                for a in 0..255usize {
-                                    let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
-                                    lut[a] =
-                                        (p_no_err * p_true + p_err_other * (1.0 - p_true)).max(1e-30);
-                                }
-                                let used_pattern = try_fill_pattern_emissions(
-                                    m_next,
-                                    partner,
-                                    Some(&allele_probs),
-                                    emissions_row,
-                                    &state_buf,
-                                );
-                                if !used_pattern {
-                                    for k in 0..n_states {
-                                        emissions_row[k] = lut[ref_row[k] as usize];
+                                if let Some(n_alleles) = n {
+                                    let p_no_err = p_no_err_base;
+                                    let p_err_other = if n_alleles > 1 {
+                                        p_err_base / (n_alleles as f32 - 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let mut lut = [0.0f32; 256];
+                                    lut[255] = 1.0;
+                                    for a in 0..255usize {
+                                        let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
+                                        lut[a] = (p_no_err * p_true + p_err_other * (1.0 - p_true))
+                                            .max(1e-30);
+                                    }
+                                    let used_pattern = try_fill_pattern_emissions(
+                                        m_next,
+                                        partner,
+                                        Some(&allele_probs),
+                                        emissions_row,
+                                        &state_buf,
+                                    );
+                                    if !used_pattern {
+                                        for k in 0..n_states {
+                                            emissions_row[k] = lut[ref_row[k] as usize];
+                                        }
+                                    }
+                                } else {
+                                    let used_pattern = try_fill_pattern_emissions(
+                                        m_next,
+                                        partner,
+                                        None,
+                                        emissions_row,
+                                        &state_buf,
+                                    );
+                                    if !used_pattern {
+                                        fill_conf_emissions_fast(m_next, emissions_row, ref_row);
                                     }
                                 }
                             } else {
@@ -1147,6 +1300,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 }
                             }
                         } else {
+                            let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
                             let used_pattern = try_fill_pattern_emissions(
                                 m_next,
                                 partner,
@@ -1158,56 +1312,48 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 fill_conf_emissions_fast(m_next, emissions_row, ref_row);
                             }
                         }
-                    } else {
-                        let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
-                        let used_pattern =
-                            try_fill_pattern_emissions(m_next, partner, None, emissions_row, &state_buf);
-                        if !used_pattern {
-                            fill_conf_emissions_fast(m_next, emissions_row, ref_row);
-                        }
                     }
                 }
-            }
 
-            let next_row = m_next * n_states_padded;
-            let curr_row = m * n_states_padded;
-            for k in 0..n_states {
-                bwd_aligned[curr_row + k] = bwd_aligned[next_row + k];
-            }
+                let next_row = m_next * n_states_padded;
+                let curr_row = m * n_states_padded;
+                for k in 0..n_states {
+                    bwd_aligned[curr_row + k] = bwd_aligned[next_row + k];
+                }
 
-            // Calculate constant term C = sum_k (bwd[k] * output_prob[k])
-            let mut constant_term = 0.0f32;
-            let current_bwd = &bwd_aligned[curr_row..curr_row + n_states];
-            for k in 0..n_states {
-                constant_term += current_bwd[k] * emissions_row[k];
-            }
+                // Calculate constant term C = sum_k (bwd[k] * output_prob[k])
+                let mut constant_term = 0.0f32;
+                let current_bwd = &bwd_aligned[curr_row..curr_row + n_states];
+                for k in 0..n_states {
+                    constant_term += current_bwd[k] * emissions_row[k];
+                }
 
-            let shift = shift_by_marker[m_next];
-            let one_minus = one_minus_by_marker[m_next];
-            let scale = one_minus / constant_term.max(1e-30);
-            const STATE_BLOCK: usize = 256;
-            if n_states > STATE_BLOCK {
-                let mut start = 0usize;
-                while start < n_states {
-                    let end = (start + STATE_BLOCK).min(n_states);
+                let shift = shift_by_marker[m_next];
+                let one_minus = one_minus_by_marker[m_next];
+                let scale = one_minus / constant_term.max(1e-30);
+                const STATE_BLOCK: usize = 256;
+                if n_states > STATE_BLOCK {
+                    let mut start = 0usize;
+                    while start < n_states {
+                        let end = (start + STATE_BLOCK).min(n_states);
+                        HmmUpdater::bwd_update_constant_scale(
+                            &mut bwd_aligned[curr_row + start..curr_row + end],
+                            scale,
+                            shift,
+                            &emissions_row[start..end],
+                            end - start,
+                        );
+                        start = end;
+                    }
+                } else {
                     HmmUpdater::bwd_update_constant_scale(
-                        &mut bwd_aligned[curr_row + start..curr_row + end],
+                        &mut bwd_aligned[curr_row..curr_row + n_states],
                         scale,
                         shift,
-                        &emissions_row[start..end],
-                        end - start,
+                        emissions_row,
+                        n_states,
                     );
-                    start = end;
                 }
-            } else {
-                HmmUpdater::bwd_update_constant_scale(
-                    &mut bwd_aligned[curr_row..curr_row + n_states],
-                    scale,
-                    shift,
-                    emissions_row,
-                    n_states,
-                );
-            }
             }
             tile_end = tile_start;
         }
@@ -1215,10 +1361,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         for m in 0..n_markers {
             let src = m * n_states_padded;
             let dst = m * n_states;
-            fwd[dst..dst + n_states]
-                .copy_from_slice(&fwd_aligned[src..src + n_states]);
-            bwd[dst..dst + n_states]
-                .copy_from_slice(&bwd_aligned[src..src + n_states]);
+            fwd[dst..dst + n_states].copy_from_slice(&fwd_aligned[src..src + n_states]);
+            bwd[dst..dst + n_states].copy_from_slice(&bwd_aligned[src..src + n_states]);
         }
 
         log_likelihood
@@ -1616,8 +1760,9 @@ mod tests {
             let p_switch = 0.05;
             let shift = p_switch / n_states as f32;
             let scale = (1.0 - p_switch) / initial_sum.max(1e-30);
-            let new_sum =
-                HmmUpdater::fwd_update_emissions_scale(&mut fwd, scale, shift, &emissions, n_states);
+            let new_sum = HmmUpdater::fwd_update_emissions_scale(
+                &mut fwd, scale, shift, &emissions, n_states,
+            );
 
             // All values should be positive
             for (k, &val) in fwd.iter().enumerate() {
@@ -1712,8 +1857,9 @@ mod tests {
             let p_switch = 0.02;
             let shift = p_switch / n_states as f32;
             let scale = (1.0 - p_switch) / initial_sum.max(1e-30);
-            let new_sum =
-                HmmUpdater::fwd_update_emissions_scale(&mut fwd, scale, shift, &emissions, n_states);
+            let new_sum = HmmUpdater::fwd_update_emissions_scale(
+                &mut fwd, scale, shift, &emissions, n_states,
+            );
 
             // Verify basic properties
             assert!(new_sum > 0.0);
@@ -1754,8 +1900,13 @@ mod tests {
         let p_switch = 0.0;
         let shift = 0.0;
         let scale = (1.0 - p_switch) / initial_sum.max(1e-30);
-        let new_sum =
-            HmmUpdater::fwd_update_emissions_scale(&mut fwd_no_recomb, scale, shift, &emissions, n_states);
+        let new_sum = HmmUpdater::fwd_update_emissions_scale(
+            &mut fwd_no_recomb,
+            scale,
+            shift,
+            &emissions,
+            n_states,
+        );
 
         // With no recombination, only states with initial probability should have probability
         // (though emission still affects all)
@@ -1812,6 +1963,44 @@ mod tests {
         for (k, &val) in fwd.iter().enumerate() {
             assert!(val.is_finite(), "fwd[{}] should be finite, got {}", k, val);
         }
+    }
+
+    #[test]
+    fn test_quantized_large_state_forward_path() {
+        // Force large-state path to exercise log8 quantized update.
+        let n_states = 2048;
+        let mut fwd = vec![1.0f32 / n_states as f32; n_states];
+        let emit_probs = [0.995f32, 0.005];
+        let mismatches: Vec<u8> = (0..n_states).map(|k| ((k * 7) % 5 == 0) as u8).collect();
+        let emissions: Vec<f32> = mismatches.iter().map(|&m| emit_probs[m as usize]).collect();
+        let p_switch = 0.02f32;
+        let shift = p_switch / n_states as f32;
+        let scale = (1.0 - p_switch) / 1.0f32;
+
+        let sum = HmmUpdater::fwd_update_emissions_scale(&mut fwd, scale, shift, &emissions, n_states);
+
+        assert!(sum.is_finite() && sum > 0.0, "quantized forward sum must be finite and positive");
+        let actual: f32 = fwd.iter().sum();
+        let rel = (sum - actual).abs() / actual.max(1e-12);
+        assert!(rel < 1e-4, "returned sum should match actual sum, rel={}", rel);
+        assert!(fwd.iter().all(|v| v.is_finite() && *v >= 0.0), "all forward entries must be finite/non-negative");
+    }
+
+    #[test]
+    fn test_quantized_large_state_backward_path() {
+        // Force large-state path to exercise log8 quantized backward update.
+        let n_states = 2048;
+        let mut bwd = vec![1.0f32 / n_states as f32; n_states];
+        let emit_probs = [0.995f32, 0.005];
+        let mismatches: Vec<u8> = (0..n_states).map(|k| ((k * 11) % 6 == 0) as u8).collect();
+
+        HmmUpdater::bwd_update(&mut bwd, 0.03, &emit_probs, &mismatches, n_states);
+
+        let sum: f32 = bwd.iter().sum();
+        assert!(sum.is_finite() && sum > 0.0, "quantized backward sum must be finite and positive");
+        // Normalized update should remain near one despite quantization.
+        assert!((sum - 1.0).abs() < 0.05, "quantized backward sum should stay near 1, got {}", sum);
+        assert!(bwd.iter().all(|v| v.is_finite() && *v >= 0.0), "all backward entries must be finite/non-negative");
     }
 
     #[test]

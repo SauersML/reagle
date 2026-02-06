@@ -108,7 +108,7 @@ fn continuity_terms(
     boundary_cm: &[f64],
     params: &ModelParams,
     n_pool: usize,
-)-> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut t11 = Vec::with_capacity(boundary_cm.len());
     let mut t10 = Vec::with_capacity(boundary_cm.len());
     let mut t01 = Vec::with_capacity(boundary_cm.len());
@@ -120,9 +120,21 @@ fn continuity_terms(
         let p10 = (1.0 - a_w) * (n_pool_f - 1.0) / n_pool_f;
         let p01 = (1.0 - a_w) / n_pool_f;
         let p00 = 1.0 - p01;
-        let t11_v = if p11 > 0.0 && p00 > 0.0 { (p11 / p00).ln() } else { NEG_INF };
-        let t10_v = if p10 > 0.0 && p00 > 0.0 { (p10 / p00).ln() } else { NEG_INF };
-        let t01_v = if p01 > 0.0 && p00 > 0.0 { (p01 / p00).ln() } else { NEG_INF };
+        let t11_v = if p11 > 0.0 && p00 > 0.0 {
+            (p11 / p00).ln()
+        } else {
+            NEG_INF
+        };
+        let t10_v = if p10 > 0.0 && p00 > 0.0 {
+            (p10 / p00).ln()
+        } else {
+            NEG_INF
+        };
+        let t01_v = if p01 > 0.0 && p00 > 0.0 {
+            (p01 / p00).ln()
+        } else {
+            NEG_INF
+        };
         t11.push(t11_v);
         t10.push(t10_v);
         t01.push(t01_v);
@@ -307,30 +319,16 @@ pub fn allocate_lms_sparse(
 
     // Ensure bounds bracket a feasible range.
     for _ in 0..5 {
-        let (used, _) = simulate_allocation(
-            scores_by_hap,
-            w,
-            &t11,
-            &t10,
-            &t01,
-            mu_low,
-            per_window_caps,
-        );
+        let (used, _) =
+            simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu_low, per_window_caps);
         if used >= total_budget {
             break;
         }
         mu_low -= 5.0;
     }
     for _ in 0..5 {
-        let (used, _) = simulate_allocation(
-            scores_by_hap,
-            w,
-            &t11,
-            &t10,
-            &t01,
-            mu_high,
-            per_window_caps,
-        );
+        let (used, _) =
+            simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu_high, per_window_caps);
         if used <= total_budget {
             break;
         }
@@ -344,17 +342,9 @@ pub fn allocate_lms_sparse(
     for k in 0..17 {
         let t = k as f32 / 16.0;
         let mu = mu_low + t * (mu_high - mu_low);
-        let (used, gain) = simulate_allocation(
-            scores_by_hap,
-            w,
-            &t11,
-            &t10,
-            &t01,
-            mu,
-            per_window_caps,
-        );
-        if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used))
-        {
+        let (used, gain) =
+            simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
+        if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used)) {
             mu_best = mu;
             best_used = used;
             best_gain = gain;
@@ -402,8 +392,7 @@ pub fn allocate_lms_sparse(
             .collect();
         for h in 0..n {
             let scores = &scores_by_hap[h];
-            let (gain, active) =
-                dp_intervals_sparse(scores, &z_w, mu, &blocked, &t11, &t10, &t01);
+            let (gain, active) = dp_intervals_sparse(scores, &z_w, mu, &blocked, &t11, &t10, &t01);
             let len = active.iter().filter(|v| **v).count();
             if gain > 0.0 && len > 0 && len <= remaining {
                 heap.push(HeapEntry {
@@ -426,8 +415,15 @@ pub fn allocate_lms_sparse(
             .enumerate()
             .map(|(w_i, &c)| c >= per_window_caps[w_i])
             .collect();
-        let (gain, active) =
-            dp_intervals_sparse(&scores_by_hap[entry.idx], &z_w, mu, &blocked, &t11, &t10, &t01);
+        let (gain, active) = dp_intervals_sparse(
+            &scores_by_hap[entry.idx],
+            &z_w,
+            mu,
+            &blocked,
+            &t11,
+            &t10,
+            &t01,
+        );
         let len = active.iter().filter(|v| **v).count();
         if gain <= 0.0 || len == 0 || len > remaining {
             continue;
@@ -458,9 +454,7 @@ pub fn allocate_lms_sparse(
         }
     }
 
-    WindowAllocation {
-        intervals_by_hap,
-    }
+    WindowAllocation { intervals_by_hap }
 }
 
 fn simulate_allocation(
@@ -528,7 +522,12 @@ fn simulate_allocation(
             let (gain, active) = dp_intervals_sparse(scores, &z_w, mu, &blocked, t11, t10, t01);
             let len = active.iter().filter(|v| **v).count();
             if gain > 0.0 && len > 0 {
-                heap.push(HeapEntry { gain, idx: h, active, len });
+                heap.push(HeapEntry {
+                    gain,
+                    idx: h,
+                    active,
+                    len,
+                });
             }
         }
     }

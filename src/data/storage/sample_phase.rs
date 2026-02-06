@@ -102,14 +102,7 @@ impl SamplePhase {
             let a1 = hap1_alleles[m];
             let a2 = hap2_alleles[m];
 
-            if is_unphased
-                && a1 != 255
-                && a2 != 255
-                && a1 != a2
-                && a1 > a2
-                && a1 <= 1
-                && a2 <= 1
-            {
+            if is_unphased && a1 != 255 && a2 != 255 && a1 != a2 && a1 > a2 && a1 <= 1 && a2 <= 1 {
                 hap1[m] = a2;
                 hap2[m] = a1;
             }
@@ -239,7 +232,8 @@ impl SamplePhase {
         if current == ClusterStatus::Unphased {
             return;
         }
-        self.status_counts[current as usize] = self.status_counts[current as usize].saturating_sub(1);
+        self.status_counts[current as usize] =
+            self.status_counts[current as usize].saturating_sub(1);
         self.status_counts[ClusterStatus::Unphased as usize] += 1;
         self.status[marker] = ClusterStatus::Unphased;
     }
@@ -282,7 +276,6 @@ impl SamplePhase {
             self.phase_confidence[marker] = 1.0;
         }
     }
-
 }
 
 #[cfg(test)]

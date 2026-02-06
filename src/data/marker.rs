@@ -2,8 +2,8 @@
 //!
 //! Genomic marker (variant site) representation. Replaces `vcf/Marker.java`.
 
-use std::sync::Arc;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 

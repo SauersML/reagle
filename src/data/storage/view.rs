@@ -85,10 +85,10 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                     // Reference haplotype - translate marker index, look up, and map allele to target encoding
                     let ref_hap = hap_idx - n_target_haps;
                     let target_marker = marker.as_usize();
-                    if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(target_marker as u32))
+                    if let Some(ref_m) =
+                        alignment.target_to_ref(MarkerIdx::new(target_marker as u32))
                     {
-                        let ref_allele = reference
-                            .allele(ref_m, HapIdx::new(ref_hap as u32));
+                        let ref_allele = reference.allele(ref_m, HapIdx::new(ref_hap as u32));
                         // Map reference allele back to target encoding (handles strand flips)
                         alignment.reverse_map_allele(target_marker, ref_allele)
                     } else {
@@ -113,8 +113,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                     let ref_hap = hap_idx - n_target_haps;
                     if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(orig_marker as u32))
                     {
-                        let ref_allele = reference
-                            .allele(ref_m, HapIdx::new(ref_hap as u32));
+                        let ref_allele = reference.allele(ref_m, HapIdx::new(ref_hap as u32));
                         // Map reference allele back to target encoding (handles strand flips)
                         alignment.reverse_map_allele(orig_marker, ref_allele)
                     } else {
@@ -152,8 +151,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                         out[i] = target.get(target_marker, haps[i]);
                     } else if let Some(ref_m) = ref_marker {
                         let ref_hap = hap_idx - n_target_haps;
-                        let ref_allele =
-                            reference.allele(ref_m, HapIdx::new(ref_hap as u32));
+                        let ref_allele = reference.allele(ref_m, HapIdx::new(ref_hap as u32));
                         out[i] = alignment.reverse_map_allele(target_marker, ref_allele);
                     } else {
                         out[i] = 255;
@@ -175,8 +173,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                         out[i] = target.get(orig_marker, haps[i]);
                     } else if let Some(ref_m) = ref_marker {
                         let ref_hap = hap_idx - n_target_haps;
-                        let ref_allele =
-                            reference.allele(ref_m, HapIdx::new(ref_hap as u32));
+                        let ref_allele = reference.allele(ref_m, HapIdx::new(ref_hap as u32));
                         out[i] = alignment.reverse_map_allele(orig_marker, ref_allele);
                     } else {
                         out[i] = 255;
@@ -188,18 +185,14 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
 }
 
 /// Conversion from `&GenotypeMatrix` (Unphased) to `GenotypeView`
-impl<'a, Space> From<&'a GenotypeMatrix<phase_state::Unphased, Space>>
-    for GenotypeView<'a, Space>
-{
+impl<'a, Space> From<&'a GenotypeMatrix<phase_state::Unphased, Space>> for GenotypeView<'a, Space> {
     fn from(matrix: &'a GenotypeMatrix<phase_state::Unphased, Space>) -> Self {
         GenotypeView::Matrix(matrix)
     }
 }
 
 /// Conversion from `&GenotypeMatrix<Phased>` to `GenotypeView`
-impl<'a, Space> From<&'a GenotypeMatrix<phase_state::Phased, Space>>
-    for GenotypeView<'a, Space>
-{
+impl<'a, Space> From<&'a GenotypeMatrix<phase_state::Phased, Space>> for GenotypeView<'a, Space> {
     fn from(matrix: &'a GenotypeMatrix<phase_state::Phased, Space>) -> Self {
         GenotypeView::Matrix(matrix.as_unphased_ref())
     }
@@ -219,8 +212,8 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Nucleotide};
-    use crate::data::storage::{GenotypeColumn, MutableGenotypes};
     use crate::data::storage::phase_state::Phased;
+    use crate::data::storage::{GenotypeColumn, MutableGenotypes};
     use std::sync::Arc;
 
     fn make_test_matrix() -> GenotypeMatrix<Phased> {
@@ -274,12 +267,16 @@ mod tests {
     fn test_fill_batch_matches_single() {
         let matrix = make_test_matrix();
         let view = GenotypeView::from(&matrix);
-        let haps = [HapIdx::new(0), HapIdx::new(1), HapIdx::new(2), HapIdx::new(3)];
+        let haps = [
+            HapIdx::new(0),
+            HapIdx::new(1),
+            HapIdx::new(2),
+            HapIdx::new(3),
+        ];
         let mut out = [0u8; 4];
         view.fill_batch(MarkerIdx::new(0), &haps, &mut out);
         for (i, hap) in haps.iter().enumerate() {
             assert_eq!(out[i], view.allele(MarkerIdx::new(0), *hap));
         }
     }
-
 }

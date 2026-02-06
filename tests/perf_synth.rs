@@ -19,13 +19,13 @@ fn write_synth_vcf(
     let mut out = BufWriter::new(std::fs::File::create(path)?);
     writeln!(out, "##fileformat=VCFv4.2")?;
     writeln!(out, "##contig=<ID={}>", chrom)?;
-    writeln!(out, "##FORMAT=<ID=GT,Number=1,Type=String,Description=Genotype>")?;
+    writeln!(
+        out,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=Genotype>"
+    )?;
 
     // Header samples
-    write!(
-        out,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
-    )?;
+    write!(out, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
     for i in 0..n_samples {
         write!(out, "\tS{}", i)?;
     }
@@ -35,8 +35,20 @@ fn write_synth_vcf(
     let mut geno = String::new();
     for i in 0..n_samples {
         let gt = match i % 20 {
-            0 => if phased { "0|1" } else { "0/1" },
-            1 => if phased { "1|0" } else { "1/0" },
+            0 => {
+                if phased {
+                    "0|1"
+                } else {
+                    "0/1"
+                }
+            }
+            1 => {
+                if phased {
+                    "1|0"
+                } else {
+                    "1/0"
+                }
+            }
             2 => "1|1",
             _ => "0|0",
         };
@@ -85,19 +97,22 @@ fn synth_impute_runtime_under_2_min() {
     let n_markers = 1000;
     let downsample_every = 1;
 
-    let bin = std::env::var("REAGLE_BIN").ok().or_else(|| {
-        let debug = std::path::PathBuf::from("target/debug/reagle");
-        if debug.exists() {
-            Some(debug.to_string_lossy().to_string())
-        } else {
-            let release = std::path::PathBuf::from("target/release/reagle");
-            if release.exists() {
-                Some(release.to_string_lossy().to_string())
+    let bin = std::env::var("REAGLE_BIN")
+        .ok()
+        .or_else(|| {
+            let debug = std::path::PathBuf::from("target/debug/reagle");
+            if debug.exists() {
+                Some(debug.to_string_lossy().to_string())
             } else {
-                None
+                let release = std::path::PathBuf::from("target/release/reagle");
+                if release.exists() {
+                    Some(release.to_string_lossy().to_string())
+                } else {
+                    None
+                }
             }
-        }
-    }).expect("reagle binary not found; set REAGLE_BIN or build target/debug/reagle");
+        })
+        .expect("reagle binary not found; set REAGLE_BIN or build target/debug/reagle");
     eprintln!("Using reagle binary: {}", bin);
 
     let tmp = TempDir::new().expect("tempdir");
@@ -107,8 +122,14 @@ fn synth_impute_runtime_under_2_min() {
 
     write_synth_vcf(&ref_vcf, ref_samples, n_markers, true, 1).expect("write ref");
     // Use phased input to skip phasing; focus on imputation runtime.
-    write_synth_vcf(&input_vcf, target_samples, n_markers, true, downsample_every)
-        .expect("write input");
+    write_synth_vcf(
+        &input_vcf,
+        target_samples,
+        n_markers,
+        true,
+        downsample_every,
+    )
+    .expect("write input");
     assert_vcf_fully_phased(&input_vcf);
 
     let mut child = Command::new(bin)

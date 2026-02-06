@@ -38,9 +38,9 @@ fn main() {
 
 /// Initialize tracing subscriber for hierarchical profiling output
 fn init_profiling() {
-    use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::filter::LevelFilter;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("trace"));
 

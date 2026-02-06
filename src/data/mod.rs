@@ -11,12 +11,12 @@
 //!   replace Java's class hierarchy with a single stack-allocated enum.
 
 pub mod alignment;
+pub mod condensed;
 pub mod genetic_map;
 pub mod haplotype;
 pub mod marker;
-pub mod storage;
-pub mod condensed;
 pub mod ref_packed;
+pub mod storage;
 
 // Re-export commonly used types
 pub use haplotype::{HapIdx, SampleIdx};

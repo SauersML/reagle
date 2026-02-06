@@ -1,15 +1,15 @@
 //! Beam search phaser for condensed targets.
 
-use crate::data::condensed::{CondensedTarget, CallSite};
-use crate::data::ref_packed::PackedRefView;
-use crate::data::storage::sample_phase::SamplePhase;
 use crate::data::MarkerIdx;
-use crate::model::parameters::ModelParams;
-use crate::model::reference_pbwt::{ReferencePbwt, RankBeam, PbwtStrictAllele};
 use crate::data::alignment::MarkerAlignment;
+use crate::data::condensed::{CallSite, CondensedTarget};
+use crate::data::marker::AnyMarkerSpace;
+use crate::data::ref_packed::PackedRefView;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
-use crate::data::marker::AnyMarkerSpace;
+use crate::data::storage::sample_phase::SamplePhase;
+use crate::model::parameters::ModelParams;
+use crate::model::reference_pbwt::{PbwtStrictAllele, RankBeam, ReferencePbwt};
 
 #[derive(Clone, Copy, Debug)]
 pub struct BeamConfig {
@@ -267,9 +267,14 @@ pub struct PbwtMeta {
 }
 
 pub trait BeamInjector {
-    fn maybe_inject(&mut self, call_site_idx: usize, hi_idx: usize, marker: MarkerIdx, active_pool: &mut ActivePool);
+    fn maybe_inject(
+        &mut self,
+        call_site_idx: usize,
+        hi_idx: usize,
+        marker: MarkerIdx,
+        active_pool: &mut ActivePool,
+    );
 }
-
 
 /// PBWT-based dynamic injection (per marker).
 pub struct PbwtBeamIndex {
@@ -298,8 +303,10 @@ impl PbwtBeamIndex {
     ) -> Self {
         let n_ref = ref_gt.n_haplotypes();
         let mut pbwt = ReferencePbwt::new(n_ref);
-        let mut donor_meta0: Vec<Option<Vec<PbwtDonorMeta>>> = Vec::with_capacity(hi_freq_to_orig.len());
-        let mut donor_meta1: Vec<Option<Vec<PbwtDonorMeta>>> = Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donor_meta0: Vec<Option<Vec<PbwtDonorMeta>>> =
+            Vec::with_capacity(hi_freq_to_orig.len());
+        let mut donor_meta1: Vec<Option<Vec<PbwtDonorMeta>>> =
+            Vec::with_capacity(hi_freq_to_orig.len());
 
         let mut ref_alleles: Vec<u8> = vec![0u8; n_ref];
         for (hi_idx, &orig_m) in hi_freq_to_orig.iter().enumerate() {
@@ -329,7 +336,10 @@ impl PbwtBeamIndex {
                 ref_alleles[h] = col.get(crate::data::haplotype::HapIdx::new(h as u32));
             }
 
-            let mapping = alignment.allele_mappings.get(orig_m).and_then(|v| v.clone());
+            let mapping = alignment
+                .allele_mappings
+                .get(orig_m)
+                .and_then(|v| v.clone());
             let (qa0, qa1) = if let Some(map) = mapping {
                 let m0 = map.targ_to_ref.get(0).copied().unwrap_or(-1);
                 let m1 = map.targ_to_ref.get(1).copied().unwrap_or(-1);
@@ -382,7 +392,9 @@ impl PbwtBeamIndex {
                 let rho = recomb_intensity.max(1e-12) as f64;
                 let d = (step_morgans.max(1e-12)) as f64;
                 let donor_score = |hap: u32| -> f64 {
-                    let Some((_, pos, start)) = pos_lens.iter().find(|(h, _, _)| *h == hap).copied() else {
+                    let Some((_, pos, start)) =
+                        pos_lens.iter().find(|(h, _, _)| *h == hap).copied()
+                    else {
                         return 0.0;
                     };
                     let start_idx = start.max(0) as usize;
@@ -393,7 +405,11 @@ impl PbwtBeamIndex {
                     let len_morgans = ((gen_pos - start_pos).abs() / 100.0) as f64;
                     let (_, cluster_size) = find_cluster(beam, pos);
                     let k = cluster_size.max(0.0) as f64;
-                    let h_k = if k >= 2.0 { k.ln() + EULER_MASCHERONI } else { 1.0 };
+                    let h_k = if k >= 2.0 {
+                        k.ln() + EULER_MASCHERONI
+                    } else {
+                        1.0
+                    };
                     let l_eff = len_morgans / h_k.max(1.0);
                     let beta = 1.0 + rho * l_eff;
                     let denom = beta + rho * d;
@@ -518,7 +534,13 @@ impl<'a> PbwtInjector<'a> {
 }
 
 impl<'a> BeamInjector for PbwtInjector<'a> {
-    fn maybe_inject(&mut self, call_site_idx: usize, hi_idx: usize, marker: MarkerIdx, active_pool: &mut ActivePool) {
+    fn maybe_inject(
+        &mut self,
+        call_site_idx: usize,
+        hi_idx: usize,
+        marker: MarkerIdx,
+        active_pool: &mut ActivePool,
+    ) {
         let _ = (call_site_idx, marker);
         if hi_idx >= self.index.donor_meta0.len() {
             return;
@@ -532,14 +554,28 @@ impl<'a> BeamInjector for PbwtInjector<'a> {
             for m in list.iter().take(self.k) {
                 let hap = m.hap as usize;
                 active_pool.touch(hap, version);
-                active_pool.set_pbwt_meta(0, hap, m.cluster_id, m.cluster_size, m.match_len_morgans, version);
+                active_pool.set_pbwt_meta(
+                    0,
+                    hap,
+                    m.cluster_id,
+                    m.cluster_size,
+                    m.match_len_morgans,
+                    version,
+                );
             }
         }
         if let Some(list) = self.index.donor_meta1[idx].as_ref() {
             for m in list.iter().take(self.k) {
                 let hap = m.hap as usize;
                 active_pool.touch(hap, version);
-                active_pool.set_pbwt_meta(1, hap, m.cluster_id, m.cluster_size, m.match_len_morgans, version);
+                active_pool.set_pbwt_meta(
+                    1,
+                    hap,
+                    m.cluster_id,
+                    m.cluster_size,
+                    m.match_len_morgans,
+                    version,
+                );
             }
         }
     }
@@ -574,7 +610,11 @@ impl BeamScratch {
 }
 
 impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
-    pub fn new(packed_ref: &'a PackedRefView<RefSpace>, params: &ModelParams, config: BeamConfig) -> Self {
+    pub fn new(
+        packed_ref: &'a PackedRefView<RefSpace>,
+        params: &ModelParams,
+        config: BeamConfig,
+    ) -> Self {
         Self {
             config,
             costs: BeamCosts::from_params(params),
@@ -623,14 +663,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             let call = &condensed.call_sites[i];
 
             // Segment consistency repair.
-            let (mut constrained, mut seg_ptrs) = self.apply_segment_constraints_with_ptrs(
-                &beam,
-                segment,
-                active_pool,
-                &mut scratch,
-            );
+            let (mut constrained, mut seg_ptrs) =
+                self.apply_segment_constraints_with_ptrs(&beam, segment, active_pool, &mut scratch);
             if constrained.is_empty() {
-                constrained = self.init_beam_with_alleles(active_pool, call.marker, call.a1, call.a2);
+                constrained =
+                    self.init_beam_with_alleles(active_pool, call.marker, call.a1, call.a2);
                 if constrained.is_empty() {
                     constrained = self.init_beam(active_pool);
                 }
@@ -668,20 +705,20 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             } else {
                 i32::MAX
             };
-        for (path_idx, path) in beam.iter().enumerate() {
-            self.expand_call_site(
-                path,
-                path_idx as u32,
-                call,
-                active_pool,
-                &mut next,
-                &mut logsum_unswapped,
-                &mut logsum_swapped,
-                i,
-                cutoff,
-                &mut scratch,
-            );
-        }
+            for (path_idx, path) in beam.iter().enumerate() {
+                self.expand_call_site(
+                    path,
+                    path_idx as u32,
+                    call,
+                    active_pool,
+                    &mut next,
+                    &mut logsum_unswapped,
+                    &mut logsum_swapped,
+                    i,
+                    cutoff,
+                    &mut scratch,
+                );
+            }
             self.prune_and_collapse(&mut next);
             let mut step_ptrs: Vec<u16> = Vec::with_capacity(next.len());
             for p in &next {
@@ -747,9 +784,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 let conf = if *phase_swapped { p } else { 1.0 - p };
                 sample_phase.set_phase_confidence(m, conf);
             }
-            return BeamPosteriors { decisions: phases, p_swapped };
+            return BeamPosteriors {
+                decisions: phases,
+                p_swapped,
+            };
         }
-        BeamPosteriors { decisions: Vec::new(), p_swapped: vec![0.5; n_calls] }
+        BeamPosteriors {
+            decisions: Vec::new(),
+            p_swapped: vec![0.5; n_calls],
+        }
     }
 
     fn init_beam(&self, active_pool: &ActivePool) -> Vec<BeamPath> {
@@ -969,7 +1012,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             out.push((hap, hap_penalty));
         }
         // switch to most recently injected candidates first
-        for &h in active_pool.list().iter().rev().take(self.config.switch_candidates) {
+        for &h in active_pool
+            .list()
+            .iter()
+            .rev()
+            .take(self.config.switch_candidates)
+        {
             if hap_constraints_penalty(self.packed_ref, h, constraints).1 {
                 out.push((h, switch_cost));
             }
@@ -1101,8 +1149,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.marker,
             hap1_al,
             hap1_freq,
-            if swapped { call.pbwt_len_morgans_a2 } else { call.pbwt_len_morgans_a1 },
-            if swapped { call.pbwt_density_a2 } else { call.pbwt_density_a1 },
+            if swapped {
+                call.pbwt_len_morgans_a2
+            } else {
+                call.pbwt_len_morgans_a1
+            },
+            if swapped {
+                call.pbwt_density_a2
+            } else {
+                call.pbwt_density_a1
+            },
             call.dist_morgans,
             pbwt_version as u32,
             call.fixed,
@@ -1116,8 +1172,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.marker,
             hap2_al,
             hap2_freq,
-            if swapped { call.pbwt_len_morgans_a1 } else { call.pbwt_len_morgans_a2 },
-            if swapped { call.pbwt_density_a1 } else { call.pbwt_density_a2 },
+            if swapped {
+                call.pbwt_len_morgans_a1
+            } else {
+                call.pbwt_len_morgans_a2
+            },
+            if swapped {
+                call.pbwt_density_a1
+            } else {
+                call.pbwt_density_a2
+            },
             call.dist_morgans,
             pbwt_version as u32,
             call.fixed,
@@ -1143,7 +1207,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 } else {
                     logsum_unswapped[call_idx] = logaddexp(logsum_unswapped[call_idx], logp);
                 }
-                let (history_bits, history_len) = push_history_bits(path.history_bits, path.history_len, swapped);
+                let (history_bits, history_len) =
+                    push_history_bits(path.history_bits, path.history_len, swapped);
                 if score <= cutoff {
                     let c1 = active_pool
                         .pbwt_meta(hap1_al, *h1, pbwt_version as u32)
@@ -1238,12 +1303,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let selection_cost = if same_cluster {
-                        let n_eff_cluster = (cluster_size.round() as usize).max(2).min(n_eff_global);
+                        let n_eff_cluster =
+                            (cluster_size.round() as usize).max(2).min(n_eff_global);
                         self.selection_cost(n_eff_cluster)
                     } else {
                         selection_cost_global
                     };
-                    let effective_switch_cost = pbwt_switch_event_cost.saturating_add(selection_cost);
+                    let effective_switch_cost =
+                        pbwt_switch_event_cost.saturating_add(selection_cost);
                     out.push((h, effective_switch_cost, effective_match_cost));
                     if out.len() >= self.config.switch_candidates {
                         break;
@@ -1267,19 +1334,27 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let selection_cost = if same_cluster {
-                        let n_eff_cluster = (cluster_size.round() as usize).max(2).min(n_eff_global);
+                        let n_eff_cluster =
+                            (cluster_size.round() as usize).max(2).min(n_eff_global);
                         self.selection_cost(n_eff_cluster)
                     } else {
                         selection_cost_global
                     };
-                    let effective_switch_cost = pbwt_switch_event_cost.saturating_add(selection_cost);
+                    let effective_switch_cost =
+                        pbwt_switch_event_cost.saturating_add(selection_cost);
                     out.push((h, effective_switch_cost, effective_match_cost));
                 }
             }
             return;
         }
         // Try switching to matching haps
-        for (idx, &h) in active_pool.list().iter().rev().take(self.config.switch_candidates).enumerate() {
+        for (idx, &h) in active_pool
+            .list()
+            .iter()
+            .rev()
+            .take(self.config.switch_candidates)
+            .enumerate()
+        {
             let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
             let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(255);
             if pooled == targ_allele {
@@ -1309,12 +1384,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let selection_cost = if same_cluster {
-                        let n_eff_cluster = (cluster_size.round() as usize).max(2).min(n_eff_global);
+                        let n_eff_cluster =
+                            (cluster_size.round() as usize).max(2).min(n_eff_global);
                         self.selection_cost(n_eff_cluster)
                     } else {
                         selection_cost_global
                     };
-                    let effective_switch_cost = pbwt_switch_event_cost.saturating_add(selection_cost);
+                    let effective_switch_cost =
+                        pbwt_switch_event_cost.saturating_add(selection_cost);
                     out.push((h, effective_switch_cost, effective_match_cost));
                 }
                 if out.len() >= self.config.switch_candidates {
@@ -1390,7 +1467,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let d = dist_morgans.max(0.0) as f64;
         let rho = self.costs.recomb_intensity;
         let denom = 1.0 + rho * d;
-        let p_no_recomb = if denom > 0.0 { (1.0 / denom).powi(2) } else { 0.0 };
+        let p_no_recomb = if denom > 0.0 {
+            (1.0 / denom).powi(2)
+        } else {
+            0.0
+        };
         let p_switch = (1.0 - p_no_recomb).clamp(1e-12, 1.0 - 1e-12);
         (-(p_switch.ln()) * 1_000_000.0)
             .round()
@@ -1406,25 +1487,21 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn fill_pool_alleles(
-        &self,
-        marker: usize,
-        active_pool: &ActivePool,
-        out: &mut Vec<u8>,
-    ) {
+    fn fill_pool_alleles(&self, marker: usize, active_pool: &ActivePool, out: &mut Vec<u8>) {
         let list = active_pool.list();
         if out.len() < list.len() {
             out.resize(list.len(), 255);
         }
         for (i, &h) in list.iter().enumerate() {
-            out[i] = self
-                .packed_ref
-                .ref_allele_targ(marker, h)
-                .unwrap_or(255);
+            out[i] = self.packed_ref.ref_allele_targ(marker, h).unwrap_or(255);
         }
     }
 
-    fn prune_inplace_with_ptrs(&self, mut beam: Vec<BeamPath>, mut ptrs: Vec<u32>) -> (Vec<BeamPath>, Vec<u32>) {
+    fn prune_inplace_with_ptrs(
+        &self,
+        mut beam: Vec<BeamPath>,
+        mut ptrs: Vec<u32>,
+    ) -> (Vec<BeamPath>, Vec<u32>) {
         self.prune_and_collapse_with_ptrs(&mut beam, &mut ptrs);
         (beam, ptrs)
     }
@@ -1474,7 +1551,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         for i in 1..beam.len() {
             let prev = &beam[write - 1];
             let curr = &beam[i];
-            let same = cluster_key(prev.cluster1, prev.hap1) == cluster_key(curr.cluster1, curr.hap1)
+            let same = cluster_key(prev.cluster1, prev.hap1)
+                == cluster_key(curr.cluster1, curr.hap1)
                 && cluster_key(prev.cluster2, prev.hap2) == cluster_key(curr.cluster2, curr.hap2)
                 && prev.history_bits == curr.history_bits
                 && prev.history_len == curr.history_len
@@ -1539,11 +1617,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 0x8000_0000u32 | (hap as u32 & 0x7FFF_FFFF)
             }
         };
-        let mut zipped: Vec<(BeamPath, u32)> = beam
-            .iter()
-            .cloned()
-            .zip(ptrs.iter().copied())
-            .collect();
+        let mut zipped: Vec<(BeamPath, u32)> =
+            beam.iter().cloned().zip(ptrs.iter().copied()).collect();
         zipped.sort_unstable_by(|(a, _), (b, _)| {
             let a1 = cluster_key(a.cluster1, a.hap1);
             let b1 = cluster_key(b.cluster1, b.hap1);
@@ -1560,7 +1635,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         for i in 1..zipped.len() {
             let (ref prev, _) = zipped[write - 1];
             let (ref curr, _) = zipped[i];
-            let same = cluster_key(prev.cluster1, prev.hap1) == cluster_key(curr.cluster1, curr.hap1)
+            let same = cluster_key(prev.cluster1, prev.hap1)
+                == cluster_key(curr.cluster1, curr.hap1)
                 && cluster_key(prev.cluster2, prev.hap2) == cluster_key(curr.cluster2, curr.hap2)
                 && prev.history_bits == curr.history_bits
                 && prev.history_len == curr.history_len
@@ -1597,8 +1673,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let mut best = i32::MAX;
         let mut worst = i32::MIN;
         for p in beam {
-            if p.score < best { best = p.score; }
-            if p.score > worst { worst = p.score; }
+            if p.score < best {
+                best = p.score;
+            }
+            if p.score > worst {
+                worst = p.score;
+            }
         }
         (worst - best) < self.config.collapse_gap
     }
@@ -1647,7 +1727,11 @@ fn push_history_bits(prev_bits: u64, prev_len: u8, swapped: bool) -> (u64, u8) {
     } else {
         ((prev_bits << 1) | bit) & ((1u64 << HISTORY_BITS) - 1)
     };
-    let len = if prev_len < HISTORY_BITS { prev_len + 1 } else { HISTORY_BITS };
+    let len = if prev_len < HISTORY_BITS {
+        prev_len + 1
+    } else {
+        HISTORY_BITS
+    };
     (bits, len)
 }
 
@@ -1694,7 +1778,10 @@ fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> 
     let mut out = Vec::with_capacity(logsum_swapped.len());
     for i in 0..logsum_swapped.len() {
         let ls = logsum_swapped[i];
-        let lu = logsum_unswapped.get(i).copied().unwrap_or(f64::NEG_INFINITY);
+        let lu = logsum_unswapped
+            .get(i)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
         if ls.is_infinite() && ls.is_sign_negative() {
             if lu.is_infinite() && lu.is_sign_negative() {
                 out.push(0.5);

@@ -42,17 +42,17 @@
 //! absolute best haplotypes matching on both sides, which is crucial for accurate
 //! phasing and imputation.
 
-pub mod hmm;
 pub mod beam;
+pub mod hmm;
 pub mod ibs2;
+pub mod impute_hmm;
 pub mod parameters;
 pub mod pbwt;
 pub mod phase_ibs;
 pub mod pl_emission;
 pub mod reference_pbwt;
-pub mod transition_matrix;
+pub mod state_allocator;
 pub mod states;
+pub mod transition_matrix;
 pub mod types;
 pub mod weighted_kernel;
-pub mod impute_hmm;
-pub mod state_allocator;

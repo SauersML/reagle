@@ -166,7 +166,6 @@ impl TelemetryBlackboard {
         self.touch_progress();
     }
 
-
     pub fn set_current_iteration(&self, iter: u64) {
         self.current_iteration.store(iter, Ordering::Relaxed);
         self.touch_progress();
@@ -268,10 +267,12 @@ impl TelemetryBlackboard {
         // min
         let mut cur = self.dyn_neighbors_min.load(Ordering::Relaxed);
         while n < cur {
-            match self
-                .dyn_neighbors_min
-                .compare_exchange(cur, n, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.dyn_neighbors_min.compare_exchange(
+                cur,
+                n,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(v) => cur = v,
             }
@@ -279,17 +280,18 @@ impl TelemetryBlackboard {
         // max
         let mut cur = self.dyn_neighbors_max.load(Ordering::Relaxed);
         while n > cur {
-            match self
-                .dyn_neighbors_max
-                .compare_exchange(cur, n, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.dyn_neighbors_max.compare_exchange(
+                cur,
+                n,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(v) => cur = v,
             }
         }
         self.touch_progress();
     }
-
 
     #[inline]
     pub fn stage(&self) -> Stage {
@@ -784,8 +786,16 @@ fn heartbeat_loop(bb: Arc<TelemetryBlackboard>, config: HeartbeatConfig, is_tty:
                     snap.stage.as_str(),
                     snap.producer_stage.as_str(),
                     snap.consumer_stage.as_str(),
-                    if snap.producer_op.is_empty() { "?" } else { snap.producer_op.as_str() },
-                    if snap.consumer_op.is_empty() { "?" } else { snap.consumer_op.as_str() },
+                    if snap.producer_op.is_empty() {
+                        "?"
+                    } else {
+                        snap.producer_op.as_str()
+                    },
+                    if snap.consumer_op.is_empty() {
+                        "?"
+                    } else {
+                        snap.consumer_op.as_str()
+                    },
                     snap.current_window,
                     snap.total_windows,
                     snap.current_iteration,
@@ -924,7 +934,10 @@ fn print_tty_progress(
     ) {
         let mut s = String::new();
         if snap.fast_beam_total > 0 {
-            s.push_str(&format!(" FB {}/{}", snap.fast_beam_fixed, snap.fast_beam_total));
+            s.push_str(&format!(
+                " FB {}/{}",
+                snap.fast_beam_fixed, snap.fast_beam_total
+            ));
         }
         if snap.dyn_k > 0 {
             let avg = if snap.dyn_neighbors_count > 0 {
@@ -1010,7 +1023,10 @@ fn print_log_progress(
         let mut phasing_fields = String::new();
         if matches!(
             snap.stage,
-            Stage::PhasingPrescan | Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
+            Stage::PhasingPrescan
+                | Stage::PhasingBurnin
+                | Stage::PhasingMain
+                | Stage::PhasingStage2
         ) {
             if snap.fast_beam_total > 0 {
                 phasing_fields.push_str(&format!(
@@ -1094,7 +1110,10 @@ fn print_log_progress(
         let mut phasing_fields = String::new();
         if matches!(
             snap.stage,
-            Stage::PhasingPrescan | Stage::PhasingBurnin | Stage::PhasingMain | Stage::PhasingStage2
+            Stage::PhasingPrescan
+                | Stage::PhasingBurnin
+                | Stage::PhasingMain
+                | Stage::PhasingStage2
         ) {
             if snap.fast_beam_total > 0 {
                 phasing_fields.push_str(&format!(

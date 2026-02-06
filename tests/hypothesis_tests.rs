@@ -20,12 +20,8 @@ fn write_vcf(path: &Path, content: &str) {
     file.write_all(content.as_bytes()).expect("write vcf");
 }
 
-fn write_synthetic_vcf<F>(
-    path: &Path,
-    n_markers: usize,
-    sample_names: &[&str],
-    gt_at: F,
-) where
+fn write_synthetic_vcf<F>(path: &Path, n_markers: usize, sample_names: &[&str], gt_at: F)
+where
     F: Fn(usize, usize) -> String,
 {
     let mut content = String::new();
@@ -39,10 +35,7 @@ fn write_synthetic_vcf<F>(
     content.push('\n');
     for i in 0..n_markers {
         let pos = (i as u32 + 1) * 1000;
-        content.push_str(&format!(
-            "chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT",
-            pos
-        ));
+        content.push_str(&format!("chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT", pos));
         for s in 0..sample_names.len() {
             content.push('\t');
             content.push_str(&gt_at(i, s));
@@ -78,10 +71,7 @@ fn write_synthetic_vcf_with_padding<F>(
     content.push('\n');
     for i in 0..n_markers {
         let pos = (i as u32 + 1) * 1000;
-        content.push_str(&format!(
-            "chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT",
-            pos
-        ));
+        content.push_str(&format!("chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT", pos));
         for s in 0..sample_names.len() {
             content.push('\t');
             content.push_str(&gt_at(i, s));
@@ -125,9 +115,8 @@ fn run_rust_imputation_with_window_toml(
     overlap: f32,
     window_markers: usize,
 ) -> reagle::Result<()> {
-    let toml = format!(
-        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n"
-    );
+    let toml =
+        format!("window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n");
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
     let config = Config::parse_from([
         "reagle",
@@ -155,9 +144,8 @@ fn run_rust_phasing_with_window_toml(
     overlap: f32,
     window_markers: usize,
 ) -> reagle::Result<()> {
-    let toml = format!(
-        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n"
-    );
+    let toml =
+        format!("window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n");
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
     let config = Config::parse_from([
         "reagle",
@@ -323,40 +311,34 @@ fn parse_vcf(path: &Path) -> Vec<ParsedRecord> {
                 .and_then(|i| sample_fields.get(i))
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            let gp = gp_idx
-                .and_then(|i| sample_fields.get(i))
-                .and_then(|s| {
-                    let parts: Vec<&str> = s.split(',').collect();
-                    if parts.len() == 3 {
-                        Some([
-                            parts[0].parse().ok()?,
-                            parts[1].parse().ok()?,
-                            parts[2].parse().ok()?,
-                        ])
-                    } else {
-                        None
-                    }
-                });
-            let ap1 = ap1_idx
-                .and_then(|i| sample_fields.get(i))
-                .and_then(|s| {
-                    let parts: Vec<&str> = s.split(',').collect();
-                    let mut vals = Vec::with_capacity(parts.len());
-                    for p in parts {
-                        vals.push(p.parse::<f64>().ok()?);
-                    }
-                    Some(vals)
-                });
-            let ap2 = ap2_idx
-                .and_then(|i| sample_fields.get(i))
-                .and_then(|s| {
-                    let parts: Vec<&str> = s.split(',').collect();
-                    let mut vals = Vec::with_capacity(parts.len());
-                    for p in parts {
-                        vals.push(p.parse::<f64>().ok()?);
-                    }
-                    Some(vals)
-                });
+            let gp = gp_idx.and_then(|i| sample_fields.get(i)).and_then(|s| {
+                let parts: Vec<&str> = s.split(',').collect();
+                if parts.len() == 3 {
+                    Some([
+                        parts[0].parse().ok()?,
+                        parts[1].parse().ok()?,
+                        parts[2].parse().ok()?,
+                    ])
+                } else {
+                    None
+                }
+            });
+            let ap1 = ap1_idx.and_then(|i| sample_fields.get(i)).and_then(|s| {
+                let parts: Vec<&str> = s.split(',').collect();
+                let mut vals = Vec::with_capacity(parts.len());
+                for p in parts {
+                    vals.push(p.parse::<f64>().ok()?);
+                }
+                Some(vals)
+            });
+            let ap2 = ap2_idx.and_then(|i| sample_fields.get(i)).and_then(|s| {
+                let parts: Vec<&str> = s.split(',').collect();
+                let mut vals = Vec::with_capacity(parts.len());
+                for p in parts {
+                    vals.push(p.parse::<f64>().ok()?);
+                }
+                Some(vals)
+            });
             genotypes.push(ParsedGenotype { gt, gp, ap1, ap2 });
         }
         records.push(ParsedRecord { pos, genotypes });
@@ -389,8 +371,7 @@ chr1\t100\t.\tG\tA\t.\tPASS\t.\tGT:PL\t0/0:0,50,100
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345)
-        .expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345).expect("Rust imputation failed");
 
     let out_vcf = work_dir.path().join("out.vcf.gz");
     let records = parse_vcf(&out_vcf);
@@ -449,8 +430,7 @@ chr1\t200\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345)
-        .expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345).expect("Rust imputation failed");
 
     let out_vcf = work_dir.path().join("out.vcf.gz");
     let records = parse_vcf(&out_vcf);
@@ -516,13 +496,7 @@ chr1\t300\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_prefix,
-        12345,
-    )
-    .expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345).expect("Rust imputation failed");
 
     let out_vcf = work_dir.path().join("out.vcf.gz");
     let records = parse_vcf(&out_vcf);
@@ -604,13 +578,7 @@ chr1\t400\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_prefix,
-        12345,
-    )
-    .expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345).expect("Rust imputation failed");
 
     let out_vcf = work_dir.path().join("out.vcf.gz");
     let records = parse_vcf(&out_vcf);
@@ -678,8 +646,8 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/0\t0/0\t1/1\t1/1\t1/1
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-    let out_vcf = run_rust_phasing(&target_vcf, &ref_vcf, &out_prefix)
-        .expect("Rust phasing failed");
+    let out_vcf =
+        run_rust_phasing(&target_vcf, &ref_vcf, &out_prefix).expect("Rust phasing failed");
 
     let records = parse_vcf(&out_vcf);
     assert_eq!(records.len(), 3, "Expected three output records");
@@ -738,10 +706,18 @@ fn test_streaming_overlap_should_not_shift_genotyped_markers() {
     let target_samples = ["T1", "T2", "T3", "T4"];
 
     write_synthetic_vcf(&ref_vcf, n_markers, &ref_samples, |i, _| {
-        if i < 1100 { "0|0".to_string() } else { "1|1".to_string() }
+        if i < 1100 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
     });
     write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, _| {
-        if i < 1100 { "0|0".to_string() } else { "1|1".to_string() }
+        if i < 1100 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
     });
 
     let out_prefix = work_dir.path().join("out");
@@ -770,10 +746,7 @@ fn test_streaming_overlap_should_not_shift_genotyped_markers() {
     for idx in check_indices {
         let pos = (idx as u64 + 1) * 1000;
         let gt = pos_to_gt.get(&pos).cloned().unwrap_or_default();
-        println!(
-            "[overlap shift] marker_idx={} pos={} gt={}",
-            idx, pos, gt
-        );
+        println!("[overlap shift] marker_idx={} pos={} gt={}", idx, pos, gt);
         assert_eq!(
             gt, "1|1",
             "Expected boundary-overlap markers to remain 1|1 at idx {}",
@@ -797,7 +770,11 @@ fn test_priors_use_recent_context_across_window_boundary() {
         if i == n_markers {
             return "0|0".to_string();
         }
-        if s == 0 { "0|0".to_string() } else { "1|1".to_string() }
+        if s == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
     });
 
     // Target: early markers 0|0, then a single late 1|1 signal just before boundary,
@@ -1042,7 +1019,11 @@ fn test_phase_states_capacity_not_destabilizing_phasing() {
         } else if s == 1 {
             "1|1".to_string()
         } else {
-            if (i + s) % 2 == 0 { "0|0".to_string() } else { "1|1".to_string() }
+            if (i + s) % 2 == 0 {
+                "0|0".to_string()
+            } else {
+                "1|1".to_string()
+            }
         }
     });
 
@@ -1051,26 +1032,20 @@ fn test_phase_states_capacity_not_destabilizing_phasing() {
         if i == n_markers {
             return "0|0".to_string();
         }
-        if s == 0 { "0/1".to_string() } else { "1/0".to_string() }
+        if s == 0 {
+            "0/1".to_string()
+        } else {
+            "1/0".to_string()
+        }
     });
 
     let out_small = work_dir.path().join("out_small");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_small,
-        12345,
-    )
-    .expect("Rust imputation failed (small phase-states)");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_small, 12345)
+        .expect("Rust imputation failed (small phase-states)");
 
     let out_large = work_dir.path().join("out_large");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_large,
-        12345,
-    )
-    .expect("Rust imputation failed (large phase-states)");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_large, 12345)
+        .expect("Rust imputation failed (large phase-states)");
 
     let records_small = parse_vcf(&work_dir.path().join("out_small.vcf.gz"));
     let records_large = parse_vcf(&work_dir.path().join("out_large.vcf.gz"));
@@ -1131,7 +1106,11 @@ fn test_two_x_neighbors_not_causing_random_phase_flips() {
         } else if s == 1 {
             "1|1".to_string()
         } else {
-            if (i + s) % 2 == 0 { "0|0".to_string() } else { "1|1".to_string() }
+            if (i + s) % 2 == 0 {
+                "0|0".to_string()
+            } else {
+                "1|1".to_string()
+            }
         }
     });
 
@@ -1140,31 +1119,33 @@ fn test_two_x_neighbors_not_causing_random_phase_flips() {
         if i == n_markers {
             return "0|0".to_string();
         }
-        if s == 0 { "0|1".to_string() } else { "1|0".to_string() }
+        if s == 0 {
+            "0|1".to_string()
+        } else {
+            "1|0".to_string()
+        }
     });
 
     let out_low = work_dir.path().join("out_low");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_low,
-        12345,
-    )
-    .expect("Rust imputation failed (low phase-states)");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_low, 12345)
+        .expect("Rust imputation failed (low phase-states)");
 
     let out_high = work_dir.path().join("out_high");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_high,
-        12345,
-    )
-    .expect("Rust imputation failed (high phase-states)");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_high, 12345)
+        .expect("Rust imputation failed (high phase-states)");
 
     let records_low = parse_vcf(&work_dir.path().join("out_low.vcf.gz"));
     let records_high = parse_vcf(&work_dir.path().join("out_high.vcf.gz"));
-    assert_eq!(records_low.len(), n_markers, "Expected full output markers (low)");
-    assert_eq!(records_high.len(), n_markers, "Expected full output markers (high)");
+    assert_eq!(
+        records_low.len(),
+        n_markers,
+        "Expected full output markers (low)"
+    );
+    assert_eq!(
+        records_high.len(),
+        n_markers,
+        "Expected full output markers (high)"
+    );
 
     let mut flip_count = 0usize;
     for (idx, (r_low, r_high)) in records_low.iter().zip(records_high.iter()).enumerate() {
@@ -1208,7 +1189,11 @@ fn test_stage2_overlap_priors_use_start_not_end() {
         if i == n_markers {
             return "0|0".to_string();
         }
-        if s == 0 { "0|0".to_string() } else { "1|1".to_string() }
+        if s == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
     });
 
     // Target: most markers are 0/1 (hi-freq scaffold). Rare markers for T1 at 1099 and 1499.
@@ -1218,9 +1203,17 @@ fn test_stage2_overlap_priors_use_start_not_end() {
             return "0|0".to_string();
         }
         if i == 1099 {
-            if s == 0 { "0/0".to_string() } else { "0/1".to_string() }
+            if s == 0 {
+                "0/0".to_string()
+            } else {
+                "0/1".to_string()
+            }
         } else if i == 1499 {
-            if s == 0 { "1/1".to_string() } else { "0/0".to_string() }
+            if s == 0 {
+                "1/1".to_string()
+            } else {
+                "0/0".to_string()
+            }
         } else if i == 1100 {
             if s == 0 {
                 "./.".to_string()
@@ -1235,7 +1228,7 @@ fn test_stage2_overlap_priors_use_start_not_end() {
     });
 
     let out_prefix = work_dir.path().join("phased");
-run_rust_phasing_with_window_toml(
+    run_rust_phasing_with_window_toml(
         work_dir.path(),
         &target_vcf,
         &out_prefix,
@@ -1286,9 +1279,17 @@ fn test_low_confidence_vs_missing_emissions_equivalence() {
             return "0|0".to_string();
         }
         if s == 0 {
-            if i % 2 == 0 { "0|0".to_string() } else { "1|1".to_string() }
+            if i % 2 == 0 {
+                "0|0".to_string()
+            } else {
+                "1|1".to_string()
+            }
         } else {
-            if i % 2 == 0 { "1|1".to_string() } else { "0|0".to_string() }
+            if i % 2 == 0 {
+                "1|1".to_string()
+            } else {
+                "0|0".to_string()
+            }
         }
     });
 
@@ -1316,7 +1317,7 @@ fn test_low_confidence_vs_missing_emissions_equivalence() {
     write_vcf(&target_uniform, &content);
 
     let out_missing = work_dir.path().join("out_missing");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_missing,
         &ref_vcf,
@@ -1329,7 +1330,7 @@ run_rust_imputation_with_window_toml(
     .expect("Rust imputation failed (missing)");
 
     let out_uniform = work_dir.path().join("out_uniform");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_uniform,
         &ref_vcf,
@@ -1356,7 +1357,11 @@ run_rust_imputation_with_window_toml(
     );
 
     let mut diffs = 0usize;
-    for (idx, (r_m, r_u)) in records_missing.iter().zip(records_uniform.iter()).enumerate() {
+    for (idx, (r_m, r_u)) in records_missing
+        .iter()
+        .zip(records_uniform.iter())
+        .enumerate()
+    {
         let gt_m = &r_m.genotypes[0].gt;
         let gt_u = &r_u.genotypes[0].gt;
         if gt_m != gt_u {
@@ -1395,7 +1400,11 @@ fn test_phasing_should_vary_under_ambiguous_signal_across_seeds() {
         if i == usize::MAX {
             return "0|0".to_string();
         }
-        if s == 0 { "0|0".to_string() } else { "1|1".to_string() }
+        if s == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
     });
     write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, s| {
         if s == usize::MAX {
@@ -1410,12 +1419,10 @@ fn test_phasing_should_vary_under_ambiguous_signal_across_seeds() {
     let out_prefix_a = work_dir.path().join("out_a");
     let out_prefix_b = work_dir.path().join("out_b");
 
-    let out_a =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 12345)
-            .expect("Phasing run A failed");
-    let out_b =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 67890)
-            .expect("Phasing run B failed");
+    let out_a = run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 12345)
+        .expect("Phasing run A failed");
+    let out_b = run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 67890)
+        .expect("Phasing run B failed");
 
     let records_a = parse_vcf(&out_a);
     let records_b = parse_vcf(&out_b);
@@ -1486,13 +1493,7 @@ chr1\t1100\t.\tA\tG\t.\tPASS\t.\tGT\t./.
     write_vcf(&target_vcf, target_content);
 
     let out_prefix = work_dir.path().join("out");
-run_rust_imputation(
-        &target_vcf,
-        &ref_vcf,
-        &out_prefix,
-        12345,
-    )
-    .expect("Rust imputation failed");
+    run_rust_imputation(&target_vcf, &ref_vcf, &out_prefix, 12345).expect("Rust imputation failed");
 
     let out_vcf = work_dir.path().join("out.vcf.gz");
     let records = parse_vcf(&out_vcf);
@@ -1538,12 +1539,10 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1
     let out_prefix_a = work_dir.path().join("out_a");
     let out_prefix_b = work_dir.path().join("out_b");
 
-    let out_a =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 1111)
-            .expect("Phasing run A failed");
-    let out_b =
-        run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 2222)
-            .expect("Phasing run B failed");
+    let out_a = run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_a, 1111)
+        .expect("Phasing run A failed");
+    let out_b = run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix_b, 2222)
+        .expect("Phasing run B failed");
 
     let records_a = parse_vcf(&out_a);
     let records_b = parse_vcf(&out_b);
@@ -1551,10 +1550,7 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1
     let gt_a = &records_a[1].genotypes[0].gt;
     let gt_b = &records_b[1].genotypes[0].gt;
 
-    println!(
-        "[stage2 seed] rare marker GT A={}, GT B={}",
-        gt_a, gt_b
-    );
+    println!("[stage2 seed] rare marker GT A={}, GT B={}", gt_a, gt_b);
 
     assert!(
         gt_a.contains('|') && gt_b.contains('|'),
@@ -1576,9 +1572,17 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
 
     write_synthetic_vcf(&ref_vcf, n_markers, &ref_samples, |i, s| {
         if i == 500 {
-            if s == 0 { "1|1".to_string() } else { "0|0".to_string() }
+            if s == 0 {
+                "1|1".to_string()
+            } else {
+                "0|0".to_string()
+            }
         } else if i == 1100 {
-            if s == 0 { "1|1".to_string() } else { "0|0".to_string() }
+            if s == 0 {
+                "1|1".to_string()
+            } else {
+                "0|0".to_string()
+            }
         } else {
             "0|0".to_string()
         }
@@ -1598,7 +1602,7 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
     });
 
     let out_prefix = work_dir.path().join("out");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_vcf,
         &ref_vcf,
@@ -1663,7 +1667,11 @@ fn test_boundary_handoff_should_match_single_window_confidence() {
 
     write_synthetic_vcf(&ref_vcf, n_markers, &ref_samples, |i, s| {
         if i == 500 || i == 1100 {
-            if s == 0 { "1|1".to_string() } else { "0|0".to_string() }
+            if s == 0 {
+                "1|1".to_string()
+            } else {
+                "0|0".to_string()
+            }
         } else {
             "0|0".to_string()
         }
@@ -1775,9 +1783,8 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1
     let mut seen = std::collections::HashSet::new();
     for seed in seeds {
         let out_prefix = work_dir.path().join(format!("out_{}", seed));
-        let out_vcf =
-            run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix, seed)
-                .expect("Phasing run failed");
+        let out_vcf = run_rust_phasing_with_seed(&target_vcf, &ref_vcf, &out_prefix, seed)
+            .expect("Phasing run failed");
         let records = parse_vcf(&out_vcf);
         let gt = records[1].genotypes[0].gt.clone();
         println!("[stage2 seed sweep] seed={} gt={}", seed, gt);
@@ -1828,9 +1835,17 @@ fn test_low_confidence_penalty_accumulates_in_region() {
             return "0|0".to_string();
         }
         if s == 0 {
-            if i % 2 == 0 { "0|0".to_string() } else { "1|1".to_string() }
+            if i % 2 == 0 {
+                "0|0".to_string()
+            } else {
+                "1|1".to_string()
+            }
         } else {
-            if i % 2 == 0 { "1|1".to_string() } else { "0|0".to_string() }
+            if i % 2 == 0 {
+                "1|1".to_string()
+            } else {
+                "0|0".to_string()
+            }
         }
     });
 
@@ -1854,16 +1869,13 @@ fn test_low_confidence_penalty_accumulates_in_region() {
                 pos
             ));
         } else {
-            content.push_str(&format!(
-                "chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT\t./.\n",
-                pos
-            ));
+            content.push_str(&format!("chr1\t{}\t.\tA\tC\t.\tPASS\t.\tGT\t./.\n", pos));
         }
     }
     write_vcf(&target_uniform, &content);
 
     let out_missing = work_dir.path().join("out_missing");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_missing,
         &ref_vcf,
@@ -1876,7 +1888,7 @@ run_rust_imputation_with_window_toml(
     .expect("Rust imputation failed (missing)");
 
     let out_uniform = work_dir.path().join("out_uniform");
-run_rust_imputation_with_window_toml(
+    run_rust_imputation_with_window_toml(
         work_dir.path(),
         &target_uniform,
         &ref_vcf,
@@ -1893,7 +1905,11 @@ run_rust_imputation_with_window_toml(
 
     let mut diffs_in = 0usize;
     let mut diffs_out = 0usize;
-    for (idx, (r_m, r_u)) in records_missing.iter().zip(records_uniform.iter()).enumerate() {
+    for (idx, (r_m, r_u)) in records_missing
+        .iter()
+        .zip(records_uniform.iter())
+        .enumerate()
+    {
         let gt_m = &r_m.genotypes[0].gt;
         let gt_u = &r_u.genotypes[0].gt;
         if gt_m != gt_u {
@@ -1938,7 +1954,9 @@ fn test_hardcall_emissions_block_ref_override_when_no_pl() {
     // Target has hard 0/0 calls (no PL/GL) at all markers.
     write_synthetic_vcf(&target_hard, n_markers, &["T1"], |_, _| "0/0".to_string());
     // Target missing at all markers.
-    write_synthetic_vcf(&target_missing, n_markers, &["T1"], |_, _| "./.".to_string());
+    write_synthetic_vcf(&target_missing, n_markers, &["T1"], |_, _| {
+        "./.".to_string()
+    });
 
     let out_prefix_hard = work_dir.path().join("out_hard");
     run_rust_imputation(&target_hard, &ref_vcf, &out_prefix_hard, 12345)
@@ -1997,9 +2015,17 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     // Two strong haplotype groups with clear LD.
     write_synthetic_vcf(&target_vcf, n_markers, &target_names, |i, s| {
         if s < 15 {
-            if i % 2 == 0 { "0/1".to_string() } else { "0/0".to_string() }
+            if i % 2 == 0 {
+                "0/1".to_string()
+            } else {
+                "0/0".to_string()
+            }
         } else {
-            if i % 2 == 0 { "1/1".to_string() } else { "0/1".to_string() }
+            if i % 2 == 0 {
+                "1/1".to_string()
+            } else {
+                "0/1".to_string()
+            }
         }
     });
 
@@ -2063,7 +2089,11 @@ fn test_uniform_recomb_shift_should_not_overweight_rare_pattern() {
 
     // One haplotype carries ALT at all markers; others are REF.
     write_synthetic_vcf(&ref_vcf, n_markers, &ref_names, |_, s| {
-        if s == 0 { "1|1".to_string() } else { "0|0".to_string() }
+        if s == 0 {
+            "1|1".to_string()
+        } else {
+            "0|0".to_string()
+        }
     });
     write_synthetic_vcf(&target_vcf, n_markers, &["T1"], |_, _| "./.".to_string());
 
@@ -2151,9 +2181,7 @@ fn test_ibs2_missing_not_universally_matching() {
 
     let n_markers = 200;
     let n_samples = 10;
-    let sample_names: Vec<String> = (0..n_samples)
-        .map(|i| format!("T{}", i + 1))
-        .collect();
+    let sample_names: Vec<String> = (0..n_samples).map(|i| format!("T{}", i + 1)).collect();
     let sample_refs: Vec<&str> = sample_names.iter().map(|s| s.as_str()).collect();
 
     write_synthetic_vcf(&target_vcf, n_markers, &sample_refs, |_, s| {

@@ -185,7 +185,6 @@ where
         self.n_haps
     }
 
-
     fn with_fwd_pos_at_marker<R>(
         &self,
         marker_idx: usize,
@@ -196,24 +195,24 @@ where
             self,
             marker_idx,
             |ppa, div| {
-            thread_local! {
-                static FWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
-                    std::cell::RefCell::new((usize::MAX, Vec::new()));
-            }
-            FWD_POS_AT.with(|cell| {
-                let mut cache = cell.borrow_mut();
-                if cache.0 != marker_idx || cache.1.len() != ppa.len() {
-                    cache.1.clear();
-                    cache.1.resize(ppa.len(), 0u32);
-                    for (i, &h) in ppa.iter().enumerate() {
-                        cache.1[h.to_usize()] = i as u32;
-                    }
-                    cache.0 = marker_idx;
+                thread_local! {
+                    static FWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
+                        std::cell::RefCell::new((usize::MAX, Vec::new()));
                 }
-                let pos = cache.1[hap_idx as usize] as usize;
-                f(ppa, div, pos)
-            })
-        },
+                FWD_POS_AT.with(|cell| {
+                    let mut cache = cell.borrow_mut();
+                    if cache.0 != marker_idx || cache.1.len() != ppa.len() {
+                        cache.1.clear();
+                        cache.1.resize(ppa.len(), 0u32);
+                        for (i, &h) in ppa.iter().enumerate() {
+                            cache.1[h.to_usize()] = i as u32;
+                        }
+                        cache.0 = marker_idx;
+                    }
+                    let pos = cache.1[hap_idx as usize] as usize;
+                    f(ppa, div, pos)
+                })
+            },
         )
     }
 
@@ -227,24 +226,24 @@ where
             self,
             marker_idx,
             |ppa, div| {
-            thread_local! {
-                static BWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
-                    std::cell::RefCell::new((usize::MAX, Vec::new()));
-            }
-            BWD_POS_AT.with(|cell| {
-                let mut cache = cell.borrow_mut();
-                if cache.0 != marker_idx || cache.1.len() != ppa.len() {
-                    cache.1.clear();
-                    cache.1.resize(ppa.len(), 0u32);
-                    for (i, &h) in ppa.iter().enumerate() {
-                        cache.1[h.to_usize()] = i as u32;
-                    }
-                    cache.0 = marker_idx;
+                thread_local! {
+                    static BWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
+                        std::cell::RefCell::new((usize::MAX, Vec::new()));
                 }
-                let pos = cache.1[hap_idx as usize] as usize;
-                f(ppa, div, pos)
-            })
-        },
+                BWD_POS_AT.with(|cell| {
+                    let mut cache = cell.borrow_mut();
+                    if cache.0 != marker_idx || cache.1.len() != ppa.len() {
+                        cache.1.clear();
+                        cache.1.resize(ppa.len(), 0u32);
+                        for (i, &h) in ppa.iter().enumerate() {
+                            cache.1[h.to_usize()] = i as u32;
+                        }
+                        cache.0 = marker_idx;
+                    }
+                    let pos = cache.1[hap_idx as usize] as usize;
+                    f(ppa, div, pos)
+                })
+            },
         )
     }
 

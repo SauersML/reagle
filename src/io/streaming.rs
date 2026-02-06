@@ -394,14 +394,19 @@ impl StreamingVcfReader {
                 if !detect_bgzf(&mut file)? {
                     return Err(anyhow::anyhow!("Expected BGZF file for extension .{}", ext).into());
                 }
-                let reader: Box<dyn BufRead + Send> =
-                    Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)));
+                let reader: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(
+                    128 * 1024,
+                    bgzf_io::Reader::new(file),
+                ));
                 Self::from_reader(reader, gen_maps, config)
             }
             "gz" => {
                 let mut file = File::open(path)?;
                 let reader: Box<dyn BufRead + Send> = if detect_bgzf(&mut file)? {
-                    Box::new(BufReader::with_capacity(128 * 1024, bgzf_io::Reader::new(file)))
+                    Box::new(BufReader::with_capacity(
+                        128 * 1024,
+                        bgzf_io::Reader::new(file),
+                    ))
                 } else {
                     Box::new(BufReader::with_capacity(128 * 1024, GzDecoder::new(file)))
                 };

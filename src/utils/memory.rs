@@ -10,11 +10,7 @@ const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 pub fn get_page_size() -> u64 {
     let val = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if val > 0 {
-        val as u64
-    } else {
-        4096
-    }
+    if val > 0 { val as u64 } else { 4096 }
 }
 
 /// Estimate available memory in bytes, accounting for cgroups.

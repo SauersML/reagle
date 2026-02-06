@@ -4,13 +4,13 @@
 //! reference haplotypes (state set). Emissions are computed using per-haplotype
 //! allele probabilities from the target, and reference alleles are read on demand.
 
+use crate::data::HapIdx;
 use crate::data::marker::{MarkerIdx, Markers};
 use crate::data::storage::{
     DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
-use crate::data::HapIdx;
-use crate::model::weighted_kernel::WeightedHmmUpdater;
 use crate::model::types::RefHapId;
+use crate::model::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::OnceLock;
 
@@ -72,7 +72,7 @@ mod tests {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 #[inline(always)]
 fn prefetch_read(ptr: *const u8) {
@@ -194,10 +194,7 @@ pub struct RefAlleleFreqs<'a, Space = crate::data::marker::AnyMarkerSpace> {
 
 impl<'a, Space> RefAlleleFreqs<'a, Space> {
     pub fn new(ref_columns: &'a [GenotypeColumn], ref_markers: &'a Markers<Space>) -> Self {
-        let n_ref_haps = ref_columns
-            .first()
-            .map(|c| c.n_haplotypes())
-            .unwrap_or(0);
+        let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
         let cache = std::iter::repeat_with(OnceLock::new)
             .take(ref_markers.len())
             .collect();
@@ -426,8 +423,16 @@ impl RefColumnLike for DenseColumn {
                 let bit_idx = idx & 63;
                 if word_idx != cached_word_idx {
                     cached_word_idx = word_idx;
-                    cached_bits_word = if word_idx < bits.len() { bits[word_idx] } else { 0 };
-                    cached_missing_word = if word_idx < missing.len() { missing[word_idx] } else { 0 };
+                    cached_bits_word = if word_idx < bits.len() {
+                        bits[word_idx]
+                    } else {
+                        0
+                    };
+                    cached_missing_word = if word_idx < missing.len() {
+                        missing[word_idx]
+                    } else {
+                        0
+                    };
                 }
                 if ((cached_missing_word >> bit_idx) & 1) != 0 {
                     out[i] = 255;
@@ -540,7 +545,9 @@ fn refresh_ref_alleles<'a, C: RefColumnLike + ?Sized>(
     dict_pattern_alleles: &mut Vec<u8>,
 ) -> RefAlleles<'a> {
     col.fill_ref_alleles(state_haps, state_alleles, dict_pattern_alleles);
-    RefAlleles { slice: state_alleles }
+    RefAlleles {
+        slice: state_alleles,
+    }
 }
 
 #[inline]
@@ -753,11 +760,7 @@ fn transition_only_forward_update(
 }
 
 #[inline]
-fn transition_only_backward_update(
-    bwd: &mut [f32],
-    recomb_rate: f32,
-    transition_haps: usize,
-) {
+fn transition_only_backward_update(bwd: &mut [f32], recomb_rate: f32, transition_haps: usize) {
     if bwd.is_empty() || recomb_rate <= 0.0 {
         return;
     }
@@ -777,22 +780,14 @@ fn transition_only_backward_update(
 }
 
 #[inline]
-fn fill_state_patterns_seqcoded(
-    hap_to_seq: &[u16],
-    state_haps: &[RefHapId],
-    out: &mut [u16],
-) {
+fn fill_state_patterns_seqcoded(hap_to_seq: &[u16], state_haps: &[RefHapId], out: &mut [u16]) {
     for (i, hap) in state_haps.iter().enumerate() {
         out[i] = hap_to_seq[hap.as_usize()];
     }
 }
 
 #[inline]
-fn fill_state_patterns_dict(
-    col: &DictionaryColumn,
-    state_haps: &[RefHapId],
-    out: &mut [u16],
-) {
+fn fill_state_patterns_dict(col: &DictionaryColumn, state_haps: &[RefHapId], out: &mut [u16]) {
     for (i, hap) in state_haps.iter().enumerate() {
         out[i] = col.hap_pattern_idx(*hap) as u16;
     }
@@ -1194,143 +1189,142 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
-            // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
-            let ref_alleles = refresh_ref_alleles(
-                &ref_columns[m_rev],
-                state_haps,
-                &mut ws.state_alleles[..active_states],
-                &mut ws.dict_pattern_alleles,
-            );
+                    // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
+                    let ref_alleles = refresh_ref_alleles(
+                        &ref_columns[m_rev],
+                        state_haps,
+                        &mut ws.state_alleles[..active_states],
+                        &mut ws.dict_pattern_alleles,
+                    );
 
-            if is_final {
-                // Compute posteriors using beta at time t (current ws.bwd), before updating
-                // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
-                ws.allele_probs.clear();
-                let n_alleles = if !probs.is_empty() {
-                    probs.len()
-                } else if m_rev < ref_allele_freqs.len() {
-                    ref_allele_freqs.n_alleles(m_rev)
-                } else {
-                    0
-                };
-                if n_alleles > 0 {
-                    ws.allele_probs.resize(n_alleles, 0.0f32);
-                    let mut total = 0.0f32;
-                    for i in 0..active_states {
-                        let ref_allele = ref_alleles.get(i);
-                        if ref_allele == 255 {
-                            continue;
-                        }
-                        let state_prob = fwd_slice[i] * ws.bwd[i];
-                        total += state_prob;
-                        let idx = ref_allele as usize;
-                        if idx < ws.allele_probs.len() {
-                            ws.allele_probs[idx] += state_prob;
-                        }
-                    }
-                    if total > 0.0 {
-                        for p in ws.allele_probs.iter_mut() {
-                            *p /= total;
-                        }
-                    } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
-                        let mut sum = 0.0f32;
-                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                            let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-                            *p = f;
-                            sum += f;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0 / sum;
-                            for p in ws.allele_probs.iter_mut() {
-                                *p *= inv;
+                    if is_final {
+                        // Compute posteriors using beta at time t (current ws.bwd), before updating
+                        // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
+                        ws.allele_probs.clear();
+                        let n_alleles = if !probs.is_empty() {
+                            probs.len()
+                        } else if m_rev < ref_allele_freqs.len() {
+                            ref_allele_freqs.n_alleles(m_rev)
+                        } else {
+                            0
+                        };
+                        if n_alleles > 0 {
+                            ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let mut total = 0.0f32;
+                            for i in 0..active_states {
+                                let ref_allele = ref_alleles.get(i);
+                                if ref_allele == 255 {
+                                    continue;
+                                }
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob;
+                                let idx = ref_allele as usize;
+                                if idx < ws.allele_probs.len() {
+                                    ws.allele_probs[idx] += state_prob;
+                                }
+                            }
+                            if total > 0.0 {
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p /= total;
+                                }
+                            } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
+                                let mut sum = 0.0f32;
+                                for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
+                                    *p = f;
+                                    sum += f;
+                                }
+                                if sum > 0.0 {
+                                    let inv = 1.0 / sum;
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p *= inv;
+                                    }
+                                } else {
+                                    let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p = uniform;
+                                    }
+                                }
+                            } else {
+                                let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p = uniform;
+                                }
+                            }
+                            if ws.allele_probs.len() == 2 {
+                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
+                            } else {
+                                let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                out.extend_from_slice(&ws.allele_probs);
+                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                             }
                         } else {
-                            let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                            for p in ws.allele_probs.iter_mut() {
-                                *p = uniform;
+                            posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
+                        }
+                    }
+
+                    // Update beta for the previous marker.
+                    // Scaled backward recursion:
+                    //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
+                    // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
+                    // at marker t (sum of unnormalized alpha_t).
+                    if uniform {
+                        transition_only_backward_update(
+                            &mut ws.bwd[..active_states],
+                            recomb_rate,
+                            transition_haps,
+                        );
+                    } else {
+                        fill_emissions(
+                            &ref_alleles,
+                            probs,
+                            current_error,
+                            &mut ws.emission_by_allele,
+                            &mut ws.emissions[..active_states],
+                        );
+                        if !probs.is_empty() && probs.len() > 1 {
+                            let mismatch_prob = current_error / (probs.len() as f32 - 1.0);
+                            let mut total_gamma = 0.0f64;
+                            let mut mismatch_expect = 0.0f64;
+                            for i in 0..active_states {
+                                let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
+                                let ref_allele = ref_alleles.get(i);
+                                if ref_allele == 255 {
+                                    continue;
+                                }
+                                total_gamma += gamma;
+                                let idx = ref_allele as usize;
+                                let p_match = probs.get(idx).copied().unwrap_or(0.0);
+                                let emission = if idx < ws.emission_by_allele.len() {
+                                    ws.emission_by_allele[idx]
+                                } else {
+                                    mismatch_prob
+                                };
+                                if emission > 0.0 {
+                                    let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
+                                    mismatch_expect += gamma * eta;
+                                }
+                            }
+                            if total_gamma > 0.0 {
+                                mismatch_sum += mismatch_expect / total_gamma;
+                                mismatch_markers += 1.0;
                             }
                         }
-                    } else {
-                        let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                        for p in ws.allele_probs.iter_mut() {
-                            *p = uniform;
-                        }
-                    }
-                    if ws.allele_probs.len() == 2 {
-                        posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                    } else {
-                        let mut out = Vec::with_capacity(ws.allele_probs.len());
-                        out.extend_from_slice(&ws.allele_probs);
-                        posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                    }
-                } else {
-                    posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
-                }
-
-            }
-
-            // Update beta for the previous marker.
-            // Scaled backward recursion:
-            //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
-            // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
-            // at marker t (sum of unnormalized alpha_t).
-                if uniform {
-                    transition_only_backward_update(
-                        &mut ws.bwd[..active_states],
-                        recomb_rate,
-                        transition_haps,
-                    );
-                } else {
-                    fill_emissions(
-                        &ref_alleles,
-                        probs,
-                        current_error,
-                        &mut ws.emission_by_allele,
-                        &mut ws.emissions[..active_states],
-                    );
-                    if !probs.is_empty() && probs.len() > 1 {
-                        let mismatch_prob = current_error / (probs.len() as f32 - 1.0);
-                        let mut total_gamma = 0.0f64;
-                        let mut mismatch_expect = 0.0f64;
+                        let mut emit_beta_sum = 0.0f32;
                         for i in 0..active_states {
-                            let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                            let ref_allele = ref_alleles.get(i);
-                            if ref_allele == 255 {
-                                continue;
-                            }
-                            total_gamma += gamma;
-                            let idx = ref_allele as usize;
-                            let p_match = probs.get(idx).copied().unwrap_or(0.0);
-                            let emission = if idx < ws.emission_by_allele.len() {
-                                ws.emission_by_allele[idx]
-                            } else {
-                                mismatch_prob
-                            };
-                            if emission > 0.0 {
-                                let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
-                                mismatch_expect += gamma * eta;
-                            }
+                            emit_beta_sum += ws.emissions[i] * ws.bwd[i];
                         }
-                        if total_gamma > 0.0 {
-                            mismatch_sum += mismatch_expect / total_gamma;
-                            mismatch_markers += 1.0;
+                        let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
+                        let scale = (1.0 - recomb_rate) / c_t;
+                        let shift = if transition_haps > 0 {
+                            (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
+                        } else {
+                            0.0
+                        };
+                        for i in 0..active_states {
+                            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                         }
                     }
-                    let mut emit_beta_sum = 0.0f32;
-                    for i in 0..active_states {
-                        emit_beta_sum += ws.emissions[i] * ws.bwd[i];
-                    }
-                    let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                    let scale = (1.0 - recomb_rate) / c_t;
-                    let shift = if transition_haps > 0 {
-                        (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
-                    } else {
-                        0.0
-                    };
-                    for i in 0..active_states {
-                        ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
-                    }
-                }
                 }
                 if block_start == 0 {
                     break;
@@ -1485,146 +1479,146 @@ fn run_impute_hmm_seqcoded<Space>(
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
 
-            if is_final {
-                ws.allele_probs.clear();
-                let n_alleles = if !probs.is_empty() {
-                    probs.len()
-                } else if m_rev < ref_allele_freqs.len() {
-                    ref_allele_freqs.n_alleles(m_rev)
-                } else {
-                    0
-                };
-                if n_alleles > 0 {
-                    ws.allele_probs.resize(n_alleles, 0.0f32);
-                    let mut total = 0.0f32;
-                    for i in 0..active_states {
-                        let ref_allele = seq_patterns.allele_for_state(i);
-                        if ref_allele == 255 {
-                            continue;
-                        }
-                        let state_prob = fwd_slice[i] * ws.bwd[i];
-                        total += state_prob;
-                        let idx = ref_allele as usize;
-                        if idx < ws.allele_probs.len() {
-                            ws.allele_probs[idx] += state_prob;
-                        }
-                    }
-                    if total > 0.0 {
-                        for p in ws.allele_probs.iter_mut() {
-                            *p /= total;
-                        }
-                    } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
-                        let mut sum = 0.0f32;
-                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                            let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-                            *p = f;
-                            sum += f;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0 / sum;
-                            for p in ws.allele_probs.iter_mut() {
-                                *p *= inv;
+                    if is_final {
+                        ws.allele_probs.clear();
+                        let n_alleles = if !probs.is_empty() {
+                            probs.len()
+                        } else if m_rev < ref_allele_freqs.len() {
+                            ref_allele_freqs.n_alleles(m_rev)
+                        } else {
+                            0
+                        };
+                        if n_alleles > 0 {
+                            ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let mut total = 0.0f32;
+                            for i in 0..active_states {
+                                let ref_allele = seq_patterns.allele_for_state(i);
+                                if ref_allele == 255 {
+                                    continue;
+                                }
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob;
+                                let idx = ref_allele as usize;
+                                if idx < ws.allele_probs.len() {
+                                    ws.allele_probs[idx] += state_prob;
+                                }
+                            }
+                            if total > 0.0 {
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p /= total;
+                                }
+                            } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
+                                let mut sum = 0.0f32;
+                                for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
+                                    *p = f;
+                                    sum += f;
+                                }
+                                if sum > 0.0 {
+                                    let inv = 1.0 / sum;
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p *= inv;
+                                    }
+                                } else {
+                                    let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p = uniform;
+                                    }
+                                }
+                            } else {
+                                let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p = uniform;
+                                }
+                            }
+                            if ws.allele_probs.len() == 2 {
+                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
+                            } else {
+                                let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                out.extend_from_slice(&ws.allele_probs);
+                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                             }
                         } else {
-                            let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                            for p in ws.allele_probs.iter_mut() {
-                                *p = uniform;
+                            posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
+                        }
+
+                        if prior_marker_idx == Some(m_rev) {
+                            let mut state_post = vec![0.0f32; active_states];
+                            let mut total = 0.0f32;
+                            for i in 0..active_states {
+                                let v = fwd_slice[i] * ws.bwd[i];
+                                state_post[i] = v;
+                                total += v;
+                            }
+                            if total > 0.0 {
+                                let inv = 1.0 / total;
+                                for v in state_post.iter_mut() {
+                                    *v *= inv;
+                                }
+                            }
+                            prior_state_post = Some(state_post);
+                        }
+                    }
+
+                    if uniform {
+                        transition_only_backward_update(
+                            &mut ws.bwd[..active_states],
+                            recomb_rate,
+                            transition_haps,
+                        );
+                    } else {
+                        let mismatch_prob = fill_pattern_emissions(
+                            seq_patterns.seq_alleles,
+                            probs,
+                            current_error,
+                            &mut ws.emission_by_allele,
+                            &mut ws.pattern_emissions,
+                        );
+                        if !probs.is_empty() && probs.len() > 1 {
+                            let mut total_gamma = 0.0f64;
+                            let mut mismatch_expect = 0.0f64;
+                            for i in 0..active_states {
+                                let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
+                                let ref_allele = seq_patterns.allele_for_state(i);
+                                if ref_allele == 255 {
+                                    continue;
+                                }
+                                total_gamma += gamma;
+                                let idx = ref_allele as usize;
+                                let p_match = probs.get(idx).copied().unwrap_or(0.0);
+                                let emission = if idx < ws.emission_by_allele.len() {
+                                    ws.emission_by_allele[idx]
+                                } else {
+                                    mismatch_prob
+                                };
+                                if emission > 0.0 {
+                                    let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
+                                    mismatch_expect += gamma * eta;
+                                }
+                            }
+                            if total_gamma > 0.0 {
+                                mismatch_sum += mismatch_expect / total_gamma;
+                                mismatch_markers += 1.0;
                             }
                         }
-                    } else {
-                        let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                        for p in ws.allele_probs.iter_mut() {
-                            *p = uniform;
-                        }
-                    }
-                    if ws.allele_probs.len() == 2 {
-                        posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                    } else {
-                        let mut out = Vec::with_capacity(ws.allele_probs.len());
-                        out.extend_from_slice(&ws.allele_probs);
-                        posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                    }
-                } else {
-                    posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
-                }
-
-                if prior_marker_idx == Some(m_rev) {
-                    let mut state_post = vec![0.0f32; active_states];
-                    let mut total = 0.0f32;
-                    for i in 0..active_states {
-                        let v = fwd_slice[i] * ws.bwd[i];
-                        state_post[i] = v;
-                        total += v;
-                    }
-                    if total > 0.0 {
-                        let inv = 1.0 / total;
-                        for v in state_post.iter_mut() {
-                            *v *= inv;
-                        }
-                    }
-                    prior_state_post = Some(state_post);
-                }
-            }
-
-                if uniform {
-                    transition_only_backward_update(
-                        &mut ws.bwd[..active_states],
-                        recomb_rate,
-                        transition_haps,
-                    );
-                } else {
-                    let mismatch_prob = fill_pattern_emissions(
-                        seq_patterns.seq_alleles,
-                        probs,
-                        current_error,
-                        &mut ws.emission_by_allele,
-                        &mut ws.pattern_emissions,
-                    );
-                    if !probs.is_empty() && probs.len() > 1 {
-                        let mut total_gamma = 0.0f64;
-                        let mut mismatch_expect = 0.0f64;
+                        let mut emit_beta_sum = 0.0f32;
                         for i in 0..active_states {
-                            let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                            let ref_allele = seq_patterns.allele_for_state(i);
-                            if ref_allele == 255 {
-                                continue;
-                            }
-                            total_gamma += gamma;
-                            let idx = ref_allele as usize;
-                            let p_match = probs.get(idx).copied().unwrap_or(0.0);
-                            let emission = if idx < ws.emission_by_allele.len() {
-                                ws.emission_by_allele[idx]
-                            } else {
-                                mismatch_prob
-                            };
-                            if emission > 0.0 {
-                                let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
-                                mismatch_expect += gamma * eta;
-                            }
+                            let pid = seq_patterns.state_patterns[i] as usize;
+                            let emit = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
+                            ws.emissions[i] = emit;
+                            emit_beta_sum += emit * ws.bwd[i];
                         }
-                        if total_gamma > 0.0 {
-                            mismatch_sum += mismatch_expect / total_gamma;
-                            mismatch_markers += 1.0;
+                        let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
+                        let scale = (1.0 - recomb_rate) / c_t;
+                        let shift = if transition_haps > 0 {
+                            (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
+                        } else {
+                            0.0
+                        };
+                        for i in 0..active_states {
+                            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                         }
                     }
-                    let mut emit_beta_sum = 0.0f32;
-                    for i in 0..active_states {
-                        let pid = seq_patterns.state_patterns[i] as usize;
-                        let emit = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
-                        ws.emissions[i] = emit;
-                        emit_beta_sum += emit * ws.bwd[i];
-                    }
-                    let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                    let scale = (1.0 - recomb_rate) / c_t;
-                    let shift = if transition_haps > 0 {
-                        (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
-                    } else {
-                        0.0
-                    };
-                    for i in 0..active_states {
-                        ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
-                    }
-                }
                 }
                 if block_start == 0 {
                     break;
@@ -1781,45 +1775,51 @@ fn run_impute_hmm_dict<Space>(
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
 
-            if is_final {
-                    ws.allele_probs.clear();
-                    let n_alleles = if !probs.is_empty() {
-                        probs.len()
-                    } else if m_rev < ref_allele_freqs.len() {
-                        ref_allele_freqs.n_alleles(m_rev)
-                    } else {
-                        0
-                    };
-                    if n_alleles > 0 {
-                        ws.allele_probs.resize(n_alleles, 0.0f32);
-                        let mut total = 0.0f32;
-                        for i in 0..active_states {
-                            let ref_allele = dict_patterns.allele_for_state(i);
-                            if ref_allele == 255 {
-                                continue;
+                    if is_final {
+                        ws.allele_probs.clear();
+                        let n_alleles = if !probs.is_empty() {
+                            probs.len()
+                        } else if m_rev < ref_allele_freqs.len() {
+                            ref_allele_freqs.n_alleles(m_rev)
+                        } else {
+                            0
+                        };
+                        if n_alleles > 0 {
+                            ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let mut total = 0.0f32;
+                            for i in 0..active_states {
+                                let ref_allele = dict_patterns.allele_for_state(i);
+                                if ref_allele == 255 {
+                                    continue;
+                                }
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob;
+                                let idx = ref_allele as usize;
+                                if idx < ws.allele_probs.len() {
+                                    ws.allele_probs[idx] += state_prob;
+                                }
                             }
-                            let state_prob = fwd_slice[i] * ws.bwd[i];
-                            total += state_prob;
-                            let idx = ref_allele as usize;
-                            if idx < ws.allele_probs.len() {
-                                ws.allele_probs[idx] += state_prob;
-                            }
-                        }
-                        if total > 0.0 {
-                            for p in ws.allele_probs.iter_mut() {
-                                *p /= total;
-                            }
-                        } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
-                            let mut sum = 0.0f32;
-                            for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-                                *p = f;
-                                sum += f;
-                            }
-                            if sum > 0.0 {
-                                let inv = 1.0 / sum;
+                            if total > 0.0 {
                                 for p in ws.allele_probs.iter_mut() {
-                                    *p *= inv;
+                                    *p /= total;
+                                }
+                            } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
+                                let mut sum = 0.0f32;
+                                for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
+                                    *p = f;
+                                    sum += f;
+                                }
+                                if sum > 0.0 {
+                                    let inv = 1.0 / sum;
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p *= inv;
+                                    }
+                                } else {
+                                    let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p = uniform;
+                                    }
                                 }
                             } else {
                                 let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
@@ -1827,100 +1827,94 @@ fn run_impute_hmm_dict<Space>(
                                     *p = uniform;
                                 }
                             }
-                        } else {
-                            let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                            for p in ws.allele_probs.iter_mut() {
-                                *p = uniform;
-                            }
-                        }
-                        if ws.allele_probs.len() == 2 {
-                            posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                        } else {
-                            let mut out = Vec::with_capacity(ws.allele_probs.len());
-                            out.extend_from_slice(&ws.allele_probs);
-                            posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                        }
-                    } else {
-                        posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
-                    }
-
-                    if prior_marker_idx == Some(m_rev) {
-                        let mut state_post = vec![0.0f32; active_states];
-                        let mut total = 0.0f32;
-                        for i in 0..active_states {
-                            let v = fwd_slice[i] * ws.bwd[i];
-                            state_post[i] = v;
-                            total += v;
-                        }
-                        if total > 0.0 {
-                            let inv = 1.0 / total;
-                            for v in state_post.iter_mut() {
-                                *v *= inv;
-                            }
-                        }
-                        prior_state_post = Some(state_post);
-                    }
-                }
-
-                if uniform {
-                    transition_only_backward_update(
-                        &mut ws.bwd[..active_states],
-                        recomb_rate,
-                        transition_haps,
-                    );
-                } else {
-                    let mismatch_prob = fill_pattern_emissions(
-                        dict_patterns.pattern_alleles,
-                        probs,
-                        current_error,
-                        &mut ws.emission_by_allele,
-                        &mut ws.pattern_emissions,
-                    );
-                    if !probs.is_empty() && probs.len() > 1 {
-                        let mut total_gamma = 0.0f64;
-                        let mut mismatch_expect = 0.0f64;
-                        for i in 0..active_states {
-                            let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                            let ref_allele = dict_patterns.allele_for_state(i);
-                            if ref_allele == 255 {
-                                continue;
-                            }
-                            total_gamma += gamma;
-                            let idx = ref_allele as usize;
-                            let p_match = probs.get(idx).copied().unwrap_or(0.0);
-                            let emission = if idx < ws.emission_by_allele.len() {
-                                ws.emission_by_allele[idx]
+                            if ws.allele_probs.len() == 2 {
+                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
                             } else {
-                                mismatch_prob
-                            };
-                            if emission > 0.0 {
-                                let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
-                                mismatch_expect += gamma * eta;
+                                let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                out.extend_from_slice(&ws.allele_probs);
+                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                            }
+                        } else {
+                            posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
+                        }
+
+                        if prior_marker_idx == Some(m_rev) {
+                            let mut state_post = vec![0.0f32; active_states];
+                            let mut total = 0.0f32;
+                            for i in 0..active_states {
+                                let v = fwd_slice[i] * ws.bwd[i];
+                                state_post[i] = v;
+                                total += v;
+                            }
+                            if total > 0.0 {
+                                let inv = 1.0 / total;
+                                for v in state_post.iter_mut() {
+                                    *v *= inv;
+                                }
+                            }
+                            prior_state_post = Some(state_post);
+                        }
+                    }
+
+                    if uniform {
+                        transition_only_backward_update(
+                            &mut ws.bwd[..active_states],
+                            recomb_rate,
+                            transition_haps,
+                        );
+                    } else {
+                        let mismatch_prob = fill_pattern_emissions(
+                            dict_patterns.pattern_alleles,
+                            probs,
+                            current_error,
+                            &mut ws.emission_by_allele,
+                            &mut ws.pattern_emissions,
+                        );
+                        if !probs.is_empty() && probs.len() > 1 {
+                            let mut total_gamma = 0.0f64;
+                            let mut mismatch_expect = 0.0f64;
+                            for i in 0..active_states {
+                                let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
+                                let ref_allele = dict_patterns.allele_for_state(i);
+                                if ref_allele == 255 {
+                                    continue;
+                                }
+                                total_gamma += gamma;
+                                let idx = ref_allele as usize;
+                                let p_match = probs.get(idx).copied().unwrap_or(0.0);
+                                let emission = if idx < ws.emission_by_allele.len() {
+                                    ws.emission_by_allele[idx]
+                                } else {
+                                    mismatch_prob
+                                };
+                                if emission > 0.0 {
+                                    let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
+                                    mismatch_expect += gamma * eta;
+                                }
+                            }
+                            if total_gamma > 0.0 {
+                                mismatch_sum += mismatch_expect / total_gamma;
+                                mismatch_markers += 1.0;
                             }
                         }
-                        if total_gamma > 0.0 {
-                            mismatch_sum += mismatch_expect / total_gamma;
-                            mismatch_markers += 1.0;
+                        let mut emit_beta_sum = 0.0f32;
+                        for i in 0..active_states {
+                            let pid = dict_patterns.state_patterns[i] as usize;
+                            let emit = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
+                            ws.emissions[i] = emit;
+                            emit_beta_sum += emit * ws.bwd[i];
+                        }
+                        let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
+                        let scale = (1.0 - recomb_rate) / c_t;
+                        let shift = if transition_haps > 0 {
+                            (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
+                        } else {
+                            0.0
+                        };
+                        for i in 0..active_states {
+                            ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                         }
                     }
-                    let mut emit_beta_sum = 0.0f32;
-                    for i in 0..active_states {
-                        let pid = dict_patterns.state_patterns[i] as usize;
-                        let emit = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
-                        ws.emissions[i] = emit;
-                        emit_beta_sum += emit * ws.bwd[i];
-                    }
-                    let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                    let scale = (1.0 - recomb_rate) / c_t;
-                    let shift = if transition_haps > 0 {
-                        (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
-                    } else {
-                        0.0
-                    };
-                    for i in 0..active_states {
-                        ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
-                    }
-                }
                 }
                 if block_start == 0 {
                     break;

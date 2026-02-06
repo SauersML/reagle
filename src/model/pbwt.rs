@@ -18,7 +18,7 @@
 use tracing::info_span;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 #[inline(always)]
 fn prefetch_read<T>(ptr: *const T) {
@@ -141,8 +141,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         }
 
         if self.scratch_a.len() < self.n_haps {
-            self.scratch_a
-                .resize(self.n_haps, I::from_usize(0));
+            self.scratch_a.resize(self.n_haps, I::from_usize(0));
             self.scratch_d.resize(self.n_haps, 0);
             self.permuted_alleles.resize(self.n_haps, 0);
             let n_words = (self.n_haps + 63) / 64;

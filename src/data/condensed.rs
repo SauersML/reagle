@@ -2,10 +2,10 @@
 //!
 //! Collapses homozygous stretches into segments with compact constraints.
 
+use crate::data::MarkerIdx;
 use crate::data::marker::AnyMarkerSpace;
-use crate::data::storage::sample_phase::SamplePhase;
-use crate::data::{MarkerIdx};
 use crate::data::ref_packed::PackedRefView;
+use crate::data::storage::sample_phase::SamplePhase;
 use crate::model::parameters::ModelParams;
 
 #[derive(Clone, Debug)]
@@ -90,7 +90,9 @@ impl CondensedTarget {
                 };
                 let fixed = !sample_phase.is_unphased(orig_m);
                 let flip_cost = if fixed {
-                    let conf = sample_phase.phase_confidence(orig_m).clamp(1e-6, 1.0 - 1e-6) as f64;
+                    let conf = sample_phase
+                        .phase_confidence(orig_m)
+                        .clamp(1e-6, 1.0 - 1e-6) as f64;
                     let odds = (1.0 - conf) / conf;
                     (-(odds.ln()) * 1_000_000.0).round() as i32
                 } else {
@@ -108,26 +110,27 @@ impl CondensedTarget {
                         (fa1.max(1e-6), fa2.max(1e-6))
                     })
                     .unwrap_or((0.5, 0.5));
-                let (pbwt_len_morgans_a1, pbwt_len_morgans_a2, pbwt_density_a1, pbwt_density_a2) = pbwt_stats
-                    .and_then(|stats| stats.get(hi_idx).copied())
-                    .map(|(len0, len1, den0, den1)| {
-                        let (l1, d1) = if a1 == 0 {
-                            (len0, den0)
-                        } else if a1 == 1 {
-                            (len1, den1)
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        let (l2, d2) = if a2 == 0 {
-                            (len0, den0)
-                        } else if a2 == 1 {
-                            (len1, den1)
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        (l1, l2, d1, d2)
-                    })
-                    .unwrap_or((0.0, 0.0, 0.0, 0.0));
+                let (pbwt_len_morgans_a1, pbwt_len_morgans_a2, pbwt_density_a1, pbwt_density_a2) =
+                    pbwt_stats
+                        .and_then(|stats| stats.get(hi_idx).copied())
+                        .map(|(len0, len1, den0, den1)| {
+                            let (l1, d1) = if a1 == 0 {
+                                (len0, den0)
+                            } else if a1 == 1 {
+                                (len1, den1)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            let (l2, d2) = if a2 == 0 {
+                                (len0, den0)
+                            } else if a2 == 1 {
+                                (len1, den1)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            (l1, l2, d1, d2)
+                        })
+                        .unwrap_or((0.0, 0.0, 0.0, 0.0));
                 call_sites.push(CallSite {
                     marker,
                     hi_idx,
@@ -187,14 +190,13 @@ impl CondensedTarget {
         );
         segments.push(trailing);
 
-
-        Self { segments, call_sites }
+        Self {
+            segments,
+            call_sites,
+        }
     }
 
-    pub fn reversed(
-        &self,
-        hi_freq_gen_positions: &[f64],
-    ) -> Self {
+    pub fn reversed(&self, hi_freq_gen_positions: &[f64]) -> Self {
         let n_hi = hi_freq_gen_positions.len();
         let mut call_sites_rev: Vec<CallSite> = Vec::with_capacity(self.call_sites.len());
         let mut last_pos: Option<f64> = None;
@@ -259,10 +261,7 @@ fn build_segment_mask<RefSpace>(
     let mut constraints: Vec<SegmentConstraint> = Vec::new();
     let mut any_constraint = false;
     let len_morgans = if end_hi > start_hi && hi_freq_gen_positions.len() > 1 {
-        let start_pos = hi_freq_gen_positions
-            .get(start_hi)
-            .copied()
-            .unwrap_or(0.0);
+        let start_pos = hi_freq_gen_positions.get(start_hi).copied().unwrap_or(0.0);
         let end_pos = hi_freq_gen_positions
             .get(end_hi.saturating_sub(1))
             .copied()
@@ -290,7 +289,10 @@ fn build_segment_mask<RefSpace>(
                 .unwrap_or(0.5)
                 .max(1e-9) as f64;
             let expected = (n_ref_haps as f64) * pi;
-            if expected <= max_expected && llr >= hard_threshold && packed_ref.can_map_targ_allele(orig_m, a1) {
+            if expected <= max_expected
+                && llr >= hard_threshold
+                && packed_ref.can_map_targ_allele(orig_m, a1)
+            {
                 constraints.push(SegmentConstraint {
                     marker: MarkerIdx::new(orig_m as u32),
                     alleles: [a1, a1],

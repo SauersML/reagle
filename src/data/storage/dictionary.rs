@@ -220,5 +220,4 @@ mod tests {
         assert_eq!(dict.get(1, HapIdx::new(2)), 0);
         assert_eq!(dict.get(2, HapIdx::new(2)), 1);
     }
-
 }

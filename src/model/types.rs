@@ -9,12 +9,15 @@ use std::fmt;
 use std::marker::PhantomData;
 
 /// Marker type: reference haplotype space (0..N_ref_haplotypes)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct RefHapSpace;
 
-
 /// Marker type: combined haplotype space (target first, then reference)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct CombinedHapSpace;
 
 /// Zero-cost haplotype ID tagged by space.
@@ -152,5 +155,4 @@ mod tests {
         assert_eq!(hid.as_u32(), 42);
         assert_eq!(hid.as_usize(), 42);
     }
-
 }

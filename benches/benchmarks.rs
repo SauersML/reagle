@@ -1,8 +1,8 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reagle::data::alignment::MarkerAlignment;
 use reagle::data::marker::{AnyMarkerSpace, Nucleotide};
-use reagle::model::types::{RefHapId, RefHapSpace};
 use reagle::model::hmm::HmmUpdater;
+use reagle::model::types::{RefHapId, RefHapSpace};
 use std::hint::black_box;
 
 /// Benchmark HMM forward update with different state counts
@@ -522,12 +522,8 @@ fn bench_phase_ibs_operations(c: &mut Criterion) {
         .collect();
 
     let subset_to_global: Vec<usize> = (0..n_markers).collect();
-    let pbwt = BidirectionalPhaseIbs::build_for_subset(
-        alleles,
-        n_haps,
-        n_markers,
-        &subset_to_global,
-    );
+    let pbwt =
+        BidirectionalPhaseIbs::build_for_subset(alleles, n_haps, n_markers, &subset_to_global);
 
     group.throughput(Throughput::Elements(100)); // 100 lookups
 

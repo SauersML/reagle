@@ -12,8 +12,8 @@ use noodles_vcf::variant::record::samples::Series;
 use serial_test::serial;
 use std::fs::File;
 use std::io::Write;
-use tempfile::NamedTempFile;
 use std::path::Path;
+use tempfile::NamedTempFile;
 
 // --- Helpers ---
 
@@ -2097,8 +2097,16 @@ fn test_imputation_polarity_consistency() {
         }
     }
 
-    let mean0 = if count0 > 0 { sum0 / count0 as f64 } else { 0.0 };
-    let mean2 = if count2 > 0 { sum2 / count2 as f64 } else { 0.0 };
+    let mean0 = if count0 > 0 {
+        sum0 / count0 as f64
+    } else {
+        0.0
+    };
+    let mean2 = if count2 > 0 {
+        sum2 / count2 as f64
+    } else {
+        0.0
+    };
     println!(
         "Polarity check: mean est truth0={:.3} truth2={:.3}, reversed {}/{}",
         mean0, mean2, reversed, total
@@ -2183,7 +2191,8 @@ fn test_phasing_confidence() {
         })
         .collect();
 
-    let mut target_gt = GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
+    let mut target_gt =
+        GenotypeMatrix::new_unphased(target_markers, target_columns, target_samples);
     let mut phase_mask = vec![vec![0u8; n_target_samples]; n_markers];
     for m in 0..n_markers {
         for s in 0..n_target_samples {
@@ -2409,9 +2418,7 @@ fn test_phasing_confidence() {
 
     // Run phasing in memory
     let result = pipeline.phase_in_memory_with_overlap(
-        &target_gt,
-        &gen_maps,
-        None, // No overlap from previous window
+        &target_gt, &gen_maps, None, // No overlap from previous window
         None,
     );
 

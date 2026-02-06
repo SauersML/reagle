@@ -298,7 +298,6 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.phase_mask.as_ref()
     }
 
-
     pub fn with_phase_mask(mut self, phase_mask: Option<Vec<Vec<u8>>>) -> Self {
         if let Some(ref mask) = phase_mask {
             debug_assert_eq!(self.markers.len(), mask.len());
@@ -306,7 +305,6 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.phase_mask = phase_mask;
         self
     }
-
 
     pub fn likelihoods_pl_arc(&self) -> Option<Arc<PlMatrix>> {
         self.likelihoods_pl.as_ref().map(Arc::clone)
@@ -503,7 +501,8 @@ impl<Space> GenotypeMatrix<Phased, Space> {
         // SAFETY: GenotypeMatrix<Phased> and GenotypeMatrix<Unphased> have identical
         // memory layouts (PhantomData is zero-sized), differing only in the type parameter
         unsafe {
-            &*(self as *const GenotypeMatrix<Phased, Space> as *const GenotypeMatrix<Unphased, Space>)
+            &*(self as *const GenotypeMatrix<Phased, Space>
+                as *const GenotypeMatrix<Unphased, Space>)
         }
     }
 }

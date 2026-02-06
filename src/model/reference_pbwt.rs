@@ -95,11 +95,7 @@ impl PbwtQueryAllele {
     pub const WILDCARD_VALUE: u8 = 128;
 
     pub fn allele(a: u8) -> Option<Self> {
-        if a <= 1 {
-            Some(Self(a))
-        } else {
-            None
-        }
+        if a <= 1 { Some(Self(a)) } else { None }
     }
 
     pub fn missing() -> Self {
@@ -119,21 +115,13 @@ impl PbwtQueryAllele {
     /// or None if it's a wildcard or missing.
     #[inline]
     pub fn as_allele(self) -> Option<u8> {
-        if self.0 <= 1 {
-            Some(self.0)
-        } else {
-            None
-        }
+        if self.0 <= 1 { Some(self.0) } else { None }
     }
 }
 
 impl PbwtStrictAllele {
     pub fn allele(a: u8) -> Option<Self> {
-        if a <= 1 {
-            Some(Self(a))
-        } else {
-            None
-        }
+        if a <= 1 { Some(Self(a)) } else { None }
     }
 
     pub fn missing() -> Self {
@@ -362,7 +350,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         );
     }
 
-
     pub fn advance_with_beams_query_scratch(
         &mut self,
         ref_alleles: &[u8],
@@ -477,7 +464,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             }
         }
     }
-
 
     pub fn update_beams_with_scratch_query(
         &self,
@@ -696,7 +682,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             }
         }
     }
-
 }
 
 pub enum ReferencePbwt {
@@ -729,20 +714,12 @@ impl ReferencePbwt {
         beams: &mut [RankBeam],
     ) {
         match self {
-            Self::U16(inner) => inner.advance_with_beams_query(
-                ref_alleles,
-                n_alleles,
-                marker,
-                query_alleles,
-                beams,
-            ),
-            Self::U32(inner) => inner.advance_with_beams_query(
-                ref_alleles,
-                n_alleles,
-                marker,
-                query_alleles,
-                beams,
-            ),
+            Self::U16(inner) => {
+                inner.advance_with_beams_query(ref_alleles, n_alleles, marker, query_alleles, beams)
+            }
+            Self::U32(inner) => {
+                inner.advance_with_beams_query(ref_alleles, n_alleles, marker, query_alleles, beams)
+            }
         }
     }
 
@@ -761,18 +738,12 @@ impl ReferencePbwt {
         scratch: &mut Vec<(u32, u32, u32)>,
     ) {
         match self {
-            Self::U16(inner) => inner.update_beams_with_scratch_query(
-                beams,
-                query_alleles,
-                n_alleles,
-                scratch,
-            ),
-            Self::U32(inner) => inner.update_beams_with_scratch_query(
-                beams,
-                query_alleles,
-                n_alleles,
-                scratch,
-            ),
+            Self::U16(inner) => {
+                inner.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch)
+            }
+            Self::U32(inner) => {
+                inner.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch)
+            }
         }
     }
 
@@ -820,5 +791,4 @@ impl ReferencePbwt {
             Self::U32(inner) => inner.collect_positions_and_lens(marker, haps, out),
         }
     }
-
 }

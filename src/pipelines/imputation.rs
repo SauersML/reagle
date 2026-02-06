@@ -51,7 +51,6 @@ impl AllelePosteriors {
             AllelePosteriors::Multiallelic(probs) => probs.get(allele).copied().unwrap_or(0.0),
         }
     }
-
 }
 
 impl ImputationPipeline {

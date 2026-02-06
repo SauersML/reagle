@@ -93,7 +93,6 @@ pub struct Config {
     /// Rare variant frequency threshold
     pub rare: f32,
 
-
     // ============ Imputation Parameters ============
     /// Impute ungenotyped markers
     pub impute: bool,
@@ -336,8 +335,7 @@ impl Config {
 
     /// Parse command line arguments and validate
     pub fn parse_and_validate() -> Result<Self> {
-        info_span!("config_parse_and_validate")
-            .in_scope(|| Self::parse_from(std::env::args_os()))
+        info_span!("config_parse_and_validate").in_scope(|| Self::parse_from(std::env::args_os()))
     }
 
     /// Parse provided CLI arguments and validate.
@@ -466,9 +464,7 @@ impl Config {
         }
 
         if self.mcmc_lr_samples == 0 {
-            return Err(ReagleError::config(
-                "mcmc-lr-samples must be positive",
-            ));
+            return Err(ReagleError::config("mcmc-lr-samples must be positive"));
         }
 
         // Validate ne > 0

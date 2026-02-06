@@ -16,7 +16,8 @@ use std::process::Command;
 
 /// URLs for test data
 const HGDP_1KG_CHR22_URL: &str = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf";
-const GSA_SITES_URL: &str = "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
+const GSA_SITES_URL: &str =
+    "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
 
 /// Get the test data cache directory
 pub fn cache_dir() -> PathBuf {
@@ -73,11 +74,7 @@ fn get_remote_sample_list() -> Vec<String> {
 }
 
 /// Stream a region from remote HGDP+1KG BCF with sample subset
-fn stream_region_from_remote(
-    samples_file: &Path,
-    region: &str,
-    output_vcf: &Path,
-) {
+fn stream_region_from_remote(samples_file: &Path, region: &str, output_vcf: &Path) {
     eprintln!(
         "Streaming region {} from remote HGDP+1KG to {:?}...",
         region, output_vcf
@@ -179,8 +176,14 @@ pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &st
     }
 
     // Split samples
-    let ref_sample_list: Vec<&str> = all_samples[..ref_samples].iter().map(|s| s.as_str()).collect();
-    let target_sample_list: Vec<&str> = all_samples[ref_samples..total_needed].iter().map(|s| s.as_str()).collect();
+    let ref_sample_list: Vec<&str> = all_samples[..ref_samples]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let target_sample_list: Vec<&str> = all_samples[ref_samples..total_needed]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
 
     // Write sample lists
     let ref_samples_file = work_dir.path().join("ref_samples.txt");
@@ -209,7 +212,10 @@ pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &st
         let chrom = region_parts[0];
         let (start, end) = if region_parts.len() > 1 {
             let range: Vec<&str> = region_parts[1].split('-').collect();
-            (range[0].parse::<u64>().unwrap_or(0), range[1].parse::<u64>().unwrap_or(u64::MAX))
+            (
+                range[0].parse::<u64>().unwrap_or(0),
+                range[1].parse::<u64>().unwrap_or(u64::MAX),
+            )
         } else {
             (0, u64::MAX)
         };
@@ -225,9 +231,12 @@ pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &st
     let status = Command::new("bcftools")
         .args([
             "view",
-            "-R", gsa_regions_file.to_str().unwrap(),
-            "-O", "z",
-            "-o", target_sparse_vcf.to_str().unwrap(),
+            "-R",
+            gsa_regions_file.to_str().unwrap(),
+            "-O",
+            "z",
+            "-o",
+            target_sparse_vcf.to_str().unwrap(),
         ])
         .arg(&target_vcf)
         .status()

@@ -311,7 +311,10 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
 
         for m in 0..n_target_markers {
             let target_marker = target_gt.marker(MarkerIdx::new(m as u32));
-            let chrom_name = target_gt.markers().chrom_name(target_marker.chrom).unwrap_or("");
+            let chrom_name = target_gt
+                .markers()
+                .chrom_name(target_marker.chrom)
+                .unwrap_or("");
             let chrom_norm = normalize_chrom(chrom_name).to_string();
             if let Some(ref_candidates) = ref_pos_map.get(&(chrom_norm, target_marker.pos)) {
                 for &ref_idx in ref_candidates {

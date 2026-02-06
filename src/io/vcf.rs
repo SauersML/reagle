@@ -3,9 +3,9 @@
 //! Parse VCF/BCF files into `GenotypeMatrix`. Write phased results back to VCF.
 //! Uses the `noodles` crate for VCF I/O.
 
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -157,7 +157,6 @@ impl MarkerImputationStats {
         // AF = Total Prob Mass / Total Haplotypes
         self.sum_p[allele] / self.n_haps as f32
     }
-
 }
 
 /// Collection of imputation statistics for all markers
@@ -193,7 +192,6 @@ impl ImputationQuality {
             stats.is_imputed = imputed;
         }
     }
-
 }
 
 /// VCF file reader
@@ -681,9 +679,9 @@ impl VcfReader {
     )> {
         let mut fields = FieldIter::new(line);
         let mut next_field = || {
-            fields
-                .next()
-                .ok_or_else(|| ReagleError::parse(line_num, "Expected at least 10 fields, got fewer"))
+            fields.next().ok_or_else(|| {
+                ReagleError::parse(line_num, "Expected at least 10 fields, got fewer")
+            })
         };
 
         // Parse CHROM
@@ -1326,12 +1324,12 @@ impl VcfWriter {
         F: Fn(usize, usize) -> f32 + Sync,
         B: Fn(usize, usize) -> (u8, u8) + Sync,
         G: Fn(
-            usize,
-            usize,
-        ) -> (
-            crate::pipelines::imputation::AllelePosteriors,
-            crate::pipelines::imputation::AllelePosteriors,
-        ) + Sync,
+                usize,
+                usize,
+            ) -> (
+                crate::pipelines::imputation::AllelePosteriors,
+                crate::pipelines::imputation::AllelePosteriors,
+            ) + Sync,
         H: Fn(usize, usize) -> Option<Vec<f32>> + Sync,
     {
         let n_samples = self.samples.len();
@@ -1461,185 +1459,177 @@ impl VcfWriter {
                 )
                 .unwrap();
 
-            for s in 0..n_samples {
-                let ds = get_dosage(m, s);
-                let posteriors = get_posteriors_ref.map(|f| f(m, s));
-                let gp_override = get_genotype_posteriors_ref
-                    .and_then(|f| f(m, s))
-                    .and_then(|gp| {
-                        let expected = n_alleles * (n_alleles + 1) / 2;
-                        if gp.len() == expected {
-                            Some(gp)
-                        } else {
-                            None
-                        }
-                    });
-                let (a1, a2) = if let Some(ref gp) = gp_override {
-                    best_gt_from_gp(n_alleles, gp)
-                } else if let Some((ref p1, ref p2)) = posteriors {
-                    if n_alleles <= 2 {
-                        let p1_alt = p1.prob(1);
-                        let p2_alt = p2.prob(1);
-                        let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
-                        let gp01 =
-                            p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
-                        let gp11 = p1_alt * p2_alt;
-                        if gp01 >= gp00 && gp01 >= gp11 {
-                            let p10 = p1_alt * (1.0 - p2_alt);
-                            let p01 = (1.0 - p1_alt) * p2_alt;
-                            if p10 >= p01 {
-                                (1, 0)
+                for s in 0..n_samples {
+                    let ds = get_dosage(m, s);
+                    let posteriors = get_posteriors_ref.map(|f| f(m, s));
+                    let gp_override =
+                        get_genotype_posteriors_ref
+                            .and_then(|f| f(m, s))
+                            .and_then(|gp| {
+                                let expected = n_alleles * (n_alleles + 1) / 2;
+                                if gp.len() == expected { Some(gp) } else { None }
+                            });
+                    let (a1, a2) = if let Some(ref gp) = gp_override {
+                        best_gt_from_gp(n_alleles, gp)
+                    } else if let Some((ref p1, ref p2)) = posteriors {
+                        if n_alleles <= 2 {
+                            let p1_alt = p1.prob(1);
+                            let p2_alt = p2.prob(1);
+                            let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
+                            let gp01 = p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
+                            let gp11 = p1_alt * p2_alt;
+                            if gp01 >= gp00 && gp01 >= gp11 {
+                                let p10 = p1_alt * (1.0 - p2_alt);
+                                let p01 = (1.0 - p1_alt) * p2_alt;
+                                if p10 >= p01 { (1, 0) } else { (0, 1) }
+                            } else if gp11 >= gp00 {
+                                (1, 1)
                             } else {
-                                (0, 1)
+                                (0, 0)
                             }
-                        } else if gp11 >= gp00 {
-                            (1, 1)
                         } else {
-                            (0, 0)
-                        }
-                    } else {
-                        let mut best = (0u8, 0u8);
-                        let mut best_prob = -1.0f32;
-                        for i in 0..n_alleles {
-                            for j in i..n_alleles {
-                                let p_i1 = p1.prob(i);
-                                let p_i2 = p2.prob(i);
-                                let p_j1 = p1.prob(j);
-                                let p_j2 = p2.prob(j);
-                                let prob = if i == j {
-                                    p_i1 * p_i2
-                                } else {
-                                    p_i1 * p_j2 + p_j1 * p_i2
-                                };
-                                if prob > best_prob {
-                                    best_prob = prob;
-                                    if i == j {
-                                        best = (i as u8, i as u8);
+                            let mut best = (0u8, 0u8);
+                            let mut best_prob = -1.0f32;
+                            for i in 0..n_alleles {
+                                for j in i..n_alleles {
+                                    let p_i1 = p1.prob(i);
+                                    let p_i2 = p2.prob(i);
+                                    let p_j1 = p1.prob(j);
+                                    let p_j2 = p2.prob(j);
+                                    let prob = if i == j {
+                                        p_i1 * p_i2
                                     } else {
-                                        let p_ij = p_i1 * p_j2;
-                                        let p_ji = p_j1 * p_i2;
-                                        if p_ij >= p_ji {
-                                            best = (i as u8, j as u8);
+                                        p_i1 * p_j2 + p_j1 * p_i2
+                                    };
+                                    if prob > best_prob {
+                                        best_prob = prob;
+                                        if i == j {
+                                            best = (i as u8, i as u8);
                                         } else {
-                                            best = (j as u8, i as u8);
+                                            let p_ij = p_i1 * p_j2;
+                                            let p_ji = p_j1 * p_i2;
+                                            if p_ij >= p_ji {
+                                                best = (i as u8, j as u8);
+                                            } else {
+                                                best = (j as u8, i as u8);
+                                            }
                                         }
                                     }
                                 }
                             }
+                            best
                         }
-                        best
+                    } else {
+                        get_best_gt(m, s)
+                    };
+
+                    line_buf.push('\t');
+                    if a1 == 255 {
+                        line_buf.push('.');
+                    } else if a1 < 10 {
+                        line_buf.push((b'0' + a1) as char);
+                    } else {
+                        let mut buffer = itoa::Buffer::new();
+                        line_buf.push_str(buffer.format(a1));
                     }
-                } else {
-                    get_best_gt(m, s)
-                };
-
-                line_buf.push('\t');
-                if a1 == 255 {
-                    line_buf.push('.');
-                } else if a1 < 10 {
-                    line_buf.push((b'0' + a1) as char);
-                } else {
-                    let mut buffer = itoa::Buffer::new();
-                    line_buf.push_str(buffer.format(a1));
-                }
-                line_buf.push('|');
-                if a2 == 255 {
-                    line_buf.push('.');
-                } else if a2 < 10 {
-                    line_buf.push((b'0' + a2) as char);
-                } else {
-                    let mut buffer = itoa::Buffer::new();
-                    line_buf.push_str(buffer.format(a2));
-                }
-                line_buf.push(':');
-                let v = format_f32_4dp(ds, &mut ryu_buf);
-                line_buf.push_str(&v);
-
-                if include_gp {
+                    line_buf.push('|');
+                    if a2 == 255 {
+                        line_buf.push('.');
+                    } else if a2 < 10 {
+                        line_buf.push((b'0' + a2) as char);
+                    } else {
+                        let mut buffer = itoa::Buffer::new();
+                        line_buf.push_str(buffer.format(a2));
+                    }
                     line_buf.push(':');
-                    if let Some(ref gp) = gp_override {
-                        let mut first = true;
-                        for p in gp.iter() {
-                            if !first {
-                                line_buf.push(',');
-                            }
-                            first = false;
-                            let v = format_f32_4dp(*p, &mut ryu_buf);
-                            line_buf.push_str(&v);
-                        }
-                    } else if let Some((ref p1, ref p2)) = posteriors {
-                        let mut first = true;
-                        for i2 in 0..n_alleles {
-                            for i1 in 0..=i2 {
+                    let v = format_f32_4dp(ds, &mut ryu_buf);
+                    line_buf.push_str(&v);
+
+                    if include_gp {
+                        line_buf.push(':');
+                        if let Some(ref gp) = gp_override {
+                            let mut first = true;
+                            for p in gp.iter() {
                                 if !first {
                                     line_buf.push(',');
                                 }
                                 first = false;
-                                let prob = if i1 == i2 {
-                                    p1.prob(i1) * p2.prob(i2)
-                                } else {
-                                    p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1)
-                                };
-                                let v = format_f32_4dp(prob, &mut ryu_buf);
+                                let v = format_f32_4dp(*p, &mut ryu_buf);
                                 line_buf.push_str(&v);
                             }
-                        }
-                    } else {
-                        let n_gp = n_alleles * (n_alleles + 1) / 2;
-                        for i in 0..n_gp {
-                            if i > 0 {
-                                line_buf.push(',');
+                        } else if let Some((ref p1, ref p2)) = posteriors {
+                            let mut first = true;
+                            for i2 in 0..n_alleles {
+                                for i1 in 0..=i2 {
+                                    if !first {
+                                        line_buf.push(',');
+                                    }
+                                    first = false;
+                                    let prob = if i1 == i2 {
+                                        p1.prob(i1) * p2.prob(i2)
+                                    } else {
+                                        p1.prob(i1) * p2.prob(i2) + p1.prob(i2) * p2.prob(i1)
+                                    };
+                                    let v = format_f32_4dp(prob, &mut ryu_buf);
+                                    line_buf.push_str(&v);
+                                }
                             }
-                            line_buf.push_str("0.00");
+                        } else {
+                            let n_gp = n_alleles * (n_alleles + 1) / 2;
+                            for i in 0..n_gp {
+                                if i > 0 {
+                                    line_buf.push(',');
+                                }
+                                line_buf.push_str("0.00");
+                            }
                         }
                     }
-                }
 
-                if include_ap {
-                    if let Some((ref p1, ref p2)) = posteriors {
-                        line_buf.push(':');
-                        for a in 1..n_alleles {
-                            if a > 1 {
-                                line_buf.push(',');
+                    if include_ap {
+                        if let Some((ref p1, ref p2)) = posteriors {
+                            line_buf.push(':');
+                            for a in 1..n_alleles {
+                                if a > 1 {
+                                    line_buf.push(',');
+                                }
+                                let v = format_f32_4dp(p1.prob(a), &mut ryu_buf);
+                                line_buf.push_str(&v);
                             }
-                            let v = format_f32_4dp(p1.prob(a), &mut ryu_buf);
-                            line_buf.push_str(&v);
-                        }
-                        if n_alleles <= 1 {
-                            line_buf.push_str("0.00");
-                        }
-                        line_buf.push(':');
-                        for a in 1..n_alleles {
-                            if a > 1 {
-                                line_buf.push(',');
+                            if n_alleles <= 1 {
+                                line_buf.push_str("0.00");
                             }
-                            let v = format_f32_4dp(p2.prob(a), &mut ryu_buf);
-                            line_buf.push_str(&v);
-                        }
-                        if n_alleles <= 1 {
-                            line_buf.push_str("0.00");
-                        }
-                    } else {
-                        let n_ap = n_alleles.saturating_sub(1).max(1);
-                        line_buf.push(':');
-                        for i in 0..n_ap {
-                            if i > 0 {
-                                line_buf.push(',');
+                            line_buf.push(':');
+                            for a in 1..n_alleles {
+                                if a > 1 {
+                                    line_buf.push(',');
+                                }
+                                let v = format_f32_4dp(p2.prob(a), &mut ryu_buf);
+                                line_buf.push_str(&v);
                             }
-                            line_buf.push_str("0.00");
-                        }
-                        line_buf.push(':');
-                        for i in 0..n_ap {
-                            if i > 0 {
-                                line_buf.push(',');
+                            if n_alleles <= 1 {
+                                line_buf.push_str("0.00");
                             }
-                            line_buf.push_str("0.00");
+                        } else {
+                            let n_ap = n_alleles.saturating_sub(1).max(1);
+                            line_buf.push(':');
+                            for i in 0..n_ap {
+                                if i > 0 {
+                                    line_buf.push(',');
+                                }
+                                line_buf.push_str("0.00");
+                            }
+                            line_buf.push(':');
+                            for i in 0..n_ap {
+                                if i > 0 {
+                                    line_buf.push(',');
+                                }
+                                line_buf.push_str("0.00");
+                            }
                         }
                     }
                 }
-            }
-            line_buf.push('\n');
-            *line = line_buf;
+                line_buf.push('\n');
+                *line = line_buf;
             });
 
             for line in lines.into_iter() {
@@ -1992,11 +1982,7 @@ mod tests {
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"
         )
         .unwrap();
-        writeln!(
-            file,
-            "1\t100\t.\tA\tC\t.\tPASS\t.\tGT:GL\t0/1:0,0,0"
-        )
-        .unwrap();
+        writeln!(file, "1\t100\t.\tA\tC\t.\tPASS\t.\tGT:GL\t0/1:0,0,0").unwrap();
 
         let (mut reader, handle) = VcfReader::open(tmp.path()).unwrap();
         let gt = reader.read_all(handle).unwrap();
@@ -2030,11 +2016,7 @@ mod tests {
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"
         )
         .unwrap();
-        writeln!(
-            file,
-            "1\t100\t.\tA\tC\t.\tPASS\t.\tGT:GL\t0/0:0,-5,-10"
-        )
-        .unwrap();
+        writeln!(file, "1\t100\t.\tA\tC\t.\tPASS\t.\tGT:GL\t0/0:0,-5,-10").unwrap();
 
         let (mut reader, handle) = VcfReader::open(tmp.path()).unwrap();
         let gt = reader.read_all(handle).unwrap();

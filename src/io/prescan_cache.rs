@@ -1,7 +1,7 @@
-use crate::data::marker::{bits_per_allele, MarkerIdx, Markers, RefWindowSpace};
+use crate::data::marker::{MarkerIdx, Markers, RefWindowSpace, bits_per_allele};
 use crate::data::storage::GenotypeColumn;
-use crate::io::bref3::RefWindow;
 use crate::error::{ReagleError, Result};
+use crate::io::bref3::RefWindow;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,9 +37,7 @@ impl PackedRefColumn {
                 }
                 let word_idx = hap / 64;
                 let bit_in_word = hap % 64;
-                if word_idx < missing.len()
-                    && ((missing[word_idx] >> bit_in_word) & 1) == 1
-                {
+                if word_idx < missing.len() && ((missing[word_idx] >> bit_in_word) & 1) == 1 {
                     return 255;
                 }
                 let bits = *bits as usize;
@@ -57,7 +55,11 @@ impl PackedRefColumn {
                         val |= hi;
                     }
                 }
-                let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
                 (val & mask) as u8
             }
         }
@@ -272,7 +274,9 @@ impl PrescanCacheReader {
         }
         let version = read_u32(&mut reader)?;
         if version != CACHE_VERSION {
-            return Err(ReagleError::vcf("unsupported prescan cache version".to_string()));
+            return Err(ReagleError::vcf(
+                "unsupported prescan cache version".to_string(),
+            ));
         }
         read_u32(&mut reader)?;
         let data_offset = reader.stream_position()?;
@@ -318,10 +322,7 @@ impl PrescanCacheReader {
             columns.push(read_packed_column(&mut self.reader)?);
         }
 
-        Ok(Some(PackedRefWindow {
-            markers,
-            columns,
-        }))
+        Ok(Some(PackedRefWindow { markers, columns }))
     }
 }
 
@@ -438,7 +439,11 @@ fn pack_bits(words: &mut [u64], bits: usize, idx: usize, value: u64) {
     if word >= words.len() {
         return;
     }
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let v = value & mask;
     words[word] |= v << shift;
     if shift + bits > 64 && word + 1 < words.len() {
@@ -457,7 +462,11 @@ fn unpack_bits(words: &[u64], bits: usize, idx: usize) -> u64 {
     if shift + bits > 64 && word + 1 < words.len() {
         val |= words[word + 1] << (64 - shift);
     }
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     val & mask
 }
 
@@ -489,7 +498,13 @@ mod tests {
     fn test_pack_unpack_biallelic() {
         let mut markers = Markers::<RefWindowSpace>::new();
         let chrom = markers.add_chrom("1");
-        let marker = Marker::new(chrom, 100, None, Allele::from_str("A"), vec![Allele::from_str("G")]);
+        let marker = Marker::new(
+            chrom,
+            100,
+            None,
+            Allele::from_str("A"),
+            vec![Allele::from_str("G")],
+        );
         markers.push(marker);
 
         let alleles = vec![0u8, 1, 0, 1, 255];
@@ -505,7 +520,13 @@ mod tests {
     fn test_cache_roundtrip() {
         let mut markers = Markers::<RefWindowSpace>::new();
         let chrom = markers.add_chrom("1");
-        let marker = Marker::new(chrom, 200, None, Allele::from_str("C"), vec![Allele::from_str("T")]);
+        let marker = Marker::new(
+            chrom,
+            200,
+            None,
+            Allele::from_str("C"),
+            vec![Allele::from_str("T")],
+        );
         markers.push(marker);
 
         let alleles = vec![0u8, 1, 1, 0];
