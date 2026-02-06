@@ -4722,6 +4722,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         struct PhaseConfidence(f32);
 
         enum Stage1OrientationUpdate {
+            NoChange,
             RelativeSwapMask(Vec<RelativeSwapBit>),
             AbsoluteHap1(Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)>),
         }
@@ -4815,6 +4816,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let threaded_haps = &threaded_haps_vec[s];
                         let mut threaded_haps = threaded_haps.clone();
 
+                        // Fast path: if this sample has no unresolved heterozygotes in Stage 1,
+                        // skip all HMM/MCMC work for this iteration.
+                        let mut has_unresolved_het = false;
+                        for &m in hi_freq_to_orig {
+                            if !sp.is_unphased(m) {
+                                continue;
+                            }
+                            let a1 = sp.allele1(m);
+                            let a2 = sp.allele2(m);
+                            if a1 != 255 && a2 != 255 && a1 != a2 {
+                                has_unresolved_het = true;
+                                break;
+                            }
+                        }
+                        if !has_unresolved_het {
+                            return Stage1PhaseDecision {
+                                orientation: Stage1OrientationUpdate::NoChange,
+                                het_updates: Vec::new(),
+                                paths: None,
+                            };
+                        }
+
                         let t0 = Instant::now();
                         // Extract alleles/confidence for SUBSET of markers using reused buffers
                         ws.seq1.clear();
@@ -4838,10 +4861,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
 
-                        // Identify heterozygotes (only UNPHASED) in hi-freq space
+                        // Identify unresolved heterozygotes in hi-freq space.
                         let mut het_positions: Vec<usize> = Vec::new();
                         let mut het_index_map: Vec<usize> = vec![usize::MAX; n_hi_freq];
                         for i in 0..n_hi_freq {
+                            let m = hi_freq_to_orig[i];
+                            if !sp.is_unphased(m) {
+                                continue;
+                            }
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             if a1 != 255 && a2 != 255 && a1 != a2 {
@@ -4852,15 +4879,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
 
                         if het_positions.is_empty() {
-                            // No hets to phase: no swaps needed, no LR values
+                            // No unresolved hets to phase for this sample.
                             ws.seq1 = seq1;
                             ws.seq2 = seq2;
                             ws.sample_conf = sample_conf;
                             ws.het_positions = het_positions;
                             return Stage1PhaseDecision {
-                                orientation: Stage1OrientationUpdate::RelativeSwapMask(
-                                    vec![RelativeSwapBit(false); n_hi_freq],
-                                ),
+                                orientation: Stage1OrientationUpdate::NoChange,
                                 het_updates: Vec::new(),
                                 paths: None,
                             };
@@ -5003,7 +5028,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         let t_mcmc_start = Instant::now();
                             let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
-                            let dyn_k = n_states.max(1);
+                            let dyn_k = self.config.dynamic_k.max(1).min(n_states.max(1));
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
@@ -5422,6 +5447,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             let sp = &mut sample_phases[s];
 
             match decision.orientation {
+                Stage1OrientationUpdate::NoChange => {}
                 Stage1OrientationUpdate::AbsoluteHap1(desired_hap1) => {
                     for (HiFreqMarkerIdx(hi_freq_idx), AbsoluteHap1Allele(desired_h1)) in
                         desired_hap1
