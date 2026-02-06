@@ -8597,7 +8597,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // This prevents symmetric mode oscillation ("Mosaic Trap").
     if let Some((paths, score, informative)) = heuristic_result.as_ref() {
         let mismatches = (*informative as f32 - *score) / 2.0;
-        if mismatches == 0.0 || (*informative > 50 && mismatches <= 2.0) {
+        // Require perfect match and sufficient evidence to bypass MCMC.
+        // Relaxed mismatch checks can suppress valid recombinations, reducing accuracy.
+        if mismatches == 0.0 && *informative >= 10 {
             let mut final_paths = paths.clone();
             // Align heuristic orientation to anchors if present
             if has_anchor {
