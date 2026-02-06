@@ -2435,11 +2435,28 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+        let mut impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
+        if let Some(phased_rho) = phased_recomb_intensity {
+            if phased_rho.is_finite() && phased_rho > 0.0 {
+                impute_recomb_intensity =
+                    phased_rho.clamp(1e-6, ModelParams::MAX_RECOMB_INTENSITY);
+            }
+        }
         self.params.recomb_intensity = impute_recomb_intensity;
-        let _ = phased_recomb_intensity;
+        eprintln!(
+            "Imputation recomb_intensity: {:.6} (source={})",
+            self.params.recomb_intensity,
+            if phased_recomb_intensity
+                .map(|v| v.is_finite() && v > 0.0)
+                .unwrap_or(false)
+            {
+                "phasing-estimated"
+            } else {
+                "config-ne"
+            }
+        );
         // Do not inherit phasing mismatch estimates for imputation. Imputation
         // should use the Li-Stephens mismatch prior (or user override) tied to
         // the reference panel, not phasing-specific error rates.

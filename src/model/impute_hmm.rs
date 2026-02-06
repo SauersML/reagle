@@ -647,10 +647,18 @@ fn smooth_allele_posteriors_subset(
         return;
     }
 
-    // Weak Bayesian shrinkage toward the active-state subset prior.
-    // As effective support grows, this prior becomes negligible.
+    // Prior should only matter when the allele posterior is weak/flat.
+    // If posterior is already decisive, applying AF pull degrades calibration.
+    let mut max_p = 0.0f32;
+    for &p in allele_probs.iter() {
+        if p > max_p {
+            max_p = p;
+        }
+    }
+    let allele_uncertainty = (1.0 - max_p).clamp(0.0, 1.0);
     let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
-    let prior_mass = (0.25f32 / effective_states).clamp(0.0, 0.5);
+    let support_dilution = ((effective_states - 1.0) / effective_states).clamp(0.0, 1.0);
+    let prior_mass = (0.05f32 * allele_uncertainty * support_dilution).clamp(0.0, 0.05);
     if prior_mass <= 0.0 {
         return;
     }
@@ -1032,10 +1040,11 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
-    let transition_haps = ref_allele_freqs.n_ref_haps().max(1);
+    let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
+    let transition_haps = active_states.max(1).min(panel_haps);
     if active_states > 0 {
-        // Li-Stephens transition denominator should be full reference-panel size.
-        // Subsequent normalization conditions probabilities onto active states.
+        // The active subset is the imputation state space for this haplotype/window.
+        // Scale transitions to that subset to avoid suppressing switch mass by K/N_ref.
         ws.weights.fill(1.0);
     }
 
@@ -1334,7 +1343,8 @@ fn run_impute_hmm_seqcoded(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
-    let transition_haps = ref_allele_freqs.n_ref_haps().max(1);
+    let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
+    let transition_haps = active_states.max(1).min(panel_haps);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1617,7 +1627,8 @@ fn run_impute_hmm_dict(
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
-    let transition_haps = ref_allele_freqs.n_ref_haps().max(1);
+    let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
+    let transition_haps = active_states.max(1).min(panel_haps);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
