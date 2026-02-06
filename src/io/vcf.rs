@@ -820,7 +820,8 @@ impl VcfReader {
                             .and_then(|gq_i| nth_colon_field(sample_field, gq_i))
                             .and_then(gq_to_confidence)
                     })
-                    .unwrap_or(255); // Default to full confidence if no quality evidence.
+                    // No quality evidence -> neutral confidence (0.5), not full certainty.
+                    .unwrap_or(128);
                 conf_vec.push(confidence);
             }
         }
