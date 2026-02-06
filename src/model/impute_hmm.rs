@@ -9,6 +9,7 @@ use crate::data::marker::{MarkerIdx, Markers};
 use crate::data::storage::{
     DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
+use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
 use crate::model::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
@@ -18,6 +19,13 @@ use std::sync::OnceLock;
 pub struct EmStats {
     pub expected_mismatches: f64,
     pub informative_sites: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ImputeHmmContext {
+    pub window_idx: usize,
+    pub sample_idx: usize,
+    pub hap_idx: usize,
 }
 
 #[cfg(test)]
@@ -712,22 +720,21 @@ fn normalize_probs(probs: &mut [f32]) {
 }
 
 #[inline]
-fn smooth_allele_posteriors<Space>(
+fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
-    marker_idx: usize,
+    subset_prior_probs: &[f32],
     total_mass: f32,
     state_prob_sq_sum: f32,
-    ref_allele_freqs: &RefAlleleFreqs<Space>,
 ) {
     if allele_probs.is_empty() || total_mass <= 0.0 || state_prob_sq_sum <= 0.0 {
         return;
     }
-    let Some(freqs) = ref_allele_freqs.get(marker_idx) else {
+    if subset_prior_probs.len() != allele_probs.len() {
         return;
-    };
+    }
 
-    // Weak Bayesian shrinkage toward panel AF to prevent overconfident 0/1
-    // allele posteriors when effective donor support is tiny.
+    // Weak Bayesian shrinkage toward the active-state subset prior.
+    // As effective support grows, this prior becomes negligible.
     let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
     let prior_mass = (0.25f32 / effective_states).clamp(0.0, 0.5);
     if prior_mass <= 0.0 {
@@ -736,8 +743,8 @@ fn smooth_allele_posteriors<Space>(
 
     let denom = 1.0 + prior_mass;
     for (i, p) in allele_probs.iter_mut().enumerate() {
-        let af = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-        *p = (*p + prior_mass * af) / denom;
+        let local_prior = subset_prior_probs.get(i).copied().unwrap_or(0.0).max(0.0);
+        *p = (*p + prior_mass * local_prior) / denom;
     }
     normalize_probs(allele_probs);
 }
@@ -1101,8 +1108,9 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
@@ -1254,6 +1262,8 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         };
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let mut subset_counts = vec![0.0f32; n_alleles];
+                            let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut sq_sum = 0.0f32;
                             for i in 0..active_states {
@@ -1267,42 +1277,35 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
+                                    subset_counts[idx] += 1.0;
+                                    subset_total += 1.0;
                                 }
                             }
                             if total > 0.0 {
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                smooth_allele_posteriors(
-                                    &mut ws.allele_probs,
-                                    m_rev,
-                                    total,
-                                    sq_sum,
-                                    ref_allele_freqs,
-                                );
-                            } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
-                                let mut sum = 0.0f32;
-                                for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-                                    *p = f;
-                                    sum += f;
-                                }
-                                if sum > 0.0 {
-                                    let inv = 1.0 / sum;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p *= inv;
+                                if uniform && subset_total > 0.0 {
+                                    let inv_subset = 1.0 / subset_total;
+                                    for p in subset_counts.iter_mut() {
+                                        *p *= inv_subset;
                                     }
-                                } else {
-                                    let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p = uniform;
-                                    }
+                                    smooth_allele_posteriors_subset(
+                                        &mut ws.allele_probs,
+                                        &subset_counts,
+                                        total,
+                                        sq_sum,
+                                    );
                                 }
                             } else {
-                                let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                                for p in ws.allele_probs.iter_mut() {
-                                    *p = uniform;
-                                }
+                                return Err(ReagleError::vcf(format!(
+                                    "Posterior mass collapse in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                    context.window_idx,
+                                    context.sample_idx,
+                                    context.hap_idx,
+                                    m_rev,
+                                    active_states
+                                )));
                             }
                             if ws.allele_probs.len() == 2 {
                                 posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -1312,7 +1315,14 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                                 posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                             }
                         } else {
-                            posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
+                            return Err(ReagleError::vcf(format!(
+                                "No allele space available in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                context.window_idx,
+                                context.sample_idx,
+                                context.hap_idx,
+                                m_rev,
+                                active_states
+                            )));
                         }
                     }
 
@@ -1393,7 +1403,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
         informative_sites: mismatch_markers,
     };
 
-    (final_posteriors, final_prior_state_post, stats)
+    Ok((final_posteriors, final_prior_state_post, stats))
 }
 
 fn run_impute_hmm_seqcoded<Space>(
@@ -1405,8 +1415,9 @@ fn run_impute_hmm_seqcoded<Space>(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
@@ -1541,6 +1552,8 @@ fn run_impute_hmm_seqcoded<Space>(
                         };
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let mut subset_counts = vec![0.0f32; n_alleles];
+                            let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut sq_sum = 0.0f32;
                             for i in 0..active_states {
@@ -1554,42 +1567,35 @@ fn run_impute_hmm_seqcoded<Space>(
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
+                                    subset_counts[idx] += 1.0;
+                                    subset_total += 1.0;
                                 }
                             }
                             if total > 0.0 {
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                smooth_allele_posteriors(
-                                    &mut ws.allele_probs,
-                                    m_rev,
-                                    total,
-                                    sq_sum,
-                                    ref_allele_freqs,
-                                );
-                            } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
-                                let mut sum = 0.0f32;
-                                for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-                                    *p = f;
-                                    sum += f;
-                                }
-                                if sum > 0.0 {
-                                    let inv = 1.0 / sum;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p *= inv;
+                                if uniform && subset_total > 0.0 {
+                                    let inv_subset = 1.0 / subset_total;
+                                    for p in subset_counts.iter_mut() {
+                                        *p *= inv_subset;
                                     }
-                                } else {
-                                    let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p = uniform;
-                                    }
+                                    smooth_allele_posteriors_subset(
+                                        &mut ws.allele_probs,
+                                        &subset_counts,
+                                        total,
+                                        sq_sum,
+                                    );
                                 }
                             } else {
-                                let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                                for p in ws.allele_probs.iter_mut() {
-                                    *p = uniform;
-                                }
+                                return Err(ReagleError::vcf(format!(
+                                    "Posterior mass collapse in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
+                                    context.window_idx,
+                                    context.sample_idx,
+                                    context.hap_idx,
+                                    m_rev,
+                                    active_states
+                                )));
                             }
                             if ws.allele_probs.len() == 2 {
                                 posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -1599,7 +1605,14 @@ fn run_impute_hmm_seqcoded<Space>(
                                 posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                             }
                         } else {
-                            posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
+                            return Err(ReagleError::vcf(format!(
+                                "No allele space available in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
+                                context.window_idx,
+                                context.sample_idx,
+                                context.hap_idx,
+                                m_rev,
+                                active_states
+                            )));
                         }
 
                     }
@@ -1678,7 +1691,7 @@ fn run_impute_hmm_seqcoded<Space>(
         informative_sites: mismatch_markers,
     };
 
-    (final_posteriors, final_prior_state_post, stats)
+    Ok((final_posteriors, final_prior_state_post, stats))
 }
 
 fn run_impute_hmm_dict<Space>(
@@ -1690,8 +1703,9 @@ fn run_impute_hmm_dict<Space>(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
@@ -1827,6 +1841,8 @@ fn run_impute_hmm_dict<Space>(
                         };
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let mut subset_counts = vec![0.0f32; n_alleles];
+                            let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut sq_sum = 0.0f32;
                             for i in 0..active_states {
@@ -1840,42 +1856,35 @@ fn run_impute_hmm_dict<Space>(
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
+                                    subset_counts[idx] += 1.0;
+                                    subset_total += 1.0;
                                 }
                             }
                             if total > 0.0 {
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                smooth_allele_posteriors(
-                                    &mut ws.allele_probs,
-                                    m_rev,
-                                    total,
-                                    sq_sum,
-                                    ref_allele_freqs,
-                                );
-                            } else if let Some(freqs) = ref_allele_freqs.get(m_rev) {
-                                let mut sum = 0.0f32;
-                                for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                    let f = freqs.get(i).copied().unwrap_or(0.0).max(0.0);
-                                    *p = f;
-                                    sum += f;
-                                }
-                                if sum > 0.0 {
-                                    let inv = 1.0 / sum;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p *= inv;
+                                if uniform && subset_total > 0.0 {
+                                    let inv_subset = 1.0 / subset_total;
+                                    for p in subset_counts.iter_mut() {
+                                        *p *= inv_subset;
                                     }
-                                } else {
-                                    let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p = uniform;
-                                    }
+                                    smooth_allele_posteriors_subset(
+                                        &mut ws.allele_probs,
+                                        &subset_counts,
+                                        total,
+                                        sq_sum,
+                                    );
                                 }
                             } else {
-                                let uniform = 1.0 / ws.allele_probs.len().max(1) as f32;
-                                for p in ws.allele_probs.iter_mut() {
-                                    *p = uniform;
-                                }
+                                return Err(ReagleError::vcf(format!(
+                                    "Posterior mass collapse in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
+                                    context.window_idx,
+                                    context.sample_idx,
+                                    context.hap_idx,
+                                    m_rev,
+                                    active_states
+                                )));
                             }
                             if ws.allele_probs.len() == 2 {
                                 posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -1885,7 +1894,14 @@ fn run_impute_hmm_dict<Space>(
                                 posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                             }
                         } else {
-                            posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
+                            return Err(ReagleError::vcf(format!(
+                                "No allele space available in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
+                                context.window_idx,
+                                context.sample_idx,
+                                context.hap_idx,
+                                m_rev,
+                                active_states
+                            )));
                         }
 
                     }
@@ -1964,7 +1980,7 @@ fn run_impute_hmm_dict<Space>(
         informative_sites: mismatch_markers,
     };
 
-    (final_posteriors, final_prior_state_post, stats)
+    Ok((final_posteriors, final_prior_state_post, stats))
 }
 
 /// Run forward-backward HMM and emit allele posteriors.
@@ -1979,8 +1995,9 @@ pub fn run_impute_hmm<Space>(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> (Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats) {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
     if ref_columns.is_empty() {
         return run_impute_hmm_impl(
             state_haps,
@@ -1991,6 +2008,7 @@ pub fn run_impute_hmm<Space>(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            context,
             ws,
         );
     }
@@ -2015,6 +2033,7 @@ pub fn run_impute_hmm<Space>(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            context,
             ws,
         );
     }
@@ -2039,6 +2058,7 @@ pub fn run_impute_hmm<Space>(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            context,
             ws,
         );
     }
@@ -2063,6 +2083,7 @@ pub fn run_impute_hmm<Space>(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            context,
             ws,
         );
     }
@@ -2090,6 +2111,7 @@ pub fn run_impute_hmm<Space>(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            context,
             ws,
         );
     }
@@ -2103,6 +2125,7 @@ pub fn run_impute_hmm<Space>(
         prior_marker_idx,
         state_priors,
         ref_allele_freqs,
+        context,
         ws,
     )
 }

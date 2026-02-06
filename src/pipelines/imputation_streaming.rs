@@ -32,7 +32,8 @@ use crate::io::streaming::{
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::impute_hmm::{
-    ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm, state_posteriors_to_priors,
+    ImputeHmmContext, ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm,
+    state_posteriors_to_priors,
 };
 use crate::model::parameters::ModelParams;
 use crate::model::pl_emission::{
@@ -4024,7 +4025,6 @@ impl crate::pipelines::ImputationPipeline {
         };
 
                 let track_hmm = |use_hmm: bool,
-                                 has_priors: bool,
                                  no_info: bool,
                                  insufficient: bool,
                                  conf_ratio: f32,
@@ -4046,14 +4046,10 @@ impl crate::pipelines::ImputationPipeline {
                     if donors_len < SM_MATCH_MIN_DONORS {
                         dbg_few_donors.fetch_add(1, Ordering::Relaxed);
                     }
-                    if !use_hmm && !has_priors {
-                        dbg_fallback_ref_freq.fetch_add(1, Ordering::Relaxed);
-                    }
                 };
 
                 track_hmm(
                     use_hmm_h1,
-                    has_priors_h1,
                     no_info_h1,
                     insufficient_info_h1,
                     conf_ratio_h1,
@@ -4061,7 +4057,6 @@ impl crate::pipelines::ImputationPipeline {
                 );
                 track_hmm(
                     use_hmm_h2,
-                    has_priors_h2,
                     no_info_h2,
                     insufficient_info_h2,
                     conf_ratio_h2,
@@ -4079,7 +4074,8 @@ impl crate::pipelines::ImputationPipeline {
                             (*prior_error_rate * 0.8 + ratio * 0.2).clamp(err_floor, 0.5);
                     }
                 };
-                let posts_from_priors = |priors: &HaplotypePriors| -> Vec<AllelePosteriors> {
+                let posts_from_priors =
+                    |priors: &HaplotypePriors| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
                         Vec::with_capacity(output_end.saturating_sub(output_start));
                     for ref_m in output_start..output_end {
@@ -4102,23 +4098,17 @@ impl crate::pipelines::ImputationPipeline {
                                 probs[idx] += *p;
                             }
                         }
-                        let mut sum: f32 = probs.iter().sum();
+                        let sum: f32 = probs.iter().sum();
                         if sum <= 0.0 {
-                            if let Some(freqs) = ref_allele_freqs.get(ref_m) {
-                                probs.clear();
-                                probs.extend_from_slice(freqs);
-                                sum = probs.iter().sum();
-                            }
+                            return Err(ReagleError::vcf(format!(
+                                "Subset prior collapsed while building allele posteriors: window={} sample={} marker={} source=handoff_priors",
+                                window_idx, s, ref_m
+                            )));
                         }
                         if sum > 0.0 {
                             let inv = 1.0 / sum;
                             for v in probs.iter_mut() {
                                 *v *= inv;
-                            }
-                        } else {
-                            let uniform = 1.0 / n_alleles.max(1) as f32;
-                            for v in probs.iter_mut() {
-                                *v = uniform;
                             }
                         }
                         if n_alleles == 2 {
@@ -4129,37 +4119,52 @@ impl crate::pipelines::ImputationPipeline {
                             out.push(AllelePosteriors::Multiallelic(probs));
                         }
                     }
-                    out
+                    Ok(out)
                 };
-                let posts_from_ref_freqs = || -> Vec<AllelePosteriors> {
+                let posts_from_donors =
+                    |donors: &[(RefHapId, u32)]| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
                         Vec::with_capacity(output_end.saturating_sub(output_start));
+                    let total: u32 = donors.iter().map(|(_, c)| *c).sum();
+                    if total == 0 {
+                        return Err(ReagleError::vcf(format!(
+                            "Empty donor subset for posterior construction: window={} sample={}",
+                            window_idx, s
+                        )));
+                    }
+                    let inv_total = 1.0f32 / total as f32;
                     for ref_m in output_start..output_end {
                         let n_alleles = ref_markers
                             .marker(MarkerIdx::new(ref_m as u32))
                             .n_alleles()
                             .max(1);
-                        let mut probs = if let Some(freqs) = ref_allele_freqs.get(ref_m) {
-                            freqs.to_vec()
-                        } else {
-                            vec![0.0f32; n_alleles]
-                        };
-                        if probs.len() != n_alleles {
-                            probs.resize(n_alleles, 0.0);
+                        let mut probs = vec![0.0f32; n_alleles];
+                        for (hap, c) in donors.iter() {
+                            let allele = ref_columns
+                                .get(ref_m)
+                                .map(|col| col.get(HapIdx::new(hap.as_u32())))
+                                .unwrap_or(255);
+                            if allele == 255 {
+                                continue;
+                            }
+                            let idx = allele as usize;
+                            if idx < probs.len() {
+                                probs[idx] += *c as f32 * inv_total;
+                            }
                         }
-                        let mut sum: f32 = probs.iter().sum();
+                        let sum: f32 = probs.iter().sum();
                         if sum <= 0.0 {
-                            let uniform = 1.0 / n_alleles.max(1) as f32;
-                            for v in probs.iter_mut() {
-                                *v = uniform;
-                            }
-                            sum = 1.0;
+                            return Err(ReagleError::vcf(format!(
+                                "Donor-based posterior collapsed at marker: window={} sample={} marker={} donors={}",
+                                window_idx,
+                                s,
+                                ref_m,
+                                donors.len()
+                            )));
                         }
-                        if sum > 0.0 {
-                            let inv = 1.0 / sum;
-                            for v in probs.iter_mut() {
-                                *v *= inv;
-                            }
+                        let inv = 1.0 / sum;
+                        for v in probs.iter_mut() {
+                            *v *= inv;
                         }
                         if n_alleles == 2 {
                             out.push(AllelePosteriors::Biallelic(
@@ -4169,7 +4174,7 @@ impl crate::pipelines::ImputationPipeline {
                             out.push(AllelePosteriors::Multiallelic(probs));
                         }
                     }
-                    out
+                    Ok(out)
                 };
 
                 let build_state_haps = |hap_idx: HapIdx,
@@ -4236,14 +4241,20 @@ impl crate::pipelines::ImputationPipeline {
                                              error_rate: f32,
                                              prior_marker_idx: Option<usize>,
                                              donors: &[(RefHapId, u32)]|
-                 -> (Vec<AllelePosteriors>, HaplotypePriors, crate::model::impute_hmm::EmStats) {
+                 -> Result<(Vec<AllelePosteriors>, HaplotypePriors, crate::model::impute_hmm::EmStats)> {
                     let state_haps = build_state_haps(hap_idx, priors, donors);
-                    assert!(
-                        !state_haps.is_empty(),
-                        "State selection produced empty haplotype set"
-                    );
+                    if state_haps.is_empty() {
+                        return Err(ReagleError::vcf(format!(
+                            "State selection produced empty subset: window={} sample={} hap={} donors={} has_priors={}",
+                            window_idx,
+                            s,
+                            hap_idx.as_usize(),
+                            donors.len(),
+                            priors.is_some()
+                        )));
+                    }
 
-                    let state_priors = priors.and_then(|p| {
+                    let state_priors: Option<Vec<f32>> = if let Some(p) = priors {
                         if p.is_empty() {
                             if !warned_no_priors {
                                 warn!(
@@ -4252,44 +4263,53 @@ impl crate::pipelines::ImputationPipeline {
                                 );
                                 warned_no_priors = true;
                             }
-                            return None;
-                        }
-                        let mapper = prior_mappers_by_hap
-                            .as_ref()
-                            .and_then(|v| v.get(hap_idx.as_usize()))
-                            .and_then(|m| m.as_ref());
-                        let mapped = if let Some(mapper) = mapper {
-                            mapper.map(p.probs()).into_vec()
+                            None
                         } else {
-                            let prev_states: Vec<RefHapId> =
-                                p.ids().iter().map(|id| RefHapId::new(id.0)).collect();
-                            let mapper = TransitionMatrix::build(&prev_states, &state_haps);
-                            mapper.map(p.probs()).into_vec()
-                        };
-                        let mut sum = 0.0f32;
-                        for v in mapped.iter() {
-                            if v.is_finite() && *v > 0.0 {
-                                sum += *v;
+                            let mapper = prior_mappers_by_hap
+                                .as_ref()
+                                .and_then(|v| v.get(hap_idx.as_usize()))
+                                .and_then(|m| m.as_ref());
+                            let mapped = if let Some(mapper) = mapper {
+                                mapper.map(p.probs()).into_vec()
+                            } else {
+                                let prev_states: Vec<RefHapId> =
+                                    p.ids().iter().map(|id| RefHapId::new(id.0)).collect();
+                                let mapper = TransitionMatrix::build(&prev_states, &state_haps);
+                                mapper.map(p.probs()).into_vec()
+                            };
+                            let mut sum = 0.0f32;
+                            for v in mapped.iter() {
+                                if v.is_finite() && *v > 0.0 {
+                                    sum += *v;
+                                }
                             }
+                            if sum <= 0.0 {
+                                if !warned_empty_map {
+                                    warn!(
+                                        "State handoff mapped to empty priors for window {} (state set mismatch)",
+                                        window_idx
+                                    );
+                                    warned_empty_map = true;
+                                }
+                                return Err(ReagleError::vcf(format!(
+                                    "Mapped handoff priors collapsed: window={} sample={} hap={} state_count={}",
+                                    window_idx,
+                                    s,
+                                    hap_idx.as_usize(),
+                                    state_haps.len()
+                                )));
+                            }
+                            let inv = 1.0 / sum;
+                            Some(
+                                mapped
+                                    .into_iter()
+                                    .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
+                                    .collect::<Vec<f32>>(),
+                            )
                         }
-                        if sum <= 0.0 && !warned_empty_map {
-                            warn!(
-                                "State handoff mapped to empty priors for window {} (state set mismatch)",
-                                window_idx
-                            );
-                            warned_empty_map = true;
-                        }
-                        if sum <= 0.0 {
-                            return None;
-                        }
-                        let inv = 1.0 / sum;
-                        let normalized =
-                            mapped
-                                .into_iter()
-                                .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
-                                .collect::<Vec<f32>>();
-                        Some(normalized)
-                    });
+                    } else {
+                        None
+                    };
 
                     let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
@@ -4304,11 +4324,16 @@ impl crate::pipelines::ImputationPipeline {
                             &p_recomb,
                             error_rate,
                             prior_marker_idx,
-                        state_priors.as_deref(),
-                        &ref_allele_freqs,
-                        ws,
-                    )
-                });
+                            state_priors.as_deref(),
+                            &ref_allele_freqs,
+                            ImputeHmmContext {
+                                window_idx,
+                                sample_idx: s,
+                                hap_idx: hap_idx.as_usize(),
+                            },
+                            ws,
+                        )
+                    })?;
 
                     let mut next_priors = HaplotypePriors::empty();
                     if let Some(state_post) = state_post.as_ref() {
@@ -4322,7 +4347,7 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    (posteriors, next_priors, stats)
+                    Ok((posteriors, next_priors, stats))
                 };
 
                 let mut hap1_posts: Option<Vec<AllelePosteriors>> = None;
@@ -4332,7 +4357,7 @@ impl crate::pipelines::ImputationPipeline {
 
                 if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        hap1_posts = Some(posts_from_priors(p));
+                        hap1_posts = Some(posts_from_priors(p)?);
                         p1_out = p.clone();
                     }
                 } else if use_hmm_h1 {
@@ -4343,32 +4368,37 @@ impl crate::pipelines::ImputationPipeline {
                         (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
                         prior_marker_idx,
                         &donors_h1,
-                    );
+                    )?;
                     hap1_posts = Some(posts);
                     p1_out = out;
                     update_error_rate(&stats, prior_error_rate);
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        hap1_posts = Some(posts_from_priors(p));
+                        hap1_posts = Some(posts_from_priors(p)?);
                         p1_out = p.clone();
                     }
                 } else {
                     let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
                     if total > 0 {
                         let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h1
-                        .iter()
-                        .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
-                        .unzip();
+                            .iter()
+                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
+                            .unzip();
                         p1_out = HaplotypePriors::new(ids, probs);
+                        hap1_posts = Some(posts_from_donors(&donors_h1)?);
+                    } else {
+                        return Err(ReagleError::vcf(format!(
+                            "No subset priors or donors for haplotype: window={} sample={} hap={}",
+                            window_idx,
+                            s,
+                            h1_idx.as_usize()
+                        )));
                     }
-                }
-                if hap1_posts.is_none() {
-                    hap1_posts = Some(posts_from_ref_freqs());
                 }
 
                 if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        hap2_posts = Some(posts_from_priors(p));
+                        hap2_posts = Some(posts_from_priors(p)?);
                         p2_out = p.clone();
                     }
                 } else if use_hmm_h2 {
@@ -4379,13 +4409,13 @@ impl crate::pipelines::ImputationPipeline {
                         (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
                         prior_marker_idx,
                         &donors_h2,
-                    );
+                    )?;
                     hap2_posts = Some(posts);
                     p2_out = out;
                     update_error_rate(&stats, prior_error_rate);
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        hap2_posts = Some(posts_from_priors(p));
+                        hap2_posts = Some(posts_from_priors(p)?);
                         p2_out = p.clone();
                     }
                 } else {
@@ -4396,10 +4426,15 @@ impl crate::pipelines::ImputationPipeline {
                             .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
                             .unzip();
                         p2_out = HaplotypePriors::new(ids, probs);
+                        hap2_posts = Some(posts_from_donors(&donors_h2)?);
+                    } else {
+                        return Err(ReagleError::vcf(format!(
+                            "No subset priors or donors for haplotype: window={} sample={} hap={}",
+                            window_idx,
+                            s,
+                            h2_idx.as_usize()
+                        )));
                     }
-                }
-                if hap2_posts.is_none() {
-                    hap2_posts = Some(posts_from_ref_freqs());
                 }
 
                 if let Some(bb) = telemetry.as_ref() {
@@ -4415,7 +4450,7 @@ impl crate::pipelines::ImputationPipeline {
                     sm_needed[h2_idx.as_usize()].store(true, Ordering::Relaxed);
                 }
 
-                ImputeResult {
+                Ok(ImputeResult {
                     result: SampleImputationResult {
                         sample_idx: s,
                         hap_alt_probs: None,
@@ -4432,8 +4467,9 @@ impl crate::pipelines::ImputationPipeline {
                         (None, None) => None,
                     },
                 }
+                )
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         eprintln!(
             "    [debug hmm] use_hmm={} no_hmm={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
