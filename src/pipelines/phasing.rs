@@ -8662,9 +8662,70 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
             }
 
-            let swap_bits = vec![0u8; het_positions.len()];
+            // Calculate swap bits to align input sequences (from sample_phases) to the heuristic path.
+            // If we just return 0s, we assume the input is already phased to this path, which is false.
+            let mut swap_bits = Vec::with_capacity(het_positions.len());
+            let mut swap_probs = Vec::with_capacity(het_positions.len());
+            let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
+            // We need a provider that doesn't borrow mutably if we use ref_alleles_flat
+            // But we can just use the flat buffer we already validated above.
+
+            for &m in het_positions {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    swap_bits.push(0);
+                    swap_probs.push(0.5);
+                    continue;
+                }
+
+                let p1 = final_paths.path1[m] as usize;
+                let p2 = final_paths.path2[m] as usize;
+
+                // Default to no-swap if states invalid (should be covered by heuristic check)
+                if p1 >= n_states_usize || p2 >= n_states_usize {
+                    swap_bits.push(0);
+                    swap_probs.push(0.5);
+                    continue;
+                }
+
+                let offset = m * n_states_usize;
+                // Safe access because we checked n_states_usize vs buffer len earlier
+                let r1 = if !ref_alleles_flat.is_empty() {
+                    ref_alleles_flat[offset + p1]
+                } else {
+                    // Fallback if buffer empty (unlikely with >0 markers)
+                    // But ref_provider is mutable borrow, can't use here easily?
+                    // Actually ref_alleles_flat IS populated if ref_flat_len > 0.
+                    // If not populated, we can't easily check.
+                    // Assume no swap if we can't check.
+                    255
+                };
+
+                let r2 = if !ref_alleles_flat.is_empty() {
+                    ref_alleles_flat[offset + p2]
+                } else {
+                    255
+                };
+
+                // Check alignment: does (r1, r2) match (a1, a2) or (a2, a1)?
+                // Heuristic ensures they match *one* of them.
+                if r1 == a1 && r2 == a2 {
+                    swap_bits.push(0);
+                    swap_probs.push(0.0);
+                } else if r1 == a2 && r2 == a1 {
+                    swap_bits.push(1);
+                    swap_probs.push(1.0);
+                } else {
+                    // Mismatch (should be rare if heuristic is perfect)
+                    // Default to 0
+                    swap_bits.push(0);
+                    swap_probs.push(0.5);
+                }
+            }
+
             let swap_lr = vec![1e6_f32; het_positions.len()];
-            let swap_probs = vec![0.0f32; het_positions.len()];
+            // Confidence is 1.0 because we are certain about this perfect path
             let swap_probs_conf = vec![1.0f32; het_positions.len()];
             return (swap_bits, swap_lr, swap_probs, swap_probs_conf, final_paths);
         }
