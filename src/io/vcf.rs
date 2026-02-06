@@ -738,7 +738,7 @@ impl VcfReader {
         // Parse FORMAT to find GT position and optionally GL position
         // Avoid Vec allocation by using position() directly on iterator
         let format = next_field()?;
-        let (gt_idx, gl_idx, pl_idx) = find_format_indices(format);
+        let (gt_idx, gl_idx, pl_idx, gq_idx) = find_format_indices(format);
         let gt_idx = gt_idx.ok_or_else(|| ReagleError::parse(line_num, "No GT field in FORMAT"))?;
 
         // Parse genotypes
@@ -746,8 +746,12 @@ impl VcfReader {
         let mut alleles = Vec::with_capacity(n_samples * 2);
         let mut is_phased = true;
         let mut phase_mask: Vec<u8> = Vec::with_capacity(n_samples);
-        // Confidence scores (only populated if GL field is present)
-        let mut confidences: Option<Vec<u8>> = gl_idx.map(|_| Vec::with_capacity(n_samples));
+        // Confidence scores (populated if GL or GQ field is present)
+        let mut confidences: Option<Vec<u8>> = if gl_idx.is_some() || gq_idx.is_some() {
+            Some(Vec::with_capacity(n_samples))
+        } else {
+            None
+        };
         let mut likelihoods_pl: Option<Vec<Vec<u16>>> = if pl_idx.is_some() || gl_idx.is_some() {
             Some(Vec::with_capacity(n_samples))
         } else {
@@ -805,15 +809,19 @@ impl VcfReader {
                 pl_out.push(pl_vec);
             }
 
-            // Parse GL field if present and compute confidence
-            if let Some(gl_i) = gl_idx {
-                if let Some(conf_vec) = confidences.as_mut() {
-                    let confidence = nth_colon_field(sample_field, gl_i)
-                        .and_then(bytes_to_str)
-                        .and_then(|gl_str| compute_gl_confidence(gl_str, a1, a2))
-                        .unwrap_or(255); // Default to full confidence if GL missing/unparseable
-                    conf_vec.push(confidence);
-                }
+            // Parse confidence from GL first, then fallback to GQ if available.
+            if let Some(conf_vec) = confidences.as_mut() {
+                let confidence = gl_idx
+                    .and_then(|gl_i| nth_colon_field(sample_field, gl_i))
+                    .and_then(bytes_to_str)
+                    .and_then(|gl_str| compute_gl_confidence(gl_str, a1, a2))
+                    .or_else(|| {
+                        gq_idx
+                            .and_then(|gq_i| nth_colon_field(sample_field, gq_i))
+                            .and_then(gq_to_confidence)
+                    })
+                    .unwrap_or(255); // Default to full confidence if no quality evidence.
+                conf_vec.push(confidence);
             }
         }
 
@@ -927,10 +935,13 @@ fn bytes_to_str(buf: &[u8]) -> Option<&str> {
     std::str::from_utf8(buf).ok()
 }
 
-fn find_format_indices(format: &[u8]) -> (Option<usize>, Option<usize>, Option<usize>) {
+fn find_format_indices(
+    format: &[u8],
+) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
     let mut gt_idx = None;
     let mut gl_idx = None;
     let mut pl_idx = None;
+    let mut gq_idx = None;
     for (i, field) in split_bytes(format, b':').enumerate() {
         if field == b"GT" {
             gt_idx = Some(i);
@@ -938,13 +949,31 @@ fn find_format_indices(format: &[u8]) -> (Option<usize>, Option<usize>, Option<u
             gl_idx = Some(i);
         } else if field == b"PL" {
             pl_idx = Some(i);
+        } else if field == b"GQ" {
+            gq_idx = Some(i);
         }
     }
-    (gt_idx, gl_idx, pl_idx)
+    (gt_idx, gl_idx, pl_idx, gq_idx)
 }
 
 fn nth_colon_field<'a>(buf: &'a [u8], idx: usize) -> Option<&'a [u8]> {
     split_bytes(buf, b':').nth(idx)
+}
+
+fn gq_to_confidence(gq_buf: &[u8]) -> Option<u8> {
+    let gq = parse_u32_bytes(gq_buf)? as f64;
+    if !gq.is_finite() {
+        return None;
+    }
+    // GQ = -10*log10(1-P_correct) => P_correct = 1 - 10^(-GQ/10)
+    let p_correct = 1.0 - 10f64.powf(-gq / 10.0);
+    let p = p_correct.clamp(0.0, 1.0);
+    let conf = if p <= 0.5 {
+        0
+    } else {
+        (255.0 * (2.0 * p - 1.0)).round() as u8
+    };
+    Some(conf)
 }
 
 fn parse_genotype_bytes(gt: &[u8]) -> Result<(u8, u8, bool, bool)> {
@@ -1958,6 +1987,21 @@ mod tests {
         // Conf = 0 (Random guess floor)
         let conf = compute_gl_confidence("0,0,-10", 0, 0).unwrap();
         assert_eq!(conf, 0);
+    }
+
+    #[test]
+    fn test_gq_to_confidence() {
+        // GQ=0 -> P_correct=0 -> confidence floor
+        assert_eq!(gq_to_confidence(b"0"), Some(0));
+        // GQ=10 -> P_correct=0.9 -> high confidence
+        let c10 = gq_to_confidence(b"10").unwrap();
+        assert!(c10 >= 200, "expected high confidence for GQ=10, got {}", c10);
+        // GQ=20 -> P_correct=0.99 -> near max
+        let c20 = gq_to_confidence(b"20").unwrap();
+        assert!(c20 >= 245, "expected near-max confidence for GQ=20, got {}", c20);
+        // Missing/invalid values should return None
+        assert_eq!(gq_to_confidence(b"."), None);
+        assert_eq!(gq_to_confidence(b""), None);
     }
 
     #[test]
