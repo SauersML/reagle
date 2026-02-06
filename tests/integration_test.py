@@ -3031,40 +3031,41 @@ def stage_reagle():
         sys.exit(1)
 
 
-def stage_phasing_compare():
-    """Compare phasing accuracy between Reagle, EagleImp, and SHAPEIT5."""
-    print("=" * 60)
-    print("STAGE: PHASING COMPARE - Reagle vs EagleImp vs SHAPEIT5")
-    print("=" * 60)
-
-    paths = get_paths()
-
-    # Verify required files exist
-    for name in ["ref_vcf", "truth_vcf", "input_vcf"]:
-        if not paths[name].exists():
-            print(f"ERROR: Required file not found: {paths[name]}")
-            print("Run 'prepare' stage first.")
-            sys.exit(1)
-
+def _prepare_phasing_input(paths):
+    """Return an unphased input VCF path for phasing comparisons."""
     input_vcf = paths["input_vcf"]
     if has_phased_genotypes(input_vcf):
         print("Input VCF appears phased; creating an unphased copy for phasing comparison.")
         unphased_input = paths["data_dir"] / "input_unphased.vcf.gz"
         run(f"bcftools +setGT {input_vcf} -O z -o {unphased_input} -- -t a -n u")
         run(f"bcftools index -f {unphased_input}")
-        input_vcf = unphased_input
+        return unphased_input
+    return input_vcf
 
+
+def _run_reagle_phasing(paths, input_vcf):
+    """Run Reagle phasing-only and return phased VCF path."""
     if not paths["reagle_bin"].exists():
         print(f"ERROR: Reagle binary not found: {paths['reagle_bin']}")
         print("Build Reagle first with: cargo build --release")
         sys.exit(1)
 
+    reagle_prefix = paths["data_dir"] / "reagle_phased"
+    reagle_vcf = Path(str(reagle_prefix) + ".vcf.gz")
+    if not reagle_vcf.exists():
+        print("\n--- Running Reagle (phasing-only) ---")
+        run(f"{paths['reagle_bin']} --target {input_vcf} --out {reagle_prefix}")
+    ensure_index(reagle_vcf)
+    return reagle_vcf
+
+
+def _run_eagleimp_phasing(paths, input_vcf):
+    """Run EagleImp phasing-only and return phased VCF/BCF path."""
     eagleimp_bin = find_executable("eagleimp", env_var="EAGLEIMP_BIN")
     if not eagleimp_bin:
         print("ERROR: EagleImp binary not found (set EAGLEIMP_BIN or ensure in PATH).")
         sys.exit(1)
 
-    # Prepare EagleImp inputs (Qref + genetic map)
     gen_map_env = os.environ.get("EAGLEIMP_GENMAP")
     if gen_map_env:
         gen_map = Path(gen_map_env)
@@ -3091,15 +3092,6 @@ def stage_phasing_compare():
 
     qref_path = ensure_eagleimp_qref(eagleimp_ref, eagleimp_bin)
 
-    # Run Reagle phasing
-    reagle_prefix = paths["data_dir"] / "reagle_phased"
-    reagle_vcf = Path(str(reagle_prefix) + ".vcf.gz")
-    if not reagle_vcf.exists():
-        print("\n--- Running Reagle (phasing-only) ---")
-        run(f"{paths['reagle_bin']} --target {input_vcf} --out {reagle_prefix}")
-    ensure_index(reagle_vcf)
-
-    # Run EagleImp phasing
     eagleimp_prefix = paths["data_dir"] / "eagleimp_phased"
     eagleimp_vcf = find_eagleimp_phased_output(eagleimp_prefix, paths["data_dir"])
     if not eagleimp_vcf or not eagleimp_vcf.exists():
@@ -3116,8 +3108,78 @@ def stage_phasing_compare():
 
     if str(eagleimp_vcf).endswith(".vcf.gz"):
         ensure_index(eagleimp_vcf)
+    return eagleimp_vcf
 
-    # Compute phasing metrics against SHAPEIT5 truth
+
+def stage_phasing_reagle():
+    """Run only Reagle phasing for phasing comparison pipeline."""
+    print("=" * 60)
+    print("STAGE: PHASING REAGLE - Reagle phasing-only")
+    print("=" * 60)
+
+    paths = get_paths()
+    for name in ["ref_vcf", "input_vcf"]:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
+    input_vcf = _prepare_phasing_input(paths)
+    reagle_vcf = _run_reagle_phasing(paths, input_vcf)
+    print(f"\nReagle phased output: {reagle_vcf}")
+    print("Phasing Reagle stage completed successfully.")
+
+
+def stage_phasing_eagleimp():
+    """Run only EagleImp phasing for phasing comparison pipeline."""
+    print("=" * 60)
+    print("STAGE: PHASING EAGLEIMP - EagleImp phasing-only")
+    print("=" * 60)
+
+    paths = get_paths()
+    for name in ["ref_vcf", "input_vcf"]:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
+    input_vcf = _prepare_phasing_input(paths)
+    eagleimp_vcf = _run_eagleimp_phasing(paths, input_vcf)
+    print(f"\nEagleImp phased output: {eagleimp_vcf}")
+    print("Phasing EagleImp stage completed successfully.")
+
+
+def stage_phasing_metrics():
+    """Calculate phasing metrics after phased outputs are produced."""
+    print("=" * 60)
+    print("STAGE: PHASING METRICS - Reagle vs EagleImp vs SHAPEIT5")
+    print("=" * 60)
+
+    paths = get_paths()
+    for name in ["ref_vcf", "truth_vcf", "input_vcf"]:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
+    input_vcf = _prepare_phasing_input(paths)
+    reagle_vcf = paths["data_dir"] / "reagle_phased.vcf.gz"
+    eagleimp_prefix = paths["data_dir"] / "eagleimp_phased"
+    eagleimp_vcf = find_eagleimp_phased_output(eagleimp_prefix, paths["data_dir"])
+
+    if not reagle_vcf.exists():
+        print(f"ERROR: Reagle phased output not found: {reagle_vcf}")
+        print("Run 'phasing-reagle' stage first.")
+        sys.exit(1)
+    ensure_index(reagle_vcf)
+
+    if not eagleimp_vcf or not eagleimp_vcf.exists():
+        print("ERROR: EagleImp phased output not found.")
+        print("Run 'phasing-eagleimp' stage first.")
+        sys.exit(1)
+    if str(eagleimp_vcf).endswith(".vcf.gz"):
+        ensure_index(eagleimp_vcf)
+
     print("\n" + "=" * 60)
     print("Calculating phasing accuracy metrics...")
     print("=" * 60)
@@ -3158,6 +3220,18 @@ def stage_phasing_compare():
         phase_conc = data.get("phase_concordance", 0.0)
         print(f"{name.upper()}: SER={ser:.4f} PhaseConc={phase_conc:.4f} N50={n50:.0f} bp")
 
+    print("\nPhasing metrics stage completed successfully.")
+
+
+def stage_phasing_compare():
+    """Compare phasing accuracy between Reagle, EagleImp, and SHAPEIT5."""
+    print("=" * 60)
+    print("STAGE: PHASING COMPARE - Reagle vs EagleImp vs SHAPEIT5")
+    print("=" * 60)
+
+    stage_phasing_reagle()
+    stage_phasing_eagleimp()
+    stage_phasing_metrics()
     print("\nPhasing comparison completed successfully.")
 
 
@@ -3307,6 +3381,9 @@ Stages:
   prepare-profile  Prepare middle 5% of chr22 target markers for profiling
   beagle       Run Java Beagle imputation
   reagle       Run Reagle imputation
+  phasing-reagle  Run Reagle phasing-only
+  phasing-eagleimp  Run EagleImp phasing-only
+  phasing-metrics  Calculate phasing metrics from phased outputs
   phasing-compare  Compare phasing accuracy (Reagle vs EagleImp vs SHAPEIT5)
   impute5      Run IMPUTE5 imputation
   minimac      Run Minimac4 imputation
@@ -3335,7 +3412,8 @@ Examples:
         nargs='?',
         default='all',
         choices=['all', 'prepare', 'prepare-profile', 'beagle', 'reagle', 'impute5', 'minimac', 
-                 'glimpse', 'metrics', 'phasing-compare', 'prepare-chr', 'impute-chr', 
+                 'glimpse', 'metrics', 'phasing-reagle', 'phasing-eagleimp', 'phasing-metrics',
+                 'phasing-compare', 'prepare-chr', 'impute-chr', 
                  'metrics-chr', 'summary'],
         help='Stage to run (default: all)'
     )
@@ -3370,6 +3448,12 @@ Examples:
         stage_beagle()
     elif args.stage == 'reagle':
         stage_reagle()
+    elif args.stage == 'phasing-reagle':
+        stage_phasing_reagle()
+    elif args.stage == 'phasing-eagleimp':
+        stage_phasing_eagleimp()
+    elif args.stage == 'phasing-metrics':
+        stage_phasing_metrics()
     elif args.stage == 'phasing-compare':
         stage_phasing_compare()
     elif args.stage == 'impute5':
