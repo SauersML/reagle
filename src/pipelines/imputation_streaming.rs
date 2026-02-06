@@ -4292,7 +4292,7 @@ impl crate::pipelines::ImputationPipeline {
                             mapped
                                 .into_iter()
                                 .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
-                                .collect(),
+                                .collect::<Vec<f32>>(),
                         )
                     });
 

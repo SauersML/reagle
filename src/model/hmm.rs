@@ -1977,13 +1977,24 @@ mod tests {
         let shift = p_switch / n_states as f32;
         let scale = (1.0 - p_switch) / 1.0f32;
 
-        let sum = HmmUpdater::fwd_update_emissions_scale(&mut fwd, scale, shift, &emissions, n_states);
+        let sum =
+            HmmUpdater::fwd_update_emissions_scale(&mut fwd, scale, shift, &emissions, n_states);
 
-        assert!(sum.is_finite() && sum > 0.0, "quantized forward sum must be finite and positive");
+        assert!(
+            sum.is_finite() && sum > 0.0,
+            "quantized forward sum must be finite and positive"
+        );
         let actual: f32 = fwd.iter().sum();
         let rel = (sum - actual).abs() / actual.max(1e-12);
-        assert!(rel < 1e-4, "returned sum should match actual sum, rel={}", rel);
-        assert!(fwd.iter().all(|v| v.is_finite() && *v >= 0.0), "all forward entries must be finite/non-negative");
+        assert!(
+            rel < 1e-4,
+            "returned sum should match actual sum, rel={}",
+            rel
+        );
+        assert!(
+            fwd.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "all forward entries must be finite/non-negative"
+        );
     }
 
     #[test]
@@ -1997,10 +2008,20 @@ mod tests {
         HmmUpdater::bwd_update(&mut bwd, 0.03, &emit_probs, &mismatches, n_states);
 
         let sum: f32 = bwd.iter().sum();
-        assert!(sum.is_finite() && sum > 0.0, "quantized backward sum must be finite and positive");
+        assert!(
+            sum.is_finite() && sum > 0.0,
+            "quantized backward sum must be finite and positive"
+        );
         // Normalized update should remain near one despite quantization.
-        assert!((sum - 1.0).abs() < 0.05, "quantized backward sum should stay near 1, got {}", sum);
-        assert!(bwd.iter().all(|v| v.is_finite() && *v >= 0.0), "all backward entries must be finite/non-negative");
+        assert!(
+            (sum - 1.0).abs() < 0.05,
+            "quantized backward sum should stay near 1, got {}",
+            sum
+        );
+        assert!(
+            bwd.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "all backward entries must be finite/non-negative"
+        );
     }
 
     #[test]

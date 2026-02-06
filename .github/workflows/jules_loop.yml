@@ -2,7 +2,7 @@ name: Jules Optimizer Loop
 
 on:
   schedule:
-    - cron: '*/59 * * * *'
+    - cron: '0 */3 * * *'
 
   workflow_dispatch:
 
