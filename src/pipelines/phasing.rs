@@ -6133,17 +6133,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mut log_swap = 0.0f32;
 
                         if is_rare_marker && !carriers.is_empty() {
-                            let carrier_set: std::collections::HashSet<u32> =
-                                carriers.iter().copied().collect();
                             let mut score1 = 0.0f32;
                             let mut score2 = 0.0f32;
                             for (&hap, &prob) in &bridge_probs1 {
-                                if carrier_set.contains(&hap) {
+                                if carriers.binary_search(&hap).is_ok() {
                                     score1 += prob;
                                 }
                             }
                             for (&hap, &prob) in &bridge_probs2 {
-                                if carrier_set.contains(&hap) {
+                                if carriers.binary_search(&hap).is_ok() {
                                     score2 += prob;
                                 }
                             }
