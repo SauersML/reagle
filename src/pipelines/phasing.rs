@@ -8643,7 +8643,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     // Short-circuit: if heuristic found a perfect match for all informative sites, use it directly.
     if let Some((ref paths, score, informative)) = heuristic_result {
-        if informative >= 10 && (score - informative as f32).abs() < 1e-4 {
+        if informative >= 100 && (score - informative as f32).abs() < 1e-4 {
             let mut swap_bits = Vec::with_capacity(het_positions.len());
             let mut swap_lr = Vec::with_capacity(het_positions.len());
             let mut swap_probs = Vec::with_capacity(het_positions.len());
