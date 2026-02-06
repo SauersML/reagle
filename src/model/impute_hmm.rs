@@ -5,7 +5,6 @@
 //! allele probabilities from the target, and reference alleles are read on demand.
 
 use crate::data::HapIdx;
-use crate::data::marker::{MarkerIdx, Markers};
 use crate::data::storage::{
     DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
@@ -13,7 +12,6 @@ use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
 use crate::model::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
-use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EmStats {
@@ -26,6 +24,23 @@ pub struct ImputeHmmContext {
     pub window_idx: usize,
     pub sample_idx: usize,
     pub hap_idx: usize,
+}
+
+#[inline]
+fn validate_target_probs_nonempty(
+    target_probs: &TargetAlleleProbs,
+    context: ImputeHmmContext,
+    kernel: &str,
+) -> Result<()> {
+    for m in 0..target_probs.n_markers() {
+        if target_probs.probs_for_marker(m).is_empty() {
+            return Err(ReagleError::vcf(format!(
+                "Empty target allele probabilities in imputation HMM ({}): window={} sample={} hap={} marker={}",
+                kernel, context.window_idx, context.sample_idx, context.hap_idx, m
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -192,121 +207,20 @@ impl<'a> DictPatternAlleles<'a> {
     }
 }
 
-/// Lazily computed reference allele frequencies per marker.
-pub struct RefAlleleFreqs<'a, Space = crate::data::marker::AnyMarkerSpace> {
-    ref_columns: &'a [GenotypeColumn],
-    ref_markers: &'a Markers<Space>,
+/// Reference haplotype count metadata for imputation HMM transitions.
+pub struct RefAlleleFreqs {
     n_ref_haps: usize,
-    cache: Vec<OnceLock<Vec<f32>>>,
 }
 
-impl<'a, Space> RefAlleleFreqs<'a, Space> {
-    pub fn new(ref_columns: &'a [GenotypeColumn], ref_markers: &'a Markers<Space>) -> Self {
+impl RefAlleleFreqs {
+    pub fn new(ref_columns: &[GenotypeColumn]) -> Self {
         let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
-        let cache = std::iter::repeat_with(OnceLock::new)
-            .take(ref_markers.len())
-            .collect();
-        Self {
-            ref_columns,
-            ref_markers,
-            n_ref_haps,
-            cache,
-        }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.cache.len()
+        Self { n_ref_haps }
     }
 
     #[inline]
     pub fn n_ref_haps(&self) -> usize {
         self.n_ref_haps
-    }
-
-    #[inline]
-    pub fn n_alleles(&self, marker_idx: usize) -> usize {
-        self.ref_markers
-            .marker(MarkerIdx::new(marker_idx as u32))
-            .n_alleles()
-            .max(1)
-    }
-
-    pub fn get(&self, marker_idx: usize) -> Option<&[f32]> {
-        if marker_idx >= self.cache.len() {
-            return None;
-        }
-        if self.n_ref_haps == 0 {
-            return None;
-        }
-        let freqs = self.cache[marker_idx].get_or_init(|| {
-            let n_alleles = self.n_alleles(marker_idx);
-            let mut counts = vec![0u32; n_alleles];
-            let mut total = 0u32;
-            match &self.ref_columns[marker_idx] {
-                GenotypeColumn::Dense(col) => {
-                    for h in 0..self.n_ref_haps {
-                        let a = col.get(HapIdx::new(h as u32));
-                        if a == 255 {
-                            continue;
-                        }
-                        let idx = a as usize;
-                        if idx < counts.len() {
-                            counts[idx] += 1;
-                            total += 1;
-                        }
-                    }
-                }
-                GenotypeColumn::Sparse(col) => {
-                    for h in 0..self.n_ref_haps {
-                        let a = col.get(HapIdx::new(h as u32));
-                        if a == 255 {
-                            continue;
-                        }
-                        let idx = a as usize;
-                        if idx < counts.len() {
-                            counts[idx] += 1;
-                            total += 1;
-                        }
-                    }
-                }
-                GenotypeColumn::Dictionary(col, offset) => {
-                    for h in 0..self.n_ref_haps {
-                        let a = col.get(*offset, HapIdx::new(h as u32));
-                        if a == 255 {
-                            continue;
-                        }
-                        let idx = a as usize;
-                        if idx < counts.len() {
-                            counts[idx] += 1;
-                            total += 1;
-                        }
-                    }
-                }
-                GenotypeColumn::SeqCoded(col) => {
-                    for h in 0..self.n_ref_haps {
-                        let a = col.get(HapIdx::new(h as u32));
-                        if a == 255 {
-                            continue;
-                        }
-                        let idx = a as usize;
-                        if idx < counts.len() {
-                            counts[idx] += 1;
-                            total += 1;
-                        }
-                    }
-                }
-            }
-            let mut out = vec![0.0f32; counts.len()];
-            if total > 0 {
-                let inv = 1.0 / total as f32;
-                for (i, c) in counts.into_iter().enumerate() {
-                    out[i] = c as f32 * inv;
-                }
-            }
-            out
-        });
-        Some(freqs.as_slice())
     }
 }
 
@@ -1099,7 +1013,7 @@ fn forward_update_dict(
 }
 
 /// Monomorphized HMM core over a concrete genotype column type.
-fn run_impute_hmm_impl<Space, C: RefColumnLike>(
+fn run_impute_hmm_impl<C: RefColumnLike>(
     state_haps: &[RefHapId],
     ref_columns: &[C],
     target_probs: &TargetAlleleProbs,
@@ -1107,10 +1021,11 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+    validate_target_probs_nonempty(target_probs, context, "dense/sparse")?;
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
@@ -1253,13 +1168,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                         // Compute posteriors using beta at time t (current ws.bwd), before updating
                         // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
                         ws.allele_probs.clear();
-                        let n_alleles = if !probs.is_empty() {
-                            probs.len()
-                        } else if m_rev < ref_allele_freqs.len() {
-                            ref_allele_freqs.n_alleles(m_rev)
-                        } else {
-                            0
-                        };
+                        let n_alleles = probs.len();
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let mut subset_counts = vec![0.0f32; n_alleles];
@@ -1285,7 +1194,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if uniform && subset_total > 0.0 {
+                                if uniform && recomb_rate > 0.0 && subset_total > 0.0 {
                                     let inv_subset = 1.0 / subset_total;
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
@@ -1406,7 +1315,7 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
     Ok((final_posteriors, final_prior_state_post, stats))
 }
 
-fn run_impute_hmm_seqcoded<Space>(
+fn run_impute_hmm_seqcoded(
     state_haps: &[RefHapId],
     ref_columns: &[&SeqCodedColumn],
     target_probs: &TargetAlleleProbs,
@@ -1414,10 +1323,11 @@ fn run_impute_hmm_seqcoded<Space>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+    validate_target_probs_nonempty(target_probs, context, "seqcoded")?;
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
@@ -1543,13 +1453,7 @@ fn run_impute_hmm_seqcoded<Space>(
 
                     if is_final {
                         ws.allele_probs.clear();
-                        let n_alleles = if !probs.is_empty() {
-                            probs.len()
-                        } else if m_rev < ref_allele_freqs.len() {
-                            ref_allele_freqs.n_alleles(m_rev)
-                        } else {
-                            0
-                        };
+                        let n_alleles = probs.len();
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let mut subset_counts = vec![0.0f32; n_alleles];
@@ -1575,7 +1479,7 @@ fn run_impute_hmm_seqcoded<Space>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if uniform && subset_total > 0.0 {
+                                if uniform && recomb_rate > 0.0 && subset_total > 0.0 {
                                     let inv_subset = 1.0 / subset_total;
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
@@ -1694,7 +1598,7 @@ fn run_impute_hmm_seqcoded<Space>(
     Ok((final_posteriors, final_prior_state_post, stats))
 }
 
-fn run_impute_hmm_dict<Space>(
+fn run_impute_hmm_dict(
     state_haps: &[RefHapId],
     ref_columns: &[DictColRef<'_>],
     target_probs: &TargetAlleleProbs,
@@ -1702,10 +1606,11 @@ fn run_impute_hmm_dict<Space>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+    validate_target_probs_nonempty(target_probs, context, "dictionary")?;
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
@@ -1832,13 +1737,7 @@ fn run_impute_hmm_dict<Space>(
 
                     if is_final {
                         ws.allele_probs.clear();
-                        let n_alleles = if !probs.is_empty() {
-                            probs.len()
-                        } else if m_rev < ref_allele_freqs.len() {
-                            ref_allele_freqs.n_alleles(m_rev)
-                        } else {
-                            0
-                        };
+                        let n_alleles = probs.len();
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let mut subset_counts = vec![0.0f32; n_alleles];
@@ -1864,7 +1763,7 @@ fn run_impute_hmm_dict<Space>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if uniform && subset_total > 0.0 {
+                                if uniform && recomb_rate > 0.0 && subset_total > 0.0 {
                                     let inv_subset = 1.0 / subset_total;
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
@@ -1986,7 +1885,7 @@ fn run_impute_hmm_dict<Space>(
 /// Run forward-backward HMM and emit allele posteriors.
 ///
 /// Returns (posteriors, optional state posterior at prior marker, EM stats).
-pub fn run_impute_hmm<Space>(
+pub fn run_impute_hmm(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
@@ -1994,7 +1893,7 @@ pub fn run_impute_hmm<Space>(
     error_rate: f32,
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
-    ref_allele_freqs: &RefAlleleFreqs<'_, Space>,
+    ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {

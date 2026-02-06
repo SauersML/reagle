@@ -2705,8 +2705,6 @@ impl crate::pipelines::ImputationPipeline {
                             ));
                         }
 
-                        let ref_allele_freqs =
-                            RefAlleleFreqs::new(&ref_window.ref_columns, &ref_window.markers);
                         self.write_imputed_window_streaming(
                             &ref_window.markers,
                             &phased_target,
@@ -2716,7 +2714,6 @@ impl crate::pipelines::ImputationPipeline {
                             &mut writer,
                             &mut window_quality,
                             &ref_is_biallelic,
-                            &ref_allele_freqs,
                             ref_window.output_start,
                             ref_window.output_end,
                             ref_window.output_start,
@@ -2993,8 +2990,6 @@ impl crate::pipelines::ImputationPipeline {
                             ));
                         }
 
-                        let ref_allele_freqs =
-                            RefAlleleFreqs::new(&ref_window.ref_columns, &ref_window.markers);
                         self.write_imputed_window_streaming(
                             &ref_window.markers,
                             &phased_target,
@@ -3004,7 +2999,6 @@ impl crate::pipelines::ImputationPipeline {
                             &mut writer,
                             &mut window_quality,
                             &ref_is_biallelic,
-                            &ref_allele_freqs,
                             ref_window.output_start,
                             ref_window.output_end,
                             ref_window.output_start,
@@ -3164,7 +3158,7 @@ impl crate::pipelines::ImputationPipeline {
             })
             .collect();
 
-        let ref_allele_freqs = RefAlleleFreqs::new(ref_columns, ref_markers);
+        let ref_allele_freqs = RefAlleleFreqs::new(ref_columns);
 
         let gen_positions: Vec<f64> = {
             let chrom = ref_markers.marker(MarkerIdx::new(0)).chrom;
@@ -3845,15 +3839,9 @@ impl crate::pipelines::ImputationPipeline {
 
                 let store = ref_m >= overlap_start && ref_m < output_end;
 
-                // Compute per-allele information weights: LLR(match vs mismatch)
-                let allele_info_weights: Vec<f32> = ref_allele_freqs
-                    .get(ref_m)
-                    .map(|freqs| {
-                        let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
-                        let llr = ((1.0 - theta) / theta).ln();
-                        freqs.iter().map(|_| llr).collect()
-                    })
-                    .unwrap_or_default();
+                // Information weight in natural log space for one informative allele observation.
+                let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
+                let info_llr = ((1.0 - theta) / theta).ln();
 
                 if store {
                     for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
@@ -3872,13 +3860,12 @@ impl crate::pipelines::ImputationPipeline {
                                 .get(i)
                                 .and_then(|qa| qa.as_allele())
                                 .unwrap_or(255);
-                            let info_weight = if target_allele == 255 {
+                            let info_weight = if target_allele == 255
+                                || (target_allele as usize) >= n_alleles
+                            {
                                 0.0
                             } else {
-                                allele_info_weights
-                                    .get(target_allele as usize)
-                                    .copied()
-                                    .unwrap_or(0.0)
+                                info_llr
                             };
                             if target_allele != 255 {
                                 sm_total_info[hap_idx] += info_weight;
@@ -4784,7 +4771,6 @@ impl crate::pipelines::ImputationPipeline {
         writer: &mut VcfWriter,
         quality: &mut ImputationQuality,
         ref_is_biallelic: &[bool],
-        ref_allele_freqs: &RefAlleleFreqs<'_, RefMarkerSpace>,
         output_start: usize,
         output_end: usize,
         markers_to_process_start: usize,
@@ -5038,7 +5024,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_posteriors_for_writer = if include_posteriors {
             Some(|marker_idx: usize, sample_idx: usize| {
-                let _ = (ref_markers, ref_allele_freqs);
+                let _ = ref_markers;
                 let local_m = marker_idx.saturating_sub(output_start);
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                     if let Some((p1, p2)) = result.hap_posteriors.as_ref() {
@@ -5837,8 +5823,6 @@ mod tests {
 
         let pipeline = ImputationPipeline::new(Config::default(), None);
         let ref_is_biallelic = vec![true; ref_markers.len()];
-        let ref_columns: Vec<crate::data::storage::GenotypeColumn> = Vec::new();
-        let ref_allele_freqs = RefAlleleFreqs::new(&ref_columns, &ref_markers);
         let result = pipeline.write_imputed_window_streaming(
             &ref_markers,
             &target_win,
@@ -5848,7 +5832,6 @@ mod tests {
             &mut writer,
             &mut quality,
             &ref_is_biallelic,
-            &ref_allele_freqs,
             output_start,
             output_end,
             output_start,
