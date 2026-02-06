@@ -1424,6 +1424,9 @@ fn run_impute_hmm_seqcoded<Space>(
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
+            if prior_marker_idx == Some(m) {
+                final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+            }
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1433,8 +1436,6 @@ fn run_impute_hmm_seqcoded<Space>(
         }
 
         ws.bwd.fill(1.0);
-        let mut prior_state_post: Option<Vec<f32>> = None;
-
         if active_markers > 0 {
             let stride = checkpoint_stride.max(1);
             let mut block_start = ((active_markers - 1) / stride) * stride;
@@ -1552,22 +1553,6 @@ fn run_impute_hmm_seqcoded<Space>(
                             posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
                         }
 
-                        if prior_marker_idx == Some(m_rev) {
-                            let mut state_post = vec![0.0f32; active_states];
-                            let mut total = 0.0f32;
-                            for i in 0..active_states {
-                                let v = fwd_slice[i] * ws.bwd[i];
-                                state_post[i] = v;
-                                total += v;
-                            }
-                            if total > 0.0 {
-                                let inv = 1.0 / total;
-                                for v in state_post.iter_mut() {
-                                    *v *= inv;
-                                }
-                            }
-                            prior_state_post = Some(state_post);
-                        }
                     }
 
                     if uniform {
@@ -1636,7 +1621,6 @@ fn run_impute_hmm_seqcoded<Space>(
 
         if is_final {
             final_posteriors = posteriors;
-            final_prior_state_post = prior_state_post;
         }
     }
 
@@ -1716,6 +1700,9 @@ fn run_impute_hmm_dict<Space>(
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
+            if prior_marker_idx == Some(m) {
+                final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+            }
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1725,8 +1712,6 @@ fn run_impute_hmm_dict<Space>(
         }
 
         ws.bwd.fill(1.0);
-        let mut prior_state_post: Option<Vec<f32>> = None;
-
         if active_markers > 0 {
             let stride = checkpoint_stride.max(1);
             let mut block_start = ((active_markers - 1) / stride) * stride;
@@ -1845,22 +1830,6 @@ fn run_impute_hmm_dict<Space>(
                             posteriors[m_rev] = AllelePosteriors::Biallelic(0.0);
                         }
 
-                        if prior_marker_idx == Some(m_rev) {
-                            let mut state_post = vec![0.0f32; active_states];
-                            let mut total = 0.0f32;
-                            for i in 0..active_states {
-                                let v = fwd_slice[i] * ws.bwd[i];
-                                state_post[i] = v;
-                                total += v;
-                            }
-                            if total > 0.0 {
-                                let inv = 1.0 / total;
-                                for v in state_post.iter_mut() {
-                                    *v *= inv;
-                                }
-                            }
-                            prior_state_post = Some(state_post);
-                        }
                     }
 
                     if uniform {
@@ -1929,7 +1898,6 @@ fn run_impute_hmm_dict<Space>(
 
         if is_final {
             final_posteriors = posteriors;
-            final_prior_state_post = prior_state_post;
         }
     }
 

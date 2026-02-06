@@ -4288,12 +4288,12 @@ impl crate::pipelines::ImputationPipeline {
                             return None;
                         }
                         let inv = 1.0 / sum;
-                        Some(
+                        let normalized =
                             mapped
                                 .into_iter()
                                 .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
-                                .collect::<Vec<f32>>(),
-                        )
+                                .collect::<Vec<f32>>();
+                        Some(normalized)
                     });
 
                     let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
@@ -4872,10 +4872,6 @@ impl crate::pipelines::ImputationPipeline {
             }
             if matches.len() == 1 {
                 Some(matches[0])
-            } else if candidates.len() == 1 {
-                // Preserve target-private genotyped records at unique positions
-                // even when REF/ALT representation does not align to reference.
-                Some(candidates[0])
             } else {
                 None
             }

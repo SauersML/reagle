@@ -240,6 +240,104 @@ fn run_rust_imputation_with_ap(
     pipeline.run()
 }
 
+fn run_cli_imputation_capture(
+    target_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+) -> std::process::Output {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let debug_bin = manifest_dir.join("target").join("debug").join("reagle");
+    let release_bin = manifest_dir.join("target").join("release").join("reagle");
+    let bin = if let Ok(p) = std::env::var("CARGO_BIN_EXE_reagle") {
+        std::path::PathBuf::from(p)
+    } else if debug_bin.exists() {
+        debug_bin
+    } else if release_bin.exists() {
+        release_bin
+    } else {
+        panic!(
+            "Could not locate reagle binary (checked CARGO_BIN_EXE_reagle, {}, {})",
+            manifest_dir.join("target").join("debug").join("reagle").display(),
+            manifest_dir.join("target").join("release").join("reagle").display()
+        );
+    };
+    std::process::Command::new(bin)
+        .arg("--target")
+        .arg(target_path)
+        .arg("--ref")
+        .arg(ref_path)
+        .arg("--out")
+        .arg(out_prefix)
+        .output()
+        .expect("Failed to run reagle binary")
+}
+
+fn parse_debug_hmm_counters(stderr: &str) -> Vec<[usize; 7]> {
+    let mut out = Vec::new();
+    for line in stderr.lines() {
+        if !line.contains("[debug hmm]") {
+            continue;
+        }
+        let mut vals = [0usize; 7];
+        let mut seen = 0usize;
+        for token in line.split_whitespace() {
+            let mut parts = token.split('=');
+            let k = parts.next().unwrap_or_default();
+            let v = parts.next().unwrap_or_default();
+            let val = v.parse::<usize>().ok();
+            match k {
+                "use_hmm" => {
+                    if let Some(x) = val {
+                        vals[0] = x;
+                        seen += 1;
+                    }
+                }
+                "no_hmm" => {
+                    if let Some(x) = val {
+                        vals[1] = x;
+                        seen += 1;
+                    }
+                }
+                "no_info" => {
+                    if let Some(x) = val {
+                        vals[2] = x;
+                        seen += 1;
+                    }
+                }
+                "insufficient" => {
+                    if let Some(x) = val {
+                        vals[3] = x;
+                        seen += 1;
+                    }
+                }
+                "low_conf" => {
+                    if let Some(x) = val {
+                        vals[4] = x;
+                        seen += 1;
+                    }
+                }
+                "few_donors" => {
+                    if let Some(x) = val {
+                        vals[5] = x;
+                        seen += 1;
+                    }
+                }
+                "fallback_ref_freq" => {
+                    if let Some(x) = val {
+                        vals[6] = x;
+                        seen += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if seen >= 2 {
+            out.push(vals);
+        }
+    }
+    out
+}
+
 #[test]
 fn test_missing_confidence_is_not_full_by_default() {
     // Hypothesis: missing GL/PL causes confidence to default to 1.0 (hard evidence).
@@ -256,6 +354,120 @@ fn test_missing_confidence_is_not_full_by_default() {
         conf < 0.9,
         "Expected missing confidence to be < 0.9, got {} (hypothesis NOT disproven)",
         conf
+    );
+}
+
+#[test]
+fn test_debug_hmm_no_ref_freq_fallback_when_informative() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_vcf = work_dir.path().join("ref.vcf");
+    let target_vcf = work_dir.path().join("target.vcf");
+
+    let n_markers = 120usize;
+    let n_ref_samples = 420usize;
+    let ref_names: Vec<String> = (0..n_ref_samples).map(|i| format!("R{}", i + 1)).collect();
+    let ref_name_refs: Vec<&str> = ref_names.iter().map(|s| s.as_str()).collect();
+
+    write_synthetic_vcf(&ref_vcf, n_markers, &ref_name_refs, |i, s| {
+        if (i + s) % 3 == 0 {
+            "0|0".to_string()
+        } else if (i + s) % 3 == 1 {
+            "0|1".to_string()
+        } else {
+            "1|1".to_string()
+        }
+    });
+
+    // Informative target: typed at every marker.
+    write_synthetic_vcf(&target_vcf, n_markers, &["T1"], |i, _| {
+        if i % 2 == 0 {
+            "0/1".to_string()
+        } else {
+            "1/1".to_string()
+        }
+    });
+
+    let out_prefix = work_dir.path().join("out");
+    let output = run_cli_imputation_capture(&target_vcf, &ref_vcf, &out_prefix);
+    assert!(
+        output.status.success(),
+        "CLI run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rows = parse_debug_hmm_counters(&stderr);
+    assert!(
+        !rows.is_empty(),
+        "Expected [debug hmm] counters in stderr, got:\n{}",
+        stderr
+    );
+    let use_hmm: usize = rows.iter().map(|r| r[0]).sum();
+    let fallback_ref_freq: usize = rows.iter().map(|r| r[6]).sum();
+    eprintln!(
+        "[debug hmm informative] windows={} use_hmm={} fallback_ref_freq={}",
+        rows.len(),
+        use_hmm,
+        fallback_ref_freq
+    );
+    assert!(use_hmm > 0, "Expected HMM usage with informative target");
+    assert_eq!(
+        fallback_ref_freq, 0,
+        "Expected no ref-frequency fallback with informative target"
+    );
+}
+
+#[test]
+fn test_debug_hmm_all_missing_target_still_uses_hmm() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_vcf = work_dir.path().join("ref.vcf");
+    let target_vcf = work_dir.path().join("target.vcf");
+
+    let n_markers = 120usize;
+    let n_ref_samples = 420usize;
+    let ref_names: Vec<String> = (0..n_ref_samples).map(|i| format!("R{}", i + 1)).collect();
+    let ref_name_refs: Vec<&str> = ref_names.iter().map(|s| s.as_str()).collect();
+
+    write_synthetic_vcf(&ref_vcf, n_markers, &ref_name_refs, |i, s| {
+        if (i + s) % 2 == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
+    });
+
+    // No information: all target genotypes missing.
+    write_synthetic_vcf(&target_vcf, n_markers, &["T1"], |_, _| "./.".to_string());
+
+    let out_prefix = work_dir.path().join("out");
+    let output = run_cli_imputation_capture(&target_vcf, &ref_vcf, &out_prefix);
+    assert!(
+        output.status.success(),
+        "CLI run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rows = parse_debug_hmm_counters(&stderr);
+    assert!(
+        !rows.is_empty(),
+        "Expected [debug hmm] counters in stderr, got:\n{}",
+        stderr
+    );
+    let use_hmm: usize = rows.iter().map(|r| r[0]).sum();
+    let fallback_ref_freq: usize = rows.iter().map(|r| r[6]).sum();
+    eprintln!(
+        "[debug hmm all-missing] windows={} use_hmm={} fallback_ref_freq={}",
+        rows.len(),
+        use_hmm,
+        fallback_ref_freq
+    );
+    assert!(use_hmm > 0, "Expected HMM usage even with all-missing target");
+    assert_eq!(
+        fallback_ref_freq, 0,
+        "Expected no ref-frequency fallback in this all-missing setup"
     );
 }
 
@@ -1562,97 +1774,112 @@ chr1\t3000\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1
 
 #[test]
 fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
-    let work_dir = tempfile::tempdir().expect("Create temp dir");
-    let ref_vcf = work_dir.path().join("ref.vcf");
-    let target_vcf = work_dir.path().join("target.vcf");
-
-    let n_markers = 3300;
     let ref_samples = ["R1", "R2"];
     let target_samples = ["T1"];
+    let seeds = [1i64, 42i64, 12345i64, 99991i64];
+    let scenarios = [
+        (3300usize, 500usize, 1100usize),
+        (4200usize, 250usize, 1250usize),
+        (5000usize, 1500usize, 2600usize),
+    ];
+    let tol = 1e-3f64;
 
-    write_synthetic_vcf(&ref_vcf, n_markers, &ref_samples, |i, s| {
-        if i == 500 {
-            if s == 0 {
-                "1|1".to_string()
-            } else {
-                "0|0".to_string()
+    for &(n_markers, anchor_idx, boundary_idx) in &scenarios {
+        for &seed in &seeds {
+            let work_dir = tempfile::tempdir().expect("Create temp dir");
+            let ref_vcf = work_dir.path().join("ref.vcf");
+            let target_vcf = work_dir.path().join("target.vcf");
+
+            write_synthetic_vcf(&ref_vcf, n_markers, &ref_samples, |i, s| {
+                if i == anchor_idx || i == boundary_idx {
+                    if s == 0 {
+                        "1|1".to_string()
+                    } else {
+                        "0|0".to_string()
+                    }
+                } else {
+                    "0|0".to_string()
+                }
+            });
+
+            write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, s| {
+                if s == usize::MAX {
+                    return "0|0".to_string();
+                }
+                if i == anchor_idx {
+                    "1|1".to_string()
+                } else if i == boundary_idx {
+                    "./.".to_string()
+                } else {
+                    "0|0".to_string()
+                }
+            });
+
+            let out_prefix_single = work_dir.path().join("out_single");
+            run_rust_imputation_with_window_toml(
+                work_dir.path(),
+                &target_vcf,
+                &ref_vcf,
+                &out_prefix_single,
+                seed,
+                5.0,
+                0.1,
+                50000,
+            )
+            .expect("Single-window imputation failed");
+
+            let out_prefix_multi = work_dir.path().join("out_multi");
+            run_rust_imputation_with_window_toml(
+                work_dir.path(),
+                &target_vcf,
+                &ref_vcf,
+                &out_prefix_multi,
+                seed,
+                1.1,
+                1.0,
+                2500,
+            )
+            .expect("Multi-window imputation failed");
+
+            let out_single = work_dir.path().join("out_single.vcf.gz");
+            let out_multi = work_dir.path().join("out_multi.vcf.gz");
+            let records_single = parse_vcf(&out_single);
+            let records_multi = parse_vcf(&out_multi);
+            let boundary_pos = (((boundary_idx as u32) + 1) * 1000) as u64;
+
+            let gp_single = records_single
+                .iter()
+                .find(|r| r.pos == boundary_pos)
+                .and_then(|r| r.genotypes[0].gp)
+                .expect("Single-window boundary GP missing");
+            let gp_multi = records_multi
+                .iter()
+                .find(|r| r.pos == boundary_pos)
+                .and_then(|r| r.genotypes[0].gp)
+                .expect("Multi-window boundary GP missing");
+
+            println!(
+                "[handoff robustness] n_markers={} anchor={} boundary={} seed={} single={:?} multi={:?}",
+                n_markers, anchor_idx, boundary_idx, seed, gp_single, gp_multi
+            );
+
+            for i in 0..3 {
+                let diff = (gp_single[i] - gp_multi[i]).abs();
+                assert!(
+                    diff <= tol,
+                    "Boundary handoff drifted from single-window baseline: scenario=({}, {}, {}), seed={}, idx={}, single={}, multi={}, diff={}",
+                    n_markers,
+                    anchor_idx,
+                    boundary_idx,
+                    seed,
+                    i,
+                    gp_single[i],
+                    gp_multi[i],
+                    diff
+                );
             }
-        } else if i == 1100 {
-            if s == 0 {
-                "1|1".to_string()
-            } else {
-                "0|0".to_string()
-            }
-        } else {
-            "0|0".to_string()
-        }
-    });
-
-    write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, s| {
-        if s == usize::MAX {
-            return "0|0".to_string();
-        }
-        if i == 500 {
-            "1|1".to_string()
-        } else if i == 1100 {
-            "./.".to_string()
-        } else {
-            "0|0".to_string()
-        }
-    });
-
-    let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_window_toml(
-        work_dir.path(),
-        &target_vcf,
-        &ref_vcf,
-        &out_prefix,
-        12345,
-        1.1,
-        1.0,
-        2500,
-    )
-    .expect("Rust imputation failed");
-
-    let out_vcf = work_dir.path().join("out.vcf.gz");
-    let records = parse_vcf(&out_vcf);
-    let mut gp_boundary = None;
-    for rec in records {
-        if rec.pos == 1101000 {
-            gp_boundary = Some(rec.genotypes[0].gp.expect("Expected GP"));
-            break;
         }
     }
-    let gp = gp_boundary.expect("Boundary marker missing");
-    println!("[handoff boundary] GP at boundary = {:?}", gp);
-    let chrom = ChromIdx::new(0);
-    let params = reagle::model::parameters::ModelParams::for_phasing(
-        ref_samples.len() * 2,
-        Config::default().ne,
-        Config::default().err,
-    );
-    let recomb_intensity = params
-        .recomb_intensity
-        .min(reagle::model::parameters::ModelParams::MAX_RECOMB_INTENSITY);
-    let mut expected_no_switch = 1.0f64;
-    let gen_maps = GeneticMaps::new();
-    let min_dist_cm = Config::default().cluster as f64;
-    for i in 500..1100 {
-        let pos1 = (i as u32 + 1) * 1000;
-        let pos2 = (i as u32 + 2) * 1000;
-        let dist_cm_raw = gen_maps.gen_dist(chrom, pos1, pos2);
-        let gen_dist_cm = dist_cm_raw.max(min_dist_cm);
-        let gen_dist_m = gen_dist_cm / 100.0;
-        let step_keep = (-recomb_intensity as f64 * gen_dist_m).exp();
-        expected_no_switch *= step_keep;
-    }
-    let expected_min = (expected_no_switch - 0.02).max(0.0);
-    assert!(
-        gp[2] >= expected_min,
-        "Expected boundary GP to respect recombination decay (min {:.4}); GP={:?}",
-        expected_min,
-        gp
-    );
 }
 
 #[test]
