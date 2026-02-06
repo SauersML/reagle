@@ -6129,6 +6129,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let marker_maf = maf[m];
                         let is_rare_marker = marker_maf < rare_threshold;
                         let carriers = &carrier_haps[m];
+                        let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
                         let mut log_same = 0.0f32;
                         let mut log_swap = 0.0f32;
 
@@ -6145,8 +6146,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     score2 += prob;
                                 }
                             }
-                            log_same += score1.max(1e-30).ln();
-                            log_swap += score2.max(1e-30).ln();
+                            log_same += obs_conf * score1.max(1e-30).ln();
+                            log_swap += obs_conf * score2.max(1e-30).ln();
                         }
 
                         let al_probs1 = stage2_phaser.interpolated_allele_probs(
@@ -6170,8 +6171,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         let p1 = al_probs1[0] * al_probs2[1];
                         let p2 = al_probs1[1] * al_probs2[0];
-                        log_same += p1.max(1e-30).ln();
-                        log_swap += p2.max(1e-30).ln();
+                        log_same += obs_conf * p1.max(1e-30).ln();
+                        log_swap += obs_conf * p2.max(1e-30).ln();
 
                         // Scaffold orientation evidence from dominant copied donors.
                         let scaffold_conf_min = 0.80f32;
@@ -6190,14 +6191,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let w1 = top1.max(1e-6).ln();
                                 let w2 = top2.max(1e-6).ln();
                                 if d1 == a1 {
-                                    log_same += w1;
+                                    log_same += obs_conf * w1;
                                 } else if d1 == a2 {
-                                    log_swap += w1;
+                                    log_swap += obs_conf * w1;
                                 }
                                 if d2 == a2 {
-                                    log_same += w2;
+                                    log_same += obs_conf * w2;
                                 } else if d2 == a1 {
-                                    log_swap += w2;
+                                    log_swap += obs_conf * w2;
                                 }
                             }
                         }
