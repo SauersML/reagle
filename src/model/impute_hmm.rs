@@ -736,6 +736,22 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
 }
 
 #[inline]
+fn subset_transition_params(recomb_rate: f32, active_states: usize, n_ref_haps: usize) -> (f32, f32, f32) {
+    if active_states == 0 {
+        return (0.0, 0.0, 1.0);
+    }
+    let r = recomb_rate.clamp(0.0, 1.0);
+    let k = active_states as f32;
+    let n = n_ref_haps.max(1) as f32;
+    let switch_full = r / n;
+    let z = ((1.0 - r) + k * switch_full).max(1e-30);
+    let stay_gap = (1.0 - r) / z;
+    let shift = switch_full / z;
+    let stay = ((1.0 - r) + switch_full) / z;
+    (stay_gap, shift, stay)
+}
+
+#[inline]
 fn transition_only_forward_update(
     fwd: &mut [f32],
     fwd_sum: f32,
@@ -749,12 +765,9 @@ fn transition_only_forward_update(
         return fwd_sum;
     }
     let denom = fwd_sum.max(1e-30);
-    let scale = (1.0 - recomb_rate) / denom;
-    let shift = if transition_haps > 0 {
-        recomb_rate / transition_haps as f32
-    } else {
-        0.0
-    };
+    let params = subset_transition_params(recomb_rate, fwd.len(), transition_haps);
+    let scale = params.0 / denom;
+    let shift = params.1;
     let mut new_sum = 0.0f32;
     for v in fwd.iter_mut() {
         let t = scale.mul_add(*v, shift);
@@ -773,12 +786,9 @@ fn transition_only_backward_update(bwd: &mut [f32], recomb_rate: f32, transition
     for v in bwd.iter() {
         sum += *v;
     }
-    let shift = if transition_haps > 0 {
-        (recomb_rate / transition_haps as f32) * sum
-    } else {
-        0.0
-    };
-    let scale = 1.0 - recomb_rate;
+    let params = subset_transition_params(recomb_rate, bwd.len(), transition_haps);
+    let shift = params.1 * sum;
+    let scale = params.0;
     for v in bwd.iter_mut() {
         *v = scale.mul_add(*v, shift);
     }
@@ -1318,12 +1328,9 @@ fn run_impute_hmm_impl<Space, C: RefColumnLike>(
                             emit_beta_sum += ws.emissions[i] * ws.bwd[i];
                         }
                         let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                        let scale = (1.0 - recomb_rate) / c_t;
-                        let shift = if transition_haps > 0 {
-                            (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
-                        } else {
-                            0.0
-                        };
+                        let params = subset_transition_params(recomb_rate, active_states, transition_haps);
+                        let scale = params.0 / c_t;
+                        let shift = params.1 * (emit_beta_sum / c_t);
                         for i in 0..active_states {
                             ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                         }
@@ -1612,12 +1619,9 @@ fn run_impute_hmm_seqcoded<Space>(
                             emit_beta_sum += emit * ws.bwd[i];
                         }
                         let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                        let scale = (1.0 - recomb_rate) / c_t;
-                        let shift = if transition_haps > 0 {
-                            (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
-                        } else {
-                            0.0
-                        };
+                        let params = subset_transition_params(recomb_rate, active_states, transition_haps);
+                        let scale = params.0 / c_t;
+                        let shift = params.1 * (emit_beta_sum / c_t);
                         for i in 0..active_states {
                             ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                         }
@@ -1908,12 +1912,9 @@ fn run_impute_hmm_dict<Space>(
                             emit_beta_sum += emit * ws.bwd[i];
                         }
                         let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                        let scale = (1.0 - recomb_rate) / c_t;
-                        let shift = if transition_haps > 0 {
-                            (recomb_rate / transition_haps as f32) * (emit_beta_sum / c_t)
-                        } else {
-                            0.0
-                        };
+                        let params = subset_transition_params(recomb_rate, active_states, transition_haps);
+                        let scale = params.0 / c_t;
+                        let shift = params.1 * (emit_beta_sum / c_t);
                         for i in 0..active_states {
                             ws.bwd[i] = scale * ws.emissions[i] * ws.bwd[i] + shift;
                         }
