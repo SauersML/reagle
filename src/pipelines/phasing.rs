@@ -1307,10 +1307,12 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 self.hap2_use_combined[m] = false;
                 self.hap2_allele[m] = a1;
             } else {
-                // Partner allele incompatible with genotype: impossible under the model.
-                self.hap2_use_combined[m] = false;
-                self.hap2_allele[m] = INVALID_ALLELE;
-                self.hap2_hard_match[m] = true;
+                // Partner allele incompatible with genotype under current sampled path.
+                // Fall back to unconstrained combined emission rather than creating
+                // an impossible hard wall in the state space.
+                self.hap2_use_combined[m] = true;
+                self.hap2_allele[m] = 255;
+                self.hap2_hard_match[m] = false;
             }
         }
         if !self.anchor_hap2.is_empty() {
@@ -1367,10 +1369,12 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 self.hap1_use_combined[m] = false;
                 self.hap1_allele[m] = a1;
             } else {
-                // Partner allele incompatible with genotype: impossible under the model.
-                self.hap1_use_combined[m] = false;
-                self.hap1_allele[m] = INVALID_ALLELE;
-                self.hap1_hard_match[m] = true;
+                // Partner allele incompatible with genotype under current sampled path.
+                // Fall back to unconstrained combined emission rather than creating
+                // an impossible hard wall in the state space.
+                self.hap1_use_combined[m] = true;
+                self.hap1_allele[m] = 255;
+                self.hap1_hard_match[m] = false;
             }
         }
         if !self.anchor_hap1.is_empty() {
