@@ -110,6 +110,14 @@ impl ModelParams {
         val.max(1e-8)
     }
 
+    /// Label switch probability for MCMC sampling
+    ///
+    /// Returns a clamped probability for phase label switching, preventing
+    /// numerical instability in log-space calculations.
+    pub fn label_switch_prob() -> f32 {
+        Self::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12)
+    }
+
     /// Calculate LR threshold for a given iteration
     ///
     /// From Java `PhaseData.lrThreshold`:

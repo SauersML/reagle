@@ -132,6 +132,7 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 32;
 const PBWT_ANCHOR_TOP_HAPS: usize = 512;
+const HEURISTIC_INIT_MARKER_LIMIT: usize = 20_000;
 const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
@@ -4936,7 +4937,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                             if prior_local.is_none() {
                                 let mut rp = RefAlleleProvider::new(subset_view, &threaded_haps);
-                                if let Some(local_best) = find_best_constant_pair_with_buffer(
+                                if let Some((local_best, _, _)) = find_best_constant_pair_with_buffer(
                                     n_hi_freq,
                                     n_states,
                                     &seq1,
@@ -8216,7 +8217,7 @@ fn sample_dynamic_mcmc(
         swap_probs.push(p_swap.clamp(0.0, 1.0));
     }
     if !swap_probs.is_empty() {
-        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
+        let label_switch = ModelParams::label_switch_prob();
         let stay = (1.0 - label_switch).ln();
         let sw = label_switch.ln();
         let mut dp0 = vec![f32::NEG_INFINITY; swap_probs.len()];
@@ -8373,7 +8374,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
-) -> Option<MosaicPaths> {
+) -> Option<(MosaicPaths, f32, usize)> {
     if n_states < 2 {
         return None;
     }
@@ -8463,14 +8464,17 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     if informative == 0 {
         return None;
     }
-    if n_markers > 2000 {
+    if n_markers > HEURISTIC_INIT_MARKER_LIMIT {
         return None;
     }
 
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
-    Some(MosaicPaths { path1, path2 })
+    // Remove bonus from returned score to reflect raw accuracy
+    let raw_score = best_score - (state_bonus[best_pair.0] + state_bonus[best_pair.1]);
+
+    Some((MosaicPaths { path1, path2 }, raw_score, informative))
 }
 
 fn calculate_log_prior(
@@ -8579,7 +8583,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // 1. Heuristic initialization (always try this)
     // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
     // found by the beam search, especially in small windows where aliases exist.
-    let mut heuristic_paths = find_best_constant_pair_with_buffer(
+    let heuristic_result = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
         seq1,
@@ -8588,6 +8592,81 @@ fn sample_swap_bits_mosaic<RefSpace>(
         &mut workspace.scores,
         None,
     );
+
+    // Short-circuit check: if heuristic result is perfect (or near-perfect), return it immediately.
+    // This prevents symmetric mode oscillation ("Mosaic Trap").
+    if let Some((paths, score, informative)) = heuristic_result.as_ref() {
+        let mismatches = (*informative as f32 - *score) / 2.0;
+        if mismatches == 0.0 || (*informative > 50 && mismatches <= 2.0) {
+            let mut final_paths = paths.clone();
+            // Align heuristic orientation to anchors if present
+            if has_anchor {
+                let mut score_direct: i32 = 0;
+                let mut score_flip: i32 = 0;
+                let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
+                for m in 0..n_markers {
+                    let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+                    let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+                    if a1 == 255 && a2 == 255 {
+                        continue;
+                    }
+                    let p1 = final_paths.path1[m] as usize;
+                    let p2 = final_paths.path2[m] as usize;
+                    if p1 >= n_states_usize || p2 >= n_states_usize {
+                        continue;
+                    }
+                    let ref_row = if !ref_alleles_flat.is_empty() {
+                        let offset = m * n_states_usize;
+                        &ref_alleles_flat[offset..offset + n_states_usize]
+                    } else {
+                        // Should not happen if ref_alleles_flat logic is correct
+                        &[]
+                    };
+                    if ref_row.len() < n_states_usize {
+                        continue;
+                    }
+
+                    let r1 = ref_row[p1];
+                    let r2 = ref_row[p2];
+                    if a1 != 255 {
+                        if r1 == a1 {
+                            score_direct += 1;
+                        } else {
+                            score_direct -= 1;
+                        }
+                        if r2 == a1 {
+                            score_flip += 1;
+                        } else {
+                            score_flip -= 1;
+                        }
+                    }
+                    if a2 != 255 {
+                        if r2 == a2 {
+                            score_direct += 1;
+                        } else {
+                            score_direct -= 1;
+                        }
+                        if r1 == a2 {
+                            score_flip += 1;
+                        } else {
+                            score_flip -= 1;
+                        }
+                    }
+                }
+                if score_flip > score_direct {
+                    std::mem::swap(&mut final_paths.path1, &mut final_paths.path2);
+                }
+            }
+
+            let swap_bits = vec![0u8; het_positions.len()];
+            let swap_lr = vec![1e6_f32; het_positions.len()];
+            let swap_probs = vec![0.0f32; het_positions.len()];
+            let swap_probs_conf = vec![1.0f32; het_positions.len()];
+            return (swap_bits, swap_lr, swap_probs, swap_probs_conf, final_paths);
+        }
+    }
+
+    let mut heuristic_paths = heuristic_result.map(|(p, _, _)| p);
 
     // Align heuristic orientation to anchors if present
     if has_anchor {
@@ -9699,7 +9778,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
-        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
+        let label_switch = ModelParams::label_switch_prob();
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];
@@ -11527,7 +11606,7 @@ mod tests {
         let seq2 = vec![1, 1, 1];
 
         let mut scores = Vec::new();
-        let paths = find_best_constant_pair_with_buffer(
+        let (paths, _, _) = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
