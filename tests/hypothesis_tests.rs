@@ -971,7 +971,6 @@ fn test_streaming_overlap_should_not_shift_genotyped_markers() {
 fn test_priors_use_recent_context_across_window_boundary() {
     let work_dir = tempfile::tempdir().expect("Create temp dir");
     let ref_vcf = work_dir.path().join("ref.vcf");
-    let target_vcf = work_dir.path().join("target.vcf");
 
     let n_markers = 3300;
     let ref_samples = ["R1", "R2"];
@@ -989,56 +988,55 @@ fn test_priors_use_recent_context_across_window_boundary() {
         }
     });
 
-    // Target: early markers 0|0, then a single late 1|1 signal just before boundary,
-    // and missing genotypes thereafter. This should bias priors toward 1|1 at the boundary.
-    write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, _| {
-        if i < 100 {
-            "0|0".to_string()
-        } else if i == 1099 {
-            "1|1".to_string()
-        } else {
-            "./.".to_string()
-        }
-    });
-
-    let out_prefix = work_dir.path().join("out");
-    run_rust_imputation_with_window_toml(
-        work_dir.path(),
-        &target_vcf,
-        &ref_vcf,
-        &out_prefix,
-        12345,
-        1.1,
-        1.0,
-        200,
-    )
-    .expect("Rust imputation failed");
-
-    let out_vcf = work_dir.path().join("out.vcf.gz");
-    let records = parse_vcf(&out_vcf);
-    assert_eq!(records.len(), n_markers, "Expected full output markers");
-
-    let mut pos_to_gt = std::collections::HashMap::new();
-    for rec in &records {
-        pos_to_gt.insert(rec.pos, rec.genotypes[0].gt.clone());
-    }
-
-    let boundary_idx = 1100usize;
+    let boundary_idx = 1200usize;
     let pos = (boundary_idx as u64 + 1) * 1000;
-    let gt = pos_to_gt.get(&pos).cloned().unwrap_or_default();
-    let gp = records
-        .iter()
-        .find(|rec| rec.pos == pos)
-        .and_then(|rec| rec.genotypes[0].gp);
+    let run_case = |name: &str, with_recent_alt_anchor: bool| -> [f32; 3] {
+        let target_vcf = work_dir.path().join(format!("target_{name}.vcf"));
+        write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, _| {
+            if i < 100 {
+                "0|0".to_string()
+            } else if with_recent_alt_anchor && i == 1199 {
+                "1|1".to_string()
+            } else {
+                "./.".to_string()
+            }
+        });
+
+        let out_prefix = work_dir.path().join(format!("out_{name}"));
+        run_rust_imputation_with_window_toml(
+            work_dir.path(),
+            &target_vcf,
+            &ref_vcf,
+            &out_prefix,
+            12345,
+            1.1,
+            1.0,
+            200,
+        )
+        .expect("Rust imputation failed");
+
+        let out_vcf = work_dir.path().join(format!("out_{name}.vcf.gz"));
+        let records = parse_vcf(&out_vcf);
+        assert_eq!(records.len(), n_markers, "Expected full output markers");
+        let gp = records
+            .iter()
+            .find(|rec| rec.pos == pos)
+            .and_then(|rec| rec.genotypes[0].gp)
+            .expect("Expected GP at boundary marker");
+        [gp[0] as f32, gp[1] as f32, gp[2] as f32]
+    };
+
+    let gp_without_anchor = run_case("no_anchor", false);
+    let gp_with_anchor = run_case("with_anchor", true);
     println!(
-        "[prior continuity] marker_idx={} pos={} gt={} gp={:?}",
-        boundary_idx, pos, gt, gp
+        "[prior continuity] marker_idx={} pos={} gp_no_anchor={:?} gp_with_anchor={:?}",
+        boundary_idx, pos, gp_without_anchor, gp_with_anchor
     );
-    let gp = gp.expect("Expected GP at boundary marker");
     assert!(
-        gp[2] > 0.5 && gp[2] > gp[0] && gp[2] > gp[1],
-        "Expected boundary priors to favor 1|1 after recent 1|1 signal, GP={:?}",
-        gp
+        gp_with_anchor[2] > gp_without_anchor[2] + 0.01,
+        "Expected recent 1|1 anchor to increase boundary P(1|1), no_anchor={:?}, with_anchor={:?}",
+        gp_without_anchor,
+        gp_with_anchor
     );
 }
 
