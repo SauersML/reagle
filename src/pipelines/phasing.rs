@@ -1626,6 +1626,21 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         reader.set_exclude_samples(&exclude_samples);
         reader.set_exclude_markers(exclude_markers);
         let target_gt = reader.read_all(file_reader)?;
+        let input_fully_phased = target_gt
+            .phase_mask()
+            .map(|mask| mask.iter().all(|row| row.iter().all(|&v| v != 0)))
+            .unwrap_or(true);
+
+        if input_fully_phased {
+            eprintln!("Input already fully phased; writing passthrough output.");
+            let output_path = self.config.out.with_extension("vcf.gz");
+            let mut writer = VcfWriter::create(&output_path, target_gt.samples_arc())?;
+            writer.write_header(target_gt.markers())?;
+            let phased = target_gt.clone().into_phased();
+            writer.write_phased(&phased, 0, phased.n_markers())?;
+            eprintln!("Phasing complete!");
+            return Ok(());
+        }
 
         if target_gt.n_markers() == 0 {
             eprintln!("No markers found in input VCF");
