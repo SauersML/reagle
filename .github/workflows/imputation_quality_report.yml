@@ -147,6 +147,32 @@ jobs:
             tests/data/beagle_metrics.json
             tests/data/reagle_metrics.txt
 
+      - name: Upload Run Outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs-${{ matrix.person }}-${{ hashFiles(matrix.file_path) }}
+          if-no-files-found: warn
+          path: |
+            tests/data/reagle_imputed.vcf.gz
+            tests/data/reagle_imputed.vcf.gz.csi
+            tests/data/reagle_imputed.vcf.gz.tbi
+            tests/data/beagle_imputed.vcf.gz
+            tests/data/beagle_imputed.vcf.gz.csi
+            tests/data/beagle_imputed.vcf.gz.tbi
+            tests/data/truth.vcf.gz
+            tests/data/truth.vcf.gz.csi
+            tests/data/truth.vcf.gz.tbi
+            target.vcf.gz
+            target.vcf.gz.csi
+            target.vcf.gz.tbi
+            reagle_out.vcf.gz
+            reagle_out.vcf.gz.csi
+            reagle_out.vcf.gz.tbi
+            beagle_out.vcf.gz
+            beagle_out.vcf.gz.csi
+            beagle_out.vcf.gz.tbi
+
   generate-report:
     needs: impute-and-measure
     runs-on: ubuntu-latest

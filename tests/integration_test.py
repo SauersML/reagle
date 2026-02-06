@@ -524,13 +524,6 @@ def parse_genotype(gt_str):
         return None
 
 
-def calculate_dosage(gt):
-    """Calculate ALT dosage from genotype tuple."""
-    if gt is None:
-        return None
-    return gt[0] + gt[1]
-
-
 def _parse_ds_field(ds_str):
     """Parse DS which may be a single float (biallelic) or comma-separated list (multiallelic).
 
@@ -782,13 +775,15 @@ def _parse_imputed_line(line, sample_indices, format_mode="full"):
 def load_input_sites(input_vcf):
     if not input_vcf or not os.path.exists(input_vcf):
         return None
-    cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {input_vcf}"
+    # Use coordinate-only keys to avoid REF/ALT representation artifacts
+    # (e.g., REF/ALT swaps or multiallelic ALT ordering differences).
+    cmd = f"bcftools query -f '%CHROM\\t%POS\\n' {input_vcf}"
     sites = set()
     for line in _stream_vcf_lines(cmd):
         parts = line.split('\t')
-        if len(parts) >= 4:
-            chrom, pos, ref, alt = parts[0], int(parts[1]), parts[2], parts[3]
-            sites.add((chrom, pos, ref, alt))
+        if len(parts) >= 2:
+            chrom, pos = parts[0], int(parts[1])
+            sites.add((chrom, pos))
     return sites
 
 
@@ -1188,9 +1183,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     sample_phase_total = [0] * n_common
     sample_phase_flip = [None] * n_common
 
-    # For IQS calculation: track per-site concordance and expected concordance
+    # For IQS calculation: track per-site chance-corrected concordance
+    # using empirical truth/imputed genotype marginals at each site.
     site_iqs_sum = 0.0
     site_iqs_count = 0
+    site_iqs_weighted_sum = 0.0
+    site_iqs_weighted_count = 0
 
     # For Hellinger score (requires GP field)
     hellinger_sum = 0.0
@@ -1483,13 +1481,12 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 if truth_multiallelic or imp_multiallelic:
                     multiallelic_sites += 1
                 common_sites_count += 1
-                is_input_site = input_sites is not None and truth_key in input_sites
+                is_input_site = input_sites is not None and (t_chrom, t_pos) in input_sites
 
                 # --- METRICS CALCULATION LOGIC (same as before) ---
                 
                 # Calculate AF/MAF for stratification from the reference panel.
                 maf = None
-                af = None
                 maf_bin = None
                 site_key = (t_chrom, t_pos)
                 while ref_key is not None and ref_key < site_key:
@@ -1503,8 +1500,6 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 if ref_key == site_key and ref_afs is not None:
                     ref_ref, ref_alt, ref_af_list = ref_afs
                     maf = _maf_from_afs(ref_af_list)
-                    if ref_af_list and len(ref_af_list) == 1:
-                        af = ref_af_list[0]
                     if maf is not None:
                         maf_bin = get_maf_bin(maf)
                     else:
@@ -1513,6 +1508,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                     ref_af_missing += 1
                 site_concordant = 0
                 site_total = 0
+                # Site-level IQS accumulators (canonical probability-based kappa formulation):
+                # - truth class counts W_i
+                # - imputed class marginals Y_i (expected counts from GP; hard one-hot fallback)
+                # - diagonal soft agreement mass for Po
+                site_iqs_truth_counts = [0.0, 0.0, 0.0]
+                site_iqs_imputed_marginals = [0.0, 0.0, 0.0]
+                site_iqs_correct_mass = 0.0
+                site_iqs_n = 0
 
                 # Dosage calibration bins (predicted dosage -> mean truth dosage)
                 # Bin over [0, 2] since diploid dosage is 0..2.
@@ -1620,6 +1623,29 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                         confusion[t_class][i_class] += 1
                         if maf_bin is not None:
                             maf_bins[maf_bin]["confusion"][t_class][i_class] += 1
+
+                    # Canonical IQS (kappa): use GP probabilities when available, otherwise hard-call one-hot.
+                    iqs_probs = None
+                    if i_gp is not None and len(i_gp) == 3:
+                        try:
+                            p0 = float(i_gp[0])
+                            p1 = float(i_gp[1])
+                            p2 = float(i_gp[2])
+                            p_sum = p0 + p1 + p2
+                            if p_sum > 0.0:
+                                iqs_probs = (p0 / p_sum, p1 / p_sum, p2 / p_sum)
+                        except Exception:
+                            iqs_probs = None
+                    elif i_class is not None:
+                        iqs_probs = (1.0, 0.0, 0.0) if i_class == 0 else ((0.0, 1.0, 0.0) if i_class == 1 else (0.0, 0.0, 1.0))
+
+                    if iqs_probs is not None:
+                        site_iqs_n += 1
+                        site_iqs_truth_counts[t_class] += 1.0
+                        site_iqs_imputed_marginals[0] += iqs_probs[0]
+                        site_iqs_imputed_marginals[1] += iqs_probs[1]
+                        site_iqs_imputed_marginals[2] += iqs_probs[2]
+                        site_iqs_correct_mass += iqs_probs[t_class]
 
                     # Concordance
                     if i_class is not None:
@@ -1736,15 +1762,18 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                             ece_bins[bin_idx]["count"] += 1
 
                 # IQS Calculation
-                if site_total > 0 and maf is not None and maf > 0 and maf < 1 and af is not None:
-                    p = af
-                    q = 1 - p
-                    expected_conc = (q*q)**2 + (2*p*q)**2 + (p*p)**2
-                    observed_conc = site_concordant / site_total
+                if site_iqs_n > 0:
+                    observed_conc = site_iqs_correct_mass / site_iqs_n
+                    expected_conc = 0.0
+                    denom_n2 = float(site_iqs_n * site_iqs_n)
+                    for cls in range(3):
+                        expected_conc += (site_iqs_truth_counts[cls] * site_iqs_imputed_marginals[cls]) / denom_n2
                     if expected_conc < 1.0:
                         iqs = (observed_conc - expected_conc) / (1.0 - expected_conc)
                         site_iqs_sum += iqs
                         site_iqs_count += 1
+                        site_iqs_weighted_sum += iqs * site_iqs_n
+                        site_iqs_weighted_count += site_iqs_n
                         if maf_bin is not None:
                             maf_bins[maf_bin]["iqs_sum"] += iqs
                             maf_bins[maf_bin]["iqs_count"] += 1
@@ -2061,9 +2090,14 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         # Calculate overall IQS (mean across sites)
         if site_iqs_count > 0:
             metrics["iqs"] = site_iqs_sum / site_iqs_count
+            metrics["iqs_weighted"] = (
+                site_iqs_weighted_sum / site_iqs_weighted_count
+                if site_iqs_weighted_count > 0 else None
+            )
             metrics["iqs_median"] = None
         else:
             metrics["iqs"] = None
+            metrics["iqs_weighted"] = None
 
         if sen_count > 0:
             metrics["sen_mean"] = sen_sum / sen_count
