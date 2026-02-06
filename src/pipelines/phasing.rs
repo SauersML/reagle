@@ -325,7 +325,18 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
         .filter(|&(_, &s)| s.is_finite() && s > 0.0)
         .map(|(i, &s)| (i, s))
         .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Break ties deterministically but pseudo-randomly to avoid bias towards
+    // lower indices (which often clusters similar haplotypes in sorted panels).
+    // This ensures diversity in state selection when many haplotypes have identical scores.
+    ranked.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ha = (a.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let hb = (b.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                ha.cmp(&hb)
+            })
+    });
     if ranked.len() > k {
         ranked.truncate(k);
     }
@@ -1608,6 +1619,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
     /// Run the phasing pipeline
     pub fn run(&mut self) -> Result<()> {
+        // Clear thread-local workspace to ensure determinism across runs
+        THREAD_WORKSPACE.with(|w| {
+            *w.borrow_mut() = None;
+        });
+
         eprintln!("Loading VCF...");
 
         // Load exclusion lists
@@ -2483,6 +2499,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
     /// Run the phasing pipeline in streaming mode for large datasets
     pub fn run_streaming(&mut self) -> Result<()> {
+        // Clear thread-local workspace to ensure determinism across runs
+        THREAD_WORKSPACE.with(|w| {
+            *w.borrow_mut() = None;
+        });
+
         eprintln!("Opening VCF for streaming...");
 
         // Configure streaming (genetic maps loaded lazily by StreamingVcfReader)
