@@ -8710,68 +8710,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    // Short-circuit: perfect match found with sufficient evidence.
-    // This avoids MCMC sampling entirely if one pair of haplotypes explains everything.
-    // We check `shared_ref` logic before using `ref_provider` directly.
-    if let Some((paths, best_score, informative)) = heuristic_result.as_ref() {
-        if *informative >= 100 && *best_score == *informative as f32 {
-            // Restore combined_checkpoint_data to avoid data loss in workspace
-            workspace.combined_checkpoint_data = combined_data;
-
-            let mut swap_bits = Vec::with_capacity(het_positions.len());
-            let swap_lr = vec![1e6f32; het_positions.len()];
-            // swap_probs are populated in swap_probs_vec dynamically below
-
-            let mut swap_probs_vec = Vec::with_capacity(het_positions.len());
-            let mut swap_probs_conf_vec = Vec::with_capacity(het_positions.len());
-
-            let use_flat = !shared_ref.is_empty();
-
-            for &m in het_positions {
-                let p1 = paths.path1.get(m).copied().unwrap_or(0) as usize;
-                let s1 = seq1.get(m).copied().unwrap_or(255);
-                let s2 = seq2.get(m).copied().unwrap_or(255);
-
-                if s1 == 255 || s2 == 255 || s1 == s2 || p1 >= n_states_usize {
-                    swap_bits.push(0);
-                    swap_probs_vec.push(0.5);
-                    swap_probs_conf_vec.push(0.5);
-                    continue;
-                }
-
-                let ref1 = if use_flat {
-                    let offset = m * n_states_usize;
-                    shared_ref[offset + p1]
-                } else {
-                    ref_provider.fill_ref_alleles(
-                        m,
-                        &mut workspace.ref_alleles[..n_states_usize],
-                    );
-                    workspace.ref_alleles[p1]
-                };
-
-                // If H1's reference allele matches seq2 (and not seq1), that's a swap (1).
-                // If it matches seq1, no swap (0).
-                if ref1 == s2 && ref1 != s1 {
-                    swap_bits.push(1);
-                    swap_probs_vec.push(1.0);
-                    swap_probs_conf_vec.push(0.9999);
-                } else {
-                    swap_bits.push(0);
-                    swap_probs_vec.push(0.0);
-                    swap_probs_conf_vec.push(0.9999);
-                }
-            }
-            return (
-                swap_bits,
-                swap_lr,
-                swap_probs_vec,
-                swap_probs_conf_vec,
-                paths.clone(),
-            );
-        }
-    }
-
     // 2. Collect candidates
     let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(3);
 
