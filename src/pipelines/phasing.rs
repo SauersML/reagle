@@ -8645,73 +8645,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Instead of picking one initialization strategy, we collect all valid strategies
     // and run them competitively, selecting the one that yields the best likelihood.
 
-    // 1. Heuristic initialization (always try this)
-    // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
-    // found by the beam search, especially in small windows where aliases exist.
-    let mut heuristic_result = find_best_constant_pair_with_buffer(
-        n_markers,
-        n_states_usize,
-        seq1,
-        seq2,
-        &mut ref_provider,
-        &mut workspace.scores,
-        None,
-    );
-
-    // Align heuristic orientation to anchors if present
-    if has_anchor {
-        if let Some((paths, _, _)) = heuristic_result.as_mut() {
-            let mut score_direct: i32 = 0;
-            let mut score_flip: i32 = 0;
-            let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
-            for m in 0..n_markers {
-                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1 == 255 && a2 == 255 {
-                    continue;
-                }
-                let p1 = paths.path1[m] as usize;
-                let p2 = paths.path2[m] as usize;
-                if p1 >= n_states_usize || p2 >= n_states_usize {
-                    continue;
-                }
-                let offset = m * n_states_usize;
-                let ref_row = &ref_alleles_flat[offset..offset + n_states_usize];
-                let r1 = ref_row[p1];
-                let r2 = ref_row[p2];
-                if a1 != 255 {
-                    if r1 == a1 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r2 == a1 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-                if a2 != 255 {
-                    if r2 == a2 {
-                        score_direct += 1;
-                    } else {
-                        score_direct -= 1;
-                    }
-                    if r1 == a2 {
-                        score_flip += 1;
-                    } else {
-                        score_flip -= 1;
-                    }
-                }
-            }
-            if score_flip > score_direct {
-                std::mem::swap(&mut paths.path1, &mut paths.path2);
-            }
-        }
-    }
-
     // 2. Collect candidates
-    let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(3);
+    let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(2);
 
     // Candidate A: Standard/Default initialization (Combined HMM checkpoints).
     // We prioritize this (put it first) so it wins ties against heuristic/beam if likelihoods are equal.
@@ -8721,19 +8656,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Candidate B: Initial paths provided by caller (e.g. from Beam Search)
     if let Some(p) = initial_paths {
         candidate_inits.push(Some(p.clone()));
-    }
-
-    // Candidate C: Heuristic paths (if found and different from initial)
-    if let Some((p, _, _)) = heuristic_result {
-        // Only add if distinct from initial_paths to save compute
-        let distinct = if let Some(init) = initial_paths {
-            init.path1 != p.path1 || init.path2 != p.path2
-        } else {
-            true
-        };
-        if distinct {
-            candidate_inits.push(Some(p));
-        }
     }
 
     // Build Combined HMM checkpoints. This is required if ANY candidate is None,
