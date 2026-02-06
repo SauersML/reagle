@@ -69,6 +69,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+# Ensure tests run fast enough
+[profile.dev]
+opt-level = 2
+
 # Separate bench profile without LTO (avoids toolchain/linker conflicts)
 [profile.bench]
 lto = false

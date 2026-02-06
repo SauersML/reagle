@@ -5025,7 +5025,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     None,
                                 ) {
                                     let global_best =
-                                        local_to_global_paths(&local_best, &threaded_haps, n_hi_freq);
+                                        local_to_global_paths(&local_best.0, &threaded_haps, n_hi_freq);
                                     prior_local = Some(MosaicPaths {
                                         path1: global_best
                                             .path1
@@ -8446,7 +8446,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
-) -> Option<MosaicPaths> {
+) -> Option<(MosaicPaths, f32, usize)> {
     if n_states < 2 {
         return None;
     }
@@ -8543,7 +8543,11 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
-    Some(MosaicPaths { path1, path2 })
+    Some((
+        MosaicPaths { path1, path2 },
+        best_score,
+        informative,
+    ))
 }
 
 fn calculate_log_prior(path1: &[u32], path2: &[u32], p_recomb: &[f32], n_states: usize) -> f64 {
@@ -8644,7 +8648,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // 1. Heuristic initialization (always try this)
     // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
     // found by the beam search, especially in small windows where aliases exist.
-    let mut heuristic_paths = find_best_constant_pair_with_buffer(
+    let mut heuristic_result = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
         seq1,
@@ -8656,7 +8660,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     // Align heuristic orientation to anchors if present
     if has_anchor {
-        if let Some(paths) = heuristic_paths.as_mut() {
+        if let Some((paths, _, _)) = heuristic_result.as_mut() {
             let mut score_direct: i32 = 0;
             let mut score_flip: i32 = 0;
             let ref_alleles_flat = &workspace.ref_alleles_flat[..ref_flat_len];
@@ -8706,6 +8710,68 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
+    // Short-circuit: perfect match found with sufficient evidence.
+    // This avoids MCMC sampling entirely if one pair of haplotypes explains everything.
+    // We check `shared_ref` logic before using `ref_provider` directly.
+    if let Some((paths, best_score, informative)) = heuristic_result.as_ref() {
+        if *informative >= 100 && *best_score == *informative as f32 {
+            // Restore combined_checkpoint_data to avoid data loss in workspace
+            workspace.combined_checkpoint_data = combined_data;
+
+            let mut swap_bits = Vec::with_capacity(het_positions.len());
+            let swap_lr = vec![1e6f32; het_positions.len()];
+            // swap_probs are populated in swap_probs_vec dynamically below
+
+            let mut swap_probs_vec = Vec::with_capacity(het_positions.len());
+            let mut swap_probs_conf_vec = Vec::with_capacity(het_positions.len());
+
+            let use_flat = !shared_ref.is_empty();
+
+            for &m in het_positions {
+                let p1 = paths.path1.get(m).copied().unwrap_or(0) as usize;
+                let s1 = seq1.get(m).copied().unwrap_or(255);
+                let s2 = seq2.get(m).copied().unwrap_or(255);
+
+                if s1 == 255 || s2 == 255 || s1 == s2 || p1 >= n_states_usize {
+                    swap_bits.push(0);
+                    swap_probs_vec.push(0.5);
+                    swap_probs_conf_vec.push(0.5);
+                    continue;
+                }
+
+                let ref1 = if use_flat {
+                    let offset = m * n_states_usize;
+                    shared_ref[offset + p1]
+                } else {
+                    ref_provider.fill_ref_alleles(
+                        m,
+                        &mut workspace.ref_alleles[..n_states_usize],
+                    );
+                    workspace.ref_alleles[p1]
+                };
+
+                // If H1's reference allele matches seq2 (and not seq1), that's a swap (1).
+                // If it matches seq1, no swap (0).
+                if ref1 == s2 && ref1 != s1 {
+                    swap_bits.push(1);
+                    swap_probs_vec.push(1.0);
+                    swap_probs_conf_vec.push(0.9999);
+                } else {
+                    swap_bits.push(0);
+                    swap_probs_vec.push(0.0);
+                    swap_probs_conf_vec.push(0.9999);
+                }
+            }
+            return (
+                swap_bits,
+                swap_lr,
+                swap_probs_vec,
+                swap_probs_conf_vec,
+                paths.clone(),
+            );
+        }
+    }
+
     // 2. Collect candidates
     let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(3);
 
@@ -8720,7 +8786,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     }
 
     // Candidate C: Heuristic paths (if found and different from initial)
-    if let Some(p) = heuristic_paths {
+    if let Some((p, _, _)) = heuristic_result {
         // Only add if distinct from initial_paths to save compute
         let distinct = if let Some(init) = initial_paths {
             init.path1 != p.path1 || init.path2 != p.path2
@@ -11715,7 +11781,7 @@ mod tests {
         let seq2 = vec![1, 1, 1];
 
         let mut scores = Vec::new();
-        let paths = find_best_constant_pair_with_buffer(
+        let (paths, _, _) = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
