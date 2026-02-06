@@ -3158,6 +3158,14 @@ impl crate::pipelines::ImputationPipeline {
             .collect();
 
         let ref_allele_freqs = RefAlleleFreqs::new(ref_columns, ref_markers);
+        if self.config.profile || (window_idx == 0) {
+            eprintln!(
+                "    [debug ref] ref_columns={} ref_markers={} n_ref_haps={} (from freqs)",
+                ref_columns.len(),
+                ref_markers.len(),
+                ref_allele_freqs.n_ref_haps()
+            );
+        }
 
         let marker_map = {
             let chrom = ref_markers
@@ -3836,6 +3844,10 @@ impl crate::pipelines::ImputationPipeline {
                     })
                     .unwrap_or_default();
                 
+                if (window_idx == 0) && (ref_m < 5) {
+                    eprintln!("    [debug weights] m={} weights={:?} theta={}", ref_m, allele_info_weights, self.params.p_mismatch);
+                }
+
                 if store {
                     for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
                         let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);

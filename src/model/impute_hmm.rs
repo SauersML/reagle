@@ -215,6 +215,11 @@ impl<'a, Space> RefAlleleFreqs<'a, Space> {
     }
 
     #[inline]
+    pub fn n_ref_haps(&self) -> usize {
+        self.n_ref_haps
+    }
+
+    #[inline]
     pub fn n_alleles(&self, marker_idx: usize) -> usize {
         self.ref_markers
             .marker(MarkerIdx::new(marker_idx as u32))
