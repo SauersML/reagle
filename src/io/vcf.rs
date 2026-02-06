@@ -816,6 +816,12 @@ impl VcfReader {
                     .and_then(bytes_to_str)
                     .and_then(|gl_str| compute_gl_confidence(gl_str, a1, a2))
                     .or_else(|| {
+                        pl_idx
+                            .and_then(|pl_i| nth_colon_field(sample_field, pl_i))
+                            .and_then(bytes_to_str)
+                            .and_then(|pl_str| compute_pl_confidence(pl_str, a1, a2))
+                    })
+                    .or_else(|| {
                         gq_idx
                             .and_then(|gq_i| nth_colon_field(sample_field, gq_i))
                             .and_then(gq_to_confidence)
@@ -1176,6 +1182,44 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
         (255.0 * (2.0 * w - 1.0)).round() as u8
     };
 
+    Some(confidence)
+}
+
+pub fn compute_pl_confidence(pl_str: &str, a1: u8, a2: u8) -> Option<u8> {
+    if pl_str.is_empty() || pl_str == "." {
+        return None;
+    }
+    let pls = parse_pl(pl_str)?;
+    if pls.len() < 3 {
+        return None;
+    }
+    if a1 == 255 || a2 == 255 {
+        return None;
+    }
+    let (min_a, max_a) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
+    let gt_idx = {
+        let max_a_usize = max_a as usize;
+        let min_a_usize = min_a as usize;
+        max_a_usize * (max_a_usize + 1) / 2 + min_a_usize
+    };
+    if gt_idx >= pls.len() {
+        return None;
+    }
+
+    let mut denom = 0.0f64;
+    for &pl in &pls {
+        denom += 10.0f64.powf(-(pl as f64) / 10.0);
+    }
+    if denom <= 0.0 {
+        return None;
+    }
+    let num = 10.0f64.powf(-(pls[gt_idx] as f64) / 10.0);
+    let w = num / denom;
+    let confidence = if w <= 0.5 {
+        0
+    } else {
+        (255.0 * (2.0 * w - 1.0)).round() as u8
+    };
     Some(confidence)
 }
 
@@ -2003,6 +2047,21 @@ mod tests {
         // Missing/invalid values should return None
         assert_eq!(gq_to_confidence(b"."), None);
         assert_eq!(gq_to_confidence(b""), None);
+    }
+
+    #[test]
+    fn test_compute_pl_confidence() {
+        // Strong call confidence
+        let conf = compute_pl_confidence("0,50,100", 0, 0).unwrap();
+        assert!(conf > 250);
+
+        // Ambiguous first two genotypes => no confidence
+        let conf = compute_pl_confidence("0,0,100", 0, 0).unwrap();
+        assert_eq!(conf, 0);
+
+        // Called genotype not best => confidence 0
+        let conf = compute_pl_confidence("50,0,50", 0, 0).unwrap();
+        assert_eq!(conf, 0);
     }
 
     #[test]
