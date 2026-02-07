@@ -2271,6 +2271,7 @@ fn test_phasing_confidence() {
         mcmc_lr_samples: 32,
         phase_states: 80,
         rare: 0.002,
+        fast_beam_fix_threshold: None,
         impute: false,
         imp_states: 10,
         imp_segment: 6.0,

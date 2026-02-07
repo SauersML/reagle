@@ -135,9 +135,7 @@ const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const FAST_BEAM_WIDTH: usize = 64;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
-// Effectively disable fast beam fixing by setting confidence threshold > 1.0.
-// This forces reliance on the MCMC step which is more accurate for ambiguous phasing.
-const FAST_BEAM_FIX_CONF: f32 = 2.0;
+const DEFAULT_FAST_BEAM_FIX_CONF: f32 = 0.99;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_HARD_CAP: usize = 200;
@@ -2246,7 +2244,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             continue;
                         }
                         let conf = p.max(1.0 - p);
-                        if conf < FAST_BEAM_FIX_CONF {
+                        let threshold = self
+                            .config
+                            .fast_beam_fix_threshold
+                            .unwrap_or(DEFAULT_FAST_BEAM_FIX_CONF);
+                        if conf < threshold {
                             continue;
                         }
                         let want_swapped = p >= 0.5;

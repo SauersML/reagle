@@ -4,10 +4,16 @@ import subprocess
 import glob
 import shutil
 import shlex
+import time
+import random
 from pathlib import Path
 
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
-
+REF_HG38_URLS = [
+    "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz",
+    "http://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz",
+    "ftp://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz",
+]
 
 def _bump_nofile_limit(min_soft: int = 4096):
     try:
@@ -28,14 +34,34 @@ def _bump_nofile_limit(min_soft: int = 4096):
             pass
 
 
-def _download_file(url, dest):
-    if shutil.which("wget"):
-        subprocess.check_call(["wget", "-q", url, "-O", str(dest)])
-        return
-    if shutil.which("curl"):
-        subprocess.check_call(["curl", "-fsSL", url, "-o", str(dest)])
-        return
-    raise RuntimeError("Neither wget nor curl found; cannot download reference panel.")
+def _download_file(url, dest, retries=5):
+    print(f"Downloading {url} to {dest}...")
+    for i in range(retries):
+        try:
+            if shutil.which("wget"):
+                subprocess.check_call(["wget", "-q", url, "-O", str(dest)])
+                return
+            if shutil.which("curl"):
+                subprocess.check_call(["curl", "-fsSL", url, "-o", str(dest)])
+                return
+            raise RuntimeError("Neither wget nor curl found.")
+        except subprocess.CalledProcessError:
+            if i < retries - 1:
+                sleep_time = 2 ** i + random.random()
+                print(f"Download failed. Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+            else:
+                raise
+    raise RuntimeError(f"Failed to download {url} after {retries} attempts.")
+
+def _download_with_fallback(urls, dest):
+    for url in urls:
+        try:
+            _download_file(url, dest)
+            return
+        except Exception as e:
+            print(f"Failed to download from {url}: {e}")
+    raise RuntimeError(f"All download attempts failed for {dest}")
 
 
 def _has_vcf_index(vcf_path: Path):
@@ -78,7 +104,7 @@ def _clear_convert_genome_cache():
         os.path.join(os.path.expanduser("~"), "Library", "Caches", "convert_genome"),
         os.path.join(os.path.expanduser("~"), "Library", "Application Support", "convert_genome"),
     ]
-    for path in cache_dirs:
+    for path in {p for p in cache_dirs if p}:
         if os.path.isdir(path):
             print(f"Removing convert_genome cache: {path}")
             shutil.rmtree(path)
@@ -179,7 +205,7 @@ def prepare_truth(source, output_vcf, panel_path):
     Reconstructs and prepares Truth VCF (Chr22) from WGS data.
 
     IMPORTANT: Truth MUST come from WGS data (vcf.gz.part* files).
-    Array data cannot be used as truth because it lacks HomRef genotypes.
+    Array data cannot be used as truth because they lack HomRef genotypes.
     """
     if os.path.exists(output_vcf) and _has_vcf_index(Path(output_vcf)) and os.path.getsize(output_vcf) > 0:
         print(f"Truth already exists: {output_vcf}")
@@ -224,7 +250,10 @@ def prepare_truth(source, output_vcf, panel_path):
     install_convert_genome()
     _bump_nofile_limit()
 
-    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    # Pre-download reference genome to avoid tool network issues
+    ref_hg38_local = "chr22.fa.gz"
+    _download_with_fallback(REF_HG38_URLS, ref_hg38_local)
+
     truth_output_dir = "convert_genome_truth_out"
     _clean_output_dir(truth_output_dir)
     truth_hg38_vcf = "truth_hg38.vcf.gz"
@@ -232,7 +261,7 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         source_vcf,
-        ref_hg38_url,
+        ref_hg38_local,
         "--output-dir", truth_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -243,6 +272,9 @@ def prepare_truth(source, output_vcf, panel_path):
     print(f"Running: {' '.join(cmd)}")
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
     subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+
+    if os.path.exists(ref_hg38_local):
+        os.remove(ref_hg38_local)
 
     truth_raw_vcf = _find_genotypes_vcf(truth_output_dir)
     if not truth_raw_vcf:
@@ -298,14 +330,17 @@ def run_conversion(input_path, output_vcf, panel_path):
 
     print(f"Converting {raw_file} to GRCh38 VCF...")
 
-    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    # Pre-download reference genome to avoid tool network issues
+    ref_hg38_local = "chr22.fa.gz"
+    _download_with_fallback(REF_HG38_URLS, ref_hg38_local)
+
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
 
     cmd = [
         "convert_genome",
         raw_file,
-        ref_hg38_url,
+        ref_hg38_local,
         "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -316,6 +351,9 @@ def run_conversion(input_path, output_vcf, panel_path):
     print(f"Running: {' '.join(cmd)}")
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
     subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+
+    if os.path.exists(ref_hg38_local):
+        os.remove(ref_hg38_local)
 
     temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
     if not temp_hg38_vcf:

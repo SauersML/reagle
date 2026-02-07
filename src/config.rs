@@ -93,6 +93,9 @@ pub struct Config {
     /// Rare variant frequency threshold
     pub rare: f32,
 
+    /// Threshold for fast beam fixing (0.0 to 1.0, or >1.0 to disable)
+    pub fast_beam_fix_threshold: Option<f32>,
+
     // ============ Imputation Parameters ============
     /// Impute ungenotyped markers
     pub impute: bool,
@@ -168,6 +171,7 @@ struct TomlConfig {
     pub mcmc_lr_samples: Option<usize>,
     pub phase_states: Option<usize>,
     pub rare: Option<f32>,
+    pub fast_beam_fix_threshold: Option<f32>,
 
     // Imputation parameters
     pub impute: Option<bool>,
@@ -211,6 +215,7 @@ impl Default for Config {
             mcmc_lr_samples: 32,
             phase_states: 0,
             rare: 0.002,
+            fast_beam_fix_threshold: None,
             impute: true,
             imp_states: 1600,
             imp_segment: 6.0,
@@ -274,6 +279,9 @@ impl Config {
         }
         if let Some(value) = cfg.rare {
             self.rare = value;
+        }
+        if let Some(value) = cfg.fast_beam_fix_threshold {
+            self.fast_beam_fix_threshold = Some(value);
         }
 
         if let Some(value) = cfg.impute {
