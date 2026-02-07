@@ -6,6 +6,7 @@ import shutil
 import shlex
 import time
 import random
+import gzip
 from pathlib import Path
 
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
@@ -62,6 +63,13 @@ def _download_with_fallback(urls, dest):
         except Exception as e:
             print(f"Failed to download from {url}: {e}")
     raise RuntimeError(f"All download attempts failed for {dest}")
+
+
+def _decompress_file(src, dest):
+    print(f"Decompressing {src} to {dest}...")
+    with gzip.open(src, 'rb') as f_in:
+        with open(dest, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
 
 
 def _has_vcf_index(vcf_path: Path):
@@ -251,8 +259,10 @@ def prepare_truth(source, output_vcf, panel_path):
     _bump_nofile_limit()
 
     # Pre-download reference genome to avoid tool network issues
-    ref_hg38_local = "chr22.fa.gz"
-    _download_with_fallback(REF_HG38_URLS, ref_hg38_local)
+    ref_hg38_gz = "chr22.fa.gz"
+    ref_hg38_fa = "chr22.fa"
+    _download_with_fallback(REF_HG38_URLS, ref_hg38_gz)
+    _decompress_file(ref_hg38_gz, ref_hg38_fa)
 
     truth_output_dir = "convert_genome_truth_out"
     _clean_output_dir(truth_output_dir)
@@ -261,7 +271,7 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         source_vcf,
-        ref_hg38_local,
+        ref_hg38_fa,
         "--output-dir", truth_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -273,8 +283,10 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
     subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
 
-    if os.path.exists(ref_hg38_local):
-        os.remove(ref_hg38_local)
+    if os.path.exists(ref_hg38_gz):
+        os.remove(ref_hg38_gz)
+    if os.path.exists(ref_hg38_fa):
+        os.remove(ref_hg38_fa)
 
     truth_raw_vcf = _find_genotypes_vcf(truth_output_dir)
     if not truth_raw_vcf:
@@ -331,8 +343,10 @@ def run_conversion(input_path, output_vcf, panel_path):
     print(f"Converting {raw_file} to GRCh38 VCF...")
 
     # Pre-download reference genome to avoid tool network issues
-    ref_hg38_local = "chr22.fa.gz"
-    _download_with_fallback(REF_HG38_URLS, ref_hg38_local)
+    ref_hg38_gz = "chr22.fa.gz"
+    ref_hg38_fa = "chr22.fa"
+    _download_with_fallback(REF_HG38_URLS, ref_hg38_gz)
+    _decompress_file(ref_hg38_gz, ref_hg38_fa)
 
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
@@ -340,7 +354,7 @@ def run_conversion(input_path, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         raw_file,
-        ref_hg38_local,
+        ref_hg38_fa,
         "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -352,8 +366,10 @@ def run_conversion(input_path, output_vcf, panel_path):
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
     subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
 
-    if os.path.exists(ref_hg38_local):
-        os.remove(ref_hg38_local)
+    if os.path.exists(ref_hg38_gz):
+        os.remove(ref_hg38_gz)
+    if os.path.exists(ref_hg38_fa):
+        os.remove(ref_hg38_fa)
 
     temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
     if not temp_hg38_vcf:
