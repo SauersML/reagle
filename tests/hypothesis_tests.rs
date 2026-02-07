@@ -350,12 +350,27 @@ fn parse_debug_hmm_counters(stderr: &str) -> Vec<[usize; 7]> {
 fn test_missing_confidence_is_not_full_by_default() {
     // Hypothesis: missing GL/PL causes confidence to default to 1.0 (hard evidence).
     // This test should FAIL if that hypothesis is true.
-    let markers = reagle::data::marker::Markers::<reagle::data::AnyMarkerSpace>::new();
+    // Create a single-marker, single-sample matrix where the genotype is
+    // missing (both alleles = 255). The missing_genotypes mask should flag
+    // this, causing sample_confidence to return 0 rather than 255.
+    use reagle::data::marker::{Allele, Marker};
+    use reagle::data::ChromIdx;
+    use reagle::data::storage::GenotypeColumn;
+    let mut markers = reagle::data::marker::Markers::<reagle::data::AnyMarkerSpace>::new();
+    markers.push(Marker::new(
+        ChromIdx::new(0),
+        1000,
+        None,
+        Allele::from_char('A'),
+        vec![Allele::from_char('G')],
+    ));
     let samples = std::sync::Arc::new(reagle::data::haplotype::Samples::from_ids(vec![
         "s0".into(),
     ]));
-    let columns: Vec<reagle::data::storage::GenotypeColumn> = Vec::new();
-    let matrix = reagle::data::storage::GenotypeMatrix::new_unphased(markers, columns, samples);
+    // Both haplotype alleles = 255 (missing)
+    let col = GenotypeColumn::from_alleles(&[255, 255], 2);
+    let matrix =
+        reagle::data::storage::GenotypeMatrix::new_unphased(markers, vec![col], samples);
     let conf = matrix.sample_confidence_f32(MarkerIdx::new(0), 0);
     eprintln!("default sample_confidence_f32 = {}", conf);
     assert!(

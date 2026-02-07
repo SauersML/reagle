@@ -244,23 +244,13 @@ impl<'a> DictPatternAlleles<'a> {
 /// Reference haplotype count metadata for imputation HMM transitions.
 pub struct RefAlleleFreqs {
     n_ref_haps: usize,
-    biallelic_alt_freq: Vec<f32>,
 }
 
 impl RefAlleleFreqs {
     pub fn new(ref_columns: &[GenotypeColumn]) -> Self {
         let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
-        let mut biallelic_alt_freq = Vec::with_capacity(ref_columns.len());
-        if n_ref_haps > 0 {
-            let denom = n_ref_haps as f32;
-            for col in ref_columns {
-                let alt = col.alt_count() as f32;
-                biallelic_alt_freq.push((alt / denom).clamp(0.0, 1.0));
-            }
-        }
         Self {
             n_ref_haps,
-            biallelic_alt_freq,
         }
     }
 
@@ -269,10 +259,6 @@ impl RefAlleleFreqs {
         self.n_ref_haps
     }
 
-    #[inline]
-    pub fn biallelic_alt_freq(&self, marker_idx: usize) -> Option<f32> {
-        self.biallelic_alt_freq.get(marker_idx).copied()
-    }
 }
 
 impl ImputeWorkspace {
@@ -796,14 +782,12 @@ fn compute_nearest_observed_lambda(
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
     subset_prior_probs: &[f32],
-    global_prior_probs: Option<&[f32]>,
     nearest_obs_lambda: f32,
     total_mass: f32,
     state_prob_sq_sum: f32,
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
-    const LOCAL_GLOBAL_PRIOR_BLEND: f32 = 0.5;
     if allele_probs.is_empty() || total_mass <= 0.0 || state_prob_sq_sum <= 0.0 {
         return;
     }
@@ -830,13 +814,7 @@ fn smooth_allele_posteriors_subset(
     let denom = 1.0 + prior_mass;
     for (i, p) in allele_probs.iter_mut().enumerate() {
         let local_prior = subset_prior_probs.get(i).copied().unwrap_or(0.0).max(0.0);
-        let merged_prior = if let Some(global) = global_prior_probs {
-            let g = global.get(i).copied().unwrap_or(0.0).max(0.0);
-            LOCAL_GLOBAL_PRIOR_BLEND * local_prior + (1.0 - LOCAL_GLOBAL_PRIOR_BLEND) * g
-        } else {
-            local_prior
-        };
-        *p = (*p + prior_mass * merged_prior) / denom;
+        *p = (*p + prior_mass * local_prior) / denom;
     }
     normalize_probs(allele_probs);
 }
@@ -869,7 +847,6 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
 fn normalized_allele_prior<'a>(
     out: &'a mut Vec<f32>,
     target_probs: &[f32],
-    global_prior_probs: Option<&[f32]>,
 ) -> &'a [f32] {
     let n = target_probs.len();
     if out.len() < n {
@@ -884,19 +861,6 @@ fn normalized_allele_prior<'a>(
         }
         prior[i] = v;
         sum += v;
-    }
-    if sum <= 0.0 {
-        if let Some(global) = global_prior_probs {
-            sum = 0.0;
-            for i in 0..n {
-                let mut v = global.get(i).copied().unwrap_or(0.0);
-                if !v.is_finite() || v < 0.0 {
-                    v = 0.0;
-                }
-                prior[i] = v;
-                sum += v;
-            }
-        }
     }
     if sum <= 0.0 {
         let uniform = 1.0 / n.max(1) as f32;
@@ -1404,14 +1368,6 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                            let biallelic_global_prior = if n_alleles == 2 {
-                                ref_allele_freqs.biallelic_alt_freq(m_rev).map(|af| {
-                                    let clamped = af.clamp(0.0, 1.0);
-                                    [1.0 - clamped, clamped]
-                                })
-                            } else {
-                                None
-                            };
                             let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut sq_sum = 0.0f32;
@@ -1437,7 +1393,6 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     let prior = normalized_allele_prior(
                                         &mut ws.allele_prior_scratch,
                                         probs,
-                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
                                     );
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior[i];
@@ -1451,14 +1406,13 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
-                                    let inv_subset = 1.0 / subset_total;
-                                    for p in subset_counts.iter_mut() {
-                                        *p *= inv_subset;
-                                    }
+                                    // Use full-panel allele frequency (stored in
+                                    // TargetAlleleProbs) as the smoothing prior instead
+                                    // of subset AF, so that abyss haplotypes' allele
+                                    // distribution is properly represented.
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        subset_counts,
-                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
+                                        probs,
                                         ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
                                         total,
                                         sq_sum,
@@ -1710,14 +1664,6 @@ fn run_impute_hmm_seqcoded(
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                            let biallelic_global_prior = if n_alleles == 2 {
-                                ref_allele_freqs.biallelic_alt_freq(m_rev).map(|af| {
-                                    let clamped = af.clamp(0.0, 1.0);
-                                    [1.0 - clamped, clamped]
-                                })
-                            } else {
-                                None
-                            };
                             let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut sq_sum = 0.0f32;
@@ -1743,7 +1689,6 @@ fn run_impute_hmm_seqcoded(
                                     let prior = normalized_allele_prior(
                                         &mut ws.allele_prior_scratch,
                                         probs,
-                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
                                     );
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior[i];
@@ -1757,14 +1702,9 @@ fn run_impute_hmm_seqcoded(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
-                                    let inv_subset = 1.0 / subset_total;
-                                    for p in subset_counts.iter_mut() {
-                                        *p *= inv_subset;
-                                    }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        subset_counts,
-                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
+                                        probs,
                                         ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
                                         total,
                                         sq_sum,
@@ -2014,14 +1954,6 @@ fn run_impute_hmm_dict(
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                            let biallelic_global_prior = if n_alleles == 2 {
-                                ref_allele_freqs.biallelic_alt_freq(m_rev).map(|af| {
-                                    let clamped = af.clamp(0.0, 1.0);
-                                    [1.0 - clamped, clamped]
-                                })
-                            } else {
-                                None
-                            };
                             let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut sq_sum = 0.0f32;
@@ -2047,7 +1979,6 @@ fn run_impute_hmm_dict(
                                     let prior = normalized_allele_prior(
                                         &mut ws.allele_prior_scratch,
                                         probs,
-                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
                                     );
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior[i];
@@ -2061,14 +1992,9 @@ fn run_impute_hmm_dict(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
-                                    let inv_subset = 1.0 / subset_total;
-                                    for p in subset_counts.iter_mut() {
-                                        *p *= inv_subset;
-                                    }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        subset_counts,
-                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
+                                        probs,
                                         ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
                                         total,
                                         sq_sum,

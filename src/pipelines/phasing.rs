@@ -1768,6 +1768,14 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
         }
+        // Calibrate LR threshold schedule for dynamic MCMC.
+        // With N Gibbs steps the max achievable LR is (N+0.5)/0.5 = 2N+1.
+        // Setting initial_lr just above this ensures only "perfect evidence"
+        // hets lock right after burnin, with gradual relaxation thereafter.
+        if self.config.dynamic_mcmc {
+            let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
+            self.params.initial_lr = (1.2 * max_lr).max(4.0);
+        }
 
         eprintln!(
             "Phasing parameters: p_mismatch={}, recomb_intensity={}, n_states={} (requested phase_states={})",
@@ -3014,6 +3022,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         if self.config.phase_states > 0 {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        }
+        if self.config.dynamic_mcmc {
+            let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
+            self.params.initial_lr = (1.2 * max_lr).max(4.0);
         }
 
         // Initialize genotypes preserving actual allele values including missing (255)

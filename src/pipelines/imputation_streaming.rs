@@ -3901,11 +3901,33 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
 
-                if !use1 {
-                    aligned1.resize(n_alleles.max(1), 1.0);
-                }
-                if !use2 {
-                    aligned2.resize(n_alleles.max(1), 1.0);
+                if !use1 || !use2 {
+                    // For untyped markers, store full-panel allele frequency
+                    // instead of uniform. This provides the correct population
+                    // prior for posterior smoothing, preventing AF collapse when
+                    // the HMM state subset is biased.
+                    let n_haps = ref_columns[ref_m].n_haplotypes();
+                    if n_haps > 0 && n_alleles == 2 {
+                        let alt_count = ref_columns[ref_m].alt_count();
+                        let alt_freq = (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
+                        if !use1 {
+                            aligned1.resize(2, 0.0);
+                            aligned1[0] = 1.0 - alt_freq;
+                            aligned1[1] = alt_freq;
+                        }
+                        if !use2 {
+                            aligned2.resize(2, 0.0);
+                            aligned2[0] = 1.0 - alt_freq;
+                            aligned2[1] = alt_freq;
+                        }
+                    } else {
+                        if !use1 {
+                            aligned1.resize(n_alleles.max(1), 1.0);
+                        }
+                        if !use2 {
+                            aligned2.resize(n_alleles.max(1), 1.0);
+                        }
+                    }
                 }
 
                 normalize_probs(&mut aligned1);
@@ -4030,8 +4052,7 @@ impl crate::pipelines::ImputationPipeline {
                     .get(ref_m)
                     .and_then(|v| *v)
                     .is_some();
-                let in_overlap = ref_m >= overlap_start && ref_m < output_end;
-                let store = aligned_here || in_overlap;
+                let store = aligned_here;
 
                 // Information weight in natural log space for one informative allele observation.
                 let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
@@ -4113,6 +4134,28 @@ impl crate::pipelines::ImputationPipeline {
                 "    [debug donors] hap_donor_counts min={} avg={:.2} max={}",
                 min_donors, avg_donors, max_donors
             );
+            if plan.n_ref_haps == 100 && n_target_haps >= 4 {
+                for hap_idx in 0..4usize {
+                    let counts = &sm_donor_counts[hap_idx];
+                    let mut low = 0u32;
+                    let mut high = 0u32;
+                    for (hap, c) in counts.iter() {
+                        if hap.as_usize() < 50 {
+                            low = low.saturating_add(*c);
+                        } else {
+                            high = high.saturating_add(*c);
+                        }
+                    }
+                    let total = low.saturating_add(high).max(1);
+                    eprintln!(
+                        "    [debug donors mix] hap={} low={} high={} frac_high={:.4}",
+                        hap_idx,
+                        low,
+                        high,
+                        high as f64 / total as f64
+                    );
+                }
+            }
         }
 
         thread_local! {
@@ -4125,6 +4168,13 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
+
+        // Total recombination mass across the window for Li-Stephens decay.
+        // When the HMM is skipped (no informative markers), the handoff prior
+        // must still decay toward uniform via recombination. Without this, a
+        // prior from a distant typed marker stays locked indefinitely.
+        let window_total_p_recomb: f32 = p_recomb.iter().sum();
+
         struct ImputeResult {
             result: SampleImputationResult,
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
@@ -4705,6 +4755,34 @@ impl crate::pipelines::ImputationPipeline {
                     Ok((posteriors, next_priors, subsetted_states, informative_ratio))
                 };
 
+                // Apply Li-Stephens recombination decay to a handoff prior.
+                // Over the window's genetic distance, the posterior diffuses
+                // toward uniform at a rate determined by p_recomb. This is
+                // equivalent to running the forward pass with uniform emissions.
+                //
+                // Li-Stephens transition for k states over total recomb r_total:
+                //   retain = exp(-r_total * (1 - 1/k))
+                //   P_new(j) = retain * P_old(j) + (1 - retain) / k
+                let decay_prior = |p: &HaplotypePriors| -> HaplotypePriors {
+                    let k = p.ids().len();
+                    if k == 0 || window_total_p_recomb <= 0.0 {
+                        return p.clone();
+                    }
+                    let retain = (-(window_total_p_recomb as f64)
+                        * (1.0 - 1.0 / k as f64))
+                        .exp() as f32;
+                    if retain >= 1.0 - 1e-9 {
+                        return p.clone();
+                    }
+                    let uniform = (1.0 - retain) / k as f32;
+                    let new_probs: Vec<f32> = p
+                        .probs()
+                        .iter()
+                        .map(|&prob| retain * prob + uniform)
+                        .collect();
+                    HaplotypePriors::new(p.ids().to_vec(), new_probs)
+                };
+
                 let mut hap1_posts: Option<Vec<AllelePosteriors>> = None;
                 let mut hap2_posts: Option<Vec<AllelePosteriors>> = None;
                 let mut p1_out = HaplotypePriors::empty();
@@ -4712,8 +4790,9 @@ impl crate::pipelines::ImputationPipeline {
 
                 if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        hap1_posts = Some(posts_from_priors(p)?);
-                        p1_out = p.clone();
+                        let decayed = decay_prior(p);
+                        hap1_posts = Some(posts_from_priors(&decayed)?);
+                        p1_out = decayed;
                     }
                 } else if use_hmm_h1 {
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
@@ -4729,8 +4808,9 @@ impl crate::pipelines::ImputationPipeline {
                     p1_out = out;
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        hap1_posts = Some(posts_from_priors(p)?);
-                        p1_out = p.clone();
+                        let decayed = decay_prior(p);
+                        hap1_posts = Some(posts_from_priors(&decayed)?);
+                        p1_out = decayed;
                     }
                 } else {
                     let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
@@ -4753,8 +4833,9 @@ impl crate::pipelines::ImputationPipeline {
 
                 if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        hap2_posts = Some(posts_from_priors(p)?);
-                        p2_out = p.clone();
+                        let decayed = decay_prior(p);
+                        hap2_posts = Some(posts_from_priors(&decayed)?);
+                        p2_out = decayed;
                     }
                 } else if use_hmm_h2 {
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
@@ -4770,8 +4851,9 @@ impl crate::pipelines::ImputationPipeline {
                     p2_out = out;
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        hap2_posts = Some(posts_from_priors(p)?);
-                        p2_out = p.clone();
+                        let decayed = decay_prior(p);
+                        hap2_posts = Some(posts_from_priors(&decayed)?);
+                        p2_out = decayed;
                     }
                 } else {
                     let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();

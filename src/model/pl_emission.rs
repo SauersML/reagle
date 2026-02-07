@@ -46,7 +46,11 @@ struct PriorModel<'a> {
 }
 
 fn build_prior_model(allele_freqs: Option<&[f32]>, n_alleles: usize) -> Option<PriorModel<'_>> {
-    const MIN_AF: f32 = 1e-6;
+    // Floor allele frequency to prevent zero-MAF priors from overwhelming
+    // strong PL evidence. With 1e-6, ln(2*1e-6) ≈ -13 which is comparable
+    // to PL=50 evidence (-11.5), causing AF collapse for observed hets.
+    // 1e-4 keeps the prior weak enough that PL evidence dominates.
+    const MIN_AF: f32 = 1e-4;
     let freqs = allele_freqs?;
     if freqs.len() != n_alleles || freqs.is_empty() {
         return None;
@@ -76,7 +80,7 @@ fn pl_to_log_likelihood(pl: u16) -> f32 {
 
 #[inline]
 fn genotype_log_prior(i: usize, j: usize, prior_model: &PriorModel<'_>) -> f32 {
-    const MIN_AF: f32 = 1e-6;
+    const MIN_AF: f32 = 1e-4;
     let fi = prior_model.freqs[i].max(MIN_AF) * prior_model.inv_sum;
     let fj = prior_model.freqs[j].max(MIN_AF) * prior_model.inv_sum;
     let prior = if i == j {
