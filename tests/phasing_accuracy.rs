@@ -143,6 +143,7 @@ fn test_ser_switching_all0_all1_reference() {
     config.ne = 10000.0;
     // Set low error rate to force strong preference for matches
     config.err = Some(0.0001);
+    config.fast_beam_fix_threshold = Some(2.0);
 
     // 4. Run
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -300,6 +301,7 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
     config.nthreads = Some(1);
     config.ne = 10000.0;
     config.err = Some(0.0001);
+    config.fast_beam_fix_threshold = Some(2.0);
 
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run().expect("Pipeline run failed");
@@ -409,6 +411,7 @@ fn test_ser_not_fixed_by_high_state_count_all0_all1() {
     config.nthreads = Some(1);
     config.ne = 10000.0;
     config.err = Some(0.0001);
+    config.fast_beam_fix_threshold = Some(2.0);
 
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run().expect("Pipeline run failed");
@@ -547,6 +550,7 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
         config.nthreads = Some(1);
         config.ne = 10000.0;
         config.err = Some(0.0001);
+        config.fast_beam_fix_threshold = Some(2.0);
 
         let mut pipeline = PhasingPipeline::new(config, None);
         pipeline.run().expect("Pipeline run failed");

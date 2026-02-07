@@ -90,6 +90,9 @@ pub struct Config {
     /// Model states for phasing (0 = auto by memory budget)
     pub phase_states: usize,
 
+    /// Threshold for fast beam fixing (heuristic)
+    pub fast_beam_fix_threshold: Option<f32>,
+
     /// Rare variant frequency threshold
     pub rare: f32,
 
@@ -167,6 +170,7 @@ struct TomlConfig {
     pub mcmc_steps: Option<usize>,
     pub mcmc_lr_samples: Option<usize>,
     pub phase_states: Option<usize>,
+    pub fast_beam_fix_threshold: Option<f32>,
     pub rare: Option<f32>,
 
     // Imputation parameters
@@ -210,6 +214,7 @@ impl Default for Config {
             mcmc_steps: 3,
             mcmc_lr_samples: 32,
             phase_states: 0,
+            fast_beam_fix_threshold: None,
             rare: 0.002,
             impute: true,
             imp_states: 1600,
@@ -271,6 +276,9 @@ impl Config {
         }
         if let Some(value) = cfg.phase_states {
             self.phase_states = value;
+        }
+        if let Some(value) = cfg.fast_beam_fix_threshold {
+            self.fast_beam_fix_threshold = Some(value);
         }
         if let Some(value) = cfg.rare {
             self.rare = value;
