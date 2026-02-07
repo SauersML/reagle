@@ -3778,6 +3778,12 @@ impl crate::pipelines::ImputationPipeline {
                     last_info2 = Some(ref_m);
                 }
 
+                // Debug print for marker 15
+                if ref_m == 15 && sample_idx == 0 {
+                    eprintln!("DEBUG: marker 15 input probs: p1={:?}, p2={:?}, use1={}, use2={}", 
+                        aligned1, aligned2, use1, use2);
+                }
+
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
                 offsets1.push(probs1.len());
@@ -4598,20 +4604,8 @@ impl crate::pipelines::ImputationPipeline {
                         &donors_h1,
                     )?;
                     let mut posts = posts;
-                    if !has_priors_h1
-                        && plan.n_ref_haps > 32
-                        && !donors_h1.is_empty()
-                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                    {
-                        let donor_posts = posts_from_donors(&donors_h1)?;
-                        let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
-                        .clamp(0.0, 1.0);
-                        let tau = 1.0 + 1.5 * t;
-                        temper_posts(&mut posts, tau);
-                        let w = 1.00f32 * t;
-                        blend_posts(&mut posts, &donor_posts, w);
-                    }
+                    // Removed global donor blending heuristic which poisons local
+                    // imputation in recombination scenarios by mixing unrelated donors.
                     hap1_posts = Some(posts);
                     p1_out = out;
                     // Keep imputation emissions stationary across windows.
@@ -4657,20 +4651,7 @@ impl crate::pipelines::ImputationPipeline {
                         &donors_h2,
                     )?;
                     let mut posts = posts;
-                    if !has_priors_h2
-                        && plan.n_ref_haps > 32
-                        && !donors_h2.is_empty()
-                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                    {
-                        let donor_posts = posts_from_donors(&donors_h2)?;
-                        let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
-                        .clamp(0.0, 1.0);
-                        let tau = 1.0 + 1.5 * t;
-                        temper_posts(&mut posts, tau);
-                        let w = 1.00f32 * t;
-                        blend_posts(&mut posts, &donor_posts, w);
-                    }
+                    // Removed global donor blending heuristic.
                     hap2_posts = Some(posts);
                     p2_out = out;
                     let _ = (stats.expected_mismatches, stats.informative_sites);
