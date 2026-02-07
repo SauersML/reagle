@@ -1334,8 +1334,8 @@ fn test_phasing_multi_window_long_map_vs_java() {
         &[
             ("gt", gt_path.to_str().unwrap()),
             ("map", map_path.to_str().unwrap()),
-            ("window", "2.0"),
-            ("overlap", "0.5"),
+            ("window", "3.0"),
+            ("overlap", "1.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
         ],
@@ -1348,7 +1348,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
     // Run Rust phasing with the same map and window sizing.
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_phased_long");
-    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 2.0, 0.5);
+    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 3.0, 1.0);
     assert!(
         rust_result.is_ok(),
         "Rust phasing failed: {:?}",
@@ -1426,7 +1426,7 @@ fn test_imputation_multi_window_long_map_vs_java() {
     // Run Java BEAGLE with map
     let java_out = work_dir.path().join("java_imputed_long");
     println!(
-        "[long-map] JAVA START ref={} gt={} map={} out={} window=2.0 overlap=1.0 seed=42 gp=true",
+        "[long-map] JAVA START ref={} gt={} map={} out={} window=3.0 overlap=1.0 seed=42 gp=true",
         ref_path.display(),
         gt_path.display(),
         map_path.display(),
@@ -1438,8 +1438,8 @@ fn test_imputation_multi_window_long_map_vs_java() {
             ("ref", ref_path.to_str().unwrap()),
             ("gt", gt_path.to_str().unwrap()),
             ("map", map_path.to_str().unwrap()),
-            ("window", "2.0"),
-            ("overlap", "0.5"),
+            ("window", "3.0"),
+            ("overlap", "1.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
             ("gp", "true"),
@@ -1462,14 +1462,14 @@ fn test_imputation_multi_window_long_map_vs_java() {
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_imputed_long");
     println!(
-        "[long-map] RUST START gt={} ref={} map={} out={} window=2.0 overlap=0.5 seed=42",
+        "[long-map] RUST START gt={} ref={} map={} out={} window=3.0 overlap=1.0 seed=42",
         gt_vcf.display(),
         ref_vcf.display(),
         map_path.display(),
         rust_out.display()
     );
     let rust_result =
-        run_rust_imputation_with_map(&gt_vcf, &ref_vcf, &map_path, &rust_out, 42, 2.0, 0.5);
+        run_rust_imputation_with_map(&gt_vcf, &ref_vcf, &map_path, &rust_out, 42, 3.0, 1.0);
     println!("[long-map] RUST END ok={}", rust_result.is_ok());
     assert!(
         rust_result.is_ok(),
