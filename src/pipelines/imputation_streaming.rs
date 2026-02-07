@@ -4314,9 +4314,26 @@ impl crate::pipelines::ImputationPipeline {
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
                                         donors: &[(RefHapId, u32)],
-                                        weak_signal: bool|
+                                        weak_signal: bool,
+                                        informative_ratio: f32|
                  -> Vec<RefHapId> {
                     let has_nonempty_priors = priors.map(|p| !p.is_empty()).unwrap_or(false);
+                    if plan.full_panel && plan.n_ref_haps <= 1024 {
+                        // In explicit full-panel mode on small/medium panels, keep the exact
+                        // LS state universe. This avoids donor truncation when typed evidence is
+                        // sparse (e.g. heavy masking), where aggressive state capping causes
+                        // heterozygote collapse and boundary instability.
+                        return (0..plan.n_ref_haps)
+                            .map(|h| RefHapId::new(h as u32))
+                            .collect();
+                    }
+                    if weak_signal && informative_ratio <= 0.35 && plan.n_ref_haps <= 2048 {
+                        // In weak-information windows on small/medium panels, use the full
+                        // reference state space to avoid donor misspecification and AF collapse.
+                        return (0..plan.n_ref_haps)
+                            .map(|h| RefHapId::new(h as u32))
+                            .collect();
+                    }
                     let full_panel_window = per_window_cap_local >= plan.n_ref_haps;
                     // Only use exact full-state LS when the planner explicitly selected
                     // a full-panel window and no per-haplotype pruning is expected.
@@ -4357,15 +4374,7 @@ impl crate::pipelines::ImputationPipeline {
                         .get(hap_idx.as_usize())
                         .cloned()
                         .unwrap_or_default();
-                    // When stitched handoff priors are available, avoid injecting fresh
-                    // PBWT donor IDs into the state set. Handoff priors already carry the
-                    // posterior continuity signal; adding local donor IDs at the seam can
-                    // create boundary-only state churn that is absent in single-window runs.
-                    let donor_haps: Vec<RefHapId> = if has_nonempty_priors {
-                        Vec::new()
-                    } else {
-                        donors.iter().map(|(hap, _)| *hap).collect()
-                    };
+                    let donor_haps: Vec<RefHapId> = donors.iter().map(|(hap, _)| *hap).collect();
                     let core_haps: Vec<RefHapId> = plan
                         .core_states
                         .get(hap_idx.as_usize())
@@ -4402,6 +4411,13 @@ impl crate::pipelines::ImputationPipeline {
                         k * STATE_MIX_DONOR_FRAC_NUM / STATE_MIX_FRAC_DEN
                     };
                     let mut q_core = k * STATE_MIX_CORE_FRAC_NUM / STATE_MIX_FRAC_DEN;
+                    if has_nonempty_priors {
+                        // Keep continuity strong across windows, but do not fully disable
+                        // local donors (they remain useful at rare/local mismatches).
+                        q_prior = q_prior.max((k * 5) / 10);
+                        q_donor = q_donor.max((k * 1) / 10);
+                        q_core = q_core.min((k * 1) / 10);
+                    }
                     if weak_signal && priors.is_none() && !donor_haps.is_empty() {
                         // In weak local signal, preserve locality by giving PBWT donors
                         // more state budget and shrinking generic core allocation.
@@ -4429,6 +4445,12 @@ impl crate::pipelines::ImputationPipeline {
                         used_q += 1;
                     }
 
+                    let prior_floor = if has_nonempty_priors {
+                        (k / 2).min(prior_haps.len())
+                    } else {
+                        0
+                    };
+                    fill_from(&mut out, &mut seen, &prior_haps, prior_floor, k);
                     fill_from(&mut out, &mut seen, &prior_haps, q_prior, k);
                     fill_from(&mut out, &mut seen, &window_haps, q_window, k);
                     fill_from(&mut out, &mut seen, &donor_haps, q_donor, k);
@@ -4494,12 +4516,7 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         informative_n as f32 / n_markers as f32
                     };
-                    let state_haps = build_state_haps(
-                        hap_idx,
-                        priors,
-                        donors,
-                        weak_signal,
-                    );
+                    let state_haps = build_state_haps(hap_idx, priors, donors, weak_signal, informative_ratio);
                     if state_haps.is_empty() {
                         return Err(ReagleError::vcf(format!(
                             "State selection produced empty subset: window={} sample={} hap={} donors={} has_priors={}",
@@ -4685,10 +4702,10 @@ impl crate::pipelines::ImputationPipeline {
                     )?;
                     let mut posts = posts;
                     if !has_priors_h1
-                        && subsetted_states
                         && plan.n_ref_haps > 32
                         && !donors_h1.is_empty()
                         && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        && (subsetted_states || informative_ratio <= 0.20)
                     {
                         let donor_posts = posts_from_donors(&donors_h1)?;
                         let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
@@ -4754,10 +4771,10 @@ impl crate::pipelines::ImputationPipeline {
                     )?;
                     let mut posts = posts;
                     if !has_priors_h2
-                        && subsetted_states
                         && plan.n_ref_haps > 32
                         && !donors_h2.is_empty()
                         && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        && (subsetted_states || informative_ratio <= 0.20)
                     {
                         let donor_posts = posts_from_donors(&donors_h2)?;
                         let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
@@ -5229,6 +5246,8 @@ impl crate::pipelines::ImputationPipeline {
 
         let samples = target_win.samples_arc();
         let target_pl = target_pl.unwrap_or(target_win);
+        let pos_fallback_used = std::sync::atomic::AtomicUsize::new(0);
+        let pos_fallback_map_fail = std::sync::atomic::AtomicUsize::new(0);
         let mut target_pos_to_indices: std::collections::HashMap<(String, u32), Vec<usize>> =
             std::collections::HashMap::new();
         for t_idx in 0..target_win.n_markers() {
@@ -5272,6 +5291,44 @@ impl crate::pipelines::ImputationPipeline {
                 Some(matches[0])
             } else {
                 None
+            }
+        };
+
+        let map_pos_fallback_allele = |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
+            if raw == 255 {
+                return None;
+            }
+            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
+            let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
+            if ref_marker.n_alleles() != 2 || target_marker.n_alleles() != 2 {
+                return None;
+            }
+            let ref0 = ref_marker.ref_allele.to_string();
+            let ref1 = ref_marker.alt_alleles.first()?.to_string();
+            let t0 = target_marker.ref_allele.to_string();
+            let t1 = target_marker.alt_alleles.first()?.to_string();
+            let same = ref0 == t0 && ref1 == t1;
+            let swapped = ref0 == t1 && ref1 == t0;
+            match raw {
+                0 => {
+                    if same {
+                        Some(0)
+                    } else if swapped {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                }
+                1 => {
+                    if same {
+                        Some(1)
+                    } else if swapped {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }
         };
 
@@ -5321,6 +5378,7 @@ impl crate::pipelines::ImputationPipeline {
             // Position-only fallback for unaligned markers: preserve target hard calls
             // when there is a unique marker at the same position.
             let target_idx = pick_target_marker_by_alleles(marker_idx)?;
+            pos_fallback_used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let target_m = MarkerIdx::new(target_idx as u32);
             if let Some(missing) = target_missing {
                 let miss_a1 = missing.allele(target_m, h1);
@@ -5334,8 +5392,20 @@ impl crate::pipelines::ImputationPipeline {
             if raw_a1 == 255 || raw_a2 == 255 {
                 return None;
             }
-            let a1 = if raw_a1 == 0 { 0 } else { 1 };
-            let a2 = if raw_a2 == 0 { 0 } else { 1 };
+            let a1 = match map_pos_fallback_allele(marker_idx, target_idx, raw_a1) {
+                Some(v) => v,
+                None => {
+                    pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            };
+            let a2 = match map_pos_fallback_allele(marker_idx, target_idx, raw_a2) {
+                Some(v) => v,
+                None => {
+                    pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            };
             Some((a1, a2))
         };
 
@@ -5394,7 +5464,22 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 ((ra1 > 0) as u8 + (ra2 > 0) as u8) as f32
             } else {
-                ((a1 > 0) as u8 + (a2 > 0) as u8) as f32
+                let target_idx = target_m.as_usize();
+                let ra1 = match map_pos_fallback_allele(marker_idx, target_idx, a1) {
+                    Some(v) => v,
+                    None => {
+                        pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return None;
+                    }
+                };
+                let ra2 = match map_pos_fallback_allele(marker_idx, target_idx, a2) {
+                    Some(v) => v,
+                    None => {
+                        pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return None;
+                    }
+                };
+                (ra1 + ra2) as f32
             };
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
                 Some(d)
@@ -6069,6 +6154,21 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
+
+        let fallback_used = pos_fallback_used.load(std::sync::atomic::Ordering::Relaxed);
+        let fallback_fail = pos_fallback_map_fail.load(std::sync::atomic::Ordering::Relaxed);
+        if fallback_used > 0 {
+            if fallback_fail > 0 {
+                return Err(ReagleError::vcf(format!(
+                    "Position-only allele fallback failed: output={}..{} used={} failures={}. Refusing lossy fallback.",
+                    output_start, output_end, fallback_used, fallback_fail
+                )));
+            }
+            eprintln!(
+                "    [alignment fallback] output={}..{} position_only_mapped={}",
+                output_start, output_end, fallback_used
+            );
+        }
 
         writer.write_imputed_streaming(
             &out_markers,
