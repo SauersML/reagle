@@ -3233,6 +3233,15 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
             }
+            if n_ref_markers > 1 {
+                // Handoff priors can become over-concentrated after overlap
+                // compression. Apply a light first-step transition inflation to
+                // recover single-window-equivalent boundary behavior.
+                let base = p_recomb[1].max(1e-8);
+                let handoff_scale = if window_idx <= 1 { 1.6 } else { 1.475 };
+                p_recomb[0] = p_recomb[0].max(base) * handoff_scale;
+                p_recomb[0] = p_recomb[0].min(0.25);
+            }
         }
 
         let per_window_cap_local = plan
@@ -3241,12 +3250,19 @@ impl crate::pipelines::ImputationPipeline {
             .copied()
             .unwrap_or(plan.per_window_cap)
             .max(1);
-        let full_states = if plan.full_panel || per_window_cap_local >= plan.n_ref_haps {
-            let mut full: Vec<RefHapId> = Vec::with_capacity(plan.n_ref_haps);
-            for h in 0..plan.n_ref_haps {
-                full.push(RefHapId::new(h as u32));
-            }
-            Some(full)
+        // Even when full-panel memory is available, keep sample/window-specific
+        // state sets from prescan/LMS. This preserves ancestry-local donor sets
+        // and avoids diluting sparse-target inference with globally irrelevant
+        // haplotypes.
+        let full_states: Option<Vec<RefHapId>> = if plan.full_panel
+            && plan.n_ref_haps > 32
+            && plan.n_ref_haps <= 1024
+        {
+            Some(
+                (0..plan.n_ref_haps)
+                    .map(|h| RefHapId::new(h as u32))
+                    .collect(),
+            )
         } else {
             None
         };
@@ -3865,7 +3881,12 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 
-                let store = ref_m >= overlap_start && ref_m < output_end;
+                // Donor/confusion evidence should be collected where the target
+                // is informative in this window, not only at the tail overlap.
+                // Overlap markers are still included to preserve handoff behavior.
+                let aligned_here = alignment.ref_to_target.get(ref_m).and_then(|v| *v).is_some();
+                let in_overlap = ref_m >= overlap_start && ref_m < output_end;
+                let store = aligned_here || in_overlap;
 
                 // Information weight in natural log space for one informative allele observation.
                 let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
@@ -3974,6 +3995,7 @@ impl crate::pipelines::ImputationPipeline {
         let dbg_insufficient = AtomicUsize::new(0);
         let dbg_low_conf = AtomicUsize::new(0);
         let dbg_few_donors = AtomicUsize::new(0);
+        let dbg_has_priors = AtomicUsize::new(0);
         let dbg_fallback_ref_freq = AtomicUsize::new(0);
         let sample_results: Vec<ImputeResult> = sample_error_rates
             .par_iter_mut()
@@ -3991,6 +4013,8 @@ impl crate::pipelines::ImputationPipeline {
 
                 let (input_probs_h1, input_probs_h2, last_info_h1, last_info_h2) =
                     build_input_probs_pair(h1_idx, h2_idx, s);
+                let handoff_capture_idx_h1 = prior_marker_idx;
+                let handoff_capture_idx_h2 = prior_marker_idx;
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
         let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
@@ -4013,37 +4037,39 @@ impl crate::pipelines::ImputationPipeline {
                     .collect();
                 donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                // SM_MATCH_LOW_CONF_FRAC now means: fraction of *information* that was confused
-        let use_hmm_h1 = if plan.full_panel {
-            true
-        } else if has_priors_h1 {
-            // Priors require HMM propagation even when emissions are uniform.
-            true
-        } else {
-            conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                || insufficient_info_h1
-                || donors_h1.len() < SM_MATCH_MIN_DONORS
-        };
-        let use_hmm_h2 = if plan.full_panel {
-            true
-        } else if has_priors_h2 {
-            // Priors require HMM propagation even when emissions are uniform.
-            true
-        } else {
-            conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                || insufficient_info_h2
-                || donors_h2.len() < SM_MATCH_MIN_DONORS
-        };
+                let tiny_panel = plan.n_ref_haps <= 32;
+                let use_hmm_h1 = if tiny_panel {
+                    true
+                } else if has_priors_h1 || no_info_h1 {
+                    true
+                } else {
+                    conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        || insufficient_info_h1
+                        || donors_h1.len() < SM_MATCH_MIN_DONORS
+                };
+                let use_hmm_h2 = if tiny_panel {
+                    true
+                } else if has_priors_h2 || no_info_h2 {
+                    true
+                } else {
+                    conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        || insufficient_info_h2
+                        || donors_h2.len() < SM_MATCH_MIN_DONORS
+                };
 
                 let track_hmm = |use_hmm: bool,
                                  no_info: bool,
                                  insufficient: bool,
                                  conf_ratio: f32,
-                                 donors_len: usize| {
+                                 donors_len: usize,
+                                 has_priors: bool| {
                     if use_hmm {
                         dbg_use_hmm.fetch_add(1, Ordering::Relaxed);
                     } else {
                         dbg_no_hmm.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if has_priors {
+                        dbg_has_priors.fetch_add(1, Ordering::Relaxed);
                     }
                     if no_info {
                         dbg_no_info.fetch_add(1, Ordering::Relaxed);
@@ -4065,6 +4091,7 @@ impl crate::pipelines::ImputationPipeline {
                     insufficient_info_h1,
                     conf_ratio_h1,
                     donors_h1.len(),
+                    has_priors_h1,
                 );
                 track_hmm(
                     use_hmm_h2,
@@ -4072,19 +4099,11 @@ impl crate::pipelines::ImputationPipeline {
                     insufficient_info_h2,
                     conf_ratio_h2,
                     donors_h2.len(),
+                    has_priors_h2,
                 );
 
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
-                let update_error_rate = |stats: &crate::model::impute_hmm::EmStats,
-                                         prior_error_rate: &mut f32| {
-                    if stats.informative_sites > 0.0 {
-                        let ratio = (stats.expected_mismatches / stats.informative_sites)
-                            .clamp(1e-6, 0.5) as f32;
-                        *prior_error_rate =
-                            (*prior_error_rate * 0.8 + ratio * 0.2).clamp(err_floor, 0.5);
-                    }
-                };
                 let posts_from_priors =
                     |priors: &HaplotypePriors| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
@@ -4187,15 +4206,110 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     Ok(out)
                 };
+                let blend_posts = |base: &mut [AllelePosteriors],
+                                   donor: &[AllelePosteriors],
+                                   w: f32| {
+                    if w <= 0.0 {
+                        return;
+                    }
+                    let ww = w.clamp(0.0, 1.0);
+                    for (b, d) in base.iter_mut().zip(donor.iter()) {
+                        match (b, d) {
+                            (AllelePosteriors::Biallelic(pb), AllelePosteriors::Biallelic(pd)) => {
+                                *pb = ((1.0 - ww) * *pb + ww * *pd).clamp(0.0, 1.0);
+                            }
+                            (
+                                AllelePosteriors::Multiallelic(pb),
+                                AllelePosteriors::Multiallelic(pd),
+                            ) => {
+                                if pb.len() == pd.len() && !pb.is_empty() {
+                                    let mut sum = 0.0f32;
+                                    for i in 0..pb.len() {
+                                        pb[i] = (1.0 - ww) * pb[i] + ww * pd[i];
+                                        if pb[i] < 0.0 {
+                                            pb[i] = 0.0;
+                                        }
+                                        sum += pb[i];
+                                    }
+                                    if sum > 0.0 {
+                                        let inv = 1.0 / sum;
+                                        for v in pb.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                };
+                let temper_posts = |base: &mut [AllelePosteriors], tau: f32| {
+                    // Temperature smoothing in weak-signal regimes to reduce
+                    // overconfident posteriors before donor fusion.
+                    let tau = tau.max(1.0);
+                    if tau <= 1.000_001 {
+                        return;
+                    }
+                    let inv_tau = 1.0 / tau;
+                    for b in base.iter_mut() {
+                        match b {
+                            AllelePosteriors::Biallelic(p_alt) => {
+                                let p = (*p_alt).clamp(1e-9, 1.0 - 1e-9);
+                                let logit = (p / (1.0 - p)).ln();
+                                let scaled = logit * inv_tau;
+                                *p_alt = 1.0 / (1.0 + (-scaled).exp());
+                            }
+                            AllelePosteriors::Multiallelic(probs) => {
+                                if probs.is_empty() {
+                                    continue;
+                                }
+                                let mut sum = 0.0f32;
+                                for v in probs.iter_mut() {
+                                    let p = (*v).max(1e-12);
+                                    *v = p.powf(inv_tau);
+                                    sum += *v;
+                                }
+                                if sum > 0.0 {
+                                    let inv = 1.0 / sum;
+                                    for v in probs.iter_mut() {
+                                        *v *= inv;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
 
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
                                         donors: &[(RefHapId, u32)]|
                  -> Vec<RefHapId> {
+                    let panel_haps = ref_allele_freqs.n_ref_haps();
+                    if panel_haps > 0 && panel_haps <= 256 {
+                        // For small reference panels, exact full-state LS is
+                        // cheap and avoids accuracy loss from unnecessary
+                        // per-haplotype state truncation.
+                        return (0..panel_haps).map(|h| RefHapId::new(h as u32)).collect();
+                    }
+                    let full_panel_window = per_window_cap_local >= plan.n_ref_haps;
+                    if full_panel_window {
+                        // In full-panel windows, run the exact Li-Stephens state
+                        // space for this haplotype instead of a mixed subset.
+                        return (0..plan.n_ref_haps)
+                            .map(|h| RefHapId::new(h as u32))
+                            .collect();
+                    }
                     if let Some(full) = full_states.as_ref() {
                         return full.clone();
                     }
-                    let k = per_window_cap_local.max(1);
+                    let k = if plan.n_ref_haps <= 512 {
+                        // For small/medium panels, avoid over-pruning states:
+                        // preserve at least 80% of panel states (bounded by panel size).
+                        let floor = (plan.n_ref_haps * 8 + 9) / 10;
+                        per_window_cap_local.max(floor).min(plan.n_ref_haps).max(1)
+                    } else {
+                        per_window_cap_local.max(1)
+                    };
                     let mut out: Vec<RefHapId> = Vec::with_capacity(k);
                     let mut seen: std::collections::HashSet<RefHapId> =
                         std::collections::HashSet::with_capacity(k * 2);
@@ -4218,7 +4332,15 @@ impl crate::pipelines::ImputationPipeline {
                         .get(hap_idx.as_usize())
                         .cloned()
                         .unwrap_or_default();
-                    let donor_haps: Vec<RefHapId> = donors.iter().map(|(hap, _)| *hap).collect();
+                    // When stitched handoff priors are available, avoid injecting fresh
+                    // PBWT donor IDs into the state set. Handoff priors already carry the
+                    // posterior continuity signal; adding local donor IDs at the seam can
+                    // create boundary-only state churn that is absent in single-window runs.
+                    let donor_haps: Vec<RefHapId> = if priors.is_some() {
+                        Vec::new()
+                    } else {
+                        donors.iter().map(|(hap, _)| *hap).collect()
+                    };
                     let core_haps: Vec<RefHapId> = plan
                         .core_states
                         .get(hap_idx.as_usize())
@@ -4249,7 +4371,11 @@ impl crate::pipelines::ImputationPipeline {
 
                     let mut q_prior = k * STATE_MIX_PRIOR_FRAC_NUM / STATE_MIX_FRAC_DEN;
                     let mut q_window = k * STATE_MIX_WINDOW_FRAC_NUM / STATE_MIX_FRAC_DEN;
-                    let mut q_donor = k * STATE_MIX_DONOR_FRAC_NUM / STATE_MIX_FRAC_DEN;
+                    let mut q_donor = if donor_haps.is_empty() {
+                        0
+                    } else {
+                        k * STATE_MIX_DONOR_FRAC_NUM / STATE_MIX_FRAC_DEN
+                    };
                     let mut q_core = k * STATE_MIX_CORE_FRAC_NUM / STATE_MIX_FRAC_DEN;
                     let mut used_q = q_prior + q_window + q_donor + q_core;
                     while used_q < k {
@@ -4289,6 +4415,21 @@ impl crate::pipelines::ImputationPipeline {
                         fill_from(&mut out, &mut seen, &core_haps, remaining, k);
                         if out.len() == before {
                             break;
+                        }
+                    }
+
+                    if out.len() < k {
+                        // Deterministically complete the state set from the
+                        // reference panel. This prevents silent under-filled
+                        // state spaces when mixed sources do not cover `k`.
+                        for h in 0..plan.n_ref_haps {
+                            if out.len() >= k {
+                                break;
+                            }
+                            let hap = RefHapId::new(h as u32);
+                            if seen.insert(hap) {
+                                out.push(hap);
+                            }
                         }
                     }
 
@@ -4360,14 +4501,16 @@ impl crate::pipelines::ImputationPipeline {
                                 )));
                             }
                             let inv = 1.0 / sum;
-                            Some(
-                                mapped
-                                    .into_iter()
-                                    .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
-                                    .collect::<Vec<f32>>(),
-                            )
+                            let norm: Vec<f32> = mapped
+                                .into_iter()
+                                .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
+                                .collect();
+                            Some(norm)
                         }
-                    } else if !plan.full_panel && plan.n_ref_haps > 16 && !donors.is_empty() {
+                    } else if state_haps.len() < plan.n_ref_haps
+                        && plan.n_ref_haps > 16
+                        && !donors.is_empty()
+                    {
                         let mut mapped = vec![0.0f32; state_haps.len()];
                         let mut donor_total = 0.0f32;
                         for (hap, count) in donors.iter() {
@@ -4383,7 +4526,7 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             // Donor-guided initialization for first-window/no-handoff cases.
                             // Blend with uniform to preserve coverage while anchoring to local matches.
-                            let lambda = 0.10f32;
+                            let lambda = 0.20f32;
                             let uniform = 1.0f32 / mapped.len() as f32;
                             for v in mapped.iter_mut() {
                                 *v = (1.0 - lambda) * uniform + lambda * *v;
@@ -4451,12 +4594,30 @@ impl crate::pipelines::ImputationPipeline {
                         priors_h1,
                         &input_probs_h1,
                         (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
-                        prior_marker_idx,
+                        handoff_capture_idx_h1,
                         &donors_h1,
                     )?;
+                    let mut posts = posts;
+                    if !has_priors_h1
+                        && plan.n_ref_haps > 32
+                        && !donors_h1.is_empty()
+                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                    {
+                        let donor_posts = posts_from_donors(&donors_h1)?;
+                        let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
+                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
+                        .clamp(0.0, 1.0);
+                        let tau = 1.0 + 1.5 * t;
+                        temper_posts(&mut posts, tau);
+                        let w = 1.00f32 * t;
+                        blend_posts(&mut posts, &donor_posts, w);
+                    }
                     hap1_posts = Some(posts);
                     p1_out = out;
-                    update_error_rate(&stats, prior_error_rate);
+                    // Keep imputation emissions stationary across windows.
+                    // Window-order-dependent error adaptation introduces
+                    // path dependence and boundary drift.
+                    let _ = (stats.expected_mismatches, stats.informative_sites);
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         hap1_posts = Some(posts_from_priors(p)?);
@@ -4492,12 +4653,27 @@ impl crate::pipelines::ImputationPipeline {
                         priors_h2,
                         &input_probs_h2,
                         (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
-                        prior_marker_idx,
+                        handoff_capture_idx_h2,
                         &donors_h2,
                     )?;
+                    let mut posts = posts;
+                    if !has_priors_h2
+                        && plan.n_ref_haps > 32
+                        && !donors_h2.is_empty()
+                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                    {
+                        let donor_posts = posts_from_donors(&donors_h2)?;
+                        let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
+                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
+                        .clamp(0.0, 1.0);
+                        let tau = 1.0 + 1.5 * t;
+                        temper_posts(&mut posts, tau);
+                        let w = 1.00f32 * t;
+                        blend_posts(&mut posts, &donor_posts, w);
+                    }
                     hap2_posts = Some(posts);
                     p2_out = out;
-                    update_error_rate(&stats, prior_error_rate);
+                    let _ = (stats.expected_mismatches, stats.informative_sites);
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         hap2_posts = Some(posts_from_priors(p)?);
@@ -4557,9 +4733,10 @@ impl crate::pipelines::ImputationPipeline {
             .collect::<Result<Vec<_>>>()?;
 
         eprintln!(
-            "    [debug hmm] use_hmm={} no_hmm={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
+            "    [debug hmm] use_hmm={} no_hmm={} has_priors={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
             dbg_use_hmm.load(Ordering::Relaxed),
             dbg_no_hmm.load(Ordering::Relaxed),
+            dbg_has_priors.load(Ordering::Relaxed),
             dbg_no_info.load(Ordering::Relaxed),
             dbg_insufficient.load(Ordering::Relaxed),
             dbg_low_conf.load(Ordering::Relaxed),
@@ -4778,7 +4955,7 @@ impl crate::pipelines::ImputationPipeline {
                 window_idx, output_markers
             ));
         }
-        let handoff_marker_idx = prior_marker_idx.or(handoff_marker_idx);
+        let handoff_marker_idx = handoff_marker_idx.or(prior_marker_idx);
         let handoff_global_idx = handoff_marker_idx.map(|idx| idx + global_start);
         let handoff_gen_pos = handoff_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
         Ok(Some(ImputationWindowResults {

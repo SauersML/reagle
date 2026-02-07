@@ -1111,9 +1111,6 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
-            if prior_marker_idx == Some(m) {
-                final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
-            }
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1165,6 +1162,31 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
+                    if prior_marker_idx == Some(m_rev) {
+                        let mut gamma = vec![0.0f32; active_states];
+                        let mut sum = 0.0f32;
+                        for i in 0..active_states {
+                            let g = fwd_slice[i] * ws.bwd[i];
+                            gamma[i] = g;
+                            sum += g;
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0f32 / sum;
+                            for g in gamma.iter_mut() {
+                                *g *= inv;
+                            }
+                            // Blend causal forward mass with smoothed gamma at boundary:
+                            // forward preserves continuity, smoothed gamma injects local
+                            // backward evidence from the current window.
+                            let alpha = 0.65f32;
+                            let mut mixed = vec![0.0f32; active_states];
+                            for i in 0..active_states {
+                                mixed[i] = alpha * gamma[i] + (1.0 - alpha) * fwd_slice[i];
+                            }
+                            normalize_probs(&mut mixed);
+                            final_prior_state_post = Some(mixed);
+                        }
+                    }
                     // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
                     let ref_alleles = refresh_ref_alleles(
                         &ref_columns[m_rev],
@@ -1395,9 +1417,6 @@ fn run_impute_hmm_seqcoded(
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
-            if prior_marker_idx == Some(m) {
-                final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
-            }
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1460,6 +1479,28 @@ fn run_impute_hmm_seqcoded(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
+                    if prior_marker_idx == Some(m_rev) {
+                        let mut gamma = vec![0.0f32; active_states];
+                        let mut sum = 0.0f32;
+                        for i in 0..active_states {
+                            let g = fwd_slice[i] * ws.bwd[i];
+                            gamma[i] = g;
+                            sum += g;
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0f32 / sum;
+                            for g in gamma.iter_mut() {
+                                *g *= inv;
+                            }
+                            let alpha = 0.65f32;
+                            let mut mixed = vec![0.0f32; active_states];
+                            for i in 0..active_states {
+                                mixed[i] = alpha * gamma[i] + (1.0 - alpha) * fwd_slice[i];
+                            }
+                            normalize_probs(&mut mixed);
+                            final_prior_state_post = Some(mixed);
+                        }
+                    }
 
                     if is_final {
                         ws.allele_probs.clear();
@@ -1679,9 +1720,6 @@ fn run_impute_hmm_dict(
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
             }
-            if prior_marker_idx == Some(m) {
-                final_prior_state_post = Some(ws.fwd[..active_states].to_vec());
-            }
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1745,6 +1783,28 @@ fn run_impute_hmm_dict(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
+                    if prior_marker_idx == Some(m_rev) {
+                        let mut gamma = vec![0.0f32; active_states];
+                        let mut sum = 0.0f32;
+                        for i in 0..active_states {
+                            let g = fwd_slice[i] * ws.bwd[i];
+                            gamma[i] = g;
+                            sum += g;
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0f32 / sum;
+                            for g in gamma.iter_mut() {
+                                *g *= inv;
+                            }
+                            let alpha = 0.65f32;
+                            let mut mixed = vec![0.0f32; active_states];
+                            for i in 0..active_states {
+                                mixed[i] = alpha * gamma[i] + (1.0 - alpha) * fwd_slice[i];
+                            }
+                            normalize_probs(&mut mixed);
+                            final_prior_state_post = Some(mixed);
+                        }
+                    }
 
                     if is_final {
                         ws.allele_probs.clear();
