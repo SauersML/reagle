@@ -4803,7 +4803,7 @@ impl crate::pipelines::ImputationPipeline {
 
             if output_markers > 0 {
                 if let Some((hmm1, hmm2)) = &mut item.result.hap_posteriors {
-                    let w = 0.1f32; // Local smoothing weight
+                    let w = 0.001f32; // Minimal smoothing to break symmetry
                     if let Some(p1) = &pbwt1 {
                         for (h, &p) in hmm1.iter_mut().zip(p1.iter()) {
                             match h {
