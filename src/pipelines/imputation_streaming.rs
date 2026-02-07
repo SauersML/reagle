@@ -3462,6 +3462,11 @@ impl crate::pipelines::ImputationPipeline {
                         (allele1, allele2)
                     };
 
+                    if target_m == 15 {
+                        eprintln!("DEBUG: Marker 15 raw alleles: {} {}, mapped: {} {}, conf: {}", 
+                             raw_allele1, raw_allele2, mapped1, mapped2, conf_base);
+                    }
+
                     let is_diploid = target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
                     let has_hard = mapped1 != 255
                         && (mapped1 as usize) < n_alleles
