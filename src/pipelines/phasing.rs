@@ -3356,7 +3356,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             // Micro-HMM refinement on hi-frequency markers (single pass).
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
-            let _ = self.run_phase_baum_iteration_stage1(
+            self.run_phase_baum_iteration_stage1(
                 target_gt,
                 &mut geno,
                 &threaded_haps_vec,
@@ -9935,16 +9935,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let mut emit0_log = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut emit1_log = vec![f32::NEG_INFINITY; het_positions.len()];
 
-        for (i, &m) in het_positions.iter().enumerate() {
+        for i in 0..het_positions.len() {
             let p_swap = swap_probs[i].clamp(1e-6, 1.0 - 1e-6);
             let p_keep = (1.0 - p_swap).clamp(1e-6, 1.0 - 1e-6);
             let emit0 = p_keep.ln();
             let emit1 = p_swap.ln();
             emit0_log[i] = emit0;
             emit1_log[i] = emit1;
-            if has_anchor {
-                let _ = anchor_h1.get(m);
-            }
             let r = label_switch;
             let stay = (1.0 - r).ln();
             let sw = r.ln();
@@ -10399,19 +10396,13 @@ impl Stage2Phaser {
         let d2 = (pos_b - pos_m).max(0.0);
         let r1 = self.p_recomb(d1);
         let r2 = self.p_recomb(d2);
-        let denom = d1 + d2;
-        let weight_a = if denom > 0.0 {
-            (d2 / denom) as f32
-        } else {
-            0.5
-        };
-        let weight_b = 1.0 - weight_a;
 
-        // Principled injected mass: LS switch mass to known carrier set under
-        // uniform jump over the reference panel.
+        // Inject carrier mass using two transition opportunities around the
+        // rare marker (A->M and M->B). This preserves map-distance behavior.
         let panel = panel_haps as f32;
         let carrier_frac = (carriers.len() as f32 / panel).clamp(0.0, 1.0);
-        let switch_mass = ((weight_a * r1 + weight_b * r2) * carrier_frac).clamp(0.0, 0.20);
+        let switch_opportunity = (1.0 - (1.0 - r1) * (1.0 - r2)).clamp(0.0, 1.0);
+        let switch_mass = (switch_opportunity * carrier_frac).clamp(0.0, 1.0);
         if switch_mass <= 0.0 {
             return base;
         }
@@ -10421,9 +10412,23 @@ impl Stage2Phaser {
             *p *= keep;
         }
 
-        let add = switch_mass / carriers.len() as f32;
-        for &hap in carriers {
-            *base.entry(hap).or_insert(0.0) += add;
+        // Allocate injected mass to carriers proportionally to the current
+        // bridge mass when available; otherwise fall back to uniform.
+        let carrier_mass: f32 = carriers
+            .iter()
+            .map(|h| base.get(h).copied().unwrap_or(0.0))
+            .sum();
+        if carrier_mass > 0.0 {
+            let inv = 1.0 / carrier_mass;
+            for &hap in carriers {
+                let w = base.get(&hap).copied().unwrap_or(0.0) * inv;
+                *base.entry(hap).or_insert(0.0) += switch_mass * w;
+            }
+        } else {
+            let add = switch_mass / carriers.len() as f32;
+            for &hap in carriers {
+                *base.entry(hap).or_insert(0.0) += add;
+            }
         }
 
         let sum: f32 = base.values().copied().sum();
@@ -10923,13 +10928,12 @@ mod tests {
                 mean_conf
             );
 
-            let _ = (
+            assert!(
+                !any_conf_nan && !any_conf_oob,
+                "Invalid confidence encountered: min={:.6} max={:.6} first_bad={:?}",
                 conf_min,
                 conf_max,
-                any_conf_nan,
-                any_conf_oob,
-                first_bad_conf,
-                het_per_marker,
+                first_bad_conf
             );
         }
     }

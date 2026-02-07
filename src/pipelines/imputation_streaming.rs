@@ -2752,7 +2752,7 @@ impl crate::pipelines::ImputationPipeline {
                         )?;
 
                         // Drop heavy reference data after writing to reduce peak RSS.
-                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        std::mem::take(&mut ref_window.ref_columns);
                         ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {
@@ -3037,7 +3037,7 @@ impl crate::pipelines::ImputationPipeline {
                         )?;
 
                         // Drop heavy reference data after writing to reduce peak RSS.
-                        let _ = std::mem::take(&mut ref_window.ref_columns);
+                        std::mem::take(&mut ref_window.ref_columns);
                         ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {
@@ -3233,19 +3233,30 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
             }
-            if n_ref_markers > 1 {
-                // Soft continuity hardening: only apply minimal seam broadening
-                // when explicit handoff priors are unavailable. With priors,
-                // keep boundary dynamics close to single-window LS behavior.
-                let has_hap_priors = overlap.hap_priors().is_some();
-                let base = p_recomb[1].max(1e-8);
-                if has_hap_priors {
-                    p_recomb[0] = p_recomb[0].max(base * 0.95).min(0.08);
-                } else {
-                    p_recomb[0] = p_recomb[0].max(base * 1.08).min(0.08);
-                }
-            }
         }
+
+        // Only consume overlap priors when their anchor marker is physically
+        // compatible with the current window. This prevents seam drift from
+        // stale/misaligned priors being projected into the wrong window.
+        let overlap_priors_usable = if let Some(overlap) = imp_overlap {
+            if let Some(prior_marker) = overlap.prior_stage1_global_marker() {
+                let window_start = global_start;
+                let window_end = global_start.saturating_add(n_ref_markers);
+                let valid_range = prior_marker >= window_start && prior_marker < window_end;
+                let adjacent_prev = prior_marker.saturating_add(1) == window_start;
+                if !(valid_range || adjacent_prev) {
+                    warn!(
+                        "Skipping overlap priors: marker anchor {} incompatible with window [{}..{})",
+                        prior_marker, window_start, window_end
+                    );
+                }
+                valid_range || adjacent_prev
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let per_window_cap_local = plan
             .per_window_caps
@@ -3315,8 +3326,13 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
 
-        let prior_mappers_by_hap: Option<Vec<Option<TransitionMatrix>>> =
-            imp_overlap.and_then(|o| o.hap_priors()).map(|hp| {
+        let overlap_hap_priors = if overlap_priors_usable {
+            imp_overlap.and_then(|o| o.hap_priors())
+        } else {
+            None
+        };
+
+        let prior_mappers_by_hap: Option<Vec<Option<TransitionMatrix>>> = overlap_hap_priors.map(|hp| {
                 let mut out: Vec<Option<TransitionMatrix>> =
                     Vec::with_capacity(n_target_samples * 2);
                 for hap_idx in 0..(n_target_samples * 2) {
@@ -4015,12 +4031,8 @@ impl crate::pipelines::ImputationPipeline {
                 let h1_idx = HapIdx::new((s * 2) as u32);
                 let h2_idx = HapIdx::new((s * 2 + 1) as u32);
 
-                let priors_h1 = imp_overlap
-                    .and_then(|o| o.hap_priors())
-                    .and_then(|p| p.get(h1_idx.as_usize()));
-                let priors_h2 = imp_overlap
-                    .and_then(|o| o.hap_priors())
-                    .and_then(|p| p.get(h2_idx.as_usize()));
+                let priors_h1 = overlap_hap_priors.and_then(|p| p.get(h1_idx.as_usize()));
+                let priors_h2 = overlap_hap_priors.and_then(|p| p.get(h2_idx.as_usize()));
 
                 let (input_probs_h1, input_probs_h2, last_info_h1, last_info_h2) =
                     build_input_probs_pair(h1_idx, h2_idx, s);
@@ -4229,17 +4241,7 @@ impl crate::pipelines::ImputationPipeline {
                         if !input_probs.is_untyped_uniform_marker(m) {
                             continue;
                         }
-                        let dist = input_probs.observed_distance(m);
-                        let dist_scale = if dist <= 2 {
-                            0.20
-                        } else if dist <= 8 {
-                            0.40
-                        } else if dist <= 32 {
-                            0.70
-                        } else {
-                            1.00
-                        };
-                        let wm = (ww * dist_scale).clamp(0.0, 1.0);
+                        let wm = ww;
                         if wm <= 0.0 {
                             continue;
                         }
@@ -4418,7 +4420,7 @@ impl crate::pipelines::ImputationPipeline {
                         q_donor = q_donor.max((k * 1) / 10);
                         q_core = q_core.min((k * 1) / 10);
                     }
-                    if weak_signal && priors.is_none() && !donor_haps.is_empty() {
+                    if weak_signal && !has_nonempty_priors && !donor_haps.is_empty() {
                         // In weak local signal, preserve locality by giving PBWT donors
                         // more state budget and shrinking generic core allocation.
                         q_donor = q_donor.max((k * 5) / 10);
@@ -4498,7 +4500,6 @@ impl crate::pipelines::ImputationPipeline {
                  -> Result<(
                     Vec<AllelePosteriors>,
                     HaplotypePriors,
-                    crate::model::impute_hmm::EmStats,
                     bool,
                     f32,
                 )> {
@@ -4584,6 +4585,7 @@ impl crate::pipelines::ImputationPipeline {
                         && !donors.is_empty()
                         && weak_signal
                         && informative_ratio <= 0.25
+                        && state_haps.len() < plan.n_ref_haps
                     {
                         let mut mapped = vec![0.0f32; state_haps.len()];
                         let mut donor_total = 0.0f32;
@@ -4635,7 +4637,7 @@ impl crate::pipelines::ImputationPipeline {
                         None
                     };
 
-                    let (posteriors, state_post, stats) = LOCAL_WORKSPACE.with(|cell| {
+                    let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
@@ -4672,13 +4674,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
 
                     let subsetted_states = state_haps.len() < plan.n_ref_haps;
-                    Ok((
-                        posteriors,
-                        next_priors,
-                        stats,
-                        subsetted_states,
-                        informative_ratio,
-                    ))
+                    Ok((posteriors, next_priors, subsetted_states, informative_ratio))
                 };
 
                 let mut hap1_posts: Option<Vec<AllelePosteriors>> = None;
@@ -4692,7 +4688,7 @@ impl crate::pipelines::ImputationPipeline {
                         p1_out = p.clone();
                     }
                 } else if use_hmm_h1 {
-                    let (posts, out, stats, subsetted_states, informative_ratio) = process_haplotype(
+                    let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h1_idx,
                         priors_h1,
                         &input_probs_h1,
@@ -4727,10 +4723,6 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     hap1_posts = Some(posts);
                     p1_out = out;
-                    // Keep imputation emissions stationary across windows.
-                    // Window-order-dependent error adaptation introduces
-                    // path dependence and boundary drift.
-                    let _ = (stats.expected_mismatches, stats.informative_sites);
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         hap1_posts = Some(posts_from_priors(p)?);
@@ -4761,7 +4753,7 @@ impl crate::pipelines::ImputationPipeline {
                         p2_out = p.clone();
                     }
                 } else if use_hmm_h2 {
-                    let (posts, out, stats, subsetted_states, informative_ratio) = process_haplotype(
+                    let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h2_idx,
                         priors_h2,
                         &input_probs_h2,
@@ -4796,7 +4788,6 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     hap2_posts = Some(posts);
                     p2_out = out;
-                    let _ = (stats.expected_mismatches, stats.informative_sites);
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         hap2_posts = Some(posts_from_priors(p)?);
@@ -5490,7 +5481,6 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_posteriors_for_writer = if include_posteriors {
             Some(|marker_idx: usize, sample_idx: usize| {
-                let _ = ref_markers;
                 let local_m = marker_idx.saturating_sub(output_start);
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                     if let Some((p1, p2)) = result.hap_posteriors.as_ref() {

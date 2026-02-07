@@ -3114,13 +3114,17 @@ def _run_eagleimp_phasing(paths, input_vcf):
 
     # EagleImp expects reference filenames to start with the chromosome label.
     eagleimp_ref = paths["data_dir"] / "22.ref.vcf.gz"
-    eagleimp_ref_index = Path(str(eagleimp_ref) + ".csi")
+    eagleimp_ref_csi = Path(str(eagleimp_ref) + ".csi")
+    eagleimp_ref_tbi = Path(str(eagleimp_ref) + ".tbi")
     if not eagleimp_ref.exists():
         eagleimp_ref.symlink_to(paths["ref_vcf"])
-    if not eagleimp_ref_index.exists():
-        src_index = Path(str(paths["ref_vcf"]) + ".csi")
-        if src_index.exists():
-            eagleimp_ref_index.symlink_to(src_index)
+    if not eagleimp_ref_csi.exists() and not eagleimp_ref_tbi.exists():
+        src_index_csi = Path(str(paths["ref_vcf"]) + ".csi")
+        src_index_tbi = Path(str(paths["ref_vcf"]) + ".tbi")
+        if src_index_csi.exists():
+            eagleimp_ref_csi.symlink_to(src_index_csi)
+        elif src_index_tbi.exists():
+            eagleimp_ref_tbi.symlink_to(src_index_tbi)
 
     qref_path = ensure_eagleimp_qref(eagleimp_ref, eagleimp_bin)
 
@@ -3967,13 +3971,17 @@ def run_eagleimp_chr(chrom, paths):
         print_tool_help("EagleImp", str(eagleimp_bin))
         map_path = ensure_simple_genetic_map(paths["ref_vcf"], data_dir / f"chr{chrom}.simple.map.txt", chrom=str(chrom))
         eagleimp_ref = data_dir / f"{chrom}.ref.vcf.gz"
-        eagleimp_ref_index = Path(str(eagleimp_ref) + ".csi")
+        eagleimp_ref_csi = Path(str(eagleimp_ref) + ".csi")
+        eagleimp_ref_tbi = Path(str(eagleimp_ref) + ".tbi")
         if not eagleimp_ref.exists():
             eagleimp_ref.symlink_to(paths["ref_vcf"])
-        if not eagleimp_ref_index.exists():
-            src_index = Path(str(paths["ref_vcf"]) + ".csi")
-            if src_index.exists():
-                eagleimp_ref_index.symlink_to(src_index)
+        if not eagleimp_ref_csi.exists() and not eagleimp_ref_tbi.exists():
+            src_index_csi = Path(str(paths["ref_vcf"]) + ".csi")
+            src_index_tbi = Path(str(paths["ref_vcf"]) + ".tbi")
+            if src_index_csi.exists():
+                eagleimp_ref_csi.symlink_to(src_index_csi)
+            elif src_index_tbi.exists():
+                eagleimp_ref_tbi.symlink_to(src_index_tbi)
         qref_path = ensure_eagleimp_qref(eagleimp_ref, eagleimp_bin)
         eagleimp_prefix = data_dir / "eagleimp_imputed"
         run(

@@ -14,12 +14,6 @@ use crate::model::weighted_kernel::WeightedHmmUpdater;
 use crate::pipelines::imputation::AllelePosteriors;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct EmStats {
-    pub expected_mismatches: f64,
-    pub informative_sites: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct ImputeHmmContext {
     pub window_idx: usize,
     pub sample_idx: usize,
@@ -688,37 +682,13 @@ fn normalize_probs(probs: &mut [f32]) {
     }
 }
 
-// In sparse/imputation-heavy regions, emissions are frequently uniform at
-// untyped markers. A pure per-marker LS transition can become too sticky over
-// long uninformative stretches, causing posterior donor collapse and AF
-// deflation. We only inflate transitions at uniform markers.
-const UNIFORM_MARKER_RECOMB_BOOST: f32 = 20.0;
-
 #[inline]
 fn adjusted_recomb_rate(
     recomb_rate: f32,
-    untyped_uniform_marker: bool,
-    missing_observed_marker: bool,
-    observed_dist: usize,
 ) -> f32 {
-    if missing_observed_marker {
-        // Masked-at-typed sites should mostly inherit flanking scaffold
-        // continuity; excessive switching here creates heterozygous drift.
-        return (recomb_rate * 0.35).max(1e-8);
-    }
-    if !untyped_uniform_marker {
-        return recomb_rate;
-    }
-    let boost = if observed_dist <= 8 {
-        1.0
-    } else if observed_dist <= 32 {
-        1.5
-    } else if observed_dist <= 128 {
-        3.0
-    } else {
-        UNIFORM_MARKER_RECOMB_BOOST
-    };
-    (recomb_rate * boost).min(0.08)
+    // Keep recombination map-consistent. Transition probability must depend
+    // only on genetic distance, not marker density or typed-marker spacing.
+    recomb_rate.max(1e-8)
 }
 
 #[inline]
@@ -728,7 +698,6 @@ fn smooth_allele_posteriors_subset(
     total_mass: f32,
     state_prob_sq_sum: f32,
     untyped_uniform_marker: bool,
-    observed_dist: usize,
 ) {
     if allele_probs.is_empty() || total_mass <= 0.0 || state_prob_sq_sum <= 0.0 {
         return;
@@ -756,18 +725,10 @@ fn smooth_allele_posteriors_subset(
     let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
     let support_dilution = ((effective_states - 1.0) / effective_states).clamp(0.0, 1.0);
     let prior_mass = {
-        let distance_weight = if observed_dist <= 8 {
-            0.10
-        } else if observed_dist <= 32 {
-            0.25
-        } else if observed_dist <= 128 {
-            0.50
-        } else {
-            1.0
-        };
-        // Tiny floor + weak adaptive term.
-        let floor = 0.004f32 * distance_weight * support_dilution;
-        let adaptive = 0.028f32 * distance_weight * allele_uncertainty * support_dilution;
+        // Keep smoothing driven by posterior uncertainty/effective support
+        // only; avoid marker-count distance buckets that are density-dependent.
+        let floor = 0.004f32 * support_dilution;
+        let adaptive = 0.028f32 * allele_uncertainty * support_dilution;
         (floor + adaptive).clamp(0.0, 0.035)
     };
     if prior_mass <= 0.0 {
@@ -895,12 +856,7 @@ fn forward_update_impl<C: RefColumnLike>(
 ) -> f32 {
     let probs = target_probs.probs_for_marker(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = adjusted_recomb_rate(
-        p_recomb.get(m).copied().unwrap_or(0.0),
-        target_probs.is_untyped_uniform_marker(m),
-        target_probs.is_missing_observed_marker(m),
-        target_probs.observed_distance(m),
-    );
+    let recomb_rate = adjusted_recomb_rate(p_recomb.get(m).copied().unwrap_or(0.0));
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -982,12 +938,7 @@ fn forward_update_seqcoded(
 ) -> f32 {
     let probs = target_probs.probs_for_marker(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = adjusted_recomb_rate(
-        p_recomb.get(m).copied().unwrap_or(0.0),
-        target_probs.is_untyped_uniform_marker(m),
-        target_probs.is_missing_observed_marker(m),
-        target_probs.observed_distance(m),
-    );
+    let recomb_rate = adjusted_recomb_rate(p_recomb.get(m).copied().unwrap_or(0.0));
 
     let col = ref_columns[m];
     let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
@@ -1070,12 +1021,7 @@ fn forward_update_dict(
 ) -> f32 {
     let probs = target_probs.probs_for_marker(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = adjusted_recomb_rate(
-        p_recomb.get(m).copied().unwrap_or(0.0),
-        target_probs.is_untyped_uniform_marker(m),
-        target_probs.is_missing_observed_marker(m),
-        target_probs.observed_distance(m),
-    );
+    let recomb_rate = adjusted_recomb_rate(p_recomb.get(m).copied().unwrap_or(0.0));
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -1158,7 +1104,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "dense/sparse")?;
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
@@ -1174,30 +1120,9 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
         ws.weights.fill(1.0);
     }
 
-    // --- Bayesian MAP update for p_mismatch (one EM step, minimal prior) ---
-    //
-    // We interpret `error_rate` as the copied-allele -> true-allele mismatch
-    // probability (Li-Stephens "miscopy" / mutation). PL/GL already model
-    // observation noise, so this parameter should *not* absorb genotyping error.
-    //
-    // We do a single MAP update with a Beta prior centered at the LS prior:
-    //   e_ls = li_stephens_p_mismatch(N_ref)
-    //   alpha = 1 + e_ls, beta = 1 + (1-e_ls)  (one pseudo-observation total)
-    //
-    // The MAP update for this conjugate model is:
-    //   e_new = (sum_{m,k} gamma_{m,k} * eta_{m,k} + (alpha-1))
-    //           / (M_eff + (alpha+beta-2))
-    // where:
-    //   gamma_{m,k} = posterior state weight at marker m and state k,
-    //   eta_{m,k}   = posterior mismatch probability given state k at marker m,
-    //   M_eff       = number of informative markers.
-    //
-    // With alpha+beta-2 = 1, this is a minimal Bayesian shrinkage toward e_ls.
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let current_error = error_rate;
-    let mut mismatch_sum = 0.0f64;
-    let mut mismatch_markers = 0.0f64;
 
     let final_pass = 0usize;
     for pass in 0..1 {
@@ -1284,12 +1209,8 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker(m_rev);
                     let uniform = target_probs.is_uniform_marker(m_rev);
-                    let recomb_rate = adjusted_recomb_rate(
-                        p_recomb.get(m_rev).copied().unwrap_or(0.0),
-                        target_probs.is_untyped_uniform_marker(m_rev),
-                        target_probs.is_missing_observed_marker(m_rev),
-                        target_probs.observed_distance(m_rev),
-                    );
+                    let recomb_rate =
+                        adjusted_recomb_rate(p_recomb.get(m_rev).copied().unwrap_or(0.0));
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
@@ -1367,7 +1288,6 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        target_probs.observed_distance(m_rev),
                                     );
                                 }
                             } else {
@@ -1418,34 +1338,6 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                             &mut ws.emission_by_allele,
                             &mut ws.emissions[..active_states],
                         );
-                        if !probs.is_empty() && probs.len() > 1 {
-                            let mismatch_prob = current_error / (probs.len() as f32 - 1.0);
-                            let mut total_gamma = 0.0f64;
-                            let mut mismatch_expect = 0.0f64;
-                            for i in 0..active_states {
-                                let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                                let ref_allele = ref_alleles.get(i);
-                                if ref_allele == 255 {
-                                    continue;
-                                }
-                                total_gamma += gamma;
-                                let idx = ref_allele as usize;
-                                let p_match = probs.get(idx).copied().unwrap_or(0.0);
-                                let emission = if idx < ws.emission_by_allele.len() {
-                                    ws.emission_by_allele[idx]
-                                } else {
-                                    mismatch_prob
-                                };
-                                if emission > 0.0 {
-                                    let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
-                                    mismatch_expect += gamma * eta;
-                                }
-                            }
-                            if total_gamma > 0.0 {
-                                mismatch_sum += mismatch_expect / total_gamma;
-                                mismatch_markers += 1.0;
-                            }
-                        }
                         let mut emit_beta_sum = 0.0f32;
                         for i in 0..active_states {
                             emit_beta_sum += ws.emissions[i] * ws.bwd[i];
@@ -1471,12 +1363,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
         }
     }
 
-    let stats = EmStats {
-        expected_mismatches: mismatch_sum,
-        informative_sites: mismatch_markers,
-    };
-
-    Ok((final_posteriors, final_prior_state_post, stats))
+    Ok((final_posteriors, final_prior_state_post))
 }
 
 fn run_impute_hmm_seqcoded(
@@ -1490,7 +1377,7 @@ fn run_impute_hmm_seqcoded(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "seqcoded")?;
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
@@ -1507,8 +1394,6 @@ fn run_impute_hmm_seqcoded(
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let current_error = error_rate;
-    let mut mismatch_sum = 0.0f64;
-    let mut mismatch_markers = 0.0f64;
 
     let final_pass = 0usize;
     for pass in 0..1 {
@@ -1600,12 +1485,8 @@ fn run_impute_hmm_seqcoded(
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker(m_rev);
                     let uniform = target_probs.is_uniform_marker(m_rev);
-                    let recomb_rate = adjusted_recomb_rate(
-                        p_recomb.get(m_rev).copied().unwrap_or(0.0),
-                        target_probs.is_untyped_uniform_marker(m_rev),
-                        target_probs.is_missing_observed_marker(m_rev),
-                        target_probs.observed_distance(m_rev),
-                    );
+                    let recomb_rate =
+                        adjusted_recomb_rate(p_recomb.get(m_rev).copied().unwrap_or(0.0));
 
                     let col = ref_columns[m_rev];
                     let seq_patterns = refresh_seq_patterns(
@@ -1679,7 +1560,6 @@ fn run_impute_hmm_seqcoded(
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        target_probs.observed_distance(m_rev),
                                     );
                                 }
                             } else {
@@ -1719,40 +1599,13 @@ fn run_impute_hmm_seqcoded(
                             transition_haps,
                         );
                     } else {
-                        let mismatch_prob = fill_pattern_emissions(
+                        fill_pattern_emissions(
                             seq_patterns.seq_alleles,
                             probs,
                             current_error,
                             &mut ws.emission_by_allele,
                             &mut ws.pattern_emissions,
                         );
-                        if !probs.is_empty() && probs.len() > 1 {
-                            let mut total_gamma = 0.0f64;
-                            let mut mismatch_expect = 0.0f64;
-                            for i in 0..active_states {
-                                let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                                let ref_allele = seq_patterns.allele_for_state(i);
-                                if ref_allele == 255 {
-                                    continue;
-                                }
-                                total_gamma += gamma;
-                                let idx = ref_allele as usize;
-                                let p_match = probs.get(idx).copied().unwrap_or(0.0);
-                                let emission = if idx < ws.emission_by_allele.len() {
-                                    ws.emission_by_allele[idx]
-                                } else {
-                                    mismatch_prob
-                                };
-                                if emission > 0.0 {
-                                    let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
-                                    mismatch_expect += gamma * eta;
-                                }
-                            }
-                            if total_gamma > 0.0 {
-                                mismatch_sum += mismatch_expect / total_gamma;
-                                mismatch_markers += 1.0;
-                            }
-                        }
                         let mut emit_beta_sum = 0.0f32;
                         for i in 0..active_states {
                             let pid = seq_patterns.state_patterns[i] as usize;
@@ -1781,12 +1634,7 @@ fn run_impute_hmm_seqcoded(
         }
     }
 
-    let stats = EmStats {
-        expected_mismatches: mismatch_sum,
-        informative_sites: mismatch_markers,
-    };
-
-    Ok((final_posteriors, final_prior_state_post, stats))
+    Ok((final_posteriors, final_prior_state_post))
 }
 
 fn run_impute_hmm_dict(
@@ -1800,7 +1648,7 @@ fn run_impute_hmm_dict(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "dictionary")?;
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
@@ -1817,9 +1665,6 @@ fn run_impute_hmm_dict(
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let current_error = error_rate;
-    let mut mismatch_sum = 0.0f64;
-    let mut mismatch_markers = 0.0f64;
-
     let final_pass = 0usize;
     for pass in 0..1 {
         let is_final = pass == final_pass;
@@ -1910,12 +1755,8 @@ fn run_impute_hmm_dict(
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker(m_rev);
                     let uniform = target_probs.is_uniform_marker(m_rev);
-                    let recomb_rate = adjusted_recomb_rate(
-                        p_recomb.get(m_rev).copied().unwrap_or(0.0),
-                        target_probs.is_untyped_uniform_marker(m_rev),
-                        target_probs.is_missing_observed_marker(m_rev),
-                        target_probs.observed_distance(m_rev),
-                    );
+                    let recomb_rate =
+                        adjusted_recomb_rate(p_recomb.get(m_rev).copied().unwrap_or(0.0));
 
                     let col = &ref_columns[m_rev];
                     let dict_patterns = refresh_dict_patterns(
@@ -1990,7 +1831,6 @@ fn run_impute_hmm_dict(
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        target_probs.observed_distance(m_rev),
                                     );
                                 }
                             } else {
@@ -2030,40 +1870,13 @@ fn run_impute_hmm_dict(
                             transition_haps,
                         );
                     } else {
-                        let mismatch_prob = fill_pattern_emissions(
+                        fill_pattern_emissions(
                             dict_patterns.pattern_alleles,
                             probs,
                             current_error,
                             &mut ws.emission_by_allele,
                             &mut ws.pattern_emissions,
                         );
-                        if !probs.is_empty() && probs.len() > 1 {
-                            let mut total_gamma = 0.0f64;
-                            let mut mismatch_expect = 0.0f64;
-                            for i in 0..active_states {
-                                let gamma = (fwd_slice[i] * ws.bwd[i]) as f64;
-                                let ref_allele = dict_patterns.allele_for_state(i);
-                                if ref_allele == 255 {
-                                    continue;
-                                }
-                                total_gamma += gamma;
-                                let idx = ref_allele as usize;
-                                let p_match = probs.get(idx).copied().unwrap_or(0.0);
-                                let emission = if idx < ws.emission_by_allele.len() {
-                                    ws.emission_by_allele[idx]
-                                } else {
-                                    mismatch_prob
-                                };
-                                if emission > 0.0 {
-                                    let eta = (mismatch_prob * (1.0 - p_match) / emission) as f64;
-                                    mismatch_expect += gamma * eta;
-                                }
-                            }
-                            if total_gamma > 0.0 {
-                                mismatch_sum += mismatch_expect / total_gamma;
-                                mismatch_markers += 1.0;
-                            }
-                        }
                         let mut emit_beta_sum = 0.0f32;
                         for i in 0..active_states {
                             let pid = dict_patterns.state_patterns[i] as usize;
@@ -2092,17 +1905,12 @@ fn run_impute_hmm_dict(
         }
     }
 
-    let stats = EmStats {
-        expected_mismatches: mismatch_sum,
-        informative_sites: mismatch_markers,
-    };
-
-    Ok((final_posteriors, final_prior_state_post, stats))
+    Ok((final_posteriors, final_prior_state_post))
 }
 
 /// Run forward-backward HMM and emit allele posteriors.
 ///
-/// Returns (posteriors, optional state posterior at prior marker, EM stats).
+/// Returns (posteriors, optional state posterior at prior marker).
 pub fn run_impute_hmm(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
@@ -2114,7 +1922,7 @@ pub fn run_impute_hmm(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     ws: &mut ImputeWorkspace,
-) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>, EmStats)> {
+) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     if ref_columns.is_empty() {
         return run_impute_hmm_impl(
             state_haps,
