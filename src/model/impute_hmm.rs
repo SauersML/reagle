@@ -667,10 +667,58 @@ fn adjusted_recomb_rate(
 }
 
 #[inline]
+fn recomb_lambda_from_p(p: f32) -> f32 {
+    // p = 1 - exp(-lambda) => lambda = -ln(1-p)
+    // Clamp for numerical stability.
+    let q = (1.0 - p.clamp(0.0, 1.0 - 1e-12)).max(1e-12);
+    -q.ln()
+}
+
+fn nearest_observed_lambda(target_probs: &TargetAlleleProbs, p_recomb: &[f32]) -> Vec<f32> {
+    let n = target_probs.n_markers();
+    let mut fwd = vec![f32::INFINITY; n];
+    let mut bwd = vec![f32::INFINITY; n];
+    if n == 0 {
+        return fwd;
+    }
+
+    let mut dist = f32::INFINITY;
+    for m in 0..n {
+        if target_probs.is_observed_marker(m) {
+            dist = 0.0;
+        } else if m > 0 && dist.is_finite() {
+            dist += recomb_lambda_from_p(p_recomb.get(m).copied().unwrap_or(0.0));
+        }
+        fwd[m] = dist;
+    }
+
+    dist = f32::INFINITY;
+    for m_rev in (0..n).rev() {
+        if target_probs.is_observed_marker(m_rev) {
+            dist = 0.0;
+        } else if m_rev + 1 < n && dist.is_finite() {
+            let next = m_rev + 1;
+            dist += recomb_lambda_from_p(p_recomb.get(next).copied().unwrap_or(0.0));
+        }
+        bwd[m_rev] = dist;
+    }
+
+    let mut out = vec![0.0f32; n];
+    for m in 0..n {
+        out[m] = fwd[m].min(bwd[m]);
+        if !out[m].is_finite() {
+            out[m] = 0.0;
+        }
+    }
+    out
+}
+
+#[inline]
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
     subset_prior_probs: &[f32],
     global_prior_probs: Option<&[f32]>,
+    nearest_obs_lambda: f32,
     total_mass: f32,
     state_prob_sq_sum: f32,
     untyped_uniform_marker: bool,
@@ -688,41 +736,22 @@ fn smooth_allele_posteriors_subset(
         return;
     }
 
-    // Keep this as a weak regularizer: enough to prevent pathological AF
-    // collapse at long untyped stretches, but too small to drag informative
-    // copy signal toward mid-frequency alleles.
-    let mut max_p = 0.0f32;
-    for &p in allele_probs.iter() {
-        if p > max_p {
-            max_p = p;
-        }
-    }
-    let allele_uncertainty = (1.0 - max_p).clamp(0.0, 1.0);
+    // Bayesian shrinkage based on genetic-distance information decay.
+    // When far from observed markers, local copy evidence should carry less
+    // confidence and panel prior should carry more.
     let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
-    let support_dilution = ((effective_states - 1.0) / effective_states).clamp(0.0, 1.0);
-    let prior_mass = {
-        // Keep smoothing driven by posterior uncertainty/effective support
-        // only; avoid marker-count distance buckets that are density-dependent.
-        let floor = 0.004f32 * support_dilution;
-        let adaptive = 0.028f32 * allele_uncertainty * support_dilution;
-        (floor + adaptive).clamp(0.0, 0.035)
-    };
+    let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(1e-4, 1.0);
+    let prior_mass = (effective_states * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
 
     let denom = 1.0 + prior_mass;
-    let k_eff = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
-    let prior_concentration = 6.0f32;
     for (i, p) in allele_probs.iter_mut().enumerate() {
         let local_prior = subset_prior_probs.get(i).copied().unwrap_or(0.0).max(0.0);
         let merged_prior = if let Some(global) = global_prior_probs {
-            // Truncated state sets can miss real ALT support at untyped markers.
-            // Blend local subset prior with global panel prior using an
-            // effective-sample Bayesian update. When posterior support is
-            // concentrated (small k_eff), shrink more toward panel AF.
             let g = global.get(i).copied().unwrap_or(0.0).max(0.0);
-            ((k_eff * local_prior) + (prior_concentration * g)) / (k_eff + prior_concentration)
+            0.5 * local_prior + 0.5 * g
         } else {
             local_prior
         };
@@ -1110,6 +1139,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = active_states.max(1).min(panel_haps);
+    let nearest_obs_lambda = nearest_observed_lambda(target_probs, p_recomb);
     if active_states > 0 {
         // The active subset is the imputation state space for this haplotype/window.
         // Scale transitions to that subset to avoid suppressing switch mass by K/N_ref.
@@ -1290,6 +1320,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                         &mut ws.allele_probs,
                                         &subset_counts,
                                         biallelic_global_prior.as_ref().map(|x| x.as_slice()),
+                                        nearest_obs_lambda[m_rev],
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
@@ -1392,6 +1423,7 @@ fn run_impute_hmm_seqcoded(
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = active_states.max(1).min(panel_haps);
+    let nearest_obs_lambda = nearest_observed_lambda(target_probs, p_recomb);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1571,6 +1603,7 @@ fn run_impute_hmm_seqcoded(
                                         &mut ws.allele_probs,
                                         &subset_counts,
                                         biallelic_global_prior.as_ref().map(|x| x.as_slice()),
+                                        nearest_obs_lambda[m_rev],
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
@@ -1672,6 +1705,7 @@ fn run_impute_hmm_dict(
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = active_states.max(1).min(panel_haps);
+    let nearest_obs_lambda = nearest_observed_lambda(target_probs, p_recomb);
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
@@ -1851,6 +1885,7 @@ fn run_impute_hmm_dict(
                                         &mut ws.allele_probs,
                                         &subset_counts,
                                         biallelic_global_prior.as_ref().map(|x| x.as_slice()),
+                                        nearest_obs_lambda[m_rev],
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
