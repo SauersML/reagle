@@ -1,7 +1,8 @@
-use crate::data::marker::{MarkerIdx, Markers, RefWindowSpace, bits_per_allele};
+use crate::data::marker::{bits_per_allele, MarkerIdx, Markers, RefWindowSpace};
 use crate::data::storage::GenotypeColumn;
 use crate::error::{ReagleError, Result};
 use crate::io::bref3::RefWindow;
+use bincode::Options;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,10 @@ impl PackedRefColumn {
                     }
                     return;
                 }
+                if *bits == 1 {
+                    fill_biallelic_bits(out, n, words, missing);
+                    return;
+                }
                 for i in 0..n {
                     if is_missing_bit(missing, i) {
                         out[i] = 255;
@@ -154,8 +159,31 @@ impl PackedRefColumn {
             )));
         }
 
-        for h in 0..n_haps {
-            let a = col.get(crate::data::haplotype::HapIdx::new(h as u32));
+        let use_bits = should_use_bit_packing(bits as usize, n_haps);
+        if !use_bits {
+            let mut alleles = Vec::with_capacity(n_haps);
+            for h in 0..n_haps {
+                let a = col.get(crate::data::haplotype::HapIdx::new(h as u32));
+                if a != 255 && (a as usize) >= n_alleles {
+                    return Err(ReagleError::vcf(format!(
+                        "invalid allele {} at marker {} (n_alleles={})",
+                        a,
+                        marker_idx.as_usize(),
+                        n_alleles
+                    )));
+                }
+                alleles.push(a);
+            }
+            return Ok(PackedRefColumn::Bytes { alleles });
+        }
+
+        let bits_usize = bits as usize;
+        let shape = PackedColumnShape::new(bits_usize, n_haps)?;
+        let mut words = vec![0u64; shape.n_words];
+        let mut missing = vec![0u64; shape.n_missing_words];
+
+        for i in 0..n_haps {
+            let a = col.get(crate::data::haplotype::HapIdx::new(i as u32));
             if a != 255 && (a as usize) >= n_alleles {
                 return Err(ReagleError::vcf(format!(
                     "invalid allele {} at marker {} (n_alleles={})",
@@ -164,24 +192,6 @@ impl PackedRefColumn {
                     n_alleles
                 )));
             }
-        }
-
-        let use_bits = should_use_bit_packing(bits as usize, n_haps);
-        if !use_bits {
-            let mut alleles = Vec::with_capacity(n_haps);
-            for h in 0..n_haps {
-                alleles.push(col.get(crate::data::haplotype::HapIdx::new(h as u32)));
-            }
-            return Ok(PackedRefColumn::Bytes { alleles });
-        }
-
-        let bits_usize = bits as usize;
-        let n_words = packed_words_len(bits_usize, n_haps);
-        let mut words = vec![0u64; n_words];
-        let mut missing = vec![0u64; packed_missing_words_len(n_haps)];
-
-        for i in 0..n_haps {
-            let a = col.get(crate::data::haplotype::HapIdx::new(i as u32));
             if a == 255 {
                 set_missing_bit(&mut missing, i);
                 continue;
@@ -197,6 +207,44 @@ impl PackedRefColumn {
             words,
             missing,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PackedColumnShape {
+    bits: usize,
+    n_haps: usize,
+    n_words: usize,
+    n_missing_words: usize,
+}
+
+impl PackedColumnShape {
+    fn new(bits: usize, n_haps: usize) -> Result<Self> {
+        if bits > 63 {
+            return Err(ReagleError::vcf(format!("invalid bit width {}", bits)));
+        }
+        Ok(Self {
+            bits,
+            n_haps,
+            n_words: packed_words_len(bits, n_haps),
+            n_missing_words: packed_missing_words_len(n_haps),
+        })
+    }
+
+    fn validate_lengths(self, words_len: usize, missing_len: usize) -> Result<()> {
+        if missing_len != self.n_missing_words {
+            return Err(ReagleError::vcf(format!(
+                "invalid missing bitmap length: got {} expected {} for n_haps={}",
+                missing_len, self.n_missing_words, self.n_haps
+            )));
+        }
+        if words_len != self.n_words {
+            return Err(ReagleError::vcf(format!(
+                "invalid packed word length: got {} expected {} for bits={} n_haps={}",
+                words_len, self.n_words, self.bits, self.n_haps
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -292,7 +340,8 @@ impl PrescanCacheWriter {
         }
         let n_markers = window.markers.len() as u32;
         write_u32(&mut self.file, n_markers)?;
-        let markers_blob = bincode::serialize(&window.markers)
+        let markers_blob = marker_bincode_options()
+            .serialize(&window.markers)
             .map_err(|e| ReagleError::vcf(format!("marker serialize failed: {}", e)))?;
         write_u32(&mut self.file, markers_blob.len() as u32)?;
         self.file.write_all(&markers_blob)?;
@@ -362,9 +411,10 @@ impl PrescanCacheReader {
         let markers_len = read_u32(&mut self.reader)? as usize;
         let mut markers_blob = vec![0u8; markers_len];
         self.reader.read_exact(&mut markers_blob)?;
-        let markers: Markers<crate::data::marker::RefWindowSpace> =
-            bincode::deserialize(&markers_blob)
-                .map_err(|e| ReagleError::vcf(format!("marker deserialize failed: {}", e)))?;
+        let markers: Markers<crate::data::marker::RefWindowSpace> = marker_bincode_options()
+            .reject_trailing_bytes()
+            .deserialize(&markers_blob)
+            .map_err(|e| ReagleError::vcf(format!("marker deserialize failed: {}", e)))?;
         if markers.len() != n_markers {
             return Err(ReagleError::vcf(format!(
                 "cache window marker count mismatch: header={} decoded={}",
@@ -468,13 +518,8 @@ fn read_packed_column<R: Read>(r: &mut R) -> Result<PackedRefColumn> {
         0 => {
             let mut bits = [0u8; 1];
             r.read_exact(&mut bits)?;
-            if bits[0] > 63 {
-                return Err(ReagleError::vcf(format!(
-                    "invalid bit width in cache column: {}",
-                    bits[0]
-                )));
-            }
             let n_haps = read_u32(r)? as usize;
+            let shape = PackedColumnShape::new(bits[0] as usize, n_haps)?;
             let n_words = read_u32(r)? as usize;
             let mut words = vec![0u64; n_words];
             for w in words.iter_mut() {
@@ -489,25 +534,7 @@ fn read_packed_column<R: Read>(r: &mut R) -> Result<PackedRefColumn> {
                 r.read_exact(&mut buf)?;
                 *w = u64::from_le_bytes(buf);
             }
-            let expected_missing = packed_missing_words_len(n_haps);
-            if missing.len() != expected_missing {
-                return Err(ReagleError::vcf(format!(
-                    "invalid missing bitmap length: got {} expected {} for n_haps={}",
-                    missing.len(),
-                    expected_missing,
-                    n_haps
-                )));
-            }
-            let expected_words = packed_words_len(bits[0] as usize, n_haps);
-            if words.len() != expected_words {
-                return Err(ReagleError::vcf(format!(
-                    "invalid packed word length: got {} expected {} for bits={} n_haps={}",
-                    words.len(),
-                    expected_words,
-                    bits[0],
-                    n_haps
-                )));
-            }
+            shape.validate_lengths(words.len(), missing.len())?;
             Ok(PackedRefColumn::Bits {
                 bits: bits[0],
                 n_haps,
@@ -566,6 +593,34 @@ fn should_use_bit_packing(bits: usize, n_haps: usize) -> bool {
     let bit_storage = packed_words_len(bits, n_haps) * std::mem::size_of::<u64>()
         + packed_missing_words_len(n_haps) * std::mem::size_of::<u64>();
     bit_storage < byte_storage
+}
+
+fn marker_bincode_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+}
+
+fn fill_biallelic_bits(out: &mut [u8], n_haps: usize, words: &[u64], missing: &[u64]) {
+    let n_blocks = n_haps.div_ceil(64);
+    for block in 0..n_blocks {
+        let start = block * 64;
+        let remaining = n_haps.saturating_sub(start);
+        let limit = remaining.min(64);
+        if limit == 0 {
+            break;
+        }
+        let data = words.get(block).copied().unwrap_or(0);
+        let miss = missing.get(block).copied().unwrap_or(0);
+        for b in 0..limit {
+            let idx = start + b;
+            if ((miss >> b) & 1) == 1 {
+                out[idx] = 255;
+            } else {
+                out[idx] = ((data >> b) & 1) as u8;
+            }
+        }
+    }
 }
 
 fn unpack_bits(words: &[u64], bits: usize, idx: usize) -> u64 {
