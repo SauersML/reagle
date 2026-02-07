@@ -3208,6 +3208,12 @@ impl crate::pipelines::ImputationPipeline {
                 gen_positions.len()
             );
         }
+        let window_span_cm = if let (Some(first), Some(last)) = (gen_positions.first(), gen_positions.last()) {
+            (last - first).abs()
+        } else {
+            0.0
+        };
+
         let mut p_recomb: Vec<f32> = Vec::with_capacity(n_ref_markers);
         p_recomb.push(0.0f32);
         for m in 1..n_ref_markers {
@@ -4057,6 +4063,63 @@ impl crate::pipelines::ImputationPipeline {
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
                 };
 
+                let temper_posts = |posts: &mut [AllelePosteriors], tau: f32| {
+                    let inv_tau = 1.0 / tau;
+                    for p in posts {
+                        match p {
+                            AllelePosteriors::Biallelic(p1) => {
+                                let p0 = 1.0 - *p1;
+                                let p0_new = p0.powf(inv_tau);
+                                let p1_new = p1.powf(inv_tau);
+                                let sum = p0_new + p1_new;
+                                if sum > 0.0 {
+                                    *p1 = p1_new / sum;
+                                }
+                            }
+                            AllelePosteriors::Multiallelic(probs) => {
+                                let mut sum = 0.0;
+                                for v in probs.iter_mut() {
+                                    *v = v.powf(inv_tau);
+                                    sum += *v;
+                                }
+                                if sum > 0.0 {
+                                    let inv_sum = 1.0 / sum;
+                                    for v in probs.iter_mut() {
+                                        *v *= inv_sum;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let blend_posts = |dest: &mut [AllelePosteriors], src: &[AllelePosteriors], w: f32| {
+                    let w_src = w.clamp(0.0, 1.0);
+                    let w_dest = 1.0 - w_src;
+                    for (d, s) in dest.iter_mut().zip(src.iter()) {
+                        match (d, s) {
+                            (AllelePosteriors::Biallelic(pd), AllelePosteriors::Biallelic(ps)) => {
+                                *pd = *pd * w_dest + *ps * w_src;
+                            }
+                            (AllelePosteriors::Multiallelic(pd), AllelePosteriors::Multiallelic(ps)) => {
+                                if pd.len() == ps.len() {
+                                    for (v_d, v_s) in pd.iter_mut().zip(ps.iter()) {
+                                        *v_d = *v_d * w_dest + *v_s * w_src;
+                                    }
+                                    let sum: f32 = pd.iter().sum();
+                                    if sum > 0.0 {
+                                        let inv_sum = 1.0 / sum;
+                                        for v in pd.iter_mut() {
+                                            *v *= inv_sum;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                };
+
                 let track_hmm = |use_hmm: bool,
                                  no_info: bool,
                                  insufficient: bool,
@@ -4516,7 +4579,7 @@ impl crate::pipelines::ImputationPipeline {
                         p1_out = p.clone();
                     }
                 } else if use_hmm_h1 {
-                    let (posts, out, stats) = process_haplotype(
+                    let (mut posts, out, stats) = process_haplotype(
                         h1_idx,
                         priors_h1,
                         &input_probs_h1,
@@ -4524,8 +4587,24 @@ impl crate::pipelines::ImputationPipeline {
                         handoff_capture_idx_h1,
                         &donors_h1,
                     )?;
-                    // Removed global donor blending heuristic which poisons local
-                    // imputation in recombination scenarios by mixing unrelated donors.
+
+                    // Global donor blending heuristic (conditional on window size)
+                    if !has_priors_h1
+                        && plan.n_ref_haps > 32
+                        && !donors_h1.is_empty()
+                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        && window_span_cm < 2.5
+                    {
+                        let donor_posts = posts_from_donors(&donors_h1)?;
+                        let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
+                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
+                        .clamp(0.0, 1.0);
+                        let tau = 1.0 + 1.5 * t;
+                        temper_posts(&mut posts, tau);
+                        let w = 1.00f32 * t;
+                        blend_posts(&mut posts, &donor_posts, w);
+                    }
+
                     hap1_posts = Some(posts);
                     p1_out = out;
                     // Keep imputation emissions stationary across windows.
@@ -4562,7 +4641,7 @@ impl crate::pipelines::ImputationPipeline {
                         p2_out = p.clone();
                     }
                 } else if use_hmm_h2 {
-                    let (posts, out, stats) = process_haplotype(
+                    let (mut posts, out, stats) = process_haplotype(
                         h2_idx,
                         priors_h2,
                         &input_probs_h2,
@@ -4570,7 +4649,24 @@ impl crate::pipelines::ImputationPipeline {
                         handoff_capture_idx_h2,
                         &donors_h2,
                     )?;
-                    // Removed global donor blending heuristic.
+
+                    // Global donor blending heuristic (conditional on window size)
+                    if !has_priors_h2
+                        && plan.n_ref_haps > 32
+                        && !donors_h2.is_empty()
+                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        && window_span_cm < 2.5
+                    {
+                        let donor_posts = posts_from_donors(&donors_h2)?;
+                        let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
+                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
+                        .clamp(0.0, 1.0);
+                        let tau = 1.0 + 1.5 * t;
+                        temper_posts(&mut posts, tau);
+                        let w = 1.00f32 * t;
+                        blend_posts(&mut posts, &donor_posts, w);
+                    }
+
                     hap2_posts = Some(posts);
                     p2_out = out;
                     let _ = (stats.expected_mismatches, stats.informative_sites);
