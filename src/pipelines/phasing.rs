@@ -250,7 +250,12 @@ fn estimate_phase_state_budget(
     if available_bytes == 0 || n_threads == 0 || window_markers == 0 {
         return 0;
     }
-    let per_state_bytes = 16usize.saturating_add(window_markers.saturating_mul(5));
+    let bytes_state_id = std::mem::size_of::<u32>();
+    let bytes_allele = std::mem::size_of::<u8>();
+    let bytes_prob = std::mem::size_of::<f32>();
+    let bytes_path =
+        bytes_state_id.saturating_add(bytes_allele).saturating_add(bytes_prob.saturating_mul(2));
+    let per_state_bytes = 64usize.saturating_add(window_markers.saturating_mul(bytes_path));
     if per_state_bytes == 0 {
         return 0;
     }
@@ -589,13 +594,14 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         }
         if is_biallelic {
             for &q in &query_alleles {
-                let a = q.value();
-                if a == PbwtQueryAllele::WILDCARD_VALUE {
+                if q.is_wildcard() {
                     continue;
                 }
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
+                if let Some(a) = q.as_allele() {
+                    if a >= 2 {
+                        is_biallelic = false;
+                        break;
+                    }
                 }
             }
         }
@@ -609,12 +615,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 }
             }
             for &q in &query_alleles {
-                let a = q.value();
-                if a == PbwtQueryAllele::WILDCARD_VALUE || a == 255 {
-                    continue;
-                }
-                if a > max_allele {
-                    max_allele = a;
+                if let Some(a) = q.as_allele() {
+                    if a > max_allele {
+                        max_allele = a;
+                    }
                 }
             }
             (max_allele as usize).saturating_add(1).max(2)
@@ -630,11 +634,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
 
         if sampling.get(local_idx).copied().unwrap_or(false) {
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i].value();
-                if targ == 255 {
+                if query_alleles[i].is_missing() {
                     continue;
                 }
-                if targ == PbwtQueryAllele::WILDCARD_VALUE {
+                if query_alleles[i].is_wildcard() {
                     pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
                     for &d in donors_buf.iter() {
                         let idx = d as usize;
@@ -669,6 +672,9 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     }
                     continue;
                 }
+                let targ = query_alleles[i]
+                    .as_allele()
+                    .expect("non-missing/non-wildcard query allele should be concrete");
                 let freq = freqs
                     .get(m)
                     .and_then(|f| f.get(targ as usize))
@@ -789,13 +795,14 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         }
         if is_biallelic {
             for &q in &query_alleles {
-                let a = q.value();
-                if a == PbwtQueryAllele::WILDCARD_VALUE {
+                if q.is_wildcard() {
                     continue;
                 }
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
+                if let Some(a) = q.as_allele() {
+                    if a >= 2 {
+                        is_biallelic = false;
+                        break;
+                    }
                 }
             }
         }
@@ -809,12 +816,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 }
             }
             for &q in &query_alleles {
-                let a = q.value();
-                if a == PbwtQueryAllele::WILDCARD_VALUE || a == 255 {
-                    continue;
-                }
-                if a > max_allele {
-                    max_allele = a;
+                if let Some(a) = q.as_allele() {
+                    if a > max_allele {
+                        max_allele = a;
+                    }
                 }
             }
             (max_allele as usize).saturating_add(1).max(2)
@@ -830,11 +835,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
 
         if sampling.get(local_idx).copied().unwrap_or(false) {
             for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i].value();
-                if targ == 255 {
+                if query_alleles[i].is_missing() {
                     continue;
                 }
-                if targ == PbwtQueryAllele::WILDCARD_VALUE {
+                if query_alleles[i].is_wildcard() {
                     pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
                     for &d in donors_buf.iter() {
                         let idx = d as usize;
@@ -869,6 +873,9 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     }
                     continue;
                 }
+                let targ = query_alleles[i]
+                    .as_allele()
+                    .expect("non-missing/non-wildcard query allele should be concrete");
                 let freq = freqs
                     .get(m)
                     .and_then(|f| f.get(targ as usize))
@@ -2685,7 +2692,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         };
 
         // Load reference panel if provided (for reference-guided phasing)
-        let mut ref_pos_map: Option<HashMap<(u32, u32), Vec<usize>>> = None;
+        let mut ref_pos_map = None;
         if let Some(ref_path) = &self.config.r#ref {
             eprintln!("Loading reference panel for streaming phasing...");
             let ref_gt: GenotypeMatrix<Phased> =
@@ -3679,15 +3686,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         n_haps: usize,
     ) -> BidirectionalPhaseIbs {
         let n_subset = marker_indices.len();
-        // Use bulk slice access instead of per-haplotype get() calls
-        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
-
+        let mut alleles_flat = Vec::with_capacity(n_subset.saturating_mul(n_haps));
         for &orig_m in marker_indices {
             let marker_slice = geno.marker_alleles(orig_m);
-            alleles_by_marker.push(marker_slice[..n_haps].to_vec());
+            alleles_flat.extend_from_slice(&marker_slice[..n_haps]);
         }
 
-        BidirectionalPhaseIbs::build_for_subset(alleles_by_marker, n_haps, n_subset, marker_indices)
+        BidirectionalPhaseIbs::build_for_subset_flat(alleles_flat, n_haps, n_subset, marker_indices)
     }
 
     /// Build bidirectional PBWT for a subset of markers using target+reference (composite).
@@ -3712,15 +3717,19 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         };
         let haps: Vec<HapIdx> = (0..n_total_haps).map(|h| HapIdx::new(h as u32)).collect();
 
-        let mut alleles_by_marker: Vec<Vec<u8>> = Vec::with_capacity(n_subset);
+        let mut alleles_flat = vec![255u8; n_subset.saturating_mul(n_total_haps)];
         for i in 0..n_subset {
-            let mut row = vec![255u8; n_total_haps];
-            view.fill_batch(MarkerIdx::new(i as u32), &haps, &mut row);
-            alleles_by_marker.push(row);
+            let row_start = i.saturating_mul(n_total_haps);
+            let row_end = row_start.saturating_add(n_total_haps);
+            view.fill_batch(
+                MarkerIdx::new(i as u32),
+                &haps,
+                &mut alleles_flat[row_start..row_end],
+            );
         }
 
-        let mut pbwt = BidirectionalPhaseIbs::build_for_subset(
-            alleles_by_marker,
+        let mut pbwt = BidirectionalPhaseIbs::build_for_subset_flat(
+            alleles_flat,
             n_total_haps,
             n_subset,
             marker_indices,
@@ -3782,10 +3791,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         } else {
             self.config.phase_states
         };
-        per_window_cap = per_window_cap
-            .min(PHASE_STATE_HARD_CAP)
-            .min(n_ref_haps)
-            .max(1);
+        per_window_cap = if self.config.phase_states == 0 {
+            per_window_cap.min(n_ref_haps).max(1)
+        } else {
+            per_window_cap
+                .min(PHASE_STATE_HARD_CAP)
+                .min(n_ref_haps)
+                .max(1)
+        };
         if self.config.phase_states == 0 {
             eprintln!(
                 "Phasing prescan: per_window_cap={} threads={} available_mb={} window_markers={}",
@@ -5708,13 +5721,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let columns: Vec<GenotypeColumn> = (0..n_markers)
             .map(|m| {
                 let alleles = geno.marker_alleles(m);
-                let bytes: Vec<u8> = alleles.to_vec();
                 let n_alleles = original
                     .markers()
                     .marker(MarkerIdx::new(m as u32))
                     .n_alleles()
                     .max(1);
-                GenotypeColumn::from_alleles(&bytes, n_alleles)
+                GenotypeColumn::from_alleles(&alleles, n_alleles)
             })
             .collect();
 
@@ -6185,21 +6197,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             (None, None, None)
                         };
 
-                    // Lazy cache for state->hap mapping. We return owned vectors from
-                    // cache to keep borrow scopes simple inside nested macros.
+                    // Lazy cache for state->hap mapping.
                     let mut hap_cache: Vec<Option<Vec<CombinedHapId>>> = vec![None; n_markers];
-
-                    macro_rules! get_haps {
-                        ($marker:expr) => {{
-                            let m = $marker;
-                            if hap_cache[m].is_none() {
-                                let mut haps = vec![CombinedHapId::new(0); n_states];
-                                threaded_haps.materialize_at(m, &mut haps);
-                                hap_cache[m] = Some(haps);
-                            }
-                            hap_cache[m].as_ref().cloned().unwrap_or_default()
-                        }};
-                    }
 
                     // Closure to get allele for any haplotype (target or reference)
                     let get_allele = |marker: usize, hap: usize| -> u8 {
@@ -6245,13 +6244,23 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                             let mkr_a = stage2_phaser.prev_stage1_marker[m];
                             let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                            let state_haps_a = get_haps!(mkr_a);
-                            let state_haps_b = get_haps!(mkr_b);
+                            if hap_cache[mkr_a].is_none() {
+                                let mut haps = vec![CombinedHapId::new(0); n_states];
+                                threaded_haps.materialize_at(mkr_a, &mut haps);
+                                hap_cache[mkr_a] = Some(haps);
+                            }
+                            if hap_cache[mkr_b].is_none() {
+                                let mut haps = vec![CombinedHapId::new(0); n_states];
+                                threaded_haps.materialize_at(mkr_b, &mut haps);
+                                hap_cache[mkr_b] = Some(haps);
+                            }
+                            let state_haps_a = hap_cache[mkr_a].as_deref().unwrap_or(&[]);
+                            let state_haps_b = hap_cache[mkr_b].as_deref().unwrap_or(&[]);
                             let bridge_probs = stage2_phaser.bridge_hap_probs(
                                 m,
                                 probs,
-                                &state_haps_a,
-                                &state_haps_b,
+                                state_haps_a,
+                                state_haps_b,
                             );
 
                             for (&hap, &prob_state) in bridge_probs.iter() {
@@ -6281,8 +6290,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let a2 = sp.allele2(m);
                         let mkr_a = stage2_phaser.prev_stage1_marker[m];
                         let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
-                        let state_haps_for_interp_a = get_haps!(mkr_a);
-                        let state_haps_for_interp_b = get_haps!(mkr_b);
+                        if hap_cache[mkr_a].is_none() {
+                            let mut haps = vec![CombinedHapId::new(0); n_states];
+                            threaded_haps.materialize_at(mkr_a, &mut haps);
+                            hap_cache[mkr_a] = Some(haps);
+                        }
+                        if hap_cache[mkr_b].is_none() {
+                            let mut haps = vec![CombinedHapId::new(0); n_states];
+                            threaded_haps.materialize_at(mkr_b, &mut haps);
+                            hap_cache[mkr_b] = Some(haps);
+                        }
+                        let state_haps_for_interp_a = hap_cache[mkr_a].as_deref().unwrap_or(&[]);
+                        let state_haps_for_interp_b = hap_cache[mkr_b].as_deref().unwrap_or(&[]);
                         let marker_maf = maf[m];
                         let is_rare_marker = marker_maf < rare_threshold;
                         let carriers = &carrier_haps[m];
@@ -6290,8 +6309,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             stage2_phaser.carrier_injected_bridge_hap_probs(
                                 m,
                                 &probs1,
-                                &state_haps_for_interp_a,
-                                &state_haps_for_interp_b,
+                                state_haps_for_interp_a,
+                                state_haps_for_interp_b,
                                 carriers,
                                 carrier_panel_haps.max(1),
                             )
@@ -6299,16 +6318,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             stage2_phaser.bridge_hap_probs(
                                 m,
                                 &probs1,
-                                &state_haps_for_interp_a,
-                                &state_haps_for_interp_b,
+                                state_haps_for_interp_a,
+                                state_haps_for_interp_b,
                             )
                         };
                         let bridge_probs2 = if is_rare_marker && !carriers.is_empty() {
                             stage2_phaser.carrier_injected_bridge_hap_probs(
                                 m,
                                 &probs2,
-                                &state_haps_for_interp_a,
-                                &state_haps_for_interp_b,
+                                state_haps_for_interp_a,
+                                state_haps_for_interp_b,
                                 carriers,
                                 carrier_panel_haps.max(1),
                             )
@@ -6316,8 +6335,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             stage2_phaser.bridge_hap_probs(
                                 m,
                                 &probs2,
-                                &state_haps_for_interp_a,
-                                &state_haps_for_interp_b,
+                                state_haps_for_interp_a,
+                                state_haps_for_interp_b,
                             )
                         };
 
@@ -11865,8 +11884,9 @@ mod tests {
             })
             .collect();
         let subset_to_global: Vec<usize> = (0..n_markers).collect();
-        let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
-            alleles,
+        let alleles_flat: Vec<u8> = alleles.into_iter().flatten().collect();
+        let phase_ibs = BidirectionalPhaseIbs::build_for_subset_flat(
+            alleles_flat,
             n_total_haps,
             n_markers,
             &subset_to_global,
@@ -11956,8 +11976,9 @@ mod tests {
             })
             .collect();
         let subset_to_global: Vec<usize> = (0..n_markers).collect();
-        let phase_ibs = BidirectionalPhaseIbs::build_for_subset(
-            alleles,
+        let alleles_flat: Vec<u8> = alleles.into_iter().flatten().collect();
+        let phase_ibs = BidirectionalPhaseIbs::build_for_subset_flat(
+            alleles_flat,
             n_total_haps,
             n_markers,
             &subset_to_global,

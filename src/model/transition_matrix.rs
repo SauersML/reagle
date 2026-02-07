@@ -6,15 +6,6 @@
 
 use crate::model::types::RefHapId;
 
-#[derive(Clone, Debug)]
-pub struct NormalizedProbs(Vec<f32>);
-
-impl NormalizedProbs {
-    pub fn into_vec(self) -> Vec<f32> {
-        self.0
-    }
-}
-
 /// Sparse CSR transition matrix from previous to next window state sets.
 pub struct TransitionMatrix {
     /// Row offsets into col_indices/weights (len = n_prev + 1)
@@ -57,13 +48,15 @@ impl TransitionMatrix {
         }
     }
 
-    /// Map previous state probabilities into next-state space.
+    /// Map previous state probabilities into next-state space, reusing `out` storage.
     ///
     /// Dropped mass is redistributed proportionally to retained mass when possible.
-    pub fn map(&self, prev_probs: &[f32]) -> NormalizedProbs {
-        let mut next = vec![0.0f32; self.n_next];
+    pub fn map_into(&self, prev_probs: &[f32], out: &mut Vec<f32>) {
+        out.resize(self.n_next, 0.0);
+        let next = &mut out[..];
+        next.fill(0.0);
         if self.n_next == 0 || prev_probs.is_empty() {
-            return NormalizedProbs(next);
+            return;
         }
 
         let mut total_mass = 0.0f32;
@@ -77,7 +70,7 @@ impl TransitionMatrix {
             for v in next.iter_mut() {
                 *v = uniform;
             }
-            return NormalizedProbs(next);
+            return;
         }
         let inv_total = 1.0 / total_mass;
 
@@ -117,7 +110,5 @@ impl TransitionMatrix {
                 }
             }
         }
-
-        NormalizedProbs(next)
     }
 }

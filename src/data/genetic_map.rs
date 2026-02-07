@@ -29,10 +29,10 @@ pub struct GeneticMap {
     chrom: ChromIdx,
 
     /// Physical positions (bp), sorted
-    positions: Vec<u32>,
+    positions: StrictlyIncreasingU32,
 
     /// Genetic positions (cM) corresponding to physical positions
-    gen_positions: Vec<f64>,
+    gen_positions: NonDecreasingF64,
 }
 
 impl GeneticMap {
@@ -87,29 +87,8 @@ impl GeneticMap {
             gen_positions.push(gen_pos);
         }
 
-        // Verify sorted order
-        for i in 1..positions.len() {
-            if positions[i] <= positions[i - 1] {
-                return Err(ReagleError::Config {
-                    message: format!(
-                        "Genetic map positions not in ascending order at position {}",
-                        positions[i]
-                    ),
-                });
-            }
-        }
-        for i in 1..gen_positions.len() {
-            if gen_positions[i] < gen_positions[i - 1] {
-                return Err(ReagleError::Config {
-                    message: format!(
-                        "Genetic map cM positions decrease at bp {} ({} -> {})",
-                        positions[i],
-                        gen_positions[i - 1],
-                        gen_positions[i]
-                    ),
-                });
-            }
-        }
+        let positions = StrictlyIncreasingU32::new(positions)?;
+        let gen_positions = NonDecreasingF64::new(gen_positions, positions.as_slice())?;
 
         Ok(Self {
             chrom: ChromIdx::new(0), // Will be set by caller
@@ -128,34 +107,39 @@ impl GeneticMap {
         }
 
         // Binary search for position
-        match self.positions.binary_search(&phys_pos) {
-            Ok(idx) => self.gen_positions[idx],
+        match self.positions.as_slice().binary_search(&phys_pos) {
+            Ok(idx) => self.gen_positions.as_slice()[idx],
             Err(idx) => {
                 if idx == 0 {
                     // Before first position: extrapolate
                     let rate = if self.positions.len() > 1 {
-                        (self.gen_positions[1] - self.gen_positions[0])
-                            / (self.positions[1] - self.positions[0]) as f64
+                        (self.gen_positions.as_slice()[1] - self.gen_positions.as_slice()[0])
+                            / (self.positions.as_slice()[1] - self.positions.as_slice()[0]) as f64
                     } else {
                         DEFAULT_SCALE_FACTOR
                     };
-                    self.gen_positions[0] - rate * (self.positions[0] - phys_pos) as f64
+                    self.gen_positions.as_slice()[0]
+                        - rate * (self.positions.as_slice()[0] - phys_pos) as f64
                 } else if idx == self.positions.len() {
                     // After last position: extrapolate
                     let last = self.positions.len() - 1;
                     let rate = if last > 0 {
-                        (self.gen_positions[last] - self.gen_positions[last - 1])
-                            / (self.positions[last] - self.positions[last - 1]) as f64
+                        (self.gen_positions.as_slice()[last]
+                            - self.gen_positions.as_slice()[last - 1])
+                            / (self.positions.as_slice()[last]
+                                - self.positions.as_slice()[last - 1])
+                                as f64
                     } else {
                         DEFAULT_SCALE_FACTOR
                     };
-                    self.gen_positions[last] + rate * (phys_pos - self.positions[last]) as f64
+                    self.gen_positions.as_slice()[last]
+                        + rate * (phys_pos - self.positions.as_slice()[last]) as f64
                 } else {
                     // Interpolate between idx-1 and idx
-                    let p0 = self.positions[idx - 1] as f64;
-                    let p1 = self.positions[idx] as f64;
-                    let g0 = self.gen_positions[idx - 1];
-                    let g1 = self.gen_positions[idx];
+                    let p0 = self.positions.as_slice()[idx - 1] as f64;
+                    let p1 = self.positions.as_slice()[idx] as f64;
+                    let g0 = self.gen_positions.as_slice()[idx - 1];
+                    let g1 = self.gen_positions.as_slice()[idx];
                     let t = (phys_pos as f64 - p0) / (p1 - p0);
                     g0 + t * (g1 - g0)
                 }
@@ -389,6 +373,70 @@ fn normalize_chrom(name: &str) -> &str {
 #[inline]
 fn chrom_name_eq(left: &str, right: &str) -> bool {
     normalize_chrom(left).eq_ignore_ascii_case(normalize_chrom(right))
+}
+
+#[derive(Clone, Debug)]
+struct StrictlyIncreasingU32(Vec<u32>);
+
+impl StrictlyIncreasingU32 {
+    fn new(values: Vec<u32>) -> Result<Self> {
+        for i in 1..values.len() {
+            if values[i] <= values[i - 1] {
+                return Err(ReagleError::Config {
+                    message: format!(
+                        "Genetic map positions not in ascending order at position {}",
+                        values[i]
+                    ),
+                });
+            }
+        }
+        Ok(Self(values))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NonDecreasingF64(Vec<f64>);
+
+impl NonDecreasingF64 {
+    fn new(values: Vec<f64>, positions: &[u32]) -> Result<Self> {
+        for i in 0..values.len() {
+            if !values[i].is_finite() {
+                return Err(ReagleError::Config {
+                    message: format!("Genetic map cM position is not finite at index {}", i),
+                });
+            }
+        }
+        for i in 1..values.len() {
+            if values[i] < values[i - 1] {
+                let pos = positions.get(i).copied().unwrap_or(0);
+                return Err(ReagleError::Config {
+                    message: format!(
+                        "Genetic map cM positions decrease at bp {} ({} -> {})",
+                        pos,
+                        values[i - 1],
+                        values[i]
+                    ),
+                });
+            }
+        }
+        Ok(Self(values))
+    }
+
+    fn as_slice(&self) -> &[f64] {
+        &self.0
+    }
 }
 
 #[cfg(test)]

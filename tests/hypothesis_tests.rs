@@ -2397,7 +2397,13 @@ fn test_pbwt_backward_span_contributes() {
         vec![1u8, 1u8],
     ];
     let subset_to_global: Vec<usize> = (0..6).collect();
-    let pbwt = BidirectionalPhaseIbsImpl::<u16>::build_for_subset(alleles, 2, 6, &subset_to_global);
+    let alleles_flat: Vec<u8> = alleles.into_iter().flatten().collect();
+    let pbwt = BidirectionalPhaseIbsImpl::<u16>::build_for_subset_flat(
+        alleles_flat,
+        2,
+        6,
+        &subset_to_global,
+    );
     let marker_idx = 2usize;
     let span = pbwt.best_match_span(0u32, marker_idx);
     println!("[pbwt span] marker={} span={}", marker_idx, span);

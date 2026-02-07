@@ -33,22 +33,71 @@ fn prefetch_read<T>(ptr: *const T) {
 }
 
 #[inline(always)]
-fn pbwt_bin_for_allele(allele: u8, n_alleles: usize) -> usize {
-    if n_alleles == 2 {
-        if allele == 0 {
-            0
-        } else if allele == 1 {
-            2
+fn pbwt_bin_for_allele(allele: u8, alphabet: PbwtAlphabet) -> usize {
+    PbwtAllele::from_raw(allele, alphabet).bin(alphabet)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PbwtAlphabet {
+    n_alleles: u16,
+}
+
+impl PbwtAlphabet {
+    pub fn new(n_alleles: usize) -> Option<Self> {
+        if (2..=255).contains(&n_alleles) {
+            Some(Self {
+                n_alleles: n_alleles as u16,
+            })
         } else {
-            1
+            None
         }
-    } else if allele == 0 {
-        0
-    } else if allele == 255 || (allele as usize) >= n_alleles {
-        // Dedicated missing/invalid bin lives at index 1.
-        1
-    } else {
-        (allele as usize) + 1
+    }
+
+    #[inline(always)]
+    pub fn n_alleles(self) -> usize {
+        self.n_alleles as usize
+    }
+
+    #[inline(always)]
+    pub fn n_bins(self) -> usize {
+        self.n_alleles() + 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PbwtAllele {
+    Ref,
+    Alt(u8),
+    Missing,
+}
+
+impl PbwtAllele {
+    #[inline(always)]
+    pub fn from_raw(allele: u8, alphabet: PbwtAlphabet) -> Self {
+        if allele == 0 {
+            Self::Ref
+        } else if allele == 255 || (allele as usize) >= alphabet.n_alleles() {
+            Self::Missing
+        } else {
+            Self::Alt(allele)
+        }
+    }
+
+    #[inline(always)]
+    pub fn bin(self, alphabet: PbwtAlphabet) -> usize {
+        if alphabet.n_alleles() == 2 {
+            match self {
+                Self::Ref => 0,
+                Self::Alt(1) => 2,
+                Self::Alt(_) | Self::Missing => 1,
+            }
+        } else {
+            match self {
+                Self::Ref => 0,
+                Self::Missing => 1,
+                Self::Alt(a) => (a as usize) + 1,
+            }
+        }
     }
 }
 
@@ -318,15 +367,15 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             assert_eq!(alleles.len(), self.n_haps);
             assert_eq!(prefix.len(), self.n_haps);
             assert!(divergence.len() >= self.n_haps);
-            assert!(n_alleles >= 2, "PBWT requires at least 2 alleles");
-            assert!(
-                n_alleles <= 255,
-                "PBWT n_alleles={} exceeds u8 allele contract (max 255 with 255 reserved for missing)",
-                n_alleles
-            );
+            let alphabet = PbwtAlphabet::new(n_alleles).unwrap_or_else(|| {
+                panic!(
+                    "PBWT invalid n_alleles={} (expected 2..=255 with 255 reserved for missing)",
+                    n_alleles
+                )
+            });
 
             // Use n_alleles + 1 bins with Bin 1 reserved for missing/invalid.
-            let n_bins = n_alleles + 1;
+            let n_bins = alphabet.n_bins();
             self.ensure_capacity(n_bins);
 
             // 1. Count frequencies of each allele (Counting Sort Phase 1) - now sequential access
@@ -349,7 +398,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
                 for i in 0..self.n_haps {
                     let allele = self.permuted_alleles[i] as usize;
                     // Map missing/invalid alleles to dedicated Bin 1.
-                    let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
+                    let bin = pbwt_bin_for_allele(allele as u8, alphabet);
                     self.counts[bin] += 1;
                 }
             }
@@ -485,7 +534,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
                     let hap = prefix[i];
                     let div = divergence[i];
                     let allele = self.permuted_alleles[i] as usize; // Sequential access
-                    let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
+                    let bin = pbwt_bin_for_allele(allele as u8, alphabet);
 
                     // Update p (Max Divergence Propagation) for ALL bins
                     for j in 0..n_bins {
@@ -548,15 +597,15 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         assert_eq!(alleles.len(), self.n_haps);
         assert_eq!(prefix.len(), self.n_haps);
         assert!(divergence.len() >= self.n_haps);
-        assert!(n_alleles >= 2, "PBWT requires at least 2 alleles");
-        assert!(
-            n_alleles <= 255,
-            "PBWT n_alleles={} exceeds u8 allele contract (max 255 with 255 reserved for missing)",
-            n_alleles
-        );
+        let alphabet = PbwtAlphabet::new(n_alleles).unwrap_or_else(|| {
+            panic!(
+                "PBWT invalid n_alleles={} (expected 2..=255 with 255 reserved for missing)",
+                n_alleles
+            )
+        });
 
         // Use n_alleles + 1 bins with Bin 1 reserved for missing/invalid.
-        let n_bins = n_alleles + 1;
+        let n_bins = alphabet.n_bins();
         self.ensure_capacity(n_bins);
 
         // 1. Initialize p array for backward PBWT
@@ -585,7 +634,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
             for i in 0..self.n_haps {
                 let allele = self.permuted_alleles[i] as usize;
-                let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
+                let bin = pbwt_bin_for_allele(allele as u8, alphabet);
                 self.counts[bin] += 1;
             }
         }
@@ -716,7 +765,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = self.permuted_alleles[i] as usize; // Sequential access
-                let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
+                let bin = pbwt_bin_for_allele(allele as u8, alphabet);
 
                 // Update p: min(p, div) for backward PBWT
                 // Smaller divergence = earlier end point = shorter match

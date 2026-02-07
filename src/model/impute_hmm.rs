@@ -651,7 +651,9 @@ fn fill_emissions(
         if idx < n_alleles {
             emissions[i] = emission_by_allele[idx];
         } else {
-            emissions[i] = mismatch_prob;
+            // Out-of-domain allele index (e.g. multiallelic residue in biallelic model):
+            // treat as missing/unknown rather than forcing mismatch likelihood.
+            emissions[i] = 1.0;
         }
     }
 }
@@ -694,7 +696,8 @@ fn fill_pattern_emissions(
             if idx < emission_by_allele.len() {
                 pattern_emissions[i] = emission_by_allele[idx];
             } else {
-                pattern_emissions[i] = mismatch_prob;
+                // Unknown allele index should be neutral, not penalized.
+                pattern_emissions[i] = 1.0;
             }
         }
     }

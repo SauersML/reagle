@@ -5,7 +5,29 @@ use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 use std::collections::HashMap;
 
-type PosKey = (u32, u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ChromKey(u32);
+
+impl ChromKey {
+    fn from_name(name: &str) -> Self {
+        Self(chrom_to_code(name))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PosKey {
+    chrom: ChromKey,
+    pos: u32,
+}
+
+impl PosKey {
+    fn new(chrom_name: &str, pos: u32) -> Self {
+        Self {
+            chrom: ChromKey::from_name(chrom_name),
+            pos,
+        }
+    }
+}
 
 /// Marker alignment between target and reference panels
 #[derive(Debug)]
@@ -281,8 +303,9 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                 .markers()
                 .chrom_name(target_marker.chrom)
                 .unwrap_or("");
-            let chrom_code = chrom_to_code(chrom_name);
-            if let Some(ref_candidates) = ref_pos_map.get(&(chrom_code, target_marker.pos)) {
+            if let Some(ref_candidates) =
+                ref_pos_map.get(&PosKey::new(chrom_name, target_marker.pos))
+            {
                 let mut best: Option<(usize, AlleleMapping, u32)> = None;
                 for &ref_idx in ref_candidates {
                     let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
@@ -409,9 +432,8 @@ fn build_target_pos_map<S: PhaseState, Space>(
     for m in 0..target_gt.n_markers() {
         let marker = target_gt.marker(MarkerIdx::new(m as u32));
         let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
-        let chrom_code = chrom_to_code(chrom_name);
         target_pos_map
-            .entry((chrom_code, marker.pos))
+            .entry(PosKey::new(chrom_name, marker.pos))
             .or_default()
             .push(m);
     }
@@ -423,9 +445,8 @@ fn build_ref_pos_map<Space>(ref_markers: &Markers<Space>) -> HashMap<PosKey, Vec
     for m in 0..ref_markers.len() {
         let marker = ref_markers.marker(MarkerIdx::new(m as u32));
         let chrom_name = ref_markers.chrom_name(marker.chrom).unwrap_or("");
-        let chrom_code = chrom_to_code(chrom_name);
         ref_pos_map
-            .entry((chrom_code, marker.pos))
+            .entry(PosKey::new(chrom_name, marker.pos))
             .or_default()
             .push(m);
     }
@@ -439,9 +460,8 @@ fn build_ref_pos_map_from_gt<S: PhaseState, Space>(
     for m in 0..ref_gt.n_markers() {
         let marker = ref_gt.marker(MarkerIdx::new(m as u32));
         let chrom_name = ref_gt.markers().chrom_name(marker.chrom).unwrap_or("");
-        let chrom_code = chrom_to_code(chrom_name);
         ref_pos_map
-            .entry((chrom_code, marker.pos))
+            .entry(PosKey::new(chrom_name, marker.pos))
             .or_default()
             .push(m);
     }

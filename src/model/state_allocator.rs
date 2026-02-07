@@ -61,6 +61,69 @@ use std::collections::BinaryHeap;
 
 const NEG_INF: f32 = -1.0e30;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowSpan {
+    start: u32,
+    end_exclusive: u32,
+}
+
+impl WindowSpan {
+    pub fn new(start: u32, end_exclusive: u32) -> Self {
+        assert!(
+            start < end_exclusive,
+            "invalid WindowSpan: start {} must be < end_exclusive {}",
+            start,
+            end_exclusive
+        );
+        Self {
+            start,
+            end_exclusive,
+        }
+    }
+
+    pub fn full(num_windows: usize) -> Self {
+        let end = num_windows as u32;
+        assert!(end > 0, "invalid full WindowSpan for zero windows");
+        Self {
+            start: 0,
+            end_exclusive: end,
+        }
+    }
+
+    #[inline]
+    pub fn contains(self, window_idx: usize) -> bool {
+        let idx = window_idx as u32;
+        idx >= self.start && idx < self.end_exclusive
+    }
+
+    #[inline]
+    pub fn len(self) -> u32 {
+        self.end_exclusive - self.start
+    }
+
+    #[inline]
+    pub fn is_full(self, num_windows: usize) -> bool {
+        self.start == 0 && self.end_exclusive == num_windows as u32
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DonorPoolSize(usize);
+
+impl DonorPoolSize {
+    fn new(raw: usize) -> Self {
+        Self(raw.max(2))
+    }
+
+    fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    fn as_f32(self) -> f32 {
+        self.0 as f32
+    }
+}
+
 #[inline]
 fn logaddexp(a: f32, b: f32) -> f32 {
     if a <= NEG_INF {
@@ -111,7 +174,7 @@ impl DpScratch {
 /// intervals per selected haplotype (reference panel indices).
 #[derive(Clone, Debug)]
 pub struct WindowAllocation {
-    pub intervals_by_hap: Vec<(usize, Vec<(u32, u32)>)>,
+    pub intervals_by_hap: Vec<(usize, Vec<WindowSpan>)>,
 }
 
 /// Compute continuity transition terms per boundary.
@@ -136,13 +199,17 @@ pub struct WindowAllocation {
 fn continuity_terms(
     boundary_cm: &[f64],
     params: &ModelParams,
-    n_pool_by_boundary: &[usize],
+    n_pool_by_boundary: &[DonorPoolSize],
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut t11 = Vec::with_capacity(boundary_cm.len());
     let mut t10 = Vec::with_capacity(boundary_cm.len());
     let mut t01 = Vec::with_capacity(boundary_cm.len());
     for (i, &dist_cm) in boundary_cm.iter().enumerate() {
-        let n_pool_f = n_pool_by_boundary.get(i).copied().unwrap_or(2).max(2) as f32;
+        let n_pool_f = n_pool_by_boundary
+            .get(i)
+            .copied()
+            .unwrap_or(DonorPoolSize::new(2))
+            .as_f32();
         let r_w = params.p_recomb(dist_cm);
         let a_w = (1.0 - r_w).max(0.0).min(1.0);
         let p11 = a_w + (1.0 - a_w) / n_pool_f;
@@ -268,7 +335,7 @@ fn dp_intervals_sparse_scratch(
     (gain, active_len)
 }
 
-fn active_to_intervals(active: &[bool]) -> Vec<(u32, u32)> {
+fn active_to_intervals(active: &[bool]) -> Vec<WindowSpan> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < active.len() {
@@ -281,7 +348,7 @@ fn active_to_intervals(active: &[bool]) -> Vec<(u32, u32)> {
         while end + 1 < active.len() && active[end + 1] {
             end += 1;
         }
-        out.push((start as u32, (end + 1) as u32));
+        out.push(WindowSpan::new(start as u32, (end + 1) as u32));
         i = end + 1;
     }
     out
@@ -331,21 +398,22 @@ pub fn allocate_lms_sparse(
     if per_window_min >= n && total_budget >= n.saturating_mul(w) {
         let intervals_by_hap = candidate_haps
             .iter()
-            .map(|&h| (h, vec![(0u32, w as u32)]))
+            .map(|&h| (h, vec![WindowSpan::full(w)]))
             .collect();
         return WindowAllocation { intervals_by_hap };
     }
-    let mut intervals_by_hap: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+    let mut intervals_by_hap: Vec<(usize, Vec<WindowSpan>)> = Vec::new();
     let mut counts = vec![0usize; w];
     let mut z_w = vec![0.0f32; w]; // log(1)
     let mut selected = vec![false; n];
     let mut remaining = total_budget;
 
-    let mut n_pool_by_boundary: Vec<usize> = Vec::with_capacity(w.saturating_sub(1));
+    let panel_pool = DonorPoolSize::new(n_pool);
+    let mut n_pool_by_boundary: Vec<DonorPoolSize> = Vec::with_capacity(w.saturating_sub(1));
     for i in 0..w.saturating_sub(1) {
-        let c0 = per_window_caps.get(i).copied().unwrap_or(n_pool);
-        let c1 = per_window_caps.get(i + 1).copied().unwrap_or(n_pool);
-        let n_eff = c0.min(c1).min(n_pool).max(2);
+        let c0 = DonorPoolSize::new(per_window_caps.get(i).copied().unwrap_or(n_pool));
+        let c1 = DonorPoolSize::new(per_window_caps.get(i + 1).copied().unwrap_or(n_pool));
+        let n_eff = c0.min(c1).min(panel_pool);
         n_pool_by_boundary.push(n_eff);
     }
     let (t11, t10, t01) = continuity_terms(boundary_cm, params, &n_pool_by_boundary);

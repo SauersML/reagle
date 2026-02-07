@@ -142,20 +142,19 @@ struct ImputationPlan {
 #[derive(Clone, Debug)]
 struct HapIntervals {
     hap: RefHapId,
-    intervals: Vec<(u32, u32)>,
+    intervals: Vec<crate::model::state_allocator::WindowSpan>,
 }
 
 #[inline]
 fn interval_support_at_window(intervals: &HapIntervals, window_idx: usize) -> Option<u32> {
-    let idx = window_idx as u32;
     let mut best_span = 0u32;
     let mut found = false;
-    for &(start, end) in intervals.intervals.iter() {
-        if idx >= start && idx < end {
+    for &span in intervals.intervals.iter() {
+        if span.contains(window_idx) {
             found = true;
-            let span = end.saturating_sub(start);
-            if span > best_span {
-                best_span = span;
+            let len = span.len();
+            if len > best_span {
+                best_span = len;
             }
         }
     }
@@ -671,9 +670,10 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             }
         }
         for &q in &query_alleles {
-            let a = q.value();
-            if a != 255 && a > max_allele {
-                max_allele = a;
+            if let Some(a) = q.as_allele() {
+                if a > max_allele {
+                    max_allele = a;
+                }
             }
         }
         let n_alleles = (max_allele as usize).saturating_add(1).max(2);
@@ -688,10 +688,12 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
 
         if sampling[m] {
             for (i, _) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i].value();
-                if targ == 255 {
+                if query_alleles[i].is_missing() {
                     continue;
                 }
+                let targ = query_alleles[i]
+                    .as_allele()
+                    .expect("non-missing strict query allele should be concrete");
                 let freq = freqs
                     .get(m)
                     .and_then(|f| f.get(targ as usize))
@@ -750,9 +752,10 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             }
         }
         for &q in &query_alleles {
-            let a = q.value();
-            if a != 255 && a > max_allele {
-                max_allele = a;
+            if let Some(a) = q.as_allele() {
+                if a > max_allele {
+                    max_allele = a;
+                }
             }
         }
         let n_alleles = (max_allele as usize).saturating_add(1).max(2);
@@ -767,10 +770,12 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
 
         if sampling[m] {
             for (i, _) in batch_haps.iter().enumerate() {
-                let targ = query_alleles[i].value();
-                if targ == 255 {
+                if query_alleles[i].is_missing() {
                     continue;
                 }
+                let targ = query_alleles[i]
+                    .as_allele()
+                    .expect("non-missing strict query allele should be concrete");
                 let freq = freqs
                     .get(m)
                     .and_then(|f| f.get(targ as usize))
@@ -808,6 +813,32 @@ fn normalize_chrom_local(name: &str) -> &str {
     } else {
         name
     }
+}
+
+#[inline]
+fn chrom_code_local(name: &str) -> u32 {
+    let norm = normalize_chrom_local(name);
+    if let Ok(parsed) = norm.parse::<u32>() {
+        return parsed;
+    }
+    if norm.eq_ignore_ascii_case("X") {
+        return 23;
+    }
+    if norm.eq_ignore_ascii_case("Y") {
+        return 24;
+    }
+    if norm.eq_ignore_ascii_case("XY") {
+        return 25;
+    }
+    if norm.eq_ignore_ascii_case("M") || norm.eq_ignore_ascii_case("MT") {
+        return 26;
+    }
+    let mut hash = 2166136261u32;
+    for b in norm.bytes() {
+        hash ^= b.to_ascii_lowercase() as u32;
+        hash = hash.wrapping_mul(16777619u32);
+    }
+    hash | (1u32 << 31)
 }
 
 fn collect_target_positions(path: &Path) -> Result<(TargetMarkerIndex, usize)> {
@@ -2101,7 +2132,7 @@ fn build_imputation_plan(
                         let hap = RefHapId::new(h as u32);
                         intervals.push(HapIntervals {
                             hap,
-                            intervals: vec![(0, end)],
+                            intervals: vec![crate::model::state_allocator::WindowSpan::new(0, end)],
                         });
                         core.push(hap);
                     }
@@ -2130,9 +2161,9 @@ fn build_imputation_plan(
                     }
                     intervals.sort_unstable_by_key(|hi| hi.hap.as_u32());
                     let mut core = Vec::new();
-                    let need_end = window_scores_matrix.len() as u32;
+                    let need_end = window_scores_matrix.len();
                     for hi in intervals.iter() {
-                        if hi.intervals.len() == 1 && hi.intervals[0] == (0, need_end) {
+                        if hi.intervals.len() == 1 && hi.intervals[0].is_full(need_end) {
                             core.push(hi.hap);
                         }
                     }
@@ -2607,10 +2638,8 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_pos_to_indices: std::collections::HashMap<
-                        (String, u32),
-                        Vec<usize>,
-                    > = std::collections::HashMap::new();
+                    let mut target_pos_to_indices: std::collections::HashMap<(u32, u32), Vec<usize>> =
+                        std::collections::HashMap::new();
                     for t_idx in 0..target_window.genotypes.n_markers() {
                         let t_marker = target_window
                             .genotypes
@@ -2621,7 +2650,7 @@ impl crate::pipelines::ImputationPipeline {
                             .markers()
                             .chrom_name(t_marker.chrom)
                             .unwrap_or("");
-                        let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+                        let key = (chrom_code_local(t_chrom), t_marker.pos);
                         target_pos_to_indices.entry(key).or_default().push(t_idx);
                     }
                     let mut dbg_pos_present = 0usize;
@@ -2636,8 +2665,7 @@ impl crate::pipelines::ImputationPipeline {
                             .unwrap_or("");
                         let has_biallelic_swap_or_match =
                             if target_idx.is_none() && ref_marker.n_alleles() == 2 {
-                                let key =
-                                    (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+                                let key = (chrom_code_local(ref_chrom), ref_marker.pos);
                                 if let Some(candidates) = target_pos_to_indices.get(&key) {
                                     let ref0 = ref_marker.ref_allele.to_string();
                                     let ref1 = ref_marker
@@ -2925,10 +2953,8 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_pos_to_indices: std::collections::HashMap<
-                        (String, u32),
-                        Vec<usize>,
-                    > = std::collections::HashMap::new();
+                    let mut target_pos_to_indices: std::collections::HashMap<(u32, u32), Vec<usize>> =
+                        std::collections::HashMap::new();
                     for t_idx in 0..target_window.genotypes.n_markers() {
                         let t_marker = target_window
                             .genotypes
@@ -2939,7 +2965,7 @@ impl crate::pipelines::ImputationPipeline {
                             .markers()
                             .chrom_name(t_marker.chrom)
                             .unwrap_or("");
-                        let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+                        let key = (chrom_code_local(t_chrom), t_marker.pos);
                         target_pos_to_indices.entry(key).or_default().push(t_idx);
                     }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
@@ -2950,8 +2976,7 @@ impl crate::pipelines::ImputationPipeline {
                             .unwrap_or("");
                         let has_biallelic_swap_or_match =
                             if target_idx.is_none() && ref_marker.n_alleles() == 2 {
-                                let key =
-                                    (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+                                let key = (chrom_code_local(ref_chrom), ref_marker.pos);
                                 if let Some(candidates) = target_pos_to_indices.get(&key) {
                                     let ref0 = ref_marker.ref_allele.to_string();
                                     let ref1 = ref_marker
@@ -4498,6 +4523,11 @@ impl crate::pipelines::ImputationPipeline {
                     out
                 };
 
+                let mut mapped_priors_buf: Vec<f32> = Vec::new();
+                let mut prev_states_buf: Vec<RefHapId> = Vec::new();
+                let mut state_index_by_hap: std::collections::HashMap<RefHapId, usize> =
+                    std::collections::HashMap::new();
+
                 let mut process_haplotype = |hap_idx: HapIdx,
                                              priors: Option<&HaplotypePriors>,
                                              input_probs: &TargetAlleleProbs,
@@ -4531,7 +4561,7 @@ impl crate::pipelines::ImputationPipeline {
                         )));
                     }
 
-                    let state_priors: Option<Vec<f32>> = if let Some(p) = priors {
+                    let mut state_priors_slice: Option<&[f32]> = if let Some(p) = priors {
                         if p.is_empty() {
                             if !warned_no_priors {
                                 warn!(
@@ -4546,16 +4576,19 @@ impl crate::pipelines::ImputationPipeline {
                                 .as_ref()
                                 .and_then(|v| v.get(hap_idx.as_usize()))
                                 .and_then(|m| m.as_ref());
-                            let mapped = if let Some(mapper) = mapper {
-                                mapper.map(p.probs()).into_vec()
+                            if let Some(mapper) = mapper {
+                                mapper.map_into(p.probs(), &mut mapped_priors_buf);
                             } else {
-                                let prev_states: Vec<RefHapId> =
-                                    p.ids().iter().map(|id| RefHapId::new(id.0)).collect();
-                                let mapper = TransitionMatrix::build(&prev_states, &state_haps);
-                                mapper.map(p.probs()).into_vec()
-                            };
+                                prev_states_buf.clear();
+                                prev_states_buf.reserve(p.ids().len());
+                                for id in p.ids() {
+                                    prev_states_buf.push(RefHapId::new(id.0));
+                                }
+                                let mapper = TransitionMatrix::build(&prev_states_buf, &state_haps);
+                                mapper.map_into(p.probs(), &mut mapped_priors_buf);
+                            }
                             let mut sum = 0.0f32;
-                            for v in mapped.iter() {
+                            for v in mapped_priors_buf.iter() {
                                 if v.is_finite() && *v > 0.0 {
                                     sum += *v;
                                 }
@@ -4577,11 +4610,14 @@ impl crate::pipelines::ImputationPipeline {
                                 )));
                             }
                             let inv = 1.0 / sum;
-                            let norm: Vec<f32> = mapped
-                                .into_iter()
-                                .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
-                                .collect();
-                            Some(norm)
+                            for v in mapped_priors_buf.iter_mut() {
+                                *v = if v.is_finite() && *v > 0.0 {
+                                    *v * inv
+                                } else {
+                                    0.0
+                                };
+                            }
+                            Some(mapped_priors_buf.as_slice())
                         }
                     } else {
                         // First-window Bayesian initialization:
@@ -4591,14 +4627,20 @@ impl crate::pipelines::ImputationPipeline {
                             None
                         } else {
                             let alpha = 1.0f32;
-                            let mut mapped = vec![alpha; state_haps.len()];
+                            mapped_priors_buf.clear();
+                            mapped_priors_buf.resize(state_haps.len(), alpha);
+                            state_index_by_hap.clear();
+                            state_index_by_hap.reserve(state_haps.len());
+                            for (idx, &hap) in state_haps.iter().enumerate() {
+                                state_index_by_hap.insert(hap, idx);
+                            }
                             let mut any_mass = false;
                             for (donor_hap, donor_count) in donors.iter() {
                                 if *donor_count == 0 {
                                     continue;
                                 }
-                                if let Some(idx) = state_haps.iter().position(|h| h == donor_hap) {
-                                    mapped[idx] += *donor_count as f32;
+                                if let Some(&idx) = state_index_by_hap.get(donor_hap) {
+                                    mapped_priors_buf[idx] += *donor_count as f32;
                                     any_mass = true;
                                 }
                             }
@@ -4606,7 +4648,7 @@ impl crate::pipelines::ImputationPipeline {
                                 None
                             } else {
                                 let mut sum = 0.0f32;
-                                for v in mapped.iter() {
+                                for v in mapped_priors_buf.iter() {
                                     if v.is_finite() && *v > 0.0 {
                                         sum += *v;
                                     }
@@ -4615,12 +4657,14 @@ impl crate::pipelines::ImputationPipeline {
                                     None
                                 } else {
                                     let inv = 1.0 / sum;
-                                    Some(
-                                        mapped
-                                            .into_iter()
-                                            .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
-                                            .collect(),
-                                    )
+                                    for v in mapped_priors_buf.iter_mut() {
+                                        *v = if v.is_finite() && *v > 0.0 {
+                                            *v * inv
+                                        } else {
+                                            0.0
+                                        };
+                                    }
+                                    Some(mapped_priors_buf.as_slice())
                                 }
                             }
                         }
@@ -4639,7 +4683,7 @@ impl crate::pipelines::ImputationPipeline {
                             &p_recomb,
                             error_rate,
                             prior_marker_idx,
-                            state_priors.as_deref(),
+                            state_priors_slice.take(),
                             &ref_allele_freqs,
                             ImputeHmmContext {
                                 window_idx,
@@ -5180,7 +5224,7 @@ impl crate::pipelines::ImputationPipeline {
         let target_pl = target_pl.unwrap_or(target_win);
         let pos_fallback_used = std::sync::atomic::AtomicUsize::new(0);
         let pos_fallback_map_fail = std::sync::atomic::AtomicUsize::new(0);
-        let mut target_pos_to_indices: std::collections::HashMap<(String, u32), Vec<usize>> =
+        let mut target_pos_to_indices: std::collections::HashMap<(u32, u32), Vec<usize>> =
             std::collections::HashMap::new();
         for t_idx in 0..target_win.n_markers() {
             let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
@@ -5188,7 +5232,7 @@ impl crate::pipelines::ImputationPipeline {
                 .markers()
                 .chrom_name(t_marker.chrom)
                 .unwrap_or("");
-            let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+            let key = (chrom_code_local(t_chrom), t_marker.pos);
             target_pos_to_indices.entry(key).or_default().push(t_idx);
         }
 
@@ -5198,7 +5242,7 @@ impl crate::pipelines::ImputationPipeline {
                 return None;
             }
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let key = (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+            let key = (chrom_code_local(ref_chrom), ref_marker.pos);
             let candidates = target_pos_to_indices.get(&key)?;
 
             let ref0 = ref_marker.ref_allele.to_string();
@@ -5852,15 +5896,15 @@ impl crate::pipelines::ImputationPipeline {
 
         // Preserve target-only markers that share positions with reference markers
         // but are not allele-aligned. These are still genotyped target variants.
-        let mut ref_pos_set: std::collections::HashSet<(String, u32)> =
+        let mut ref_pos_set: std::collections::HashSet<(u32, u32)> =
             std::collections::HashSet::new();
         for ref_m in output_start..output_end {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            ref_pos_set.insert((normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos));
+            ref_pos_set.insert((chrom_code_local(ref_chrom), ref_marker.pos));
         }
 
-        let mut target_only_by_pos: std::collections::HashMap<(String, u32), Vec<usize>> =
+        let mut target_only_by_pos: std::collections::HashMap<(u32, u32), Vec<usize>> =
             std::collections::HashMap::new();
         for t_idx in 0..target_win.n_markers() {
             let target_m = MarkerIdx::new(t_idx as u32);
@@ -5872,7 +5916,7 @@ impl crate::pipelines::ImputationPipeline {
                 .markers()
                 .chrom_name(t_marker.chrom)
                 .unwrap_or("");
-            let key = (normalize_chrom_local(t_chrom).to_string(), t_marker.pos);
+            let key = (chrom_code_local(t_chrom), t_marker.pos);
             if ref_pos_set.contains(&key) {
                 target_only_by_pos.entry(key).or_default().push(t_idx);
             }
@@ -5904,7 +5948,7 @@ impl crate::pipelines::ImputationPipeline {
         for ref_m in output_start..output_end {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let key = (normalize_chrom_local(ref_chrom).to_string(), ref_marker.pos);
+            let key = (chrom_code_local(ref_chrom), ref_marker.pos);
             if let Some(targets) = target_only_by_pos.get(&key) {
                 for &t_idx in targets {
                     output_markers.push(OutputMarker::Target(t_idx));

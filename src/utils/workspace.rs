@@ -70,9 +70,10 @@ impl ThreadWorkspace {
     /// O(checkpoint_interval * n_states) for `fwd`/`bwd`/`fwd_prior`.
     /// Some other buffers are O(n_markers) or O(n_markers * n_states) by design.
     pub fn new(checkpoint_interval: usize, n_states: usize) -> Self {
-        const DEFAULT_CHECKPOINT_INTERVAL: usize = 64; // L2 cache friendly
-        let interval = checkpoint_interval.max(1).min(DEFAULT_CHECKPOINT_INTERVAL);
-        let size = checked_product(interval, n_states, "initial HMM block length");
+        let interval = checkpoint_interval.max(1);
+        let size = ElemCount::from(interval)
+            .checked_mul(ElemCount::from(n_states), "initial HMM block length")
+            .get();
 
         Self {
             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
@@ -125,7 +126,9 @@ impl ThreadWorkspace {
             } else {
                 64
             };
-            let new_size = checked_product(current_interval, n_states, "resized HMM block length");
+            let new_size = ElemCount::from(current_interval)
+                .checked_mul(ElemCount::from(n_states), "resized HMM block length")
+                .get();
 
             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
@@ -148,7 +151,9 @@ impl ThreadWorkspace {
         if self.ref_alleles.len() < n_states {
             self.ref_alleles.resize(n_states, 0);
         }
-        let flat_len = checked_product(n_markers, n_states, "ref_alleles_flat length");
+        let flat_len = ElemCount::from(n_markers)
+            .checked_mul(ElemCount::from(n_states), "ref_alleles_flat length")
+            .get();
         if self.ref_alleles_flat.len() < flat_len {
             self.ref_alleles_flat.resize(flat_len, 0);
         }
@@ -188,12 +193,16 @@ impl ThreadWorkspace {
             self.hap2_hard_match.resize(n_markers, false);
         }
 
-        let block_len = checked_product(n_states, max_block_len, "fwd_block length");
+        let block_len = ElemCount::from(n_states)
+            .checked_mul(ElemCount::from(max_block_len), "fwd_block length")
+            .get();
         if self.fwd_block.len() < block_len {
             self.fwd_block.resize(block_len, 0.0);
         }
 
-        let checkpoints_len = checked_product(n_blocks, n_states, "checkpoint buffer length");
+        let checkpoints_len = ElemCount::from(n_blocks)
+            .checked_mul(ElemCount::from(n_states), "checkpoint buffer length")
+            .get();
         if self.combined_checkpoint_data.len() < checkpoints_len {
             self.combined_checkpoint_data.resize(checkpoints_len, 0.0);
         }
@@ -216,7 +225,9 @@ impl ThreadWorkspace {
         if self.ffbs_weights.len() < n_states {
             self.ffbs_weights.resize(n_states, 0.0);
         }
-        let needed = checked_product(n_markers, n_states, "FFBS marker-state buffer length");
+        let needed = ElemCount::from(n_markers)
+            .checked_mul(ElemCount::from(n_states), "FFBS marker-state buffer length")
+            .get();
         if self.ffbs_fwd_at_marker.len() < needed {
             self.ffbs_fwd_at_marker.resize(needed, 0.0);
         }
@@ -228,12 +239,28 @@ impl ThreadWorkspace {
     }
 }
 
-#[inline]
-fn checked_product(a: usize, b: usize, context: &str) -> usize {
-    a.checked_mul(b).unwrap_or_else(|| {
-        panic!(
-            "ThreadWorkspace size overflow while computing {} ({} * {})",
-            context, a, b
-        )
-    })
+#[derive(Clone, Copy, Debug)]
+struct ElemCount(usize);
+
+impl ElemCount {
+    #[inline]
+    fn checked_mul(self, rhs: Self, context: &str) -> Self {
+        Self(self.0.checked_mul(rhs.0).unwrap_or_else(|| {
+            panic!(
+                "ThreadWorkspace size overflow while computing {} ({} * {})",
+                context, self.0, rhs.0
+            )
+        }))
+    }
+
+    #[inline]
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for ElemCount {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
 }

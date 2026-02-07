@@ -1,4 +1,4 @@
-use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
+use crate::model::pbwt::{PbwtAllele, PbwtAlphabet, PbwtDivUpdater, PbwtIndex};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -83,15 +83,23 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     offsets: Vec<u32>,
     intervals_buf: Vec<(usize, usize)>,
     step_scratch: Vec<(u32, u32, u32)>,
+    wanted_map: HashMap<u32, usize>,
+    found_pos_start: Vec<(usize, i32)>,
+    found_mask: Vec<bool>,
 }
 
-#[repr(transparent)]
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub struct PbwtQueryAllele(u8);
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PbwtQueryAllele {
+    Allele(u8),
+    Missing,
+    Wildcard,
+}
 
-#[repr(transparent)]
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub struct PbwtStrictAllele(u8);
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PbwtStrictAllele {
+    Allele(u8),
+    Missing,
+}
 
 impl PbwtQueryAllele {
     pub const WILDCARD_VALUE: u8 = 128;
@@ -100,46 +108,62 @@ impl PbwtQueryAllele {
         if a == Self::WILDCARD_VALUE || a == 255 {
             None
         } else {
-            Some(Self(a))
+            Some(Self::Allele(a))
         }
     }
 
     pub fn missing() -> Self {
-        Self(255)
+        Self::Missing
     }
 
     pub fn wildcard() -> Self {
-        Self(Self::WILDCARD_VALUE)
-    }
-
-    #[inline]
-    pub fn value(self) -> u8 {
-        self.0
+        Self::Wildcard
     }
 
     /// Returns the concrete allele value, or None for wildcard/missing.
     #[inline]
     pub fn as_allele(self) -> Option<u8> {
-        if self.0 == Self::WILDCARD_VALUE || self.0 == 255 {
-            None
-        } else {
-            Some(self.0)
+        match self {
+            Self::Allele(a) => Some(a),
+            Self::Missing | Self::Wildcard => None,
         }
+    }
+
+    #[inline]
+    pub fn is_missing(self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    #[inline]
+    pub fn is_wildcard(self) -> bool {
+        matches!(self, Self::Wildcard)
     }
 }
 
 impl PbwtStrictAllele {
     pub fn allele(a: u8) -> Option<Self> {
-        if a == 255 { None } else { Some(Self(a)) }
+        if a == 255 {
+            None
+        } else {
+            Some(Self::Allele(a))
+        }
     }
 
     pub fn missing() -> Self {
-        Self(255)
+        Self::Missing
     }
 
     #[inline]
-    pub fn value(self) -> u8 {
-        self.0
+    pub fn as_allele(self) -> Option<u8> {
+        match self {
+            Self::Allele(a) => Some(a),
+            Self::Missing => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_missing(self) -> bool {
+        matches!(self, Self::Missing)
     }
 }
 
@@ -182,6 +206,9 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             offsets: Vec::new(),
             intervals_buf: Vec::new(),
             step_scratch: Vec::new(),
+            wanted_map: HashMap::new(),
+            found_pos_start: Vec::new(),
+            found_mask: Vec::new(),
         }
     }
 
@@ -290,22 +317,8 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         }
     }
 
-    fn bin_for_allele(a: u8, n_alleles: usize) -> usize {
-        if n_alleles == 2 {
-            if a == 0 {
-                0
-            } else if a == 1 {
-                2
-            } else {
-                1
-            }
-        } else if a == 0 {
-            0
-        } else if a == 255 || (a as usize) >= n_alleles {
-            1
-        } else {
-            (a as usize) + 1
-        }
+    fn bin_for_allele(a: u8, alphabet: PbwtAlphabet) -> usize {
+        PbwtAllele::from_raw(a, alphabet).bin(alphabet)
     }
 
     fn ensure_buffers(&mut self, n_bins: usize) {
@@ -456,9 +469,15 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
+        let alphabet = PbwtAlphabet::new(n_alleles)
+            .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
         let n_ref = self.ppa.len();
-        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
-        if n_alleles == 2 {
+        let n_bins = if alphabet.n_alleles() == 2 {
+            3
+        } else {
+            alphabet.n_bins()
+        };
+        if alphabet.n_alleles() == 2 {
             self.ensure_bit_buffers();
             let n_words = (n_ref + 63) / 64;
             let mut count1 = 0u32;
@@ -514,7 +533,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
 
             self.counts[..n_bins].fill(0);
             for &a in &self.permuted_ref {
-                let b = Self::bin_for_allele(a, n_alleles);
+                let b = Self::bin_for_allele(a, alphabet);
                 if b < n_bins {
                     self.counts[b] += 1;
                 }
@@ -532,7 +551,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 self.prefix_counts[base] = 0;
                 for i in 0..n_ref {
                     let a = self.permuted_ref[i];
-                    let bin = Self::bin_for_allele(a, n_alleles);
+                    let bin = Self::bin_for_allele(a, alphabet);
                     if bin == b {
                         c += 1;
                     }
@@ -549,21 +568,26 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         n_alleles: usize,
         scratch: &mut Vec<(u32, u32, u32)>,
     ) {
+        let alphabet = PbwtAlphabet::new(n_alleles)
+            .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
         let n_ref = self.ppa.len();
-        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
+        let n_bins = if alphabet.n_alleles() == 2 {
+            3
+        } else {
+            alphabet.n_bins()
+        };
 
         for (q_idx, &qa) in query_alleles.iter().enumerate() {
             if q_idx >= beams.len() {
                 break;
             }
-            let qa = qa.value();
             let old = beams[q_idx];
             let mut next = RankBeam {
                 intervals: [(0, 0); MAX_RANK_INTERVALS],
                 len: 0,
             };
 
-            if qa == PbwtQueryAllele::WILDCARD_VALUE {
+            if qa.is_wildcard() {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
@@ -579,7 +603,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     }
                 }
                 Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
-            } else if qa == 255 {
+            } else if qa.is_missing() {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
@@ -593,7 +617,10 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
                 Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
             } else {
-                let b = Self::bin_for_allele(qa, n_alleles);
+                let queried_allele = qa
+                    .as_allele()
+                    .expect("non-wildcard/non-missing query allele should be concrete");
+                let b = Self::bin_for_allele(queried_allele, alphabet);
                 if b < n_bins {
                     for &(l, r) in old.intervals() {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
@@ -605,30 +632,31 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
 
                 if next.len == 0 {
-                    // No match inside current beam for queried allele. First reset to
-                    // the full panel interval for that allele (recombination fallback),
-                    // then only broaden if that allele does not exist at this marker.
-                    let queried_bin = Self::bin_for_allele(qa, n_alleles);
+                    // Preserve locality first: recover from the previous beam across bins.
+                    // This avoids global hard-resets on single-site errors/mismatches.
+                    scratch.clear();
+                    for &(l, r) in old.intervals() {
+                        for b in 0..n_bins {
+                            let nl =
+                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                            if nl < nr {
+                                let score = nr - nl;
+                                scratch.push((nl, nr, score));
+                            }
+                        }
+                    }
+                    Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
+                }
+
+                if next.len == 0 {
+                    let queried_bin = Self::bin_for_allele(queried_allele, alphabet);
                     let nl = self.offset_for(queried_bin, n_alleles);
                     let nr = nl + self.count_for(queried_bin, n_alleles);
                     if nl < nr {
                         next.intervals[0] = (nl, nr);
                         next.len = 1;
-                    } else {
-                        scratch.clear();
-                        for &(l, r) in old.intervals() {
-                            for b in 0..n_bins {
-                                let nl = self.offset_for(b, n_alleles)
-                                    + self.rank(b, l, n_ref, n_alleles);
-                                let nr = self.offset_for(b, n_alleles)
-                                    + self.rank(b, r, n_ref, n_alleles);
-                                if nl < nr {
-                                    let score = nr - nl;
-                                    scratch.push((nl, nr, score));
-                                }
-                            }
-                        }
-                        Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
                     }
                 }
 
@@ -649,21 +677,26 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         n_alleles: usize,
         scratch: &mut Vec<(u32, u32, u32)>,
     ) {
+        let alphabet = PbwtAlphabet::new(n_alleles)
+            .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
         let n_ref = self.ppa.len();
-        let n_bins = if n_alleles == 2 { 3 } else { n_alleles + 1 };
+        let n_bins = if alphabet.n_alleles() == 2 {
+            3
+        } else {
+            alphabet.n_bins()
+        };
 
         for (q_idx, &qa) in query_alleles.iter().enumerate() {
             if q_idx >= beams.len() {
                 break;
             }
-            let qa = qa.value();
             let old = beams[q_idx];
             let mut next = RankBeam {
                 intervals: [(0, 0); MAX_RANK_INTERVALS],
                 len: 0,
             };
 
-            if qa == 255 {
+            if qa.is_missing() {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
                     for b in 0..n_bins {
@@ -677,7 +710,10 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
                 Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
             } else {
-                let b = Self::bin_for_allele(qa, n_alleles);
+                let queried_allele = qa
+                    .as_allele()
+                    .expect("non-missing strict query allele should be concrete");
+                let b = Self::bin_for_allele(queried_allele, alphabet);
                 if b < n_bins {
                     for &(l, r) in old.intervals() {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
@@ -689,27 +725,29 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
 
                 if next.len == 0 {
-                    let queried_bin = Self::bin_for_allele(qa, n_alleles);
+                    scratch.clear();
+                    for &(l, r) in old.intervals() {
+                        for b in 0..n_bins {
+                            let nl =
+                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                            if nl < nr {
+                                let score = nr - nl;
+                                scratch.push((nl, nr, score));
+                            }
+                        }
+                    }
+                    Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
+                }
+
+                if next.len == 0 {
+                    let queried_bin = Self::bin_for_allele(queried_allele, alphabet);
                     let nl = self.offset_for(queried_bin, n_alleles);
                     let nr = nl + self.count_for(queried_bin, n_alleles);
                     if nl < nr {
                         next.intervals[0] = (nl, nr);
                         next.len = 1;
-                    } else {
-                        scratch.clear();
-                        for &(l, r) in old.intervals() {
-                            for b in 0..n_bins {
-                                let nl = self.offset_for(b, n_alleles)
-                                    + self.rank(b, l, n_ref, n_alleles);
-                                let nr = self.offset_for(b, n_alleles)
-                                    + self.rank(b, r, n_ref, n_alleles);
-                                if nl < nr {
-                                    let score = nr - nl;
-                                    scratch.push((nl, nr, score));
-                                }
-                            }
-                        }
-                        Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
                     }
                 }
             }
@@ -725,7 +763,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     pub fn collect_positions_and_lens(
-        &self,
+        &mut self,
         marker: usize,
         haps: &[u32],
         out: &mut Vec<(u32, usize, i32)>,
@@ -735,25 +773,37 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             return;
         }
         let m = marker as i32;
-        let mut wanted: HashMap<u32, usize> = HashMap::with_capacity(haps.len());
+        self.wanted_map.clear();
+        self.wanted_map.reserve(haps.len());
         for (i, &h) in haps.iter().enumerate() {
-            wanted.insert(h, i);
+            self.wanted_map.insert(h, i);
         }
-        let mut found: Vec<Option<(usize, i32)>> = vec![None; haps.len()];
-        let mut remaining = wanted.len();
+        if self.found_pos_start.len() < haps.len() {
+            self.found_pos_start.resize(haps.len(), (0, m));
+        }
+        if self.found_mask.len() < haps.len() {
+            self.found_mask.resize(haps.len(), false);
+        }
+        for i in 0..haps.len() {
+            self.found_pos_start[i] = (0, m);
+            self.found_mask[i] = false;
+        }
+        let mut remaining = self.wanted_map.len();
         for (pos, hap) in self.ppa.iter().enumerate() {
             if remaining == 0 {
                 break;
             }
             let h = hap.to_usize() as u32;
-            if let Some(&idx) = wanted.get(&h) {
+            if let Some(&idx) = self.wanted_map.get(&h) {
                 let start = self.div.get(pos).copied().unwrap_or(m);
-                found[idx] = Some((pos, start));
+                self.found_pos_start[idx] = (pos, start);
+                self.found_mask[idx] = true;
                 remaining -= 1;
             }
         }
         for (i, &h) in haps.iter().enumerate() {
-            if let Some((pos, start)) = found[i] {
+            if self.found_mask[i] {
+                let (pos, start) = self.found_pos_start[i];
                 out.push((h, pos, start));
             }
         }
@@ -857,7 +907,7 @@ impl ReferencePbwt {
     }
 
     pub fn collect_positions_and_lens(
-        &self,
+        &mut self,
         marker: usize,
         haps: &[u32],
         out: &mut Vec<(u32, usize, i32)>,

@@ -87,9 +87,9 @@ pub struct BidirectionalPhaseIbsImpl<I: crate::model::pbwt::PbwtIndex> {
     /// are defined in global marker space.
     /// When None (full chromosome), marker indices are used directly.
     subset_to_global: Option<Vec<usize>>,
-    /// Stored alleles per marker for O(1) allele lookup.
-    /// alleles[m][h] = allele of haplotype h at marker m.
-    alleles: Vec<Vec<u8>>,
+    /// Stored alleles in row-major layout for O(1) allele lookup.
+    /// alleles_flat[m * n_haps + h] = allele of haplotype h at marker m.
+    alleles_flat: Vec<u8>,
     /// Number of distinct alleles per marker (after normalization)
     n_alleles_by_marker: Vec<usize>,
 
@@ -100,20 +100,24 @@ impl<I: crate::model::pbwt::PbwtIndex> BidirectionalPhaseIbsImpl<I>
 where
     BidirectionalPhaseIbsImpl<I>: PbwtStateCache<I>,
 {
+    #[inline]
+    fn marker_allele_row(&self, marker_idx: usize) -> &[u8] {
+        let start = marker_idx.saturating_mul(self.n_haps);
+        let end = start.saturating_add(self.n_haps).min(self.alleles_flat.len());
+        &self.alleles_flat[start..end]
+    }
+
     pub fn set_reference_start_hap(&mut self, start: u32) {
         self.reference_start_hap = Some(start);
     }
 
-    /// Build bidirectional PBWT from genotype data
-    ///
-    /// Uses sparse storage: PPA/div/pos arrays are only stored at checkpoint intervals
-    /// to reduce memory from O(n_markers × n_haps) to O(n_markers/64 × n_haps).
-    ///
-    /// # Arguments
-    /// * `alleles` - Allele data per marker
-    /// * `n_haps` - Number of haplotypes
-    /// * `n_markers` - Number of markers
-    pub fn build(mut alleles: Vec<Vec<u8>>, n_haps: usize, n_markers: usize) -> Self {
+    /// Build bidirectional PBWT from flat row-major allele data.
+    pub fn build_flat(mut alleles_flat: Vec<u8>, n_haps: usize, n_markers: usize) -> Self {
+        assert_eq!(
+            alleles_flat.len(),
+            n_markers.saturating_mul(n_haps),
+            "PBWT flat allele buffer has wrong length"
+        );
         let mut checkpoint_markers: Vec<usize> =
             (0..n_markers).step_by(PBWT_CHECKPOINT_INTERVAL).collect();
         if let Some(&last) = checkpoint_markers.last() {
@@ -138,9 +142,12 @@ where
 
         let mut next_checkpoint = 0usize;
         for m in 0..n_markers {
-            let n_alleles = normalize_pbwt_alleles(&mut alleles[m]);
+            let row_start = m.saturating_mul(n_haps);
+            let row_end = row_start.saturating_add(n_haps);
+            let row = &mut alleles_flat[row_start..row_end];
+            let n_alleles = normalize_pbwt_alleles(row);
             n_alleles_by_marker[m] = n_alleles;
-            updater.fwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
+            updater.fwd_update(row, n_alleles, m, &mut ppa, &mut div);
 
             if next_checkpoint < n_checkpoints && m == checkpoint_markers[next_checkpoint] {
                 fwd_ppa.push(ppa.clone());
@@ -155,7 +162,10 @@ where
         let mut next_checkpoint = n_checkpoints;
         for m in (0..n_markers).rev() {
             let n_alleles = n_alleles_by_marker[m];
-            updater.bwd_update(&alleles[m], n_alleles, m, &mut ppa, &mut div);
+            let row_start = m.saturating_mul(n_haps);
+            let row_end = row_start.saturating_add(n_haps);
+            let row = &alleles_flat[row_start..row_end];
+            updater.bwd_update(row, n_alleles, m, &mut ppa, &mut div);
 
             if next_checkpoint > 0 && m == checkpoint_markers[next_checkpoint - 1] {
                 let checkpoint_idx = next_checkpoint - 1;
@@ -175,7 +185,7 @@ where
             n_markers,
             n_checkpoints,
             subset_to_global: None,
-            alleles,
+            alleles_flat,
             n_alleles_by_marker,
             reference_start_hap: None,
         }
@@ -247,29 +257,13 @@ where
         )
     }
 
-    /// Build bidirectional PBWT for a marker subset with global index mapping.
-    ///
-    /// This variant is used when phasing operates on a subset of markers (e.g.,
-    /// high-frequency markers in Stage 1 phasing). The subset_to_global mapping
-    /// ensures IBS2 segment lookups (which use global indices) work correctly.
-    ///
-    /// # Arguments
-    /// * `alleles` - Allele data per subset marker (2D: [marker][haplotype])
-    /// * `n_haps` - Number of haplotypes
-    /// * `n_markers` - Number of markers in the subset
-    /// * `subset_to_global` - Mapping from subset index to global marker index
-    ///
-    /// # Example Use Case
-    /// Stage 1 phasing uses only high-frequency markers (e.g., MAF > 0.1) to
-    /// establish initial phase. The subset indices (0, 1, 2, ...) map to
-    /// non-contiguous global indices (e.g., 0, 5, 12, ...).
-    pub fn build_for_subset(
-        alleles: Vec<Vec<u8>>,
+    pub fn build_for_subset_flat(
+        alleles_flat: Vec<u8>,
         n_haps: usize,
         n_markers: usize,
         subset_to_global: &[usize],
     ) -> Self {
-        let mut result = Self::build(alleles, n_haps, n_markers);
+        let mut result = Self::build_flat(alleles_flat, n_haps, n_markers);
         result.subset_to_global = Some(subset_to_global.to_vec());
         result
     }
@@ -586,7 +580,10 @@ where
     /// when computing emissions for the HMM states.
     #[inline]
     pub fn allele(&self, marker: usize, hap: u32) -> u8 {
-        self.alleles[marker][hap as usize]
+        let idx = marker
+            .saturating_mul(self.n_haps)
+            .saturating_add(hap as usize);
+        self.alleles_flat.get(idx).copied().unwrap_or(255)
     }
 
     /// Find neighbors of a reference haplotype state in the PBWT.
@@ -730,7 +727,13 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
                     let mut div = std::mem::take(&mut state.3);
                     for m in (checkpoint_marker + 1)..=marker_idx {
                         let n_alleles = this.n_alleles_by_marker[m];
-                        updater.fwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                        updater.fwd_update(
+                            this.marker_allele_row(m),
+                            n_alleles,
+                            m,
+                            &mut ppa,
+                            &mut div,
+                        );
                     }
                     state.2 = ppa;
                     state.3 = div;
@@ -778,7 +781,13 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
                     let mut div = std::mem::take(&mut state.3);
                     for m in (marker_idx..checkpoint_marker).rev() {
                         let n_alleles = this.n_alleles_by_marker[m];
-                        updater.bwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                        updater.bwd_update(
+                            this.marker_allele_row(m),
+                            n_alleles,
+                            m,
+                            &mut ppa,
+                            &mut div,
+                        );
                     }
                     state.2 = ppa;
                     state.3 = div;
@@ -828,7 +837,13 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
                     let mut div = std::mem::take(&mut state.3);
                     for m in (checkpoint_marker + 1)..=marker_idx {
                         let n_alleles = this.n_alleles_by_marker[m];
-                        updater.fwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                        updater.fwd_update(
+                            this.marker_allele_row(m),
+                            n_alleles,
+                            m,
+                            &mut ppa,
+                            &mut div,
+                        );
                     }
                     state.2 = ppa;
                     state.3 = div;
@@ -876,7 +891,13 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
                     let mut div = std::mem::take(&mut state.3);
                     for m in (marker_idx..checkpoint_marker).rev() {
                         let n_alleles = this.n_alleles_by_marker[m];
-                        updater.bwd_update(&this.alleles[m], n_alleles, m, &mut ppa, &mut div);
+                        updater.bwd_update(
+                            this.marker_allele_row(m),
+                            n_alleles,
+                            m,
+                            &mut ppa,
+                            &mut div,
+                        );
                     }
                     state.2 = ppa;
                     state.3 = div;
@@ -893,22 +914,22 @@ pub enum BidirectionalPhaseIbs {
 }
 
 impl BidirectionalPhaseIbs {
-    pub fn build_for_subset(
-        alleles: Vec<Vec<u8>>,
+    pub fn build_for_subset_flat(
+        alleles_flat: Vec<u8>,
         n_haps: usize,
         n_markers: usize,
         subset_to_global: &[usize],
     ) -> Self {
         if n_haps <= u16::MAX as usize {
-            Self::U16(BidirectionalPhaseIbsImpl::<u16>::build_for_subset(
-                alleles,
+            Self::U16(BidirectionalPhaseIbsImpl::<u16>::build_for_subset_flat(
+                alleles_flat,
                 n_haps,
                 n_markers,
                 subset_to_global,
             ))
         } else {
-            Self::U32(BidirectionalPhaseIbsImpl::<u32>::build_for_subset(
-                alleles,
+            Self::U32(BidirectionalPhaseIbsImpl::<u32>::build_for_subset_flat(
+                alleles_flat,
                 n_haps,
                 n_markers,
                 subset_to_global,
