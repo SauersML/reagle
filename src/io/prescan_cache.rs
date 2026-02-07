@@ -23,6 +23,13 @@ pub enum PackedRefColumn {
 }
 
 impl PackedRefColumn {
+    pub fn n_haplotypes(&self) -> usize {
+        match self {
+            PackedRefColumn::Bits { n_haps, .. } => *n_haps,
+            PackedRefColumn::Bytes { alleles } => alleles.len(),
+        }
+    }
+
     pub fn allele(&self, hap: usize) -> u8 {
         match self {
             PackedRefColumn::Bytes { alleles } => alleles.get(hap).copied().unwrap_or(255),
@@ -134,42 +141,62 @@ impl PackedRefColumn {
         marker_idx: MarkerIdx<Space>,
         markers: &Markers<Space>,
         col: &GenotypeColumn,
-    ) -> Self {
+    ) -> Result<Self> {
         let marker = markers.marker(marker_idx);
         let n_alleles = marker.n_alleles();
         let bits = bits_per_allele(n_alleles);
         let n_haps = col.n_haplotypes();
 
-        let mut alleles = Vec::with_capacity(n_haps);
-        for h in 0..n_haps {
-            alleles.push(col.get(crate::data::haplotype::HapIdx::new(h as u32)));
+        if n_alleles > 255 {
+            return Err(ReagleError::vcf(format!(
+                "marker has {} alleles; maximum supported is 255 because 255 is reserved for missing",
+                n_alleles
+            )));
         }
 
-        if bits == 0 || bits >= 8 {
-            return PackedRefColumn::Bytes { alleles };
+        for h in 0..n_haps {
+            let a = col.get(crate::data::haplotype::HapIdx::new(h as u32));
+            if a != 255 && (a as usize) >= n_alleles {
+                return Err(ReagleError::vcf(format!(
+                    "invalid allele {} at marker {} (n_alleles={})",
+                    a,
+                    marker_idx.as_usize(),
+                    n_alleles
+                )));
+            }
+        }
+
+        let use_bits = should_use_bit_packing(bits as usize, n_haps);
+        if !use_bits {
+            let mut alleles = Vec::with_capacity(n_haps);
+            for h in 0..n_haps {
+                alleles.push(col.get(crate::data::haplotype::HapIdx::new(h as u32)));
+            }
+            return Ok(PackedRefColumn::Bytes { alleles });
         }
 
         let bits_usize = bits as usize;
-        let n_words = ((n_haps * bits_usize) + 63) / 64;
+        let n_words = packed_words_len(bits_usize, n_haps);
         let mut words = vec![0u64; n_words];
-        let mut missing = vec![0u64; (n_haps + 63) / 64];
-        let max_val = (1u16 << bits_usize) - 1;
+        let mut missing = vec![0u64; packed_missing_words_len(n_haps)];
 
-        for (i, &a) in alleles.iter().enumerate() {
-            let miss = a == 255 || (a as u16) > max_val;
-            if miss {
+        for i in 0..n_haps {
+            let a = col.get(crate::data::haplotype::HapIdx::new(i as u32));
+            if a == 255 {
                 set_missing_bit(&mut missing, i);
                 continue;
             }
-            pack_bits(&mut words, bits_usize, i, a as u64);
+            if bits_usize > 0 {
+                pack_bits(&mut words, bits_usize, i, a as u64);
+            }
         }
 
-        PackedRefColumn::Bits {
+        Ok(PackedRefColumn::Bits {
             bits,
             n_haps,
             words,
             missing,
-        }
+        })
     }
 }
 
@@ -182,16 +209,16 @@ pub struct PackedRefWindow {
 pub fn pack_ref_columns(
     markers: &Markers<RefWindowSpace>,
     ref_columns: &[GenotypeColumn],
-) -> Vec<PackedRefColumn> {
+) -> Result<Vec<PackedRefColumn>> {
     let mut packed = Vec::with_capacity(ref_columns.len());
     for (m, col) in ref_columns.iter().enumerate() {
         packed.push(PackedRefColumn::pack_from_column(
             MarkerIdx::new(m as u32),
             markers,
             col,
-        ));
+        )?);
     }
-    packed
+    Ok(packed)
 }
 
 pub struct PrescanCacheWriter {
@@ -237,6 +264,32 @@ impl PrescanCacheWriter {
                 "prescan cache header not written".to_string(),
             ));
         }
+        if window.markers.len() != window.ref_columns.len() {
+            return Err(ReagleError::vcf(format!(
+                "cache window marker/column mismatch: markers={} columns={}",
+                window.markers.len(),
+                window.ref_columns.len()
+            )));
+        }
+        if let Some(first_col) = window.ref_columns.first() {
+            let window_haps = first_col.n_haplotypes();
+            for (i, col) in window.ref_columns.iter().enumerate().skip(1) {
+                if col.n_haplotypes() != window_haps {
+                    return Err(ReagleError::vcf(format!(
+                        "cache window has inconsistent haplotypes across columns: col0={} col{}={}",
+                        window_haps,
+                        i,
+                        col.n_haplotypes()
+                    )));
+                }
+            }
+            if self.n_ref_haps != window_haps {
+                return Err(ReagleError::vcf(format!(
+                    "cache header n_ref_haps={} does not match window haplotypes={}",
+                    self.n_ref_haps, window_haps
+                )));
+            }
+        }
         let n_markers = window.markers.len() as u32;
         write_u32(&mut self.file, n_markers)?;
         let markers_blob = bincode::serialize(&window.markers)
@@ -245,7 +298,7 @@ impl PrescanCacheWriter {
         self.file.write_all(&markers_blob)?;
 
         write_u32(&mut self.file, window.ref_columns.len() as u32)?;
-        let packed_cols = pack_ref_columns(&window.markers, &window.ref_columns);
+        let packed_cols = pack_ref_columns(&window.markers, &window.ref_columns)?;
         for packed in packed_cols {
             write_packed_column(&mut self.file, &packed)?;
         }
@@ -261,6 +314,7 @@ impl PrescanCacheWriter {
 pub struct PrescanCacheReader {
     reader: BufReader<File>,
     data_offset: u64,
+    n_ref_haps: usize,
     eof: bool,
 }
 
@@ -278,11 +332,12 @@ impl PrescanCacheReader {
                 "unsupported prescan cache version".to_string(),
             ));
         }
-        read_u32(&mut reader)?;
+        let n_ref_haps = read_u32(&mut reader)? as usize;
         let data_offset = reader.stream_position()?;
         Ok(Self {
             reader,
             data_offset,
+            n_ref_haps,
             eof: false,
         })
     }
@@ -310,6 +365,13 @@ impl PrescanCacheReader {
         let markers: Markers<crate::data::marker::RefWindowSpace> =
             bincode::deserialize(&markers_blob)
                 .map_err(|e| ReagleError::vcf(format!("marker deserialize failed: {}", e)))?;
+        if markers.len() != n_markers {
+            return Err(ReagleError::vcf(format!(
+                "cache window marker count mismatch: header={} decoded={}",
+                n_markers,
+                markers.len()
+            )));
+        }
 
         let n_cols = read_u32(&mut self.reader)? as usize;
         if n_cols != n_markers {
@@ -319,7 +381,15 @@ impl PrescanCacheReader {
         }
         let mut columns = Vec::with_capacity(n_cols);
         for _ in 0..n_cols {
-            columns.push(read_packed_column(&mut self.reader)?);
+            let col = read_packed_column(&mut self.reader)?;
+            if col.n_haplotypes() != self.n_ref_haps {
+                return Err(ReagleError::vcf(format!(
+                    "cache haplotype count mismatch: header={} column={}",
+                    self.n_ref_haps,
+                    col.n_haplotypes()
+                )));
+            }
+            columns.push(col);
         }
 
         Ok(Some(PackedRefWindow { markers, columns }))
@@ -398,6 +468,12 @@ fn read_packed_column<R: Read>(r: &mut R) -> Result<PackedRefColumn> {
         0 => {
             let mut bits = [0u8; 1];
             r.read_exact(&mut bits)?;
+            if bits[0] > 63 {
+                return Err(ReagleError::vcf(format!(
+                    "invalid bit width in cache column: {}",
+                    bits[0]
+                )));
+            }
             let n_haps = read_u32(r)? as usize;
             let n_words = read_u32(r)? as usize;
             let mut words = vec![0u64; n_words];
@@ -412,6 +488,25 @@ fn read_packed_column<R: Read>(r: &mut R) -> Result<PackedRefColumn> {
                 let mut buf = [0u8; 8];
                 r.read_exact(&mut buf)?;
                 *w = u64::from_le_bytes(buf);
+            }
+            let expected_missing = packed_missing_words_len(n_haps);
+            if missing.len() != expected_missing {
+                return Err(ReagleError::vcf(format!(
+                    "invalid missing bitmap length: got {} expected {} for n_haps={}",
+                    missing.len(),
+                    expected_missing,
+                    n_haps
+                )));
+            }
+            let expected_words = packed_words_len(bits[0] as usize, n_haps);
+            if words.len() != expected_words {
+                return Err(ReagleError::vcf(format!(
+                    "invalid packed word length: got {} expected {} for bits={} n_haps={}",
+                    words.len(),
+                    expected_words,
+                    bits[0],
+                    n_haps
+                )));
             }
             Ok(PackedRefColumn::Bits {
                 bits: bits[0],
@@ -449,6 +544,28 @@ fn pack_bits(words: &mut [u64], bits: usize, idx: usize, value: u64) {
     if shift + bits > 64 && word + 1 < words.len() {
         words[word + 1] |= v >> (64 - shift);
     }
+}
+
+fn packed_missing_words_len(n_haps: usize) -> usize {
+    n_haps.div_ceil(64)
+}
+
+fn packed_words_len(bits: usize, n_haps: usize) -> usize {
+    if bits == 0 {
+        0
+    } else {
+        (n_haps * bits).div_ceil(64)
+    }
+}
+
+fn should_use_bit_packing(bits: usize, n_haps: usize) -> bool {
+    if bits == 0 {
+        return true;
+    }
+    let byte_storage = n_haps;
+    let bit_storage = packed_words_len(bits, n_haps) * std::mem::size_of::<u64>()
+        + packed_missing_words_len(n_haps) * std::mem::size_of::<u64>();
+    bit_storage < byte_storage
 }
 
 fn unpack_bits(words: &[u64], bits: usize, idx: usize) -> u64 {
@@ -509,7 +626,7 @@ mod tests {
 
         let alleles = vec![0u8, 1, 0, 1, 255];
         let col = GenotypeColumn::from_alleles(&alleles, 2);
-        let packed = PackedRefColumn::pack_from_column(MarkerIdx::new(0), &markers, &col);
+        let packed = PackedRefColumn::pack_from_column(MarkerIdx::new(0), &markers, &col).unwrap();
 
         let mut out = vec![0u8; alleles.len()];
         packed.fill_alleles(&mut out);

@@ -8,6 +8,7 @@ use crate::data::marker::AlleleMapping;
 use crate::data::marker::AnyMarkerSpace;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
+use crate::error::Result;
 use crate::io::prescan_cache::PackedRefColumn;
 
 /// Packed reference columns aligned to target marker indices.
@@ -63,7 +64,7 @@ impl<RefSpace: Send + Sync> PackedRefView<RefSpace> {
         ref_gt: &GenotypeMatrix<crate::data::storage::phase_state::Phased, RefSpace>,
         alignment: &MarkerAlignment<AnyMarkerSpace, RefSpace>,
         target_markers: &[usize],
-    ) -> Self {
+    ) -> Result<Self> {
         let n_targets = target_gt.n_markers();
         let n_ref_haps = ref_gt.n_haplotypes();
         let mut columns: Vec<Option<PackedRefColumn>> = vec![None; n_targets];
@@ -75,17 +76,17 @@ impl<RefSpace: Send + Sync> PackedRefView<RefSpace> {
             }
             if let Some(r_idx) = alignment.target_to_ref[t] {
                 let col = ref_gt.column(r_idx);
-                let packed = PackedRefColumn::pack_from_column(r_idx, ref_gt.markers(), &col);
+                let packed = PackedRefColumn::pack_from_column(r_idx, ref_gt.markers(), &col)?;
                 columns[t] = Some(packed);
                 allele_maps[t] = alignment.allele_mappings[t].clone();
             }
         }
 
-        Self {
+        Ok(Self {
             n_ref_haps,
             columns,
             allele_maps,
             phantom: std::marker::PhantomData,
-        }
+        })
     }
 }

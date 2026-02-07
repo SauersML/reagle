@@ -82,6 +82,7 @@ const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
+const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
 const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
@@ -108,9 +109,7 @@ fn estimate_state_budget(available_bytes: u64, n_threads: usize, window_markers:
     if available_bytes == 0 || n_threads == 0 || window_markers == 0 {
         return 0;
     }
-    // Per-state memory: fwd + bwd + emissions + weights (4 * f32),
-    // plus per-marker fwd_history (f32) and ref_alleles (u8).
-    let per_state_bytes = 16usize.saturating_add(window_markers.saturating_mul(5));
+    let per_state_bytes = estimate_per_state_bytes(window_markers);
     if per_state_bytes == 0 {
         return 0;
     }
@@ -118,6 +117,14 @@ fn estimate_state_budget(available_bytes: u64, n_threads: usize, window_markers:
     let per_thread = budget / n_threads.max(1) as u64;
     let safe_bytes = (per_thread as f64 * STATE_BUDGET_SAFETY) as u64;
     (safe_bytes as usize) / per_state_bytes
+}
+
+#[inline]
+fn estimate_per_state_bytes(window_markers: usize) -> usize {
+    // Conservative model used by both planning paths:
+    // - per-state vectors (fwd, bwd, emissions, weights): 4 * f32 = 16 bytes
+    // - marker-scaled scratch upper bound (history/checkpoint + allele cache): 5 bytes/marker
+    16usize.saturating_add(window_markers.saturating_mul(5))
 }
 
 #[derive(Clone, Debug)]
@@ -138,16 +145,21 @@ struct HapIntervals {
     intervals: Vec<(u32, u32)>,
 }
 
-impl HapIntervals {
-    fn contains(&self, window_idx: usize) -> bool {
-        let idx = window_idx as u32;
-        for &(start, end) in self.intervals.iter() {
-            if idx >= start && idx <= end {
-                return true;
+#[inline]
+fn interval_support_at_window(intervals: &HapIntervals, window_idx: usize) -> Option<u32> {
+    let idx = window_idx as u32;
+    let mut best_span = 0u32;
+    let mut found = false;
+    for &(start, end) in intervals.intervals.iter() {
+        if idx >= start && idx <= end {
+            found = true;
+            let span = end.saturating_sub(start).saturating_add(1);
+            if span > best_span {
+                best_span = span;
             }
         }
-        false
     }
+    if found { Some(best_span) } else { None }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -327,18 +339,53 @@ fn build_sampling_points(gen_positions: &[f64], step_cm: f64) -> Vec<bool> {
     sampling
 }
 
+fn add_typed_anchor_sampling<SpaceA, SpaceB>(
+    sampling: &mut [bool],
+    gen_positions: &[f64],
+    alignment: &MarkerAlignment<SpaceA, SpaceB>,
+    step_cm: f64,
+) {
+    let n = sampling.len().min(gen_positions.len());
+    if n == 0 {
+        return;
+    }
+    let step = step_cm.max(1e-6);
+    let first = gen_positions[0];
+    let mut anchors_per_bin: HashMap<i64, usize> = HashMap::new();
+
+    for m in 0..n {
+        if !sampling[m] {
+            continue;
+        }
+        let bin = ((gen_positions[m] - first) / step).floor() as i64;
+        let entry = anchors_per_bin.entry(bin).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    for m in 0..n {
+        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_none() || sampling[m] {
+            continue;
+        }
+        let bin = ((gen_positions[m] - first) / step).floor() as i64;
+        let used = anchors_per_bin.get(&bin).copied().unwrap_or(0);
+        if used < PBWT_TYPED_ANCHORS_PER_BIN {
+            sampling[m] = true;
+            anchors_per_bin.insert(bin, used + 1);
+        }
+    }
+}
+
 fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> Vec<f64> {
     if handoff.len() < 2 {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(handoff.len() - 1);
     for i in 0..handoff.len() - 1 {
-        let (prev_left, _) = handoff[i];
-        let (_, next_right) = handoff[i + 1];
-        // Use handoff anchor distance in cM (gen_pos is cM here); enforce
-        // a small minimum to avoid
-        // zero-distance degeneracy across overlapping windows.
-        let dist = (next_right - prev_left).max(min_step_cm);
+        let (prev_start, _) = handoff[i];
+        let (next_start, _) = handoff[i + 1];
+        // Use output-start step in cM so overlap geometry does not collapse
+        // distances to a clamped constant.
+        let dist = (next_start - prev_start).abs().max(min_step_cm);
         out.push(dist);
     }
     out
@@ -582,15 +629,12 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     let mut gen_positions = Vec::with_capacity(n_markers);
     for m in 0..n_markers {
         let marker = target_gt.markers().marker(MarkerIdx::new(m as u32));
-        let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
+        let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
+        let gen_pos = gen_maps.gen_pos_by_name(chrom_name, marker.pos);
         gen_positions.push(gen_pos);
     }
     let mut sampling = build_sampling_points(&gen_positions, step_cm);
-    for m in 0..n_markers {
-        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_some() {
-            sampling[m] = true;
-        }
-    }
+    add_typed_anchor_sampling(&mut sampling, &gen_positions, alignment, step_cm);
     let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
 
     let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
@@ -620,23 +664,19 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             ref_alleles.fill(255);
         }
 
-        let mut is_biallelic = true;
+        let mut max_allele = 1u8;
         for &a in ref_alleles.iter() {
-            if a >= 2 && a != 255 {
-                is_biallelic = false;
-                break;
+            if a != 255 && a > max_allele {
+                max_allele = a;
             }
         }
-        if is_biallelic {
-            for &q in &query_alleles {
-                let a = q.value();
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
+        for &q in &query_alleles {
+            let a = q.value();
+            if a != 255 && a > max_allele {
+                max_allele = a;
             }
         }
-        let n_alleles = if is_biallelic { 2 } else { 256 };
+        let n_alleles = (max_allele as usize).saturating_add(1).max(2);
 
         pbwt_fwd.advance_with_beams_strict(
             &ref_alleles,
@@ -703,23 +743,19 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             ref_alleles.fill(255);
         }
 
-        let mut is_biallelic = true;
+        let mut max_allele = 1u8;
         for &a in ref_alleles.iter() {
-            if a >= 2 && a != 255 {
-                is_biallelic = false;
-                break;
+            if a != 255 && a > max_allele {
+                max_allele = a;
             }
         }
-        if is_biallelic {
-            for &q in &query_alleles {
-                let a = q.value();
-                if a >= 2 && a != 255 {
-                    is_biallelic = false;
-                    break;
-                }
+        for &q in &query_alleles {
+            let a = q.value();
+            if a != 255 && a > max_allele {
+                max_allele = a;
             }
         }
-        let n_alleles = if is_biallelic { 2 } else { 256 };
+        let n_alleles = (max_allele as usize).saturating_add(1).max(2);
 
         pbwt_bwd.advance_with_beams_strict(
             &ref_alleles,
@@ -1022,7 +1058,7 @@ fn compute_per_window_cap(
     let mut per_window_cap_window = if force_full_panel {
         n_ref_haps.max(1)
     } else {
-        let per_state_bytes = 4usize.saturating_mul(4 + n_ref_markers);
+        let per_state_bytes = estimate_per_state_bytes(n_ref_markers);
         let mut cap = if per_state_bytes == 0 {
             0
         } else {
@@ -1152,16 +1188,18 @@ fn prepare_reference_data(
 
             let output_start = ref_window.output_start.min(n_ref_markers.saturating_sub(1));
             let output_end = ref_window.output_end.min(n_ref_markers).max(1);
-            let left_idx = output_end.saturating_sub(1);
-            let right_idx = output_start.min(n_ref_markers.saturating_sub(1));
-            let left_marker = ref_window.markers.marker(MarkerIdx::new(left_idx as u32));
-            let right_marker = ref_window.markers.marker(MarkerIdx::new(right_idx as u32));
-            let left_gen = gen_maps.gen_pos(left_marker.chrom, left_marker.pos);
-            let right_gen = gen_maps.gen_pos(right_marker.chrom, right_marker.pos);
-            window_handoff.push((left_gen, right_gen));
+            let start_idx = output_start.min(n_ref_markers.saturating_sub(1));
+            let end_idx = output_end.saturating_sub(1);
+            let start_marker = ref_window.markers.marker(MarkerIdx::new(start_idx as u32));
+            let end_marker = ref_window.markers.marker(MarkerIdx::new(end_idx as u32));
+            let start_chrom = ref_window.markers.chrom_name(start_marker.chrom).unwrap_or("");
+            let end_chrom = ref_window.markers.chrom_name(end_marker.chrom).unwrap_or("");
+            let start_gen = gen_maps.gen_pos_by_name(start_chrom, start_marker.pos);
+            let end_gen = gen_maps.gen_pos_by_name(end_chrom, end_marker.pos);
+            window_handoff.push((start_gen, end_gen));
 
             if use_in_memory {
-                let packed = pack_ref_columns(&ref_window.markers, &ref_window.ref_columns);
+                let packed = pack_ref_columns(&ref_window.markers, &ref_window.ref_columns)?;
                 total_bytes =
                     total_bytes.saturating_add(estimate_ref_window_bytes(&ref_window, &packed));
                 if total_bytes <= memory_budget {
@@ -1285,15 +1323,11 @@ fn is_vcf_fully_phased(path: &Path) -> Result<bool> {
         for sample in parts {
             let mut fields = sample.split(':');
             let gt = fields.nth(gt_idx).unwrap_or("");
-            // Missing genotypes (e.g. "./.", ".|.", "0/.") should not force
-            // the entire file to be treated as unphased.
-            if gt.contains('.') {
-                continue;
-            }
             if gt.contains('/') {
                 line.clear();
                 return Ok(false);
             }
+            // Missing phased genotypes such as ".|." are allowed here.
         }
         line.clear();
     }
@@ -1600,6 +1634,18 @@ fn build_imputation_plan(
         for list in scores_by_window.iter_mut() {
             list.clear();
         }
+        for i in 0..batch_len {
+            if global_scores[i].len() != n_ref_haps {
+                global_scores[i] = vec![0.0f32; n_ref_haps];
+                window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                window_rank_hits[i] = vec![0u32; n_ref_haps];
+            } else {
+                global_scores[i].fill(0.0);
+                best_window_scores[i].fill(f32::NEG_INFINITY);
+                window_rank_hits[i].fill(0);
+            }
+        }
 
         let mut window_idx = 0usize;
         match ref_data {
@@ -1622,12 +1668,12 @@ fn build_imputation_plan(
                             .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
                             .pos;
                         let span_bp = end_pos.saturating_sub(start_pos);
-                        let start_cm = gen_maps.gen_pos(
-                            ref_window.markers.marker(MarkerIdx::new(0)).chrom,
-                            start_pos,
-                        );
-                        let end_cm = gen_maps
-                            .gen_pos(ref_window.markers.marker(MarkerIdx::new(0)).chrom, end_pos);
+                        let span_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
+                            .unwrap_or("");
+                        let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
+                        let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
                         window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
@@ -1698,15 +1744,6 @@ fn build_imputation_plan(
                         let phased_target = target_window.genotypes.clone().into_phased();
                         (alignment, phased_target)
                     };
-
-                    for i in 0..batch_len {
-                        if global_scores[i].len() != n_ref_haps {
-                            global_scores[i] = vec![0.0f32; n_ref_haps];
-                            window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
-                            best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
-                            window_rank_hits[i] = vec![0u32; n_ref_haps];
-                        }
-                    }
 
                     for w in window_scores.iter_mut() {
                         w.fill(f32::NEG_INFINITY);
@@ -1808,12 +1845,12 @@ fn build_imputation_plan(
                             .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
                             .pos;
                         let span_bp = end_pos.saturating_sub(start_pos);
-                        let start_cm = gen_maps.gen_pos(
-                            ref_window.markers.marker(MarkerIdx::new(0)).chrom,
-                            start_pos,
-                        );
-                        let end_cm = gen_maps
-                            .gen_pos(ref_window.markers.marker(MarkerIdx::new(0)).chrom, end_pos);
+                        let span_chrom = ref_window
+                            .markers
+                            .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
+                            .unwrap_or("");
+                        let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
+                        let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
                         window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
@@ -1888,15 +1925,6 @@ fn build_imputation_plan(
                         let phased_target = target_window.genotypes.clone().into_phased();
                         (alignment, phased_target)
                     };
-
-                    for i in 0..batch_len {
-                        if global_scores[i].len() != n_ref_haps {
-                            global_scores[i] = vec![0.0f32; n_ref_haps];
-                            window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
-                            best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
-                            window_rank_hits[i] = vec![0u32; n_ref_haps];
-                        }
-                    }
 
                     for w in window_scores.iter_mut() {
                         w.fill(f32::NEG_INFINITY);
@@ -2094,6 +2122,7 @@ fn build_imputation_plan(
                             intervals: spans,
                         });
                     }
+                    intervals.sort_unstable_by_key(|hi| hi.hap.as_u32());
                     let mut core = Vec::new();
                     let need_end = window_scores_matrix.len().saturating_sub(1) as u32;
                     for hi in intervals.iter() {
@@ -2445,8 +2474,7 @@ impl crate::pipelines::ImputationPipeline {
             .max(1e-6);
         if let Some(phased_rho) = phased_recomb_intensity {
             if phased_rho.is_finite() && phased_rho > 0.0 {
-                impute_recomb_intensity =
-                    phased_rho.clamp(1e-6, ModelParams::MAX_RECOMB_INTENSITY);
+                impute_recomb_intensity = phased_rho.clamp(1e-6, ModelParams::MAX_RECOMB_INTENSITY);
             }
         }
         self.params.recomb_intensity = impute_recomb_intensity;
@@ -3188,8 +3216,9 @@ impl crate::pipelines::ImputationPipeline {
         let ref_allele_freqs = RefAlleleFreqs::new(ref_columns);
 
         let gen_positions: Vec<f64> = {
-            let chrom = ref_markers.marker(MarkerIdx::new(0)).chrom;
-            if let Some(gen_map) = gen_maps.get(chrom) {
+            let chrom_idx = ref_markers.marker(MarkerIdx::new(0)).chrom;
+            let chrom_name = ref_markers.chrom_name(chrom_idx).unwrap_or("");
+            if let Some(gen_map) = gen_maps.get_by_name(chrom_name) {
                 crate::data::genetic_map::MarkerMap::create(ref_markers, gen_map)
                     .gen_positions()
                     .to_vec()
@@ -3282,13 +3311,17 @@ impl crate::pipelines::ImputationPipeline {
             for hap_idx in 0..(n_target_samples * 2) {
                 let mut state_haps: Vec<RefHapId> = Vec::new();
                 if hap_idx < plan.window_intervals.len() {
+                    let mut ranked: Vec<(RefHapId, u32)> = Vec::new();
                     for hi in plan.window_intervals[hap_idx].iter() {
-                        if hi.contains(window_idx) {
-                            state_haps.push(hi.hap);
-                            if state_haps.len() >= per_window_cap_local {
-                                break;
-                            }
+                        if let Some(span) = interval_support_at_window(hi, window_idx) {
+                            ranked.push((hi.hap, span));
                         }
+                    }
+                    ranked.sort_unstable_by(|a, b| {
+                        b.1.cmp(&a.1).then_with(|| a.0.as_u32().cmp(&b.0.as_u32()))
+                    });
+                    for (hap, _) in ranked {
+                        state_haps.push(hap);
                     }
                 }
                 if state_haps.is_empty() && hap_idx < plan.core_states.len() {
@@ -3299,6 +3332,33 @@ impl crate::pipelines::ImputationPipeline {
                 if hap_idx < plan.abyss_mask.len() {
                     let abyss = &plan.abyss_mask[hap_idx];
                     state_haps.retain(|g| !abyss[g.as_usize()]);
+                }
+                if state_haps.len() > per_window_cap_local {
+                    let core_for_hap = plan
+                        .core_states
+                        .get(hap_idx)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let core_set: std::collections::HashSet<u32> =
+                        core_for_hap.iter().map(|h| h.as_u32()).collect();
+                    let mut prioritized: Vec<RefHapId> = state_haps
+                        .iter()
+                        .copied()
+                        .filter(|h| core_set.contains(&h.as_u32()))
+                        .collect();
+                    if prioritized.len() < per_window_cap_local {
+                        for hap in state_haps.iter().copied() {
+                            if !core_set.contains(&hap.as_u32()) {
+                                prioritized.push(hap);
+                                if prioritized.len() >= per_window_cap_local {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        prioritized.truncate(per_window_cap_local);
+                    }
+                    state_haps = prioritized;
                 }
                 if state_haps.is_empty() {
                     // Hard fallback: pick the first non-abyss haplotypes.
@@ -3314,10 +3374,12 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
                 }
-                assert!(
-                    !state_haps.is_empty(),
-                    "State selection produced empty haplotype set"
-                );
+                if state_haps.is_empty() {
+                    return Err(ReagleError::vcf(format!(
+                        "State selection produced empty haplotype set (window={}, hap={}, cap={})",
+                        window_idx, hap_idx, per_window_cap_local
+                    )));
+                }
                 state_haps_by_hap.push(state_haps);
             }
         }
@@ -3328,7 +3390,8 @@ impl crate::pipelines::ImputationPipeline {
             None
         };
 
-        let prior_mappers_by_hap: Option<Vec<Option<TransitionMatrix>>> = overlap_hap_priors.map(|hp| {
+        let prior_mappers_by_hap: Option<Vec<Option<TransitionMatrix>>> =
+            overlap_hap_priors.map(|hp| {
                 let mut out: Vec<Option<TransitionMatrix>> =
                     Vec::with_capacity(n_target_samples * 2);
                 for hap_idx in 0..(n_target_samples * 2) {
@@ -3489,11 +3552,7 @@ impl crate::pipelines::ImputationPipeline {
                         && (!is_diploid || (mapped2 != 255 && (mapped2 as usize) < n_alleles));
                     let input_phased = target_win
                         .phase_mask()
-                        .and_then(|mask| {
-                            mask.get(target_m)
-                                .and_then(|row| row.get(sample_idx))
-                                .copied()
-                        })
+                        .and_then(|mask| mask.get(target_m, sample_idx))
                         .map(|v| v != 0)
                         .unwrap_or(true);
                     let local_phase_conf_valid = phase_conf_valid && input_phased;
@@ -3907,7 +3966,11 @@ impl crate::pipelines::ImputationPipeline {
                 // Donor/confusion evidence should be collected where the target
                 // is informative in this window, not only at the tail overlap.
                 // Overlap markers are still included to preserve handoff behavior.
-                let aligned_here = alignment.ref_to_target.get(ref_m).and_then(|v| *v).is_some();
+                let aligned_here = alignment
+                    .ref_to_target
+                    .get(ref_m)
+                    .and_then(|v| *v)
+                    .is_some();
                 let in_overlap = ref_m >= overlap_start && ref_m < output_end;
                 let store = aligned_here || in_overlap;
 
@@ -3932,13 +3995,12 @@ impl crate::pipelines::ImputationPipeline {
                                 .get(i)
                                 .and_then(|qa| qa.as_allele())
                                 .unwrap_or(255);
-                            let info_weight = if target_allele == 255
-                                || (target_allele as usize) >= n_alleles
-                            {
-                                0.0
-                            } else {
-                                info_llr
-                            };
+                            let info_weight =
+                                if target_allele == 255 || (target_allele as usize) >= n_alleles {
+                                    0.0
+                                } else {
+                                    info_llr
+                                };
                             if target_allele != 255 {
                                 sm_total_info[hap_idx] += info_weight;
                             }
@@ -4225,89 +4287,6 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     Ok(out)
                 };
-                let blend_posts_untyped = |base: &mut [AllelePosteriors],
-                                           donor: &[AllelePosteriors],
-                                           input_probs: &TargetAlleleProbs,
-                                           w: f32| {
-                    if w <= 0.0 {
-                        return;
-                    }
-                    let ww = w.clamp(0.0, 1.0);
-                    for (m, (b, d)) in base.iter_mut().zip(donor.iter()).enumerate() {
-                        if !input_probs.is_untyped_uniform_marker(m) {
-                            continue;
-                        }
-                        let wm = ww;
-                        if wm <= 0.0 {
-                            continue;
-                        }
-                        match (b, d) {
-                            (AllelePosteriors::Biallelic(pb), AllelePosteriors::Biallelic(pd)) => {
-                                *pb = ((1.0 - wm) * *pb + wm * *pd).clamp(0.0, 1.0);
-                            }
-                            (
-                                AllelePosteriors::Multiallelic(pb),
-                                AllelePosteriors::Multiallelic(pd),
-                            ) => {
-                                if pb.len() == pd.len() && !pb.is_empty() {
-                                    let mut sum = 0.0f32;
-                                    for i in 0..pb.len() {
-                                        pb[i] = (1.0 - wm) * pb[i] + wm * pd[i];
-                                        if pb[i] < 0.0 {
-                                            pb[i] = 0.0;
-                                        }
-                                        sum += pb[i];
-                                    }
-                                    if sum > 0.0 {
-                                        let inv = 1.0 / sum;
-                                        for v in pb.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                };
-                let temper_posts_untyped =
-                    |base: &mut [AllelePosteriors], input_probs: &TargetAlleleProbs, tau: f32| {
-                        let tau = tau.max(1.0);
-                        if tau <= 1.000_001 {
-                            return;
-                        }
-                        let inv_tau = 1.0 / tau;
-                        for (m, b) in base.iter_mut().enumerate() {
-                            if !input_probs.is_untyped_uniform_marker(m) {
-                                continue;
-                            }
-                            match b {
-                                AllelePosteriors::Biallelic(p_alt) => {
-                                    let p = (*p_alt).clamp(1e-9, 1.0 - 1e-9);
-                                    let logit = (p / (1.0 - p)).ln();
-                                    let scaled = logit * inv_tau;
-                                    *p_alt = 1.0 / (1.0 + (-scaled).exp());
-                                }
-                                AllelePosteriors::Multiallelic(probs) => {
-                                    if probs.is_empty() {
-                                        continue;
-                                    }
-                                    let mut sum = 0.0f32;
-                                    for v in probs.iter_mut() {
-                                        let p = (*v).max(1e-12);
-                                        *v = p.powf(inv_tau);
-                                        sum += *v;
-                                    }
-                                    if sum > 0.0 {
-                                        let inv = 1.0 / sum;
-                                        for v in probs.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
 
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
@@ -4565,31 +4544,47 @@ impl crate::pipelines::ImputationPipeline {
                                 .collect();
                             Some(norm)
                         }
-                    } else if !donors.is_empty() {
-                        let mut mapped = vec![0.0f32; state_haps.len()];
-                        let mut donor_total = 0.0f32;
-                        for (hap, count) in donors.iter() {
-                            donor_total += *count as f32;
-                            if let Ok(idx) = state_haps.binary_search(hap) {
-                                mapped[idx] += *count as f32;
-                            }
-                        }
-                        if donor_total > 0.0 && !mapped.is_empty() {
-                            let k = mapped.len() as f32;
-                            let denom = donor_total + k;
-                            for v in mapped.iter_mut() {
-                                *v = (*v + 1.0) / denom;
-                            }
-                            if normalize_probs(&mut mapped) {
-                                Some(mapped)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
                     } else {
-                        None
+                        // First-window Bayesian initialization:
+                        // build a Dirichlet-smoothed state prior from PBWT donor
+                        // multiplicities when no handoff prior exists.
+                        if donors.is_empty() {
+                            None
+                        } else {
+                            let alpha = 1.0f32;
+                            let mut mapped = vec![alpha; state_haps.len()];
+                            let mut any_mass = false;
+                            for (donor_hap, donor_count) in donors.iter() {
+                                if *donor_count == 0 {
+                                    continue;
+                                }
+                                if let Some(idx) = state_haps.iter().position(|h| h == donor_hap) {
+                                    mapped[idx] += *donor_count as f32;
+                                    any_mass = true;
+                                }
+                            }
+                            if !any_mass {
+                                None
+                            } else {
+                                let mut sum = 0.0f32;
+                                for v in mapped.iter() {
+                                    if v.is_finite() && *v > 0.0 {
+                                        sum += *v;
+                                    }
+                                }
+                                if sum <= 0.0 {
+                                    None
+                                } else {
+                                    let inv = 1.0 / sum;
+                                    Some(
+                                        mapped
+                                            .into_iter()
+                                            .map(|v| if v.is_finite() && v > 0.0 { v * inv } else { 0.0 })
+                                            .collect(),
+                                    )
+                                }
+                            }
+                        }
                     };
 
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
@@ -4651,31 +4646,7 @@ impl crate::pipelines::ImputationPipeline {
                         handoff_capture_idx_h1,
                         &donors_h1,
                     )?;
-                    let mut posts = posts;
-                    if !has_priors_h1
-                        && plan.n_ref_haps > 32
-                        && !donors_h1.is_empty()
-                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                        && subsetted_states
-                    {
-                        let donor_posts = posts_from_donors(&donors_h1)?;
-                        let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
-                        .clamp(0.0, 1.0);
-                        let tau = 1.0 + 1.25 * t;
-                        temper_posts_untyped(&mut posts, &input_probs_h1, tau);
-                        let w_floor = if informative_ratio <= 0.05 {
-                            0.50f32
-                        } else if informative_ratio <= 0.10 {
-                            0.35f32
-                        } else if insufficient_info_h1 {
-                            0.20f32
-                        } else {
-                            0.10f32
-                        };
-                        let w = (w_floor + (1.0 - w_floor) * t).clamp(0.0, 1.0);
-                        blend_posts_untyped(&mut posts, &donor_posts, &input_probs_h1, w);
-                    }
+                    let _ = (subsetted_states, informative_ratio);
                     hap1_posts = Some(posts);
                     p1_out = out;
                 } else if has_priors_h1 {
@@ -4716,31 +4687,7 @@ impl crate::pipelines::ImputationPipeline {
                         handoff_capture_idx_h2,
                         &donors_h2,
                     )?;
-                    let mut posts = posts;
-                    if !has_priors_h2
-                        && plan.n_ref_haps > 32
-                        && !donors_h2.is_empty()
-                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                        && subsetted_states
-                    {
-                        let donor_posts = posts_from_donors(&donors_h2)?;
-                        let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
-                        .clamp(0.0, 1.0);
-                        let tau = 1.0 + 1.25 * t;
-                        temper_posts_untyped(&mut posts, &input_probs_h2, tau);
-                        let w_floor = if informative_ratio <= 0.05 {
-                            0.50f32
-                        } else if informative_ratio <= 0.10 {
-                            0.35f32
-                        } else if insufficient_info_h2 {
-                            0.20f32
-                        } else {
-                            0.10f32
-                        };
-                        let w = (w_floor + (1.0 - w_floor) * t).clamp(0.0, 1.0);
-                        blend_posts_untyped(&mut posts, &donor_posts, &input_probs_h2, w);
-                    }
+                    let _ = (subsetted_states, informative_ratio);
                     hap2_posts = Some(posts);
                     p2_out = out;
                 } else if has_priors_h2 {
@@ -5240,43 +5187,44 @@ impl crate::pipelines::ImputationPipeline {
             }
         };
 
-        let map_pos_fallback_allele = |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
-            if raw == 255 {
-                return None;
-            }
-            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
-            let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
-            if ref_marker.n_alleles() != 2 || target_marker.n_alleles() != 2 {
-                return None;
-            }
-            let ref0 = ref_marker.ref_allele.to_string();
-            let ref1 = ref_marker.alt_alleles.first()?.to_string();
-            let t0 = target_marker.ref_allele.to_string();
-            let t1 = target_marker.alt_alleles.first()?.to_string();
-            let same = ref0 == t0 && ref1 == t1;
-            let swapped = ref0 == t1 && ref1 == t0;
-            match raw {
-                0 => {
-                    if same {
-                        Some(0)
-                    } else if swapped {
-                        Some(1)
-                    } else {
-                        None
-                    }
+        let map_pos_fallback_allele =
+            |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
+                if raw == 255 {
+                    return None;
                 }
-                1 => {
-                    if same {
-                        Some(1)
-                    } else if swapped {
-                        Some(0)
-                    } else {
-                        None
-                    }
+                let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
+                let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
+                if ref_marker.n_alleles() != 2 || target_marker.n_alleles() != 2 {
+                    return None;
                 }
-                _ => None,
-            }
-        };
+                let ref0 = ref_marker.ref_allele.to_string();
+                let ref1 = ref_marker.alt_alleles.first()?.to_string();
+                let t0 = target_marker.ref_allele.to_string();
+                let t1 = target_marker.alt_alleles.first()?.to_string();
+                let same = ref0 == t0 && ref1 == t1;
+                let swapped = ref0 == t1 && ref1 == t0;
+                match raw {
+                    0 => {
+                        if same {
+                            Some(0)
+                        } else if swapped {
+                            Some(1)
+                        } else {
+                            None
+                        }
+                    }
+                    1 => {
+                        if same {
+                            Some(1)
+                        } else if swapped {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
 
         let get_genotyped_alleles = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
             let h1 = HapIdx::new((sample_idx * 2) as u32);
