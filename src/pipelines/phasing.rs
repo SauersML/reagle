@@ -2244,7 +2244,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             continue;
                         }
                         let conf = p.max(1.0 - p);
-                        if conf < FAST_BEAM_FIX_CONF {
+                        let threshold = self
+                            .config
+                            .fast_beam_fix_threshold
+                            .unwrap_or(FAST_BEAM_FIX_CONF);
+                        if conf < threshold {
                             continue;
                         }
                         let want_swapped = p >= 0.5;
