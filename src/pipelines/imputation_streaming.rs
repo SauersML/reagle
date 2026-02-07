@@ -3267,10 +3267,7 @@ impl crate::pipelines::ImputationPipeline {
         // state sets from prescan/LMS. This preserves ancestry-local donor sets
         // and avoids diluting sparse-target inference with globally irrelevant
         // haplotypes.
-        let full_states: Option<Vec<RefHapId>> = if plan.full_panel
-            && plan.n_ref_haps > 32
-            && plan.n_ref_haps <= 1024
-        {
+        let full_states: Option<Vec<RefHapId>> = if plan.full_panel {
             Some(
                 (0..plan.n_ref_haps)
                     .map(|h| RefHapId::new(h as u32))
@@ -4315,22 +4312,12 @@ impl crate::pipelines::ImputationPipeline {
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
                                         donors: &[(RefHapId, u32)],
-                                        weak_signal: bool,
                                         informative_ratio: f32|
                  -> Vec<RefHapId> {
                     let has_nonempty_priors = priors.map(|p| !p.is_empty()).unwrap_or(false);
-                    if plan.full_panel && plan.n_ref_haps <= 1024 {
-                        // In explicit full-panel mode on small/medium panels, keep the exact
-                        // LS state universe. This avoids donor truncation when typed evidence is
-                        // sparse (e.g. heavy masking), where aggressive state capping causes
-                        // heterozygote collapse and boundary instability.
-                        return (0..plan.n_ref_haps)
-                            .map(|h| RefHapId::new(h as u32))
-                            .collect();
-                    }
-                    if weak_signal && informative_ratio <= 0.35 && plan.n_ref_haps <= 2048 {
-                        // In weak-information windows on small/medium panels, use the full
-                        // reference state space to avoid donor misspecification and AF collapse.
+                    if plan.full_panel {
+                        // In explicit full-panel mode, keep the exact LS state universe.
+                        // This avoids donor truncation and preserves rare-carrier support.
                         return (0..plan.n_ref_haps)
                             .map(|h| RefHapId::new(h as u32))
                             .collect();
@@ -4419,7 +4406,10 @@ impl crate::pipelines::ImputationPipeline {
                         q_donor = q_donor.max((k * 1) / 10);
                         q_core = q_core.min((k * 1) / 10);
                     }
-                    if weak_signal && !has_nonempty_priors && !donor_haps.is_empty() {
+                    if informative_ratio <= 0.25
+                        && !has_nonempty_priors
+                        && !donor_haps.is_empty()
+                    {
                         // In weak local signal, preserve locality by giving PBWT donors
                         // more state budget and shrinking generic core allocation.
                         q_donor = q_donor.max((k * 5) / 10);
@@ -4502,11 +4492,6 @@ impl crate::pipelines::ImputationPipeline {
                     bool,
                     f32,
                 )> {
-                    let weak_signal = if hap_idx.as_usize() == h1_idx.as_usize() {
-                        conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC || insufficient_info_h1
-                    } else {
-                        conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC || insufficient_info_h2
-                    };
                     let n_markers = input_probs.n_markers();
                     let informative_n = (0..n_markers)
                         .filter(|&m| !input_probs.is_uniform_marker(m))
@@ -4516,7 +4501,7 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         informative_n as f32 / n_markers as f32
                     };
-                    let state_haps = build_state_haps(hap_idx, priors, donors, weak_signal, informative_ratio);
+                    let state_haps = build_state_haps(hap_idx, priors, donors, informative_ratio);
                     if state_haps.is_empty() {
                         return Err(ReagleError::vcf(format!(
                             "State selection produced empty subset: window={} sample={} hap={} donors={} has_priors={}",
@@ -4580,12 +4565,7 @@ impl crate::pipelines::ImputationPipeline {
                                 .collect();
                             Some(norm)
                         }
-                    } else if plan.n_ref_haps > 16
-                        && !donors.is_empty()
-                        && weak_signal
-                        && informative_ratio <= 0.25
-                        && state_haps.len() < plan.n_ref_haps
-                    {
+                    } else if !donors.is_empty() {
                         let mut mapped = vec![0.0f32; state_haps.len()];
                         let mut donor_total = 0.0f32;
                         for (hap, count) in donors.iter() {
@@ -4595,39 +4575,15 @@ impl crate::pipelines::ImputationPipeline {
                             }
                         }
                         if donor_total > 0.0 && !mapped.is_empty() {
-                            let inv = 1.0f32 / donor_total;
+                            let k = mapped.len() as f32;
+                            let denom = donor_total + k;
                             for v in mapped.iter_mut() {
-                                *v *= inv;
+                                *v = (*v + 1.0) / denom;
                             }
-                            let mut max_p = 0.0f32;
-                            let mut entropy = 0.0f32;
-                            let mut support = 0usize;
-                            for &p in mapped.iter() {
-                                if p > 0.0 {
-                                    support += 1;
-                                    if p > max_p {
-                                        max_p = p;
-                                    }
-                                    entropy -= p * p.ln();
-                                }
-                            }
-                            let entropy_norm = if support > 1 {
-                                (entropy / (support as f32).ln()).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            let concentration = (1.0 - entropy_norm).max(max_p).clamp(0.0, 1.0);
-                            if weak_signal && concentration < 0.35 {
-                                None
-                            } else {
-                                // Donor-guided initialization only in weak/untyped regimes.
-                                // Keep blending conservative so likelihood still dominates.
-                                let lambda = (0.10 + 0.25 * concentration).clamp(0.08, 0.35);
-                                let uniform = 1.0f32 / mapped.len() as f32;
-                                for v in mapped.iter_mut() {
-                                    *v = (1.0 - lambda) * uniform + lambda * *v;
-                                }
+                            if normalize_probs(&mut mapped) {
                                 Some(mapped)
+                            } else {
+                                None
                             }
                         } else {
                             None

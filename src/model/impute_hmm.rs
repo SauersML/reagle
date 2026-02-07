@@ -1139,6 +1139,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = active_states.max(1).min(panel_haps);
+    let use_prior_smoothing = active_states < panel_haps;
     let nearest_obs_lambda = nearest_observed_lambda(target_probs, p_recomb);
     if active_states > 0 {
         // The active subset is the imputation state space for this haplotype/window.
@@ -1303,7 +1304,11 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if uniform && recomb_rate > 0.0 && subset_total > 0.0 {
+                                if use_prior_smoothing
+                                    && uniform
+                                    && recomb_rate > 0.0
+                                    && subset_total > 0.0
+                                {
                                     let inv_subset = 1.0 / subset_total;
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
@@ -1423,6 +1428,7 @@ fn run_impute_hmm_seqcoded(
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = active_states.max(1).min(panel_haps);
+    let use_prior_smoothing = active_states < panel_haps;
     let nearest_obs_lambda = nearest_observed_lambda(target_probs, p_recomb);
     if active_states > 0 {
         ws.weights.fill(1.0);
@@ -1586,7 +1592,11 @@ fn run_impute_hmm_seqcoded(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if uniform && recomb_rate > 0.0 && subset_total > 0.0 {
+                                if use_prior_smoothing
+                                    && uniform
+                                    && recomb_rate > 0.0
+                                    && subset_total > 0.0
+                                {
                                     let inv_subset = 1.0 / subset_total;
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
@@ -1705,6 +1715,7 @@ fn run_impute_hmm_dict(
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = active_states.max(1).min(panel_haps);
+    let use_prior_smoothing = active_states < panel_haps;
     let nearest_obs_lambda = nearest_observed_lambda(target_probs, p_recomb);
     if active_states > 0 {
         ws.weights.fill(1.0);
@@ -1868,7 +1879,11 @@ fn run_impute_hmm_dict(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if uniform && recomb_rate > 0.0 && subset_total > 0.0 {
+                                if use_prior_smoothing
+                                    && uniform
+                                    && recomb_rate > 0.0
+                                    && subset_total > 0.0
+                                {
                                     let inv_subset = 1.0 / subset_total;
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
