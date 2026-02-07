@@ -853,7 +853,7 @@ impl StreamingBref3WindowReader {
             }
 
             if marker.gen_pos >= full_window_gen {
-                next_overlap.push_front(marker);
+                next_overlap.push_back(marker);
                 break;
             }
 
