@@ -342,11 +342,16 @@ impl AlleleMapping {
 ///
 /// # Returns
 /// AlleleMapping if markers can be aligned, or None if incompatible
+///
+/// # Note
+/// This function assumes that the caller has already verified that `targ` and `ref_marker`
+/// represent the same genomic locus (e.g. by matching chromosome name and position).
+/// It does NOT check `chrom` or `pos` equality, because `ChromIdx` values are context-specific
+/// and may differ between independently loaded Target and Reference panels.
 pub fn compute_allele_mapping(targ: &Marker, ref_marker: &Marker) -> Option<AlleleMapping> {
-    // Must be at same position
-    if targ.chrom != ref_marker.chrom || targ.pos != ref_marker.pos {
-        return None;
-    }
+    // We do NOT check targ.chrom != ref_marker.chrom here.
+    // Different panels may assign different internal indices to the same chromosome.
+    // The caller ensures alignment by position/name.
 
     // Only handle SNVs (strand flip only makes sense for SNVs)
     if !targ.is_snv() || !ref_marker.is_snv() {

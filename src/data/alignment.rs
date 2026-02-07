@@ -178,7 +178,7 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
             let ref_marker = ref_markers.marker(MarkerIdx::new(m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
             let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
-            if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
+            if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm.clone(), ref_marker.pos)) {
                 let mut aligned = false;
                 for &target_idx in target_candidates {
                     if used_targets[target_idx] {
