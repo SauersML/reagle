@@ -132,13 +132,11 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_FORCE_TOP_HAPS: usize = 32;
 const PBWT_ANCHOR_TOP_HAPS: usize = 512;
-const FAST_BEAM_WIDTH: usize = 16;
+const FAST_BEAM_WIDTH: usize = 64;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
-// Increase confidence threshold for fast beam fixing to prevent locking in
-// errors from the heuristic pass, especially in ambiguous scenarios.
-// Setting to 2.0 effectively disables fast beam fixing, forcing reliance on
-// the rigorous MCMC pass which is robust to symmetry-breaking artifacts.
+// Effectively disable fast beam fixing by setting confidence threshold > 1.0.
+// This forces reliance on the MCMC step which is more accurate for ambiguous phasing.
 const FAST_BEAM_FIX_CONF: f32 = 2.0;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
