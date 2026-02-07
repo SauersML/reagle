@@ -356,6 +356,9 @@ fn add_typed_anchor_sampling<SpaceA, SpaceB>(
         if !sampling[m] {
             continue;
         }
+        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_none() {
+            continue;
+        }
         let bin = ((gen_positions[m] - first) / step).floor() as i64;
         let entry = anchors_per_bin.entry(bin).or_insert(0);
         *entry = entry.saturating_add(1);
@@ -813,32 +816,6 @@ fn normalize_chrom_local(name: &str) -> &str {
     } else {
         name
     }
-}
-
-#[inline]
-fn chrom_code_local(name: &str) -> u32 {
-    let norm = normalize_chrom_local(name);
-    if let Ok(parsed) = norm.parse::<u32>() {
-        return parsed;
-    }
-    if norm.eq_ignore_ascii_case("X") {
-        return 23;
-    }
-    if norm.eq_ignore_ascii_case("Y") {
-        return 24;
-    }
-    if norm.eq_ignore_ascii_case("XY") {
-        return 25;
-    }
-    if norm.eq_ignore_ascii_case("M") || norm.eq_ignore_ascii_case("MT") {
-        return 26;
-    }
-    let mut hash = 2166136261u32;
-    for b in norm.bytes() {
-        hash ^= b.to_ascii_lowercase() as u32;
-        hash = hash.wrapping_mul(16777619u32);
-    }
-    hash | (1u32 << 31)
 }
 
 fn collect_target_positions(path: &Path) -> Result<(TargetMarkerIndex, usize)> {
@@ -2638,8 +2615,10 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_pos_to_indices: std::collections::HashMap<(u32, u32), Vec<usize>> =
-                        std::collections::HashMap::new();
+                    let mut target_pos_to_indices: std::collections::HashMap<
+                        String,
+                        std::collections::HashMap<u32, Vec<usize>>,
+                    > = std::collections::HashMap::new();
                     for t_idx in 0..target_window.genotypes.n_markers() {
                         let t_marker = target_window
                             .genotypes
@@ -2650,8 +2629,13 @@ impl crate::pipelines::ImputationPipeline {
                             .markers()
                             .chrom_name(t_marker.chrom)
                             .unwrap_or("");
-                        let key = (chrom_code_local(t_chrom), t_marker.pos);
-                        target_pos_to_indices.entry(key).or_default().push(t_idx);
+                        let chrom_key = normalize_chrom_local(t_chrom).to_string();
+                        target_pos_to_indices
+                            .entry(chrom_key)
+                            .or_default()
+                            .entry(t_marker.pos)
+                            .or_default()
+                            .push(t_idx);
                     }
                     let mut dbg_pos_present = 0usize;
                     let mut dbg_aligned_present = 0usize;
@@ -2665,8 +2649,10 @@ impl crate::pipelines::ImputationPipeline {
                             .unwrap_or("");
                         let has_biallelic_swap_or_match =
                             if target_idx.is_none() && ref_marker.n_alleles() == 2 {
-                                let key = (chrom_code_local(ref_chrom), ref_marker.pos);
-                                if let Some(candidates) = target_pos_to_indices.get(&key) {
+                                if let Some(candidates) = target_pos_to_indices
+                                    .get(normalize_chrom_local(ref_chrom))
+                                    .and_then(|m| m.get(&ref_marker.pos))
+                                {
                                     let ref0 = ref_marker.ref_allele.to_string();
                                     let ref1 = ref_marker
                                         .alt_alleles
@@ -2953,8 +2939,10 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_pos_to_indices: std::collections::HashMap<(u32, u32), Vec<usize>> =
-                        std::collections::HashMap::new();
+                    let mut target_pos_to_indices: std::collections::HashMap<
+                        String,
+                        std::collections::HashMap<u32, Vec<usize>>,
+                    > = std::collections::HashMap::new();
                     for t_idx in 0..target_window.genotypes.n_markers() {
                         let t_marker = target_window
                             .genotypes
@@ -2965,8 +2953,13 @@ impl crate::pipelines::ImputationPipeline {
                             .markers()
                             .chrom_name(t_marker.chrom)
                             .unwrap_or("");
-                        let key = (chrom_code_local(t_chrom), t_marker.pos);
-                        target_pos_to_indices.entry(key).or_default().push(t_idx);
+                        let chrom_key = normalize_chrom_local(t_chrom).to_string();
+                        target_pos_to_indices
+                            .entry(chrom_key)
+                            .or_default()
+                            .entry(t_marker.pos)
+                            .or_default()
+                            .push(t_idx);
                     }
                     for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
                         let ref_marker = ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
@@ -2976,8 +2969,10 @@ impl crate::pipelines::ImputationPipeline {
                             .unwrap_or("");
                         let has_biallelic_swap_or_match =
                             if target_idx.is_none() && ref_marker.n_alleles() == 2 {
-                                let key = (chrom_code_local(ref_chrom), ref_marker.pos);
-                                if let Some(candidates) = target_pos_to_indices.get(&key) {
+                                if let Some(candidates) = target_pos_to_indices
+                                    .get(normalize_chrom_local(ref_chrom))
+                                    .and_then(|m| m.get(&ref_marker.pos))
+                                {
                                     let ref0 = ref_marker.ref_allele.to_string();
                                     let ref1 = ref_marker
                                         .alt_alleles
@@ -5224,16 +5219,23 @@ impl crate::pipelines::ImputationPipeline {
         let target_pl = target_pl.unwrap_or(target_win);
         let pos_fallback_used = std::sync::atomic::AtomicUsize::new(0);
         let pos_fallback_map_fail = std::sync::atomic::AtomicUsize::new(0);
-        let mut target_pos_to_indices: std::collections::HashMap<(u32, u32), Vec<usize>> =
-            std::collections::HashMap::new();
+        let mut target_pos_to_indices: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u32, Vec<usize>>,
+        > = std::collections::HashMap::new();
         for t_idx in 0..target_win.n_markers() {
             let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
             let t_chrom = target_win
                 .markers()
                 .chrom_name(t_marker.chrom)
                 .unwrap_or("");
-            let key = (chrom_code_local(t_chrom), t_marker.pos);
-            target_pos_to_indices.entry(key).or_default().push(t_idx);
+            let chrom_key = normalize_chrom_local(t_chrom).to_string();
+            target_pos_to_indices
+                .entry(chrom_key)
+                .or_default()
+                .entry(t_marker.pos)
+                .or_default()
+                .push(t_idx);
         }
 
         let pick_target_marker_by_alleles = |ref_marker_idx: usize| -> Option<usize> {
@@ -5242,8 +5244,9 @@ impl crate::pipelines::ImputationPipeline {
                 return None;
             }
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let key = (chrom_code_local(ref_chrom), ref_marker.pos);
-            let candidates = target_pos_to_indices.get(&key)?;
+            let candidates = target_pos_to_indices
+                .get(normalize_chrom_local(ref_chrom))
+                .and_then(|m| m.get(&ref_marker.pos))?;
 
             let ref0 = ref_marker.ref_allele.to_string();
             let ref1 = ref_marker.alt_alleles.first()?.to_string();
@@ -5896,16 +5899,22 @@ impl crate::pipelines::ImputationPipeline {
 
         // Preserve target-only markers that share positions with reference markers
         // but are not allele-aligned. These are still genotyped target variants.
-        let mut ref_pos_set: std::collections::HashSet<(u32, u32)> =
-            std::collections::HashSet::new();
+        let mut ref_pos_set: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
         for ref_m in output_start..output_end {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            ref_pos_set.insert((chrom_code_local(ref_chrom), ref_marker.pos));
+            let chrom_key = normalize_chrom_local(ref_chrom).to_string();
+            ref_pos_set
+                .entry(chrom_key)
+                .or_default()
+                .insert(ref_marker.pos);
         }
 
-        let mut target_only_by_pos: std::collections::HashMap<(u32, u32), Vec<usize>> =
-            std::collections::HashMap::new();
+        let mut target_only_by_pos: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u32, Vec<usize>>,
+        > = std::collections::HashMap::new();
         for t_idx in 0..target_win.n_markers() {
             let target_m = MarkerIdx::new(t_idx as u32);
             if alignment.target_to_ref(target_m).is_some() {
@@ -5916,9 +5925,17 @@ impl crate::pipelines::ImputationPipeline {
                 .markers()
                 .chrom_name(t_marker.chrom)
                 .unwrap_or("");
-            let key = (chrom_code_local(t_chrom), t_marker.pos);
-            if ref_pos_set.contains(&key) {
-                target_only_by_pos.entry(key).or_default().push(t_idx);
+            let chrom_key = normalize_chrom_local(t_chrom).to_string();
+            if ref_pos_set
+                .get(chrom_key.as_str())
+                .is_some_and(|set| set.contains(&t_marker.pos))
+            {
+                target_only_by_pos
+                    .entry(chrom_key)
+                    .or_default()
+                    .entry(t_marker.pos)
+                    .or_default()
+                    .push(t_idx);
             }
         }
 
@@ -5948,8 +5965,10 @@ impl crate::pipelines::ImputationPipeline {
         for ref_m in output_start..output_end {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let key = (chrom_code_local(ref_chrom), ref_marker.pos);
-            if let Some(targets) = target_only_by_pos.get(&key) {
+            if let Some(targets) = target_only_by_pos
+                .get(normalize_chrom_local(ref_chrom))
+                .and_then(|m| m.get(&ref_marker.pos))
+            {
                 for &t_idx in targets {
                     output_markers.push(OutputMarker::Target(t_idx));
                 }

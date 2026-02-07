@@ -46,6 +46,7 @@ struct PriorModel<'a> {
 }
 
 fn build_prior_model(allele_freqs: Option<&[f32]>, n_alleles: usize) -> Option<PriorModel<'_>> {
+    const MIN_AF: f32 = 1e-6;
     let freqs = allele_freqs?;
     if freqs.len() != n_alleles || freqs.is_empty() {
         return None;
@@ -53,10 +54,10 @@ fn build_prior_model(allele_freqs: Option<&[f32]>, n_alleles: usize) -> Option<P
 
     let mut sum = 0.0f32;
     for &f in freqs {
-        if !f.is_finite() || f <= 0.0 {
+        if !f.is_finite() || f < 0.0 {
             return None;
         }
-        sum += f;
+        sum += f.max(MIN_AF);
     }
 
     if sum <= 0.0 || !sum.is_finite() {
@@ -75,8 +76,9 @@ fn pl_to_log_likelihood(pl: u16) -> f32 {
 
 #[inline]
 fn genotype_log_prior(i: usize, j: usize, prior_model: &PriorModel<'_>) -> f32 {
-    let fi = prior_model.freqs[i] * prior_model.inv_sum;
-    let fj = prior_model.freqs[j] * prior_model.inv_sum;
+    const MIN_AF: f32 = 1e-6;
+    let fi = prior_model.freqs[i].max(MIN_AF) * prior_model.inv_sum;
+    let fj = prior_model.freqs[j].max(MIN_AF) * prior_model.inv_sum;
     let prior = if i == j {
         fi * fi
     } else {

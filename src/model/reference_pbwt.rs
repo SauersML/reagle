@@ -725,23 +725,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
 
                 if next.len == 0 {
-                    scratch.clear();
-                    for &(l, r) in old.intervals() {
-                        for b in 0..n_bins {
-                            let nl =
-                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
-                            let nr =
-                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
-                            if nl < nr {
-                                let score = nr - nl;
-                                scratch.push((nl, nr, score));
-                            }
-                        }
-                    }
-                    Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
-                }
-
-                if next.len == 0 {
                     let queried_bin = Self::bin_for_allele(queried_allele, alphabet);
                     let nl = self.offset_for(queried_bin, n_alleles);
                     let nr = nl + self.count_for(queried_bin, n_alleles);

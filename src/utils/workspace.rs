@@ -6,6 +6,8 @@
 
 use aligned_vec::{AVec, ConstAlign};
 
+const MAX_CHECKPOINT_INTERVAL: usize = 256;
+
 /// Workspace for phasing HMM computations
 #[derive(Debug)]
 pub struct ThreadWorkspace {
@@ -70,7 +72,7 @@ impl ThreadWorkspace {
     /// O(checkpoint_interval * n_states) for `fwd`/`bwd`/`fwd_prior`.
     /// Some other buffers are O(n_markers) or O(n_markers * n_states) by design.
     pub fn new(checkpoint_interval: usize, n_states: usize) -> Self {
-        let interval = checkpoint_interval.max(1);
+        let interval = checkpoint_interval.clamp(1, MAX_CHECKPOINT_INTERVAL);
         let size = ElemCount::from(interval)
             .checked_mul(ElemCount::from(n_states), "initial HMM block length")
             .get();
@@ -125,7 +127,8 @@ impl ThreadWorkspace {
                 self.fwd.len() / self.n_states
             } else {
                 64
-            };
+            }
+            .clamp(1, MAX_CHECKPOINT_INTERVAL);
             let new_size = ElemCount::from(current_interval)
                 .checked_mul(ElemCount::from(n_states), "resized HMM block length")
                 .get();

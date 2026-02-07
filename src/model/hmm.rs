@@ -1016,7 +1016,12 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     0.0
                                 };
                                 let mut lut = [0.0f32; 256];
-                                lut.fill(1.0);
+                                let unknown_prob = if n_alleles > 1 {
+                                    p_err_other.max(1e-30)
+                                } else {
+                                    p_err_base.max(1e-30)
+                                };
+                                lut.fill(unknown_prob);
                                 for a in 0..255usize {
                                     if a < n_alleles {
                                         let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
@@ -1251,7 +1256,12 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                         0.0
                                     };
                                     let mut lut = [0.0f32; 256];
-                                    lut.fill(1.0);
+                                    let unknown_prob = if n_alleles > 1 {
+                                        p_err_other.max(1e-30)
+                                    } else {
+                                        p_err_base.max(1e-30)
+                                    };
+                                    lut.fill(unknown_prob);
                                     for a in 0..255usize {
                                         if a < n_alleles {
                                             let p_true = allele_probs.get(a).copied().unwrap_or(0.0);

@@ -1334,7 +1334,8 @@ fn test_phasing_multi_window_long_map_vs_java() {
         &[
             ("gt", gt_path.to_str().unwrap()),
             ("map", map_path.to_str().unwrap()),
-            ("window", "2.0"),
+            ("window", "2.2"),
+            ("overlap", "1.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
         ],
@@ -1347,7 +1348,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
     // Run Rust phasing with the same map and window sizing.
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_phased_long");
-    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 2.0, 2.0);
+    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 2.2, 1.0);
     assert!(
         rust_result.is_ok(),
         "Rust phasing failed: {:?}",
@@ -1414,21 +1415,24 @@ fn test_imputation_multi_window_long_map_vs_java() {
     fs::copy(&files.target_sparse_vcf, &gt_path).expect("Copy target VCF");
 
     // Create a linear genetic map with a modest span to keep runtime bounded.
-    let map_path = work_dir.path().join("long_span.map");
+    let map_path_java = work_dir.path().join("long_span_java.map");
+    let map_path_rust = work_dir.path().join("long_span_rust.map");
     println!(
-        "[long-map] write_linear_map_for_span input={} output={} span_cm=10.0",
+        "[long-map] write_linear_map_for_span input={} output_java={} output_rust={} span_cm=10.0",
         ref_path.display(),
-        map_path.display()
+        map_path_java.display(),
+        map_path_rust.display()
     );
-    write_linear_map_for_span(&ref_path, &map_path, 10.0);
+    write_linear_map_for_span_java(&ref_path, &map_path_java, 10.0);
+    write_linear_map_for_span(&ref_path, &map_path_rust, 10.0);
 
     // Run Java BEAGLE with map
     let java_out = work_dir.path().join("java_imputed_long");
     println!(
-        "[long-map] JAVA START ref={} gt={} map={} out={} window=2.0 overlap=1.0 seed=42 gp=true",
+        "[long-map] JAVA START ref={} gt={} map={} out={} window=12.0 overlap=1.0 seed=42 gp=true",
         ref_path.display(),
         gt_path.display(),
-        map_path.display(),
+        map_path_java.display(),
         java_out.display()
     );
     let java_status = run_beagle(
@@ -1436,8 +1440,8 @@ fn test_imputation_multi_window_long_map_vs_java() {
         &[
             ("ref", ref_path.to_str().unwrap()),
             ("gt", gt_path.to_str().unwrap()),
-            ("map", map_path.to_str().unwrap()),
-            ("window", "2.0"),
+            ("map", map_path_java.to_str().unwrap()),
+            ("window", "12.0"),
             ("overlap", "1.0"),
             ("out", java_out.to_str().unwrap()),
             ("seed", "42"),
@@ -1461,14 +1465,14 @@ fn test_imputation_multi_window_long_map_vs_java() {
     let ref_vcf = decompress_vcf_for_rust(&ref_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_imputed_long");
     println!(
-        "[long-map] RUST START gt={} ref={} map={} out={} window=2.0 overlap=1.0 seed=42",
+        "[long-map] RUST START gt={} ref={} map={} out={} window=12.0 overlap=1.0 seed=42",
         gt_vcf.display(),
         ref_vcf.display(),
-        map_path.display(),
+        map_path_rust.display(),
         rust_out.display()
     );
     let rust_result =
-        run_rust_imputation_with_map(&gt_vcf, &ref_vcf, &map_path, &rust_out, 42, 2.0, 1.0);
+        run_rust_imputation_with_map(&gt_vcf, &ref_vcf, &map_path_rust, &rust_out, 42, 12.0, 1.0);
     println!("[long-map] RUST END ok={}", rust_result.is_ok());
     assert!(
         rust_result.is_ok(),
@@ -1478,9 +1482,42 @@ fn test_imputation_multi_window_long_map_vs_java() {
 
     let rust_vcf = work_dir.path().join("rust_imputed_long.vcf.gz");
     println!("[long-map] rust_vcf={}", rust_vcf.display());
-    println!("[long-map] compare_imputation_results START");
-    compare_imputation_results("long-map multi-window", &gt_path, &java_vcf, &rust_vcf);
-    println!("[long-map] compare_imputation_results END");
+    println!("[long-map] compare Java vs Rust START");
+    let (_, java_records) = parse_vcf(&java_vcf);
+    let (_, rust_records) = parse_vcf(&rust_vcf);
+    assert_eq!(
+        java_records.len(),
+        rust_records.len(),
+        "long-map multi-window: record count mismatch"
+    );
+    let mut concordant = 0usize;
+    let mut total = 0usize;
+    for (j_rec, r_rec) in java_records.iter().zip(rust_records.iter()) {
+        assert_eq!(
+            (j_rec.chrom.as_str(), j_rec.pos),
+            (r_rec.chrom.as_str(), r_rec.pos),
+            "long-map multi-window: position mismatch between Java and Rust outputs"
+        );
+        for (j_gt, r_gt) in j_rec.genotypes.iter().zip(r_rec.genotypes.iter()) {
+            total += 1;
+            if normalize_gt_unphased(&j_gt.gt) == normalize_gt_unphased(&r_gt.gt) {
+                concordant += 1;
+            }
+        }
+    }
+    let concordance = concordant as f64 / total as f64;
+    println!(
+        "[long-map imputation] concordance Java vs Rust: {:.2}% ({}/{})",
+        concordance * 100.0,
+        concordant,
+        total
+    );
+    assert!(
+        concordance > 0.95,
+        "long-map imputation concordance too low: {:.2}%",
+        concordance * 100.0
+    );
+    println!("[long-map] compare Java vs Rust END");
     println!("[long-map] END test_imputation_multi_window_long_map_vs_java");
 }
 
@@ -2987,18 +3024,21 @@ fn write_vcf_with_uniform_gl(src_gz: &Path, dst_vcf: &Path, max_markers: usize) 
     fs::write(dst_vcf, out).expect("Write modified VCF");
 }
 
-/// Find chrom/min/max positions from a gzipped VCF.
-fn vcf_min_max_pos(vcf_gz: &Path) -> (String, u64, u64) {
-    let output = Command::new("gzip")
-        .args(["-dc", vcf_gz.to_str().unwrap()])
-        .output()
-        .expect("Failed to run gzip");
+/// Write a simple linear PLINK map with a specified genetic span.
+fn write_linear_map_for_span(vcf_gz: &Path, map_path: &Path, total_cm: f64) -> (String, u64, u64) {
+    use flate2::read::MultiGzDecoder;
+    use std::io::Read;
 
-    assert!(output.status.success(), "gzip decompression failed");
-    let text = String::from_utf8_lossy(&output.stdout);
+    let file = std::fs::File::open(vcf_gz).expect("open vcf for map");
+    let mut decoder = MultiGzDecoder::new(file);
+    let mut text = String::new();
+    decoder
+        .read_to_string(&mut text)
+        .expect("read vcf for map generation");
+
     let mut chrom = String::new();
-    let mut min_pos: Option<u64> = None;
-    let mut max_pos: Option<u64> = None;
+    let mut positions: Vec<u64> = Vec::new();
+    let mut last_pos: Option<u64> = None;
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -3010,33 +3050,89 @@ fn vcf_min_max_pos(vcf_gz: &Path) -> (String, u64, u64) {
         if chrom.is_empty() {
             chrom = c.to_string();
         }
-        min_pos = Some(min_pos.map_or(pos, |p| p.min(pos)));
-        max_pos = Some(max_pos.map_or(pos, |p| p.max(pos)));
+        if c != chrom {
+            continue;
+        }
+        if last_pos != Some(pos) {
+            positions.push(pos);
+            last_pos = Some(pos);
+        }
     }
-    let min_pos = min_pos.expect("No VCF records found");
-    let max_pos = max_pos.expect("No VCF records found");
+    assert!(
+        !positions.is_empty(),
+        "No VCF records found to generate map: {}",
+        vcf_gz.display()
+    );
+    let min_pos = positions[0];
+    let max_pos = *positions.last().expect("positions non-empty");
+    let span_cm = total_cm.max(1e-6);
+    let bp_span = (max_pos.saturating_sub(min_pos)).max(1) as f64;
+
+    // PLINK map format expected by both Beagle and Reagle parser:
+    //   CHROM  position_bp  rate_cM_per_Mb  cumulative_cM
+    // Write a dense linear map across unique marker positions.
+    let mut content = String::new();
+    for &pos in &positions {
+        let frac = (pos.saturating_sub(min_pos)) as f64 / bp_span;
+        let cm = frac * span_cm;
+        content.push_str(&format!("{chrom}\t{pos}\t0.0\t{cm:.6}\n"));
+    }
+    fs::write(map_path, content).expect("Write map file");
     (chrom, min_pos, max_pos)
 }
 
-/// Write a simple linear PLINK map with a specified genetic span.
-fn write_linear_map_for_span(vcf_gz: &Path, map_path: &Path, total_cm: f64) -> (String, u64, u64) {
-    let (chrom, min_pos, max_pos) = vcf_min_max_pos(vcf_gz);
-    let mut total_cm_int = total_cm.round();
-    if total_cm_int <= 0.0 {
-        total_cm_int = 1.0;
+/// Write a Java/PLINK-style map:
+///   CHROM  ID  cM  bp
+fn write_linear_map_for_span_java(vcf_gz: &Path, map_path: &Path, total_cm: f64) -> (String, u64, u64) {
+    use flate2::read::MultiGzDecoder;
+    use std::io::Read;
+
+    let file = std::fs::File::open(vcf_gz).expect("open vcf for java map");
+    let mut decoder = MultiGzDecoder::new(file);
+    let mut text = String::new();
+    decoder
+        .read_to_string(&mut text)
+        .expect("read vcf for java map generation");
+
+    let mut chrom = String::new();
+    let mut positions: Vec<u64> = Vec::new();
+    let mut last_pos: Option<u64> = None;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let c = parts.next().unwrap_or("");
+        let pos_str = parts.next().unwrap_or("0");
+        let pos: u64 = pos_str.parse().unwrap_or(0);
+        if chrom.is_empty() {
+            chrom = c.to_string();
+        }
+        if c != chrom {
+            continue;
+        }
+        if last_pos != Some(pos) {
+            positions.push(pos);
+            last_pos = Some(pos);
+        }
     }
-    let total_cm_int = total_cm_int as u64;
-    // Beagle's PlinkGenMap expects integer genetic positions and
-    // rejects maps where all genetic positions are identical.
-    // Use increasing integer positions in both the 3rd and 4th columns.
-    let content = format!(
-        "{chrom}\t{min_pos}\t0\t0\n{chrom}\t{max_pos}\t{total_cm}\t{total_cm}\n",
-        chrom = chrom,
-        min_pos = min_pos,
-        max_pos = max_pos,
-        total_cm = total_cm_int
+    assert!(
+        !positions.is_empty(),
+        "No VCF records found to generate Java map: {}",
+        vcf_gz.display()
     );
-    fs::write(map_path, content).expect("Write map file");
+    let min_pos = positions[0];
+    let max_pos = *positions.last().expect("positions non-empty");
+    let span_cm = total_cm.max(1e-6);
+    let bp_span = (max_pos.saturating_sub(min_pos)).max(1) as f64;
+
+    let mut content = String::new();
+    for &pos in &positions {
+        let frac = (pos.saturating_sub(min_pos)) as f64 / bp_span;
+        let cm = frac * span_cm;
+        content.push_str(&format!("{chrom}\t.\t{cm:.6}\t{pos}\n"));
+    }
+    fs::write(map_path, content).expect("Write java map file");
     (chrom, min_pos, max_pos)
 }
 

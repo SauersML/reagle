@@ -651,9 +651,9 @@ fn fill_emissions(
         if idx < n_alleles {
             emissions[i] = emission_by_allele[idx];
         } else {
-            // Out-of-domain allele index (e.g. multiallelic residue in biallelic model):
-            // treat as missing/unknown rather than forcing mismatch likelihood.
-            emissions[i] = 1.0;
+            // Out-of-domain allele index must be treated as a mismatch under
+            // the current emission model, not as neutral missingness.
+            emissions[i] = mismatch_prob.max(1e-30);
         }
     }
 }
@@ -696,8 +696,8 @@ fn fill_pattern_emissions(
             if idx < emission_by_allele.len() {
                 pattern_emissions[i] = emission_by_allele[idx];
             } else {
-                // Unknown allele index should be neutral, not penalized.
-                pattern_emissions[i] = 1.0;
+                // Unknown allele index must be treated as mismatch likelihood.
+                pattern_emissions[i] = mismatch_prob.max(1e-30);
             }
         }
     }
@@ -1376,8 +1376,8 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
-                            let g = fwd_slice[i] * ws.bwd[i];
-                            gamma[i] = g.max(0.0);
+                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
+                            gamma[i] = g;
                             sum += g;
                         }
                         if sum > 0.0 {
@@ -1691,8 +1691,8 @@ fn run_impute_hmm_seqcoded(
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
-                            let g = fwd_slice[i] * ws.bwd[i];
-                            gamma[i] = g.max(0.0);
+                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
+                            gamma[i] = g;
                             sum += g;
                         }
                         if sum > 0.0 {
@@ -1995,8 +1995,8 @@ fn run_impute_hmm_dict(
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
-                            let g = fwd_slice[i] * ws.bwd[i];
-                            gamma[i] = g.max(0.0);
+                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
+                            gamma[i] = g;
                             sum += g;
                         }
                         if sum > 0.0 {
