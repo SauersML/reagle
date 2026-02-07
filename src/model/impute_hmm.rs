@@ -111,10 +111,12 @@ pub struct TargetAlleleProbs {
     offsets: Vec<usize>,
     probs: Vec<f32>,
     uniform: Vec<bool>,
+    observed: Vec<bool>,
+    nearest_observed: Vec<u16>,
 }
 
 impl TargetAlleleProbs {
-    pub fn new(offsets: Vec<usize>, probs: Vec<f32>) -> Self {
+    pub fn new(offsets: Vec<usize>, probs: Vec<f32>, observed: Vec<bool>) -> Self {
         let mut uniform = Vec::new();
         if offsets.len() >= 2 {
             uniform.reserve(offsets.len() - 1);
@@ -125,10 +127,13 @@ impl TargetAlleleProbs {
                 uniform.push(is_uniform_probs(slice));
             }
         }
+        let nearest_observed = compute_nearest_observed_dist(&observed);
         Self {
             offsets,
             probs,
             uniform,
+            observed,
+            nearest_observed,
         }
     }
 
@@ -148,6 +153,56 @@ impl TargetAlleleProbs {
     pub fn is_uniform_marker(&self, marker_idx: usize) -> bool {
         self.uniform.get(marker_idx).copied().unwrap_or(true)
     }
+
+    #[inline]
+    pub fn is_observed_marker(&self, marker_idx: usize) -> bool {
+        self.observed.get(marker_idx).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn is_untyped_uniform_marker(&self, marker_idx: usize) -> bool {
+        self.is_uniform_marker(marker_idx) && !self.is_observed_marker(marker_idx)
+    }
+
+    #[inline]
+    pub fn is_missing_observed_marker(&self, marker_idx: usize) -> bool {
+        self.is_uniform_marker(marker_idx) && self.is_observed_marker(marker_idx)
+    }
+
+    #[inline]
+    pub fn observed_distance(&self, marker_idx: usize) -> usize {
+        self.nearest_observed
+            .get(marker_idx)
+            .copied()
+            .unwrap_or(u16::MAX) as usize
+    }
+}
+
+#[inline]
+fn compute_nearest_observed_dist(observed: &[bool]) -> Vec<u16> {
+    let n = observed.len();
+    let mut out = vec![u16::MAX; n];
+    let mut last_obs: Option<usize> = None;
+    for i in 0..n {
+        if observed[i] {
+            out[i] = 0;
+            last_obs = Some(i);
+        } else if let Some(j) = last_obs {
+            out[i] = (i - j).min(u16::MAX as usize) as u16;
+        }
+    }
+    let mut next_obs: Option<usize> = None;
+    for i in (0..n).rev() {
+        if observed[i] {
+            next_obs = Some(i);
+        } else if let Some(j) = next_obs {
+            let d = (j - i).min(u16::MAX as usize) as u16;
+            if d < out[i] {
+                out[i] = d;
+            }
+        }
+    }
+    out
 }
 
 /// Workspace for per-haplotype imputation HMM.
@@ -633,12 +688,47 @@ fn normalize_probs(probs: &mut [f32]) {
     }
 }
 
+// In sparse/imputation-heavy regions, emissions are frequently uniform at
+// untyped markers. A pure per-marker LS transition can become too sticky over
+// long uninformative stretches, causing posterior donor collapse and AF
+// deflation. We only inflate transitions at uniform markers.
+const UNIFORM_MARKER_RECOMB_BOOST: f32 = 20.0;
+
+#[inline]
+fn adjusted_recomb_rate(
+    recomb_rate: f32,
+    untyped_uniform_marker: bool,
+    missing_observed_marker: bool,
+    observed_dist: usize,
+) -> f32 {
+    if missing_observed_marker {
+        // Masked-at-typed sites should mostly inherit flanking scaffold
+        // continuity; excessive switching here creates heterozygous drift.
+        return (recomb_rate * 0.35).max(1e-8);
+    }
+    if !untyped_uniform_marker {
+        return recomb_rate;
+    }
+    let boost = if observed_dist <= 8 {
+        1.0
+    } else if observed_dist <= 32 {
+        1.5
+    } else if observed_dist <= 128 {
+        3.0
+    } else {
+        UNIFORM_MARKER_RECOMB_BOOST
+    };
+    (recomb_rate * boost).min(0.08)
+}
+
 #[inline]
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
     subset_prior_probs: &[f32],
     total_mass: f32,
     state_prob_sq_sum: f32,
+    untyped_uniform_marker: bool,
+    observed_dist: usize,
 ) {
     if allele_probs.is_empty() || total_mass <= 0.0 || state_prob_sq_sum <= 0.0 {
         return;
@@ -647,8 +737,15 @@ fn smooth_allele_posteriors_subset(
         return;
     }
 
-    // Prior should only matter when the allele posterior is weak/flat.
-    // If posterior is already decisive, applying AF pull degrades calibration.
+    // Apply local-prior smoothing only on truly untyped/uniform markers.
+    // Informative markers should be driven by likelihood, not AF pull.
+    if !untyped_uniform_marker {
+        return;
+    }
+
+    // Keep this as a weak regularizer: enough to prevent pathological AF
+    // collapse at long untyped stretches, but too small to drag informative
+    // copy signal toward mid-frequency alleles.
     let mut max_p = 0.0f32;
     for &p in allele_probs.iter() {
         if p > max_p {
@@ -658,7 +755,21 @@ fn smooth_allele_posteriors_subset(
     let allele_uncertainty = (1.0 - max_p).clamp(0.0, 1.0);
     let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
     let support_dilution = ((effective_states - 1.0) / effective_states).clamp(0.0, 1.0);
-    let prior_mass = (0.05f32 * allele_uncertainty * support_dilution).clamp(0.0, 0.05);
+    let prior_mass = {
+        let distance_weight = if observed_dist <= 8 {
+            0.10
+        } else if observed_dist <= 32 {
+            0.25
+        } else if observed_dist <= 128 {
+            0.50
+        } else {
+            1.0
+        };
+        // Tiny floor + weak adaptive term.
+        let floor = 0.004f32 * distance_weight * support_dilution;
+        let adaptive = 0.028f32 * distance_weight * allele_uncertainty * support_dilution;
+        (floor + adaptive).clamp(0.0, 0.035)
+    };
     if prior_mass <= 0.0 {
         return;
     }
@@ -783,8 +894,13 @@ fn forward_update_impl<C: RefColumnLike>(
     transition_haps: usize,
 ) -> f32 {
     let probs = target_probs.probs_for_marker(m);
-    let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
     let uniform = target_probs.is_uniform_marker(m);
+    let recomb_rate = adjusted_recomb_rate(
+        p_recomb.get(m).copied().unwrap_or(0.0),
+        target_probs.is_untyped_uniform_marker(m),
+        target_probs.is_missing_observed_marker(m),
+        target_probs.observed_distance(m),
+    );
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -865,8 +981,13 @@ fn forward_update_seqcoded(
     last_hap_ptr: &mut *const u16,
 ) -> f32 {
     let probs = target_probs.probs_for_marker(m);
-    let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
     let uniform = target_probs.is_uniform_marker(m);
+    let recomb_rate = adjusted_recomb_rate(
+        p_recomb.get(m).copied().unwrap_or(0.0),
+        target_probs.is_untyped_uniform_marker(m),
+        target_probs.is_missing_observed_marker(m),
+        target_probs.observed_distance(m),
+    );
 
     let col = ref_columns[m];
     let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
@@ -948,8 +1069,13 @@ fn forward_update_dict(
     last_dict_ptr: &mut *const DictionaryColumn,
 ) -> f32 {
     let probs = target_probs.probs_for_marker(m);
-    let recomb_rate = p_recomb.get(m).copied().unwrap_or(0.0);
     let uniform = target_probs.is_uniform_marker(m);
+    let recomb_rate = adjusted_recomb_rate(
+        p_recomb.get(m).copied().unwrap_or(0.0),
+        target_probs.is_untyped_uniform_marker(m),
+        target_probs.is_missing_observed_marker(m),
+        target_probs.observed_distance(m),
+    );
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -1157,8 +1283,13 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
 
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker(m_rev);
-                    let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
                     let uniform = target_probs.is_uniform_marker(m_rev);
+                    let recomb_rate = adjusted_recomb_rate(
+                        p_recomb.get(m_rev).copied().unwrap_or(0.0),
+                        target_probs.is_untyped_uniform_marker(m_rev),
+                        target_probs.is_missing_observed_marker(m_rev),
+                        target_probs.observed_distance(m_rev),
+                    );
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
@@ -1235,6 +1366,8 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                         &subset_counts,
                                         total,
                                         sq_sum,
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        target_probs.observed_distance(m_rev),
                                     );
                                 }
                             } else {
@@ -1466,8 +1599,13 @@ fn run_impute_hmm_seqcoded(
 
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker(m_rev);
-                    let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
                     let uniform = target_probs.is_uniform_marker(m_rev);
+                    let recomb_rate = adjusted_recomb_rate(
+                        p_recomb.get(m_rev).copied().unwrap_or(0.0),
+                        target_probs.is_untyped_uniform_marker(m_rev),
+                        target_probs.is_missing_observed_marker(m_rev),
+                        target_probs.observed_distance(m_rev),
+                    );
 
                     let col = ref_columns[m_rev];
                     let seq_patterns = refresh_seq_patterns(
@@ -1540,6 +1678,8 @@ fn run_impute_hmm_seqcoded(
                                         &subset_counts,
                                         total,
                                         sq_sum,
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        target_probs.observed_distance(m_rev),
                                     );
                                 }
                             } else {
@@ -1769,8 +1909,13 @@ fn run_impute_hmm_dict(
 
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker(m_rev);
-                    let recomb_rate = p_recomb.get(m_rev).copied().unwrap_or(0.0);
                     let uniform = target_probs.is_uniform_marker(m_rev);
+                    let recomb_rate = adjusted_recomb_rate(
+                        p_recomb.get(m_rev).copied().unwrap_or(0.0),
+                        target_probs.is_untyped_uniform_marker(m_rev),
+                        target_probs.is_missing_observed_marker(m_rev),
+                        target_probs.observed_distance(m_rev),
+                    );
 
                     let col = &ref_columns[m_rev];
                     let dict_patterns = refresh_dict_patterns(
@@ -1844,6 +1989,8 @@ fn run_impute_hmm_dict(
                                         &subset_counts,
                                         total,
                                         sq_sum,
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        target_probs.observed_distance(m_rev),
                                     );
                                 }
                             } else {

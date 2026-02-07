@@ -5876,10 +5876,18 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             };
 
+            let carrier_panel_haps = if n_ref_haps > 0 { n_ref_haps } else { n_total_haps };
             let mut carrier_haps: Vec<Vec<u32>> = vec![Vec::new(); n_markers];
             for &m in &rare_markers {
                 let mut carriers = Vec::new();
-                for h in 0..n_total_haps {
+                let hap_iter: Box<dyn Iterator<Item = usize>> = if n_ref_haps > 0 {
+                    // Reference-guided Stage 2: only reference carriers should
+                    // define injected rare-donor support.
+                    Box::new(n_haps..n_total_haps)
+                } else {
+                    Box::new(0..n_total_haps)
+                };
+                for h in hap_iter {
                     let allele = get_allele_global(m, h);
                     if allele > 0 && allele != 255 {
                         carriers.push(h as u32);
@@ -6174,18 +6182,43 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mkr_b = (mkr_a + 1).min(n_stage1.saturating_sub(1));
                         let state_haps_for_interp_a = get_haps!(mkr_a);
                         let state_haps_for_interp_b = get_haps!(mkr_b);
-                        let bridge_probs1 = stage2_phaser.bridge_hap_probs(
-                            m,
-                            &probs1,
-                            &state_haps_for_interp_a,
-                            &state_haps_for_interp_b,
-                        );
-                        let bridge_probs2 = stage2_phaser.bridge_hap_probs(
-                            m,
-                            &probs2,
-                            &state_haps_for_interp_a,
-                            &state_haps_for_interp_b,
-                        );
+                        let marker_maf = maf[m];
+                        let is_rare_marker = marker_maf < rare_threshold;
+                        let carriers = &carrier_haps[m];
+                        let bridge_probs1 = if is_rare_marker && !carriers.is_empty() {
+                            stage2_phaser.carrier_injected_bridge_hap_probs(
+                                m,
+                                &probs1,
+                                &state_haps_for_interp_a,
+                                &state_haps_for_interp_b,
+                                carriers,
+                                carrier_panel_haps.max(1),
+                            )
+                        } else {
+                            stage2_phaser.bridge_hap_probs(
+                                m,
+                                &probs1,
+                                &state_haps_for_interp_a,
+                                &state_haps_for_interp_b,
+                            )
+                        };
+                        let bridge_probs2 = if is_rare_marker && !carriers.is_empty() {
+                            stage2_phaser.carrier_injected_bridge_hap_probs(
+                                m,
+                                &probs2,
+                                &state_haps_for_interp_a,
+                                &state_haps_for_interp_b,
+                                carriers,
+                                carrier_panel_haps.max(1),
+                            )
+                        } else {
+                            stage2_phaser.bridge_hap_probs(
+                                m,
+                                &probs2,
+                                &state_haps_for_interp_a,
+                                &state_haps_for_interp_b,
+                            )
+                        };
 
                         // Handle missing genotypes by imputation
                         if sp.is_missing(m) || a1 == 255 || a2 == 255 {
@@ -6233,9 +6266,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             continue;
                         }
 
-                        let marker_maf = maf[m];
-                        let is_rare_marker = marker_maf < rare_threshold;
-                        let carriers = &carrier_haps[m];
                         let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
                         let mut log_same = 0.0f32;
                         let mut log_swap = 0.0f32;
@@ -6257,20 +6287,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             log_swap += obs_conf * score2.max(1e-30).ln();
                         }
 
-                        let al_probs1 = stage2_phaser.interpolated_allele_probs(
+                        let al_probs1 = stage2_phaser.interpolated_allele_probs_from_bridge(
                             m,
-                            &probs1,
-                            &state_haps_for_interp_a,
-                            &state_haps_for_interp_b,
+                            &bridge_probs1,
                             &get_allele,
                             a1,
                             a2,
                         );
-                        let al_probs2 = stage2_phaser.interpolated_allele_probs(
+                        let al_probs2 = stage2_phaser.interpolated_allele_probs_from_bridge(
                             m,
-                            &probs2,
-                            &state_haps_for_interp_a,
-                            &state_haps_for_interp_b,
+                            &bridge_probs2,
                             &get_allele,
                             a1,
                             a2,
@@ -6307,6 +6333,31 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 } else if d2 == a1 {
                                     log_swap += obs_conf * w2;
                                 }
+                            }
+                        }
+
+                        // Private/singleton-like sites are weakly identifiable under
+                        // pure copying. Apply a low-confidence coalescent heuristic:
+                        // place the non-reference allele on the haplotype with weaker
+                        // local panel match (less copied from panel backbone).
+                        let singleton_private = is_rare_marker
+                            && carriers.is_empty()
+                            && ((a1 == 0 && a2 > 0) || (a2 == 0 && a1 > 0));
+                        if singleton_private {
+                            let match1 = top_bridge_haplotype(&bridge_probs1)
+                                .map(|(_, p, _)| p)
+                                .unwrap_or(0.5);
+                            let match2 = top_bridge_haplotype(&bridge_probs2)
+                                .map(|(_, p, _)| p)
+                                .unwrap_or(0.5);
+                            let alt_on_h1 = a1 > 0 && a2 == 0;
+                            let prefer_h1 = match1 <= match2;
+                            let support_same = if alt_on_h1 { prefer_h1 } else { !prefer_h1 };
+                            let bias = (0.02 + 0.10 * (match1 - match2).abs()).clamp(0.02, 0.12);
+                            if support_same {
+                                log_same += bias;
+                            } else {
+                                log_swap += bias;
                             }
                         }
 
@@ -8500,28 +8551,46 @@ fn sample_dynamic_mcmc(
         let suspicious_swap_entropy =
             swap_bits.len() >= 8 && swap_transitions * 3 > swap_bits.len();
         let suspicious_overconfidence = near_mid == 0 && mean_prob > 0.95;
-        if het_positions.len() >= 20 {
-            let preview = swap_bits.len().min(16);
-            eprintln!(
-                "[mosaic dynamic summary] seed={} sample={} markers={} hets={} steps={} has_anchor={} anomaly={} path_switches=({},{}) h1_transitions={} swap_transitions={} swap_mean={:.3} near_mid={} top_path1={:?} top_path2={:?} preview_bits={:?} preview_probs={:?}",
-                seed,
-                sample_idx,
-                n_markers,
-                het_positions.len(),
-                n_mcmc_steps,
-                has_anchor,
-                suspicious_swap_entropy || suspicious_overconfidence,
-                path1_switches,
-                path2_switches,
-                h1_transitions,
-                swap_transitions,
-                mean_prob,
-                near_mid,
-                top1,
-                top2,
-                &swap_bits[..preview],
-                &swap_probs[..preview]
-            );
+        let is_anomaly = suspicious_swap_entropy || suspicious_overconfidence;
+        let periodic_sample = sample_idx % 128 == 0;
+        if het_positions.len() >= 20 && (is_anomaly || periodic_sample) {
+            if is_anomaly {
+                let preview = swap_bits.len().min(16);
+                eprintln!(
+                    "[mosaic dynamic summary] seed={} sample={} markers={} hets={} steps={} has_anchor={} anomaly=true path_switches=({},{}) h1_transitions={} swap_transitions={} swap_mean={:.3} near_mid={} top_path1={:?} top_path2={:?} preview_bits={:?} preview_probs={:?}",
+                    seed,
+                    sample_idx,
+                    n_markers,
+                    het_positions.len(),
+                    n_mcmc_steps,
+                    has_anchor,
+                    path1_switches,
+                    path2_switches,
+                    h1_transitions,
+                    swap_transitions,
+                    mean_prob,
+                    near_mid,
+                    top1,
+                    top2,
+                    &swap_bits[..preview],
+                    &swap_probs[..preview]
+                );
+            } else {
+                eprintln!(
+                    "[mosaic dynamic summary] seed={} sample={} markers={} hets={} steps={} has_anchor={} anomaly=false path_switches=({},{}) h1_transitions={} swap_transitions={} swap_mean={:.3}",
+                    seed,
+                    sample_idx,
+                    n_markers,
+                    het_positions.len(),
+                    n_mcmc_steps,
+                    has_anchor,
+                    path1_switches,
+                    path2_switches,
+                    h1_transitions,
+                    swap_transitions,
+                    mean_prob
+                );
+            }
         }
     }
     (
@@ -10146,56 +10215,29 @@ impl Stage2Phaser {
         }
     }
 
-    /// Compute interpolated allele probabilities for a rare marker
-    ///
-    /// Following Java Stage2Baum.unscaledAlProbs:
-    /// - For each HMM state, interpolate probability from flanking Stage 1 markers
-    /// - Accumulate allele probabilities based on reference haplotype alleles
-    /// Compute allele probabilities using haploid Li-Stephens emission model.
-    ///
-    /// Each HMM state corresponds to a specific reference haplotype. The emission
-    /// probability depends ONLY on that haplotype's allele - checking paired
-    /// haplotypes would violate the haploid model assumption.
-    fn interpolated_allele_probs<F>(
+    fn interpolated_allele_probs_from_bridge<F>(
         &self,
         marker: usize,
-        state_probs: &[Vec<f32>],        // [stage1_marker][state]
-        haps_at_mkr_a: &[CombinedHapId], // haplotypes at left flanking Stage 1 marker
-        haps_at_mkr_b: &[CombinedHapId], // haplotypes at right flanking Stage 1 marker
-        get_allele: &F,                  // Closure to get allele for any haplotype
+        bridge_probs: &std::collections::HashMap<u32, f32>,
+        get_allele: &F,
         a1: u8,
         a2: u8,
     ) -> [f32; 2]
     where
-        F: Fn(usize, usize) -> u8, // (marker, hap_index) -> allele
+        F: Fn(usize, usize) -> u8,
     {
         let mut al_probs = [0.0f32; 2];
-        let bridge_probs = self.bridge_hap_probs(marker, state_probs, haps_at_mkr_a, haps_at_mkr_b);
-
         for (&hap, &prob) in bridge_probs.iter() {
-            let hap = hap as usize;
-
-            // Get allele from this specific haplotype at the rare marker.
-            // Li-Stephens HMM models haploid copying: state k means we're copying
-            // haplotype k, so emission depends ONLY on haplotype k's allele.
-            // The paired haplotype (hap ^ 1) is irrelevant - checking it would
-            // introduce "free switching" and wash out the phasing signal.
-            let ref_allele = get_allele(marker, hap);
-
+            let ref_allele = get_allele(marker, hap as usize);
             if ref_allele == 255 {
                 continue;
             }
-
-            // Simple haploid emission: if this reference haplotype carries a1, add
-            // probability to a1; if it carries a2, add to a2.
             if ref_allele == a1 {
                 al_probs[0] += prob;
             } else if ref_allele == a2 {
                 al_probs[1] += prob;
             }
-            // If ref_allele matches neither (e.g., multiallelic), no contribution
         }
-
         al_probs
     }
 
@@ -10321,6 +10363,77 @@ impl Stage2Phaser {
             }
         }
         hap_probs
+    }
+
+    fn carrier_injected_bridge_hap_probs(
+        &self,
+        marker: usize,
+        state_probs: &[Vec<f32>],
+        haps_at_mkr_a: &[CombinedHapId],
+        haps_at_mkr_b: &[CombinedHapId],
+        carriers: &[u32],
+        panel_haps: usize,
+    ) -> std::collections::HashMap<u32, f32> {
+        let mut base = self.bridge_hap_probs(marker, state_probs, haps_at_mkr_a, haps_at_mkr_b);
+        if carriers.is_empty() || panel_haps == 0 {
+            return base;
+        }
+
+        let mkr_a = self.prev_stage1_marker[marker];
+        let mkr_b = (mkr_a + 1).min(self.n_stage1.saturating_sub(1));
+        if mkr_a == mkr_b || self.stage1_markers.is_empty() {
+            return base;
+        }
+
+        let pos_a_idx = self.stage1_markers[mkr_a];
+        let pos_b_idx = self.stage1_markers[mkr_b];
+        let pos_a = *self.gen_positions.get(pos_a_idx).unwrap_or(&0.0);
+        let pos_b = *self.gen_positions.get(pos_b_idx).unwrap_or(&pos_a);
+        let pos_m = *self.gen_positions.get(marker).unwrap_or(&pos_a);
+
+        if !(pos_b > pos_a && pos_m > pos_a && pos_m < pos_b) {
+            return base;
+        }
+
+        let d1 = (pos_m - pos_a).max(0.0);
+        let d2 = (pos_b - pos_m).max(0.0);
+        let r1 = self.p_recomb(d1);
+        let r2 = self.p_recomb(d2);
+        let denom = d1 + d2;
+        let weight_a = if denom > 0.0 {
+            (d2 / denom) as f32
+        } else {
+            0.5
+        };
+        let weight_b = 1.0 - weight_a;
+
+        // Principled injected mass: LS switch mass to known carrier set under
+        // uniform jump over the reference panel.
+        let panel = panel_haps as f32;
+        let carrier_frac = (carriers.len() as f32 / panel).clamp(0.0, 1.0);
+        let switch_mass = ((weight_a * r1 + weight_b * r2) * carrier_frac).clamp(0.0, 0.20);
+        if switch_mass <= 0.0 {
+            return base;
+        }
+
+        let keep = (1.0 - switch_mass).max(0.0);
+        for p in base.values_mut() {
+            *p *= keep;
+        }
+
+        let add = switch_mass / carriers.len() as f32;
+        for &hap in carriers {
+            *base.entry(hap).or_insert(0.0) += add;
+        }
+
+        let sum: f32 = base.values().copied().sum();
+        if sum > 0.0 {
+            let inv = 1.0 / sum;
+            for p in base.values_mut() {
+                *p *= inv;
+            }
+        }
+        base
     }
 }
 

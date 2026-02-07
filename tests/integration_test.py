@@ -27,7 +27,7 @@ Usage:
   python integration_test.py prepare-profile  # Prepare 5% subset for profiling
   python integration_test.py beagle       # Run Beagle imputation only
   python integration_test.py reagle       # Run Reagle imputation only
-  python integration_test.py phasing-compare  # Compare phasing vs EagleImp/SHAPEIT5
+  python integration_test.py phasing-compare  # Compare phasing vs EagleImp/TRUTH baseline
   python integration_test.py metrics      # Calculate metrics only
 """
 
@@ -341,6 +341,13 @@ def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):
                 break
 
     chrom_label = find_chrom_label(ref_vcf, chrom) or f"chr{chrom}"
+    chrom_token = str(chrom).replace("chr", "")
+    if chrom_token.upper() == "X":
+        map_chr = "23"
+    elif chrom_token.upper() == "Y":
+        map_chr = "24"
+    else:
+        map_chr = chrom_token
     positions = []
     with _open_maybe_gzip(ref_vcf) as handle:
         for line in handle:
@@ -366,10 +373,11 @@ def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):
         # EagleImp requires one of:
         #   chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)
         #   position COMBINED_rate(cM/Mb) Genetic_Map(cM)
+        # If chromosome column is present, use numeric chromosome IDs (no "chr" prefix).
         f.write("chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)\n")
         for pos in positions:
             cm = pos / 1_000_000.0
-            f.write(f"{chrom_label} {pos} 1.0 {cm:.6f}\n")
+            f.write(f"{map_chr} {pos} 1.0 {cm:.6f}\n")
 
     return map_path
 
@@ -400,6 +408,30 @@ def find_eagleimp_phased_output(output_prefix, data_dir):
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    for candidate in Path(data_dir).glob("*eagleimp*phased*.vcf.gz"):
+        return candidate
+    for candidate in Path(data_dir).glob("*eagleimp*phased*.bcf"):
+        return candidate
+    return None
+
+
+def find_eagleimp_imputed_output(output_prefix, data_dir):
+    """Find EagleImp imputed output from common naming conventions."""
+    candidates = [
+        Path(str(output_prefix) + ".imputed.vcf.gz"),
+        Path(str(output_prefix) + ".imputed.bcf"),
+        Path(str(output_prefix) + ".phased.vcf.gz"),
+        Path(str(output_prefix) + ".phased.bcf"),
+        Path(str(output_prefix) + ".vcf.gz"),
+        Path(str(output_prefix) + ".bcf"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    for candidate in Path(data_dir).glob("*eagleimp*imput*.vcf.gz"):
+        return candidate
+    for candidate in Path(data_dir).glob("*eagleimp*imput*.bcf"):
+        return candidate
     for candidate in Path(data_dir).glob("*eagleimp*phased*.vcf.gz"):
         return candidate
     for candidate in Path(data_dir).glob("*eagleimp*phased*.bcf"):
@@ -3152,7 +3184,7 @@ def stage_phasing_eagleimp():
 def stage_phasing_metrics():
     """Calculate phasing metrics after phased outputs are produced."""
     print("=" * 60)
-    print("STAGE: PHASING METRICS - Reagle vs EagleImp vs SHAPEIT5")
+    print("STAGE: PHASING METRICS - Reagle vs EagleImp vs TRUTH")
     print("=" * 60)
 
     paths = get_paths()
@@ -3201,10 +3233,10 @@ def stage_phasing_metrics():
         reference_vcf=str(paths["ref_vcf"]),
         require_ds_gp=False
     )
-    metrics["shapeit5"] = calculate_metrics(
+    metrics["truth"] = calculate_metrics(
         str(paths["truth_vcf"]),
         str(paths["truth_vcf"]),
-        str(paths["data_dir"] / "shapeit5_phasing"),
+        str(paths["data_dir"] / "truth_phasing"),
         input_vcf=str(input_vcf),
         reference_vcf=str(paths["ref_vcf"]),
         require_ds_gp=False
@@ -3224,9 +3256,9 @@ def stage_phasing_metrics():
 
 
 def stage_phasing_compare():
-    """Compare phasing accuracy between Reagle, EagleImp, and SHAPEIT5."""
+    """Compare phasing accuracy between Reagle, EagleImp, and TRUTH baseline."""
     print("=" * 60)
-    print("STAGE: PHASING COMPARE - Reagle vs EagleImp vs SHAPEIT5")
+    print("STAGE: PHASING COMPARE - Reagle vs EagleImp vs TRUTH")
     print("=" * 60)
 
     stage_phasing_reagle()
@@ -3384,7 +3416,7 @@ Stages:
   phasing-reagle  Run Reagle phasing-only
   phasing-eagleimp  Run EagleImp phasing-only
   phasing-metrics  Calculate phasing metrics from phased outputs
-  phasing-compare  Compare phasing accuracy (Reagle vs EagleImp vs SHAPEIT5)
+  phasing-compare  Compare phasing accuracy (Reagle vs EagleImp vs TRUTH baseline)
   impute5      Run IMPUTE5 imputation
   minimac      Run Minimac4 imputation
   glimpse      Run GLIMPSE imputation
@@ -3729,6 +3761,8 @@ def stage_impute_chr(chrom, tools):
             run_minimac_chr(chrom, paths)
         elif tool == 'glimpse':
             run_glimpse_chr(chrom, paths)
+        elif tool == 'eagleimp':
+            run_eagleimp_chr(chrom, paths)
 
 
 def run_beagle_chr(chrom, paths):
@@ -3916,6 +3950,52 @@ def run_glimpse_chr(chrom, paths):
         print(f"Using existing GLIMPSE output for chr{chrom}")
 
 
+def run_eagleimp_chr(chrom, paths):
+    """Run EagleImp imputation for a chromosome."""
+    data_dir = paths['data_dir']
+    out = data_dir / "eagleimp_imputed.vcf.gz"
+    if out.exists():
+        print(f"Using existing EagleImp output for chr{chrom}")
+        return
+
+    eagleimp_bin = find_executable("eagleimp", env_var="EAGLEIMP_BIN")
+    if not eagleimp_bin:
+        raise RuntimeError("EagleImp binary not found (set EAGLEIMP_BIN or ensure in PATH).")
+
+    print(f"Running EagleImp on chr{chrom}...")
+    try:
+        print_tool_help("EagleImp", str(eagleimp_bin))
+        map_path = ensure_simple_genetic_map(paths["ref_vcf"], data_dir / f"chr{chrom}.simple.map.txt", chrom=str(chrom))
+        eagleimp_ref = data_dir / f"{chrom}.ref.vcf.gz"
+        eagleimp_ref_index = Path(str(eagleimp_ref) + ".csi")
+        if not eagleimp_ref.exists():
+            eagleimp_ref.symlink_to(paths["ref_vcf"])
+        if not eagleimp_ref_index.exists():
+            src_index = Path(str(paths["ref_vcf"]) + ".csi")
+            if src_index.exists():
+                eagleimp_ref_index.symlink_to(src_index)
+        qref_path = ensure_eagleimp_qref(eagleimp_ref, eagleimp_bin)
+        eagleimp_prefix = data_dir / "eagleimp_imputed"
+        run(
+            f"{eagleimp_bin} --geneticMap {map_path} --ref {qref_path} "
+            f"--target {paths['input_vcf']} --skipPhasing --imputeInfo gp "
+            f"--outputPhasedFile -o {eagleimp_prefix}"
+        )
+
+        produced = find_eagleimp_imputed_output(eagleimp_prefix, data_dir)
+        if not produced or not produced.exists():
+            raise RuntimeError("EagleImp output not found after run")
+
+        if str(produced).endswith(".bcf"):
+            run(f"bcftools view {produced} -O z -o {out}")
+        elif produced != out:
+            run(f"cp {produced} {out}")
+
+        run(f"bcftools index -f {out}")
+    except Exception as e:
+        print(f"EagleImp failed on chr{chrom}: {e}")
+
+
 def stage_metrics_chr(chrom):
     """Calculate metrics for a specific chromosome."""
     print(f"\n{'=' * 60}")
@@ -3932,6 +4012,7 @@ def stage_metrics_chr(chrom):
         ("impute5", "impute5_imputed.vcf.gz"),
         ("minimac", "minimac_imputed.vcf.gz"),
         ("glimpse", "glimpse_imputed.vcf.gz"),
+        ("eagleimp", "eagleimp_imputed.vcf.gz"),
     ]
     
     degraded_any = False
@@ -3974,13 +4055,14 @@ def stage_summary():
     print("=" * 60)
     
     script_dir = Path(__file__).parent
-    tools = ["beagle", "reagle", "impute5", "minimac", "glimpse"]
+    tools = ["beagle", "reagle", "impute5", "minimac", "glimpse", "eagleimp"]
     display_names = {
         "beagle": "Beagle 5.5",
         "reagle": "Reagle (Rust)",
         "impute5": "IMPUTE5",
         "minimac": "Minimac4",
-        "glimpse": "GLIMPSE2"
+        "glimpse": "GLIMPSE2",
+        "eagleimp": "EagleImp"
     }
 
     final_metrics = []

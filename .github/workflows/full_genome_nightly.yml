@@ -16,7 +16,7 @@ on:
       tools:
         description: 'Tools to run (comma-separated)'
         required: false
-        default: 'beagle,reagle,impute5,minimac,glimpse'
+        default: 'beagle,reagle,impute5,minimac,glimpse,eagleimp'
 
 jobs:
   # Job 0: Determine which chromosomes to test
@@ -124,7 +124,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tool: [beagle, reagle, impute5, minimac, glimpse]
+        tool: [beagle, reagle, impute5, minimac, glimpse, eagleimp]
         chromosome: ${{ fromJson(needs.setup.outputs.chromosomes) }}
     steps:
       - uses: actions/checkout@v4
@@ -133,6 +133,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bcftools tabix curl openjdk-17-jre
+
+      - name: Install EagleImp build dependencies
+        if: matrix.tool == 'eagleimp'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake zlib1g-dev \
+            libboost-dev libboost-filesystem-dev libboost-program-options-dev \
+            libtbb-dev libhts-dev
 
       - name: Download Reagle binary
         if: matrix.tool == 'reagle'
@@ -144,6 +153,14 @@ jobs:
       - name: Make Reagle executable
         if: matrix.tool == 'reagle'
         run: chmod +x target/release/reagle
+
+      - name: Build EagleImp
+        if: matrix.tool == 'eagleimp'
+        run: |
+          git clone --depth 1 https://github.com/ikmb/eagleimp.git "$RUNNER_TEMP/eagleimp"
+          cmake -DCMAKE_BUILD_TYPE=Release -S "$RUNNER_TEMP/eagleimp/src" -B "$RUNNER_TEMP/eagleimp/build"
+          cmake --build "$RUNNER_TEMP/eagleimp/build" -j
+          echo "EAGLEIMP_BIN=$RUNNER_TEMP/eagleimp/build/eagleimp" >> "$GITHUB_ENV"
 
       - name: Download chromosome data
         uses: actions/download-artifact@v4
@@ -176,7 +193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tool: [beagle, reagle, impute5, minimac, glimpse]
+        tool: [beagle, reagle, impute5, minimac, glimpse, eagleimp]
         chromosome: ${{ fromJson(needs.setup.outputs.chromosomes) }}
     steps:
       - uses: actions/checkout@v4

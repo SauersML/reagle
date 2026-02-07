@@ -75,6 +75,7 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
             let ref_chrom = ref_gt.markers().chrom_name(ref_marker.chrom).unwrap_or("");
             let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
             if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
+                let mut best: Option<(usize, AlleleMapping, (usize, usize, usize, usize))> = None;
                 for &target_idx in target_candidates {
                     if used_targets[target_idx] {
                         continue;
@@ -83,47 +84,55 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
 
                     // Compute allele mapping (handles strand flips)
                     if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
-                        // Check if the mapping is valid (at least REF allele maps)
                         if mapping.is_valid() {
-                            let strand_flipped = mapping.strand_flipped;
-                            let alleles_swapped = mapping.alleles_swapped;
-                            ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
-                            target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
-                            allele_mappings[target_idx] = Some(mapping);
-                            used_targets[target_idx] = true;
-
-                            if strand_flipped {
-                                n_strand_flipped += 1;
-                                // Warn about strand-ambiguous markers (A/T or C/G SNV) where flip detection is unreliable
-                                if crate::data::marker::is_strand_ambiguous(target_marker) {
-                                    eprintln!(
-                                        "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
-                                        target_marker.pos
-                                    );
-                                }
+                            let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count();
+                            let ref_is_ref =
+                                usize::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
+                            let unswapped = usize::from(!mapping.alleles_swapped);
+                            let unflipped = usize::from(!mapping.strand_flipped);
+                            let score = (mapped, ref_is_ref, unswapped, unflipped);
+                            if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
+                                best = Some((target_idx, mapping, score));
                             }
-                            if alleles_swapped {
-                                n_allele_swapped += 1;
-                                eprintln!(
-                                    "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
-                                    target_marker.pos,
-                                    target_marker.ref_allele,
-                                    target_marker
-                                        .alt_alleles
-                                        .get(0)
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                    ref_marker.ref_allele,
-                                    ref_marker
-                                        .alt_alleles
-                                        .get(0)
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                );
-                            }
-                            break;
                         }
-                        // If mapping is invalid, marker won't be aligned
+                    }
+                }
+                if let Some((target_idx, mapping, _)) = best {
+                    let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+                    let strand_flipped = mapping.strand_flipped;
+                    let alleles_swapped = mapping.alleles_swapped;
+                    ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
+                    target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
+                    allele_mappings[target_idx] = Some(mapping);
+                    used_targets[target_idx] = true;
+
+                    if strand_flipped {
+                        n_strand_flipped += 1;
+                        if crate::data::marker::is_strand_ambiguous(target_marker) {
+                            eprintln!(
+                                "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
+                                target_marker.pos
+                            );
+                        }
+                    }
+                    if alleles_swapped {
+                        n_allele_swapped += 1;
+                        eprintln!(
+                            "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                            target_marker.pos,
+                            target_marker.ref_allele,
+                            target_marker
+                                .alt_alleles
+                                .get(0)
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            ref_marker.ref_allele,
+                            ref_marker
+                                .alt_alleles
+                                .get(0)
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
                     }
                 }
             }
@@ -179,6 +188,7 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
             let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
             if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
+                let mut best: Option<(usize, AlleleMapping, (usize, usize, usize, usize))> = None;
                 let mut aligned = false;
                 for &target_idx in target_candidates {
                     if used_targets[target_idx] {
@@ -188,44 +198,55 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
 
                     if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
                         if mapping.is_valid() {
-                            let strand_flipped = mapping.strand_flipped;
-                            let alleles_swapped = mapping.alleles_swapped;
-                            ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
-                            target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
-                            allele_mappings[target_idx] = Some(mapping);
-                            used_targets[target_idx] = true;
-                            aligned = true;
-
-                            if strand_flipped {
-                                n_strand_flipped += 1;
-                                if crate::data::marker::is_strand_ambiguous(target_marker) {
-                                    eprintln!(
-                                        "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
-                                        target_marker.pos
-                                    );
-                                }
+                            let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count();
+                            let ref_is_ref =
+                                usize::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
+                            let unswapped = usize::from(!mapping.alleles_swapped);
+                            let unflipped = usize::from(!mapping.strand_flipped);
+                            let score = (mapped, ref_is_ref, unswapped, unflipped);
+                            if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
+                                best = Some((target_idx, mapping, score));
                             }
-                            if alleles_swapped {
-                                n_allele_swapped += 1;
-                                eprintln!(
-                                    "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
-                                    target_marker.pos,
-                                    target_marker.ref_allele,
-                                    target_marker
-                                        .alt_alleles
-                                        .get(0)
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                    ref_marker.ref_allele,
-                                    ref_marker
-                                        .alt_alleles
-                                        .get(0)
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                );
-                            }
-                            break;
                         }
+                    }
+                }
+                if let Some((target_idx, mapping, _)) = best {
+                    let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+                    let strand_flipped = mapping.strand_flipped;
+                    let alleles_swapped = mapping.alleles_swapped;
+                    ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
+                    target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
+                    allele_mappings[target_idx] = Some(mapping);
+                    used_targets[target_idx] = true;
+                    aligned = true;
+
+                    if strand_flipped {
+                        n_strand_flipped += 1;
+                        if crate::data::marker::is_strand_ambiguous(target_marker) {
+                            eprintln!(
+                                "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
+                                target_marker.pos
+                            );
+                        }
+                    }
+                    if alleles_swapped {
+                        n_allele_swapped += 1;
+                        eprintln!(
+                            "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                            target_marker.pos,
+                            target_marker.ref_allele,
+                            target_marker
+                                .alt_alleles
+                                .get(0)
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            ref_marker.ref_allele,
+                            ref_marker
+                                .alt_alleles
+                                .get(0)
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
                     }
                 }
                 if !aligned {
@@ -317,40 +338,52 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                 .unwrap_or("");
             let chrom_norm = normalize_chrom(chrom_name).to_string();
             if let Some(ref_candidates) = ref_pos_map.get(&(chrom_norm, target_marker.pos)) {
+                let mut best: Option<(usize, AlleleMapping, (usize, usize, usize, usize))> = None;
                 for &ref_idx in ref_candidates {
                     let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
                     if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
                         if mapping.is_valid() {
-                            let strand_flipped = mapping.strand_flipped;
-                            let alleles_swapped = mapping.alleles_swapped;
-                            target_to_ref[m] = Some(MarkerIdx::new(ref_idx as u32));
-                            if strand_flipped {
-                                stats.strand_flipped += 1;
+                            let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count();
+                            let ref_is_ref =
+                                usize::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
+                            let unswapped = usize::from(!mapping.alleles_swapped);
+                            let unflipped = usize::from(!mapping.strand_flipped);
+                            let score = (mapped, ref_is_ref, unswapped, unflipped);
+                            if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
+                                best = Some((ref_idx, mapping, score));
                             }
-                            if alleles_swapped {
-                                stats.allele_swapped += 1;
-                                eprintln!(
-                                    "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
-                                    target_marker.pos,
-                                    target_marker.ref_allele,
-                                    target_marker
-                                        .alt_alleles
-                                        .get(0)
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                    ref_marker.ref_allele,
-                                    ref_marker
-                                        .alt_alleles
-                                        .get(0)
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                );
-                            }
-                            allele_mappings[m] = Some(mapping);
-                            stats.aligned += 1;
-                            break;
                         }
                     }
+                }
+                if let Some((ref_idx, mapping, _)) = best {
+                    let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
+                    let strand_flipped = mapping.strand_flipped;
+                    let alleles_swapped = mapping.alleles_swapped;
+                    target_to_ref[m] = Some(MarkerIdx::new(ref_idx as u32));
+                    if strand_flipped {
+                        stats.strand_flipped += 1;
+                    }
+                    if alleles_swapped {
+                        stats.allele_swapped += 1;
+                        eprintln!(
+                            "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                            target_marker.pos,
+                            target_marker.ref_allele,
+                            target_marker
+                                .alt_alleles
+                                .get(0)
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            ref_marker.ref_allele,
+                            ref_marker
+                                .alt_alleles
+                                .get(0)
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                    }
+                    allele_mappings[m] = Some(mapping);
+                    stats.aligned += 1;
                 }
             }
         }
@@ -386,8 +419,8 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
         if let Some(Some(mapping)) = self.allele_mappings.get(target_marker) {
             mapping.reverse_map_allele(ref_allele).unwrap_or(255)
         } else {
-            // No mapping means identity (direct match assumed)
-            ref_allele
+            // Unaligned markers must not leak through as identity; treat as missing.
+            255
         }
     }
 
