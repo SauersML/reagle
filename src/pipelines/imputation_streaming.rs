@@ -3852,10 +3852,10 @@ impl crate::pipelines::ImputationPipeline {
                             let h = HapIdx::new((sample_idx * 2 + local) as u32);
                             let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
                             if let Some(missing) = target_missing {
-                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                    a = 255;
-                                }
-                            }
+                               if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
+                                   a = 255;
+                               }
+                           }
                             let a = if a == 255 {
                                 255
                             } else if let Some(mapping) = mapping {
@@ -4601,7 +4601,7 @@ impl crate::pipelines::ImputationPipeline {
                     if !has_priors_h1
                         && plan.n_ref_haps > 32
                         && !donors_h1.is_empty()
-                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        && false && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                     {
                         let donor_posts = posts_from_donors(&donors_h1)?;
                         let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
@@ -4660,7 +4660,7 @@ impl crate::pipelines::ImputationPipeline {
                     if !has_priors_h2
                         && plan.n_ref_haps > 32
                         && !donors_h2.is_empty()
-                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        && false && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
                     {
                         let donor_posts = posts_from_donors(&donors_h2)?;
                         let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
@@ -4806,10 +4806,10 @@ impl crate::pipelines::ImputationPipeline {
                             let h = HapIdx::new((sample_idx * 2 + local) as u32);
                             let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
                             if let Some(missing) = target_missing {
-                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                    a = 255;
-                                }
-                            }
+                               if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
+                                   a = 255;
+                               }
+                           }
                             let a = if a == 255 {
                                 255
                             } else if let Some(mapping) = mapping {
