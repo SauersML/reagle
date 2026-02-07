@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use bitvec::prelude::*;
 use rayon::prelude::*;
 use tracing::{info_span, instrument, warn};
 
@@ -132,7 +133,7 @@ struct ImputationPlan {
     n_ref_haps: usize,
     core_states: Vec<Vec<RefHapId>>, // per target hap (derived)
     window_intervals: Vec<Vec<HapIntervals>>, // per target hap (sparse)
-    abyss_mask: Vec<Vec<bool>>,      // per target hap
+    abyss_mask: Vec<BitVec<u64, Lsb0>>, // per target hap
     per_window_cap: usize,
     per_window_caps: Vec<usize>, // per window (global, same for all target haps)
     full_panel: bool,
@@ -252,7 +253,7 @@ fn log_imputation_plan_summary(plan: &ImputationPlan) {
             let abyss = plan
                 .abyss_mask
                 .get(hap_idx)
-                .map(|v| v.iter().filter(|&&b| b).count())
+                .map(|v| v.count_ones())
                 .unwrap_or(0);
 
             core_min = core_min.min(core);
@@ -395,7 +396,7 @@ fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> V
 
 fn build_sparse_scores(
     window_scores: &[Vec<(usize, f32)>],
-    abyss: &[bool],
+    abyss: &BitSlice<u64, Lsb0>,
 ) -> (Vec<usize>, Vec<Vec<(usize, f32)>>) {
     let mut map: HashMap<usize, usize> = HashMap::new();
     let mut candidate_haps: Vec<usize> = Vec::new();
@@ -406,7 +407,8 @@ fn build_sparse_scores(
             if score <= 0.0 || !score.is_finite() {
                 continue;
             }
-            if hap < abyss.len() && abyss[hap] {
+            // BitSlice::get returns Option<BitRef>, deref to bool
+            if hap < abyss.len() && *abyss.get(hap).unwrap() {
                 continue;
             }
             let idx = *map.entry(hap).or_insert_with(|| {
@@ -1376,7 +1378,7 @@ fn build_imputation_plan(
         n_ref_haps: 0,
         core_states: vec![Vec::new(); n_target_haps],
         window_intervals: vec![Vec::new(); n_target_haps],
-        abyss_mask: vec![Vec::new(); n_target_haps],
+        abyss_mask: vec![BitVec::new(); n_target_haps],
         per_window_cap: per_window_cap.max(1),
         per_window_caps: Vec::new(),
         full_panel: false,
@@ -2055,12 +2057,12 @@ fn build_imputation_plan(
             .par_iter()
             .enumerate()
             .map(|(i, &hap_idx)| {
-                let mut abyss = vec![false; n_ref_haps];
+                let mut abyss = bitvec![u64, Lsb0; 0; n_ref_haps];
                 let mut abyss_count = 0usize;
                 for h in 0..n_ref_haps {
                     let score = best_window_scores[i][h];
                     if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
-                        abyss[h] = true;
+                        abyss.set(h, true);
                         abyss_count += 1;
                     }
                 }
@@ -2071,13 +2073,13 @@ fn build_imputation_plan(
                     let top = select_top_k_allow_zero(&global_scores[i], keep);
                     if top.is_empty() {
                         for h in 0..keep {
-                            abyss[h] = false;
+                            abyss.set(h, false);
                         }
                         abyss_count = n_ref_haps.saturating_sub(keep);
                     } else {
                         for (h, _) in top {
-                            if abyss[h] {
-                                abyss[h] = false;
+                            if *abyss.get(h).unwrap() {
+                                abyss.set(h, false);
                                 abyss_count = abyss_count.saturating_sub(1);
                             }
                         }
@@ -3413,7 +3415,8 @@ impl crate::pipelines::ImputationPipeline {
                     if hap_idx < plan.abyss_mask.len() {
                         let abyss = &plan.abyss_mask[hap_idx];
                         for h in 0..plan.n_ref_haps {
-                            if !abyss.get(h).copied().unwrap_or(true) {
+                            // BitVec::get returns Option<BitRef>, deref to bool
+                            if !abyss.get(h).map(|b| *b).unwrap_or(true) {
                                 state_haps.push(RefHapId::new(h as u32));
                                 if state_haps.len() >= per_window_cap_local {
                                     break;
