@@ -4589,15 +4589,18 @@ impl crate::pipelines::ImputationPipeline {
                     )?;
 
                     // Global donor blending heuristic (conditional on window size)
+                    // Only apply when confidence is VERY low (ratio > 0.5) to avoid
+                    // degrading accuracy on dense panels where the HMM is reliable.
+                    let heuristic_threshold = 0.5f32;
                     if !has_priors_h1
                         && plan.n_ref_haps > 32
                         && !donors_h1.is_empty()
-                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        && conf_ratio_h1 > heuristic_threshold
                         && window_span_cm < 2.5
                     {
                         let donor_posts = posts_from_donors(&donors_h1)?;
-                        let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
+                        let t = ((conf_ratio_h1 - heuristic_threshold)
+                            / (1.0 - heuristic_threshold).max(1e-6))
                         .clamp(0.0, 1.0);
                         let tau = 1.0 + 1.5 * t;
                         temper_posts(&mut posts, tau);
@@ -4651,15 +4654,18 @@ impl crate::pipelines::ImputationPipeline {
                     )?;
 
                     // Global donor blending heuristic (conditional on window size)
+                    // Only apply when confidence is VERY low (ratio > 0.5) to avoid
+                    // degrading accuracy on dense panels where the HMM is reliable.
+                    let heuristic_threshold = 0.5f32;
                     if !has_priors_h2
                         && plan.n_ref_haps > 32
                         && !donors_h2.is_empty()
-                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        && conf_ratio_h2 > heuristic_threshold
                         && window_span_cm < 2.5
                     {
                         let donor_posts = posts_from_donors(&donors_h2)?;
-                        let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
+                        let t = ((conf_ratio_h2 - heuristic_threshold)
+                            / (1.0 - heuristic_threshold).max(1e-6))
                         .clamp(0.0, 1.0);
                         let tau = 1.0 + 1.5 * t;
                         temper_posts(&mut posts, tau);
