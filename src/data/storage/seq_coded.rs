@@ -18,32 +18,41 @@ use std::sync::Arc;
 pub struct SeqCodedBlock {
     /// Maps haplotype index -> sequence pattern index (shared across all markers in block)
     hap_to_seq: Arc<Vec<u16>>,
-    /// For each marker: maps sequence pattern index -> allele
-    /// Outer vec indexed by local marker offset within block
-    seq_to_allele: Vec<Vec<u8>>,
+    /// Number of sequences per marker (fixed within a BREF3 block)
+    n_seq: usize,
+    /// Flat marker-major storage:
+    /// marker `m` occupies `seq_to_allele_flat[m * n_seq .. (m + 1) * n_seq]`.
+    seq_to_allele_flat: Vec<u8>,
+    /// Number of markers stored in this block.
+    n_markers: usize,
     /// Number of haplotypes
     n_haps: usize,
 }
 
 impl SeqCodedBlock {
     /// Create a new sequence-coded block
-    pub fn new(hap_to_seq: Vec<u16>) -> Self {
+    pub fn new(hap_to_seq: Vec<u16>, n_seq: usize) -> Self {
         let n_haps = hap_to_seq.len();
         Self {
             hap_to_seq: Arc::new(hap_to_seq),
-            seq_to_allele: Vec::new(),
+            n_seq,
+            seq_to_allele_flat: Vec::new(),
+            n_markers: 0,
             n_haps,
         }
     }
 
-    /// Add a marker's sequence-to-allele mapping to the block
-    pub fn push_marker(&mut self, seq_alleles: Vec<u8>) {
-        self.seq_to_allele.push(seq_alleles);
+    /// Reserve space for one marker and return a writable slice for direct fill.
+    pub fn push_marker_slot(&mut self) -> &mut [u8] {
+        let start = self.seq_to_allele_flat.len();
+        self.seq_to_allele_flat.resize(start + self.n_seq, 0);
+        self.n_markers += 1;
+        &mut self.seq_to_allele_flat[start..start + self.n_seq]
     }
 
     /// Number of markers in this block
     pub fn n_markers(&self) -> usize {
-        self.seq_to_allele.len()
+        self.n_markers
     }
 
     /// Number of haplotypes
@@ -58,26 +67,29 @@ impl SeqCodedBlock {
 
     /// Sequence-to-allele mapping for a marker offset
     pub fn seq_alleles(&self, marker_offset: usize) -> &[u8] {
-        &self.seq_to_allele[marker_offset]
+        let start = marker_offset * self.n_seq;
+        let end = start + self.n_seq;
+        &self.seq_to_allele_flat[start..end]
     }
 
     /// Get allele for a haplotype at a marker (by local offset within block)
     #[inline]
     pub fn get(&self, marker_offset: usize, hap: HapIdx) -> u8 {
         let seq_idx = self.hap_to_seq[hap.as_usize()] as usize;
-        self.seq_to_allele[marker_offset][seq_idx]
+        let start = marker_offset * self.n_seq;
+        self.seq_to_allele_flat[start + seq_idx]
     }
 
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
         let hap_to_seq_size = self.hap_to_seq.len() * 2;
-        let seq_to_allele_size: usize = self.seq_to_allele.iter().map(|v| v.len()).sum();
+        let seq_to_allele_size = self.seq_to_allele_flat.len();
         hap_to_seq_size + seq_to_allele_size + std::mem::size_of::<Self>()
     }
 
     /// Count ALT allele carriers at a marker
     pub fn alt_count(&self, marker_offset: usize) -> usize {
-        let seq_alleles = &self.seq_to_allele[marker_offset];
+        let seq_alleles = self.seq_alleles(marker_offset);
         let mut count = 0usize;
         for &seq_idx in self.hap_to_seq.iter() {
             if seq_alleles[seq_idx as usize] > 0 {

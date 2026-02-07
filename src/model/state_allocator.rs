@@ -78,6 +78,35 @@ fn logaddexp(a: f32, b: f32) -> f32 {
     }
 }
 
+#[derive(Default)]
+struct DpScratch {
+    dp0: Vec<f32>,
+    dp1: Vec<f32>,
+    prev0: Vec<u8>,
+    prev1: Vec<u8>,
+    active: Vec<bool>,
+}
+
+impl DpScratch {
+    fn ensure_len(&mut self, w: usize) {
+        if self.dp0.len() < w {
+            self.dp0.resize(w, 0.0);
+        }
+        if self.dp1.len() < w {
+            self.dp1.resize(w, NEG_INF);
+        }
+        if self.prev0.len() < w {
+            self.prev0.resize(w, 0);
+        }
+        if self.prev1.len() < w {
+            self.prev1.resize(w, 0);
+        }
+        if self.active.len() < w {
+            self.active.resize(w, false);
+        }
+    }
+}
+
 /// Allocation result for a single target haplotype:
 /// intervals per selected haplotype (reference panel indices).
 #[derive(Clone, Debug)]
@@ -93,7 +122,7 @@ pub struct WindowAllocation {
 ///     r_w = p_recomb(d_w)
 ///     a_w = 1 - r_w
 ///
-/// Then, with donor pool size n_pool:
+/// Then, with boundary-specific donor pool size n_pool[w]:
 ///     p_stay = a_w + (1-a_w)/n_pool
 ///     p_switch_diff = (1-a_w) * (n_pool-1)/n_pool
 ///
@@ -107,13 +136,13 @@ pub struct WindowAllocation {
 fn continuity_terms(
     boundary_cm: &[f64],
     params: &ModelParams,
-    n_pool: usize,
+    n_pool_by_boundary: &[usize],
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut t11 = Vec::with_capacity(boundary_cm.len());
     let mut t10 = Vec::with_capacity(boundary_cm.len());
     let mut t01 = Vec::with_capacity(boundary_cm.len());
-    let n_pool_f = n_pool.max(2) as f32;
-    for &dist_cm in boundary_cm {
+    for (i, &dist_cm) in boundary_cm.iter().enumerate() {
+        let n_pool_f = n_pool_by_boundary.get(i).copied().unwrap_or(2).max(2) as f32;
         let r_w = params.p_recomb(dist_cm);
         let a_w = (1.0 - r_w).max(0.0).min(1.0);
         let p11 = a_w + (1.0 - a_w) / n_pool_f;
@@ -150,8 +179,7 @@ fn continuity_terms(
 /// - mu: per-window slot price.
 /// - t11/t10/t01: 2-state transition log-odds vs OFF->OFF.
 ///
-/// Returns: (total_gain, active_flags)
-fn dp_intervals_sparse(
+fn dp_intervals_sparse_scratch(
     scores: &[(usize, f32)],
     logz: &[f32],
     mu: f32,
@@ -159,15 +187,19 @@ fn dp_intervals_sparse(
     t11: &[f32],
     t10: &[f32],
     t01: &[f32],
-) -> (f32, Vec<bool>) {
+    scratch: &mut DpScratch,
+) -> (f32, usize) {
     let w = logz.len();
     if w == 0 {
-        return (0.0, Vec::new());
+        return (0.0, 0);
     }
-    let mut dp0 = vec![0.0f32; w];
-    let mut dp1 = vec![NEG_INF; w];
-    let mut prev0 = vec![0u8; w];
-    let mut prev1 = vec![0u8; w];
+    scratch.ensure_len(w);
+    let dp0 = &mut scratch.dp0[..w];
+    let dp1 = &mut scratch.dp1[..w];
+    let prev0 = &mut scratch.prev0[..w];
+    let prev1 = &mut scratch.prev1[..w];
+    let active = &mut scratch.active[..w];
+    active.fill(false);
 
     let mut s_idx = 0usize;
     let mut score0 = NEG_INF;
@@ -215,12 +247,13 @@ fn dp_intervals_sparse(
         }
     }
 
-    let mut active = vec![false; w];
+    let mut active_len = 0usize;
     let mut state = if dp1[w - 1] >= dp0[w - 1] { 1 } else { 0 };
     let mut i = w - 1;
     loop {
         if state == 1 {
             active[i] = true;
+            active_len += 1;
             state = prev1[i] as usize;
         } else {
             state = prev0[i] as usize;
@@ -232,7 +265,7 @@ fn dp_intervals_sparse(
     }
 
     let gain = dp0[w - 1].max(dp1[w - 1]);
-    (gain, active)
+    (gain, active_len)
 }
 
 fn active_to_intervals(active: &[bool]) -> Vec<(u32, u32)> {
@@ -248,7 +281,7 @@ fn active_to_intervals(active: &[bool]) -> Vec<(u32, u32)> {
         while end + 1 < active.len() && active[end + 1] {
             end += 1;
         }
-        out.push((start as u32, end as u32));
+        out.push((start as u32, (end + 1) as u32));
         i = end + 1;
     }
     out
@@ -308,9 +341,14 @@ pub fn allocate_lms_sparse(
     let mut selected = vec![false; n];
     let mut remaining = total_budget;
 
-    // Use a fixed donor pool size for separability. We default to the full
-    // reference panel size so continuity odds align with the actual HMM physics.
-    let (t11, t10, t01) = continuity_terms(boundary_cm, params, n_pool);
+    let mut n_pool_by_boundary: Vec<usize> = Vec::with_capacity(w.saturating_sub(1));
+    for i in 0..w.saturating_sub(1) {
+        let c0 = per_window_caps.get(i).copied().unwrap_or(n_pool);
+        let c1 = per_window_caps.get(i + 1).copied().unwrap_or(n_pool);
+        let n_eff = c0.min(c1).min(n_pool).max(2);
+        n_pool_by_boundary.push(n_eff);
+    }
+    let (t11, t10, t01) = continuity_terms(boundary_cm, params, &n_pool_by_boundary);
 
     // Determine mu by binary search to approximately meet budget.
     // We tune mu on the fly: larger mu -> fewer activations.
@@ -384,6 +422,7 @@ pub fn allocate_lms_sparse(
 
     // Lazy-greedy allocation using tuned mu.
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    let mut dp_scratch = DpScratch::default();
     {
         let blocked: Vec<bool> = counts
             .iter()
@@ -392,8 +431,17 @@ pub fn allocate_lms_sparse(
             .collect();
         for h in 0..n {
             let scores = &scores_by_hap[h];
-            let (gain, active) = dp_intervals_sparse(scores, &z_w, mu, &blocked, &t11, &t10, &t01);
-            let len = active.iter().filter(|v| **v).count();
+            let (gain, len) = dp_intervals_sparse_scratch(
+                scores,
+                &z_w,
+                mu,
+                &blocked,
+                &t11,
+                &t10,
+                &t01,
+                &mut dp_scratch,
+            );
+            let active = dp_scratch.active[..w].to_vec();
             if gain > 0.0 && len > 0 && len <= remaining {
                 heap.push(HeapEntry {
                     gain,
@@ -415,7 +463,7 @@ pub fn allocate_lms_sparse(
             .enumerate()
             .map(|(w_i, &c)| c >= per_window_caps[w_i])
             .collect();
-        let (gain, active) = dp_intervals_sparse(
+        let (gain, len) = dp_intervals_sparse_scratch(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
@@ -423,8 +471,9 @@ pub fn allocate_lms_sparse(
             &t11,
             &t10,
             &t01,
+            &mut dp_scratch,
         );
-        let len = active.iter().filter(|v| **v).count();
+        let active = dp_scratch.active[..w].to_vec();
         if gain <= 0.0 || len == 0 || len > remaining {
             continue;
         }
@@ -511,6 +560,7 @@ fn simulate_allocation(
     }
 
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    let mut dp_scratch = DpScratch::default();
     {
         let blocked: Vec<bool> = counts
             .iter()
@@ -519,8 +569,17 @@ fn simulate_allocation(
             .collect();
         for h in 0..n {
             let scores = &scores_by_hap[h];
-            let (gain, active) = dp_intervals_sparse(scores, &z_w, mu, &blocked, t11, t10, t01);
-            let len = active.iter().filter(|v| **v).count();
+            let (gain, len) = dp_intervals_sparse_scratch(
+                scores,
+                &z_w,
+                mu,
+                &blocked,
+                t11,
+                t10,
+                t01,
+                &mut dp_scratch,
+            );
+            let active = dp_scratch.active[..w].to_vec();
             if gain > 0.0 && len > 0 {
                 heap.push(HeapEntry {
                     gain,
@@ -542,9 +601,17 @@ fn simulate_allocation(
             .enumerate()
             .map(|(w_i, &c)| c >= per_window_caps[w_i])
             .collect();
-        let (gain, active) =
-            dp_intervals_sparse(&scores_by_hap[entry.idx], &z_w, mu, &blocked, t11, t10, t01);
-        let len = active.iter().filter(|v| **v).count();
+        let (gain, len) = dp_intervals_sparse_scratch(
+            &scores_by_hap[entry.idx],
+            &z_w,
+            mu,
+            &blocked,
+            t11,
+            t10,
+            t01,
+            &mut dp_scratch,
+        );
+        let active = dp_scratch.active[..w].to_vec();
         if gain <= 0.0 || len == 0 {
             continue;
         }

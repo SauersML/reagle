@@ -1,4 +1,4 @@
-use crate::data::marker::{bits_per_allele, MarkerIdx, Markers, RefWindowSpace};
+use crate::data::marker::{MarkerIdx, Markers, RefWindowSpace, bits_per_allele};
 use crate::data::storage::GenotypeColumn;
 use crate::error::{ReagleError, Result};
 use crate::io::bref3::RefWindow;

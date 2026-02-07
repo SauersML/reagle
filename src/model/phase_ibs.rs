@@ -976,12 +976,5 @@ fn normalize_pbwt_alleles(alleles: &mut [u8]) -> usize {
             max_allele = a;
         }
     }
-    let n_alleles = (max_allele as usize + 1).max(2);
-    let missing_u8 = n_alleles as u8;
-    for a in alleles.iter_mut() {
-        if *a == 255 {
-            *a = missing_u8;
-        }
-    }
-    n_alleles + 1
+    (max_allele as usize + 1).max(2)
 }

@@ -257,8 +257,16 @@ fn run_cli_imputation_capture(
     } else {
         panic!(
             "Could not locate reagle binary (checked CARGO_BIN_EXE_reagle, {}, {})",
-            manifest_dir.join("target").join("debug").join("reagle").display(),
-            manifest_dir.join("target").join("release").join("reagle").display()
+            manifest_dir
+                .join("target")
+                .join("debug")
+                .join("reagle")
+                .display(),
+            manifest_dir
+                .join("target")
+                .join("release")
+                .join("reagle")
+                .display()
         );
     };
     std::process::Command::new(bin)
@@ -464,7 +472,10 @@ fn test_debug_hmm_all_missing_target_still_uses_hmm() {
         use_hmm,
         fallback_ref_freq
     );
-    assert!(use_hmm > 0, "Expected HMM usage even with all-missing target");
+    assert!(
+        use_hmm > 0,
+        "Expected HMM usage even with all-missing target"
+    );
     assert_eq!(
         fallback_ref_freq, 0,
         "Expected no ref-frequency fallback in this all-missing setup"

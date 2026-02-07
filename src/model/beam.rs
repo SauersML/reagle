@@ -10,6 +10,7 @@ use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::model::parameters::ModelParams;
 use crate::model::reference_pbwt::{PbwtStrictAllele, RankBeam, ReferencePbwt};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub struct BeamConfig {
@@ -594,6 +595,16 @@ struct BeamScratch {
     hap2_allele: Vec<(usize, i32, i32)>,
     spread: Vec<usize>,
     pool_alleles: Vec<u8>,
+    switch_support: SwitchSupportCache,
+}
+
+struct SwitchSupportCache {
+    marker_idx: usize,
+    pbwt_version: u32,
+    initialized: bool,
+    global_match_counts: [usize; 2],
+    cluster_match_counts0: HashMap<u16, usize>,
+    cluster_match_counts1: HashMap<u16, usize>,
 }
 
 impl BeamScratch {
@@ -605,7 +616,92 @@ impl BeamScratch {
             hap2_allele: Vec::with_capacity(cap),
             spread: Vec::with_capacity(cap),
             pool_alleles: Vec::with_capacity(cap),
+            switch_support: SwitchSupportCache::new(),
         }
+    }
+}
+
+impl SwitchSupportCache {
+    fn new() -> Self {
+        Self {
+            marker_idx: usize::MAX,
+            pbwt_version: u32::MAX,
+            initialized: false,
+            global_match_counts: [1, 1],
+            cluster_match_counts0: HashMap::new(),
+            cluster_match_counts1: HashMap::new(),
+        }
+    }
+
+    fn ensure_initialized(
+        &mut self,
+        marker_idx: usize,
+        pbwt_version: u32,
+        active_pool: &ActivePool,
+        pool_alleles: &[u8],
+    ) {
+        if self.initialized && self.marker_idx == marker_idx && self.pbwt_version == pbwt_version {
+            return;
+        }
+        self.initialized = true;
+        self.marker_idx = marker_idx;
+        self.pbwt_version = pbwt_version;
+        self.global_match_counts = [0, 0];
+        self.cluster_match_counts0.clear();
+        self.cluster_match_counts1.clear();
+
+        for (idx, &hap) in active_pool.list().iter().enumerate() {
+            let allele = pool_alleles.get(idx).copied().unwrap_or(255);
+            if allele == 0 {
+                self.global_match_counts[0] = self.global_match_counts[0].saturating_add(1);
+                if let Some(meta) = active_pool.pbwt_meta(0, hap, pbwt_version) {
+                    let e = self
+                        .cluster_match_counts0
+                        .entry(meta.cluster_id)
+                        .or_insert(0);
+                    *e = e.saturating_add(1);
+                }
+            } else if allele == 1 {
+                self.global_match_counts[1] = self.global_match_counts[1].saturating_add(1);
+                if let Some(meta) = active_pool.pbwt_meta(1, hap, pbwt_version) {
+                    let e = self
+                        .cluster_match_counts1
+                        .entry(meta.cluster_id)
+                        .or_insert(0);
+                    *e = e.saturating_add(1);
+                }
+            }
+        }
+        self.global_match_counts[0] = self.global_match_counts[0].max(1);
+        self.global_match_counts[1] = self.global_match_counts[1].max(1);
+    }
+
+    #[inline]
+    fn global_match_count(&self, allele: u8) -> usize {
+        if allele == 0 {
+            self.global_match_counts[0]
+        } else {
+            self.global_match_counts[1]
+        }
+    }
+
+    #[inline]
+    fn cluster_match_count(&self, allele: u8, cluster_id: u16) -> usize {
+        if cluster_id == u16::MAX {
+            return 1;
+        }
+        let count = if allele == 0 {
+            self.cluster_match_counts0
+                .get(&cluster_id)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            self.cluster_match_counts1
+                .get(&cluster_id)
+                .copied()
+                .unwrap_or(0)
+        };
+        count.max(1)
     }
 }
 
@@ -1058,8 +1154,19 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let a1 = call.a1;
         let a2 = call.a2;
         let marker_idx = call.marker.as_usize();
+        let pbwt_version = if self.config.inject_interval > 0 {
+            call.hi_idx - (call.hi_idx % self.config.inject_interval)
+        } else {
+            call.hi_idx
+        } as u32;
         let mut pool_alleles = std::mem::take(&mut scratch.pool_alleles);
         self.fill_pool_alleles(marker_idx, active_pool, &mut pool_alleles);
+        scratch.switch_support.ensure_initialized(
+            marker_idx,
+            pbwt_version,
+            active_pool,
+            &pool_alleles,
+        );
 
         if call.fixed {
             self.expand_orientation(
@@ -1069,6 +1176,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 a1,
                 a2,
                 false,
+                pbwt_version,
                 active_pool,
                 &pool_alleles,
                 out,
@@ -1086,6 +1194,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 a1,
                 a2,
                 false,
+                pbwt_version,
                 active_pool,
                 &pool_alleles,
                 out,
@@ -1102,6 +1211,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 a2,
                 a1,
                 true,
+                pbwt_version,
                 active_pool,
                 &pool_alleles,
                 out,
@@ -1123,6 +1233,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         hap1_al: u8,
         hap2_al: u8,
         swapped: bool,
+        pbwt_version: u32,
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         out: &mut Vec<BeamPath>,
@@ -1132,23 +1243,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         cutoff: i32,
         scratch: &mut BeamScratch,
     ) {
-        // Get allele frequencies for TMRCA-aware scoring.
-        let (hap1_freq, hap2_freq) = if swapped {
-            (call.a2_freq, call.a1_freq)
-        } else {
-            (call.a1_freq, call.a2_freq)
-        };
-        let pbwt_version = if self.config.inject_interval > 0 {
-            call.hi_idx - (call.hi_idx % self.config.inject_interval)
-        } else {
-            call.hi_idx
-        };
-
         self.repair_hap_for_allele_into(
             path.hap1,
             call.marker,
             hap1_al,
-            hap1_freq,
             if swapped {
                 call.pbwt_len_morgans_a2
             } else {
@@ -1164,6 +1262,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.fixed,
             active_pool,
             pool_alleles,
+            &scratch.switch_support,
             &mut scratch.hap1_allele,
             &mut scratch.spread,
         );
@@ -1171,7 +1270,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             path.hap2,
             call.marker,
             hap2_al,
-            hap2_freq,
             if swapped {
                 call.pbwt_len_morgans_a1
             } else {
@@ -1187,6 +1285,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.fixed,
             active_pool,
             pool_alleles,
+            &scratch.switch_support,
             &mut scratch.hap2_allele,
             &mut scratch.spread,
         );
@@ -1240,7 +1339,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         hap: usize,
         marker: MarkerIdx,
         targ_allele: u8,
-        targ_freq: f32,
         pbwt_match_len: f32,
         pbwt_density: f32,
         dist_morgans: f32,
@@ -1248,13 +1346,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         fixed: bool,
         active_pool: &ActivePool,
         pool_alleles: &[u8],
+        switch_support: &SwitchSupportCache,
         out: &mut Vec<(usize, i32, i32)>,
         spread: &mut Vec<usize>,
     ) {
         out.clear();
         let marker_idx = marker.as_usize();
 
-        let _ = targ_freq;
         // Emission costs (uniform genotyping error model):
         //   P(match) = 1 - θ
         //   P(mismatch) = θ
@@ -1279,10 +1377,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         } else {
             (pbwt_match_len.max(0.0), pbwt_density.max(0.0), u16::MAX)
         };
-        let n_eff_global = active_pool.list().len().max(2);
+        let n_match_global = switch_support.global_match_count(targ_allele);
+        let n_match_cluster = switch_support.cluster_match_count(targ_allele, cluster_id);
         let (pbwt_stay_cost, pbwt_switch_event_cost) =
-            self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans, n_eff_global);
-        let selection_cost_global = self.selection_cost(n_eff_global);
+            self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans);
+        let selection_cost_global = self.selection_cost(n_match_global);
+        let selection_cost_cluster = self.selection_cost(n_match_cluster);
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         if fixed {
@@ -1303,9 +1403,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let selection_cost = if same_cluster {
-                        let n_eff_cluster =
-                            (cluster_size.round() as usize).max(2).min(n_eff_global);
-                        self.selection_cost(n_eff_cluster)
+                        selection_cost_cluster
                     } else {
                         selection_cost_global
                     };
@@ -1334,9 +1432,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let selection_cost = if same_cluster {
-                        let n_eff_cluster =
-                            (cluster_size.round() as usize).max(2).min(n_eff_global);
-                        self.selection_cost(n_eff_cluster)
+                        selection_cost_cluster
                     } else {
                         selection_cost_global
                     };
@@ -1363,8 +1459,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     .map(|m| m.cluster_id == cluster_id)
                     .unwrap_or(false);
                 let selection_cost = if same_cluster {
-                    let n_eff_cluster = (cluster_size.round() as usize).max(2).min(n_eff_global);
-                    self.selection_cost(n_eff_cluster)
+                    selection_cost_cluster
                 } else {
                     selection_cost_global
                 };
@@ -1384,9 +1479,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         .map(|m| m.cluster_id == cluster_id)
                         .unwrap_or(false);
                     let selection_cost = if same_cluster {
-                        let n_eff_cluster =
-                            (cluster_size.round() as usize).max(2).min(n_eff_global);
-                        self.selection_cost(n_eff_cluster)
+                        selection_cost_cluster
                     } else {
                         selection_cost_global
                     };
@@ -1410,25 +1503,23 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         match_len_morgans: f32,
         density: f32,
         dist_morgans: f32,
-        n_eff: usize,
     ) -> (i32, i32) {
         // Coalescent-based stay probability from PBWT one-sided match length with
         // explicit recombination intensity scaling (rho = 4Ne in Morgans):
         //   prior: t ~ Exp(1) over TMRCA (coalescent units)
         //   L | t ~ Exp(rate = rho * t)
-        //   t | L ~ Gamma(α=2, β=1 + rho * L)
+        //   t | L ~ Gamma(α=2, β=1 + rho * L) for a single exponential draw
         //   P(stay | L, d) = E[exp(-rho * t * d)] = (β / (β + rho * d))^2
+        // The PBWT uses a max over candidates; we map the observed max length to
+        // an effective single-draw length using an order-statistic correction.
         // Use true negative log transition probabilities (no log-odds).
         const EULER_MASCHERONI: f64 = 0.5772156649015329;
         let l_raw = match_len_morgans.max(0.0) as f64;
         let k = density.max(0.0) as f64;
         let l = if k > 0.0 {
-            // Order-statistic correction: E[L_max] ≈ H_k / (rho * t)
-            let h_k = if k >= 2.0 {
-                k.ln() + EULER_MASCHERONI
-            } else {
-                1.0
-            };
+            // Order-statistic correction: E[L_max] ~= H_k / (rho * t),
+            // where H_k is the harmonic number (or its continuous extension).
+            let h_k = Self::harmonic_number_approx(k, EULER_MASCHERONI);
             l_raw / h_k.max(1.0)
         } else {
             l_raw
@@ -1442,8 +1533,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         } else {
             0.0
         };
-        let n_eff = (n_eff as f64).max(2.0);
-        let p_stay = (p_no_recomb + (1.0 - p_no_recomb) / n_eff).clamp(1e-12, 1.0 - 1e-12);
+        let p_stay = p_no_recomb.clamp(1e-12, 1.0 - 1e-12);
         let p_switch_event = (1.0 - p_no_recomb).clamp(1e-12, 1.0 - 1e-12);
         let stay_cost = (-(p_stay.ln()) * 1_000_000.0)
             .round()
@@ -1467,15 +1557,31 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let d = dist_morgans.max(0.0) as f64;
         let rho = self.costs.recomb_intensity;
         let denom = 1.0 + rho * d;
-        let p_no_recomb = if denom > 0.0 {
-            (1.0 / denom).powi(2)
-        } else {
-            0.0
-        };
+        let p_no_recomb = if denom > 0.0 { 1.0 / denom } else { 0.0 };
         let p_switch = (1.0 - p_no_recomb).clamp(1e-12, 1.0 - 1e-12);
         (-(p_switch.ln()) * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+    }
+
+    #[inline]
+    fn harmonic_number_approx(k: f64, euler_mascheroni: f64) -> f64 {
+        if !k.is_finite() || k <= 1.0 {
+            return 1.0;
+        }
+        let k_round = k.round();
+        if (k - k_round).abs() <= 1e-9 && k_round <= 128.0 {
+            let n = k_round as usize;
+            let mut h = 0.0;
+            for i in 1..=n {
+                h += 1.0 / (i as f64);
+            }
+            return h;
+        }
+        let inv = 1.0 / k;
+        let inv2 = inv * inv;
+        let inv4 = inv2 * inv2;
+        k.ln() + euler_mascheroni + 0.5 * inv - (inv2 / 12.0) + (inv4 / 120.0)
     }
 
     #[inline]

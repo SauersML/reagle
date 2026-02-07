@@ -9,6 +9,8 @@
 //! - `MosaicCursor` provides SIMD-friendly state access for the HMM hot path
 
 use crate::model::types::HapId;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 /// Arena-based storage for composite haplotypes using threaded indices.
 ///
@@ -179,6 +181,17 @@ pub struct MosaicCursor<Space> {
     next_switch: Vec<usize>,
     /// Current segment arena index for each state
     cursor_indices: Vec<u32>,
+    /// Min-heap of pending state switches keyed by marker
+    pending_switches: BinaryHeap<Reverse<PendingSwitch>>,
+    /// Monotonic version to invalidate stale heap entries
+    state_versions: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PendingSwitch {
+    marker: usize,
+    state_idx: usize,
+    version: u32,
 }
 
 impl<Space> MosaicCursor<Space> {
@@ -188,18 +201,31 @@ impl<Space> MosaicCursor<Space> {
         let mut active_haps = Vec::with_capacity(n);
         let mut next_switch = Vec::with_capacity(n);
         let mut cursor_indices = Vec::with_capacity(n);
+        let mut pending_switches: BinaryHeap<Reverse<PendingSwitch>> = BinaryHeap::new();
+        let mut state_versions = Vec::with_capacity(n);
 
         for state in 0..n {
             let head = th.state_heads[state] as usize;
             active_haps.push(th.segments_hap[head]);
-            next_switch.push(th.segments_end[head] as usize);
+            let switch_marker = th.segments_end[head] as usize;
+            next_switch.push(switch_marker);
             cursor_indices.push(th.state_heads[state]);
+            state_versions.push(0);
+            if switch_marker < th.n_markers {
+                pending_switches.push(Reverse(PendingSwitch {
+                    marker: switch_marker,
+                    state_idx: state,
+                    version: 0,
+                }));
+            }
         }
 
         Self {
             active_haps,
             next_switch,
             cursor_indices,
+            pending_switches,
+            state_versions,
         }
     }
 
@@ -229,6 +255,20 @@ impl<Space> MosaicCursor<Space> {
         self.next_switch[state] = th.segments_end[cur] as usize;
     }
 
+    #[inline]
+    fn schedule_state_switch(&mut self, state: usize, th: &ThreadedHaps<Space>) {
+        let switch_marker = self.next_switch[state];
+        if switch_marker >= th.n_markers {
+            return;
+        }
+        self.state_versions[state] = self.state_versions[state].wrapping_add(1);
+        self.pending_switches.push(Reverse(PendingSwitch {
+            marker: switch_marker,
+            state_idx: state,
+            version: self.state_versions[state],
+        }));
+    }
+
     /// Phase A with history: Advance to marker, recording state switches.
     ///
     /// Same as `advance_to_marker` but pushes `StateSwitch` events onto the
@@ -241,16 +281,27 @@ impl<Space> MosaicCursor<Space> {
         th: &ThreadedHaps<Space>,
         history: &mut Vec<StateSwitch<Space>>,
     ) {
-        for state in 0..self.active_haps.len() {
-            if marker >= self.next_switch[state] {
-                // Record the switch BEFORE updating
-                history.push(StateSwitch {
-                    marker: self.next_switch[state] as u32,
-                    state_idx: state as u32,
-                    old_hap: self.active_haps[state],
-                });
-                self.advance_state(state, marker, th);
+        while let Some(Reverse(event)) = self.pending_switches.peek().copied() {
+            if event.marker > marker {
+                break;
             }
+            self.pending_switches.pop();
+            if event.state_idx >= self.state_versions.len() {
+                continue;
+            }
+            if event.version != self.state_versions[event.state_idx] {
+                continue;
+            }
+            if marker < self.next_switch[event.state_idx] {
+                continue;
+            }
+            history.push(StateSwitch {
+                marker: self.next_switch[event.state_idx] as u32,
+                state_idx: event.state_idx as u32,
+                old_hap: self.active_haps[event.state_idx],
+            });
+            self.advance_state(event.state_idx, marker, th);
+            self.schedule_state_switch(event.state_idx, th);
         }
     }
 
@@ -276,11 +327,21 @@ impl<Space> MosaicCursor<Space> {
     /// Reset cursor to the initial state (marker 0).
     #[cfg(test)]
     pub fn reset(&mut self, th: &ThreadedHaps<Space>) {
+        self.pending_switches.clear();
         for state in 0..th.n_states() {
             let head = th.state_heads[state] as usize;
             self.active_haps[state] = th.segments_hap[head];
-            self.next_switch[state] = th.segments_end[head] as usize;
+            let switch_marker = th.segments_end[head] as usize;
+            self.next_switch[state] = switch_marker;
             self.cursor_indices[state] = th.state_heads[state];
+            self.state_versions[state] = 0;
+            if switch_marker < th.n_markers {
+                self.pending_switches.push(Reverse(PendingSwitch {
+                    marker: switch_marker,
+                    state_idx: state,
+                    version: 0,
+                }));
+            }
         }
     }
 }

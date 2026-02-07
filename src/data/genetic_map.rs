@@ -7,6 +7,7 @@
 //!
 //! Replaces Java `vcf/GeneticMap.java`, `vcf/PlinkGenMap.java`, and `vcf/MarkerMap.java`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -62,7 +63,7 @@ impl GeneticMap {
             }
 
             let chrom = parts[0];
-            if chrom != target_chrom {
+            if !chrom_name_eq(chrom, target_chrom) {
                 continue;
             }
 
@@ -93,6 +94,18 @@ impl GeneticMap {
                     message: format!(
                         "Genetic map positions not in ascending order at position {}",
                         positions[i]
+                    ),
+                });
+            }
+        }
+        for i in 1..gen_positions.len() {
+            if gen_positions[i] < gen_positions[i - 1] {
+                return Err(ReagleError::Config {
+                    message: format!(
+                        "Genetic map cM positions decrease at bp {} ({} -> {})",
+                        positions[i],
+                        gen_positions[i - 1],
+                        gen_positions[i]
                     ),
                 });
             }
@@ -205,20 +218,14 @@ impl MarkerMap {
         }
 
         // Calculate mean single-base genetic distance
-        let mean_gen_dist = Self::mean_single_base_gen_dist(markers, gen_map);
-
-        // Calculate genetic positions with minimum distance enforcement
-        Self::from_gen_map_with_min_dist(markers, gen_map, mean_gen_dist)
+        // Keep map mass faithful; rely on numerically stable transition math for tiny distances.
+        Self::from_gen_map(markers, gen_map)
     }
 
-    /// Create from genetic map with minimum distance between markers
+    /// Create from genetic map with non-negative incremental distances.
     ///
     /// From Java `GeneticMap.genPos(GeneticMap genMap, double minGenDist, Markers markers)`
-    pub fn from_gen_map_with_min_dist<Space>(
-        markers: &Markers<Space>,
-        gen_map: &GeneticMap,
-        min_gen_dist: f64,
-    ) -> Self {
+    pub fn from_gen_map<Space>(markers: &Markers<Space>, gen_map: &GeneticMap) -> Self {
         let n = markers.len();
         if n == 0 {
             return Self {
@@ -241,7 +248,7 @@ impl MarkerMap {
         for i in 1..n {
             let pos = markers.get(MarkerIdx::from(i)).map(|m| m.pos).unwrap_or(0);
             let map_pos = gen_map.gen_pos(pos);
-            let dist = (map_pos - last_map_pos).max(min_gen_dist);
+            let dist = (map_pos - last_map_pos).max(0.0);
             gen_pos.push(gen_pos[i - 1] + dist);
             last_map_pos = map_pos;
         }
@@ -269,40 +276,6 @@ impl MarkerMap {
         Self { gen_pos }
     }
 
-    /// Mean single-base genetic distance
-    ///
-    /// From Java `MarkerMap.meanSingleBaseGenDist`
-    fn mean_single_base_gen_dist<Space>(markers: &Markers<Space>, gen_map: &GeneticMap) -> f64 {
-        // Minimum genetic distance (~0.01 * mean human single base genetic distance)
-        const MIN_GEN_DIST: f64 = 1e-8;
-
-        let n = markers.len();
-        if n < 2 {
-            return MIN_GEN_DIST;
-        }
-
-        let first_pos = markers
-            .get(MarkerIdx::from(0usize))
-            .map(|m| m.pos)
-            .unwrap_or(0);
-        let last_pos = markers
-            .get(MarkerIdx::from(n - 1))
-            .map(|m| m.pos)
-            .unwrap_or(0);
-
-        if first_pos == last_pos {
-            return MIN_GEN_DIST;
-        }
-
-        let first_gen = gen_map.gen_pos(first_pos);
-        let last_gen = gen_map.gen_pos(last_pos);
-
-        let mean = (last_gen - first_gen).abs() / (last_pos as f64 - first_pos as f64).abs();
-
-        // Require mean to be at least 0.01 * mean human single base genetic distance
-        mean.max(MIN_GEN_DIST)
-    }
-
     /// Get all genetic positions
     pub fn gen_positions(&self) -> &[f64] {
         &self.gen_pos
@@ -313,6 +286,7 @@ impl MarkerMap {
 #[derive(Clone, Debug, Default)]
 pub struct GeneticMaps {
     maps: Vec<Option<GeneticMap>>,
+    chrom_name_to_idx: HashMap<String, ChromIdx>,
 }
 
 impl GeneticMaps {
@@ -325,12 +299,34 @@ impl GeneticMaps {
     pub fn from_plink_file(path: &Path, chrom_names: &[&str]) -> Result<Self> {
         info_span!("genetic_maps_from_plink_file", path = ?path).in_scope(|| {
             let mut maps = Vec::with_capacity(chrom_names.len());
+            let mut chrom_name_to_idx: HashMap<String, ChromIdx> = HashMap::new();
+            let mut missing_names: Vec<String> = Vec::new();
             for (i, &name) in chrom_names.iter().enumerate() {
                 let mut map = GeneticMap::from_plink_file(path, name)?;
-                map.set_chrom(ChromIdx::new(i as u16));
+                let chrom_idx = ChromIdx::new(i as u16);
+                if map.positions.is_empty() {
+                    missing_names.push(name.to_string());
+                }
+                map.set_chrom(chrom_idx);
                 maps.push(Some(map));
+                chrom_name_to_idx
+                    .entry(chrom_name_key(name))
+                    .or_insert(chrom_idx);
             }
-            Ok(Self { maps })
+            if !missing_names.is_empty() {
+                eprintln!(
+                    "Warning: genetic map has no rows for {} requested chromosome name(s) in {:?}; default {:.1} cM/Mb will be used where needed",
+                    missing_names.len(),
+                    path,
+                    DEFAULT_SCALE_FACTOR * 1_000_000.0
+                );
+                let preview = missing_names.iter().take(8).cloned().collect::<Vec<_>>();
+                eprintln!("  Missing examples: {}", preview.join(", "));
+            }
+            Ok(Self {
+                maps,
+                chrom_name_to_idx,
+            })
         })
     }
 
@@ -339,9 +335,30 @@ impl GeneticMaps {
         self.maps.get(chrom.as_usize()).and_then(|m| m.as_ref())
     }
 
+    /// Get chromosome index by chromosome name.
+    pub fn chrom_idx_by_name(&self, chrom_name: &str) -> Option<ChromIdx> {
+        self.chrom_name_to_idx
+            .get(&chrom_name_key(chrom_name))
+            .copied()
+    }
+
+    /// Get genetic map for a chromosome name.
+    pub fn get_by_name(&self, chrom_name: &str) -> Option<&GeneticMap> {
+        self.chrom_idx_by_name(chrom_name)
+            .and_then(|idx| self.get(idx))
+    }
+
     /// Get genetic position, falling back to default rate if no map
     pub fn gen_pos(&self, chrom: ChromIdx, phys_pos: u32) -> f64 {
         match self.get(chrom) {
+            Some(map) => map.gen_pos(phys_pos),
+            None => phys_pos as f64 * DEFAULT_SCALE_FACTOR,
+        }
+    }
+
+    /// Get genetic position by chromosome name, falling back to default rate if no map.
+    pub fn gen_pos_by_name(&self, chrom_name: &str, phys_pos: u32) -> f64 {
+        match self.get_by_name(chrom_name) {
             Some(map) => map.gen_pos(phys_pos),
             None => phys_pos as f64 * DEFAULT_SCALE_FACTOR,
         }
@@ -354,6 +371,24 @@ impl GeneticMaps {
             None => (pos2 as f64 - pos1 as f64).abs() * DEFAULT_SCALE_FACTOR,
         }
     }
+}
+
+fn chrom_name_key(name: &str) -> String {
+    normalize_chrom(name).to_ascii_lowercase()
+}
+
+#[inline]
+fn normalize_chrom(name: &str) -> &str {
+    if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
+        &name[3..]
+    } else {
+        name
+    }
+}
+
+#[inline]
+fn chrom_name_eq(left: &str, right: &str) -> bool {
+    normalize_chrom(left).eq_ignore_ascii_case(normalize_chrom(right))
 }
 
 #[cfg(test)]

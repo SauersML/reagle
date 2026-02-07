@@ -1,4 +1,5 @@
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 const MAX_RANK_INTERVALS: usize = 8;
@@ -81,6 +82,7 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     counts: Vec<u32>,
     offsets: Vec<u32>,
     intervals_buf: Vec<(usize, usize)>,
+    step_scratch: Vec<(u32, u32, u32)>,
 }
 
 #[repr(transparent)]
@@ -95,7 +97,11 @@ impl PbwtQueryAllele {
     pub const WILDCARD_VALUE: u8 = 128;
 
     pub fn allele(a: u8) -> Option<Self> {
-        if a <= 1 { Some(Self(a)) } else { None }
+        if a == Self::WILDCARD_VALUE || a == 255 {
+            None
+        } else {
+            Some(Self(a))
+        }
     }
 
     pub fn missing() -> Self {
@@ -111,17 +117,20 @@ impl PbwtQueryAllele {
         self.0
     }
 
-    /// Returns the allele value (0 or 1) if this is a valid allele query,
-    /// or None if it's a wildcard or missing.
+    /// Returns the concrete allele value, or None for wildcard/missing.
     #[inline]
     pub fn as_allele(self) -> Option<u8> {
-        if self.0 <= 1 { Some(self.0) } else { None }
+        if self.0 == Self::WILDCARD_VALUE || self.0 == 255 {
+            None
+        } else {
+            Some(self.0)
+        }
     }
 }
 
 impl PbwtStrictAllele {
     pub fn allele(a: u8) -> Option<Self> {
-        if a <= 1 { Some(Self(a)) } else { None }
+        if a == 255 { None } else { Some(Self(a)) }
     }
 
     pub fn missing() -> Self {
@@ -135,6 +144,27 @@ impl PbwtStrictAllele {
 }
 
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
+    #[inline]
+    fn load_top_intervals(
+        scratch: &mut Vec<(u32, u32, u32)>,
+        next: &mut RankBeam,
+        keep_cap: usize,
+    ) {
+        let keep = scratch.len().min(keep_cap);
+        if keep == 0 {
+            next.len = 0;
+            return;
+        }
+        if scratch.len() > keep {
+            scratch.select_nth_unstable_by(keep - 1, |a, b| b.2.cmp(&a.2));
+        }
+        scratch[..keep].sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        for i in 0..keep {
+            next.intervals[i] = (scratch[i].0, scratch[i].1);
+        }
+        next.len = keep;
+    }
+
     pub fn new(n_ref_haps: usize) -> Self {
         Self {
             updater: PbwtDivUpdater::new(n_ref_haps),
@@ -151,6 +181,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             counts: Vec::new(),
             offsets: Vec::new(),
             intervals_buf: Vec::new(),
+            step_scratch: Vec::new(),
         }
     }
 
@@ -164,9 +195,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             return;
         }
 
-        // Uniform spaced sampling from all intervals to ensure coverage of the
-        // entire PBWT space, avoiding bias towards the center or beginning.
-        // We treat the intervals as a single contiguous range and sample uniformly.
         self.intervals_buf.clear();
         self.intervals_buf.reserve(beam.intervals().len());
         for &(l, r) in beam.intervals() {
@@ -182,7 +210,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         }
 
         let total_len: usize = self.intervals_buf.iter().map(|&(l, r)| r - l).sum();
-
         if total_len <= k {
             out.reserve(total_len);
             for &(l, r) in &self.intervals_buf {
@@ -190,17 +217,18 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     out.push(self.ppa[i].to_u32());
                 }
             }
-        } else {
-            // Centered uniform spaced sampling
-            // i-th sample at: (2*i + 1) * total_len / (2*k)
-            let mut current_interval_idx = 0;
-            let mut current_interval_start_offset = 0;
+            return;
+        }
 
+        // For very wide beams, keep the old O(k) behavior to avoid turning
+        // donor selection into a bandwidth bottleneck.
+        const EXACT_DIV_SCAN_FACTOR: usize = 64;
+        if total_len > k.saturating_mul(EXACT_DIV_SCAN_FACTOR) {
+            let mut current_interval_idx = 0usize;
+            let mut current_interval_start_offset = 0usize;
             out.reserve(k);
             for i in 0..k {
                 let target = (2 * i + 1) * total_len / (2 * k);
-
-                // Advance to interval containing target
                 while current_interval_idx < self.intervals_buf.len() {
                     let (l, r) = self.intervals_buf[current_interval_idx];
                     let len = r - l;
@@ -213,6 +241,52 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     current_interval_idx += 1;
                 }
             }
+            return;
+        }
+
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        struct DonorChoice {
+            div: i32,
+            pos: usize,
+        }
+
+        impl Ord for DonorChoice {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.div
+                    .cmp(&other.div)
+                    .then_with(|| self.pos.cmp(&other.pos))
+            }
+        }
+
+        impl PartialOrd for DonorChoice {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut best: std::collections::BinaryHeap<DonorChoice> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        for &(l, r) in &self.intervals_buf {
+            for pos in l..r {
+                let choice = DonorChoice {
+                    div: self.div.get(pos).copied().unwrap_or(i32::MAX),
+                    pos,
+                };
+                if best.len() < k {
+                    best.push(choice);
+                } else if let Some(top) = best.peek().copied() {
+                    if choice.div < top.div || (choice.div == top.div && choice.pos < top.pos) {
+                        best.pop();
+                        best.push(choice);
+                    }
+                }
+            }
+        }
+        let mut choices: Vec<DonorChoice> = best.into_vec();
+        choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
+        out.reserve(choices.len());
+        for c in choices {
+            out.push(self.ppa[c.pos].to_u32());
         }
     }
 
@@ -227,7 +301,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             }
         } else if a == 0 {
             0
-        } else if (a as usize) >= n_alleles {
+        } else if a == 255 || (a as usize) >= n_alleles {
             1
         } else {
             (a as usize) + 1
@@ -269,11 +343,12 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         }
     }
 
+    #[inline]
     fn count_for(&self, bin: usize, n_alleles: usize) -> u32 {
         if n_alleles == 2 {
-            self.binary_counts[bin]
+            self.binary_counts.get(bin).copied().unwrap_or(0)
         } else {
-            self.counts[bin]
+            self.counts.get(bin).copied().unwrap_or(0)
         }
     }
 
@@ -320,7 +395,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         query_alleles: &[PbwtQueryAllele],
         beams: &mut [RankBeam],
     ) {
-        let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
+        let mut scratch = std::mem::take(&mut self.step_scratch);
         self.advance_with_beams_query_scratch(
             ref_alleles,
             n_alleles,
@@ -329,6 +404,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             beams,
             &mut scratch,
         );
+        self.step_scratch = scratch;
     }
 
     pub fn advance_with_beams_strict(
@@ -339,7 +415,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         query_alleles: &[PbwtStrictAllele],
         beams: &mut [RankBeam],
     ) {
-        let mut scratch: Vec<(u32, u32, u32)> = Vec::new();
+        let mut scratch = std::mem::take(&mut self.step_scratch);
         self.advance_with_beams_strict_scratch(
             ref_alleles,
             n_alleles,
@@ -348,6 +424,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             beams,
             &mut scratch,
         );
+        self.step_scratch = scratch;
     }
 
     pub fn advance_with_beams_query_scratch(
@@ -489,23 +566,19 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             if qa == PbwtQueryAllele::WILDCARD_VALUE {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
-                    for &b in &[0usize, 2usize] {
+                    for b in 0..n_bins {
+                        if b == 1 {
+                            continue;
+                        }
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
-                            let len = nr - nl;
-                            let score = len.saturating_mul(self.count_for(b, n_alleles));
+                            let score = nr - nl;
                             scratch.push((nl, nr, score));
                         }
                     }
                 }
-
-                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                let keep = scratch.len().min(MAX_RANK_INTERVALS);
-                for i in 0..keep {
-                    next.intervals[i] = (scratch[i].0, scratch[i].1);
-                }
-                next.len = keep;
+                Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
             } else if qa == 255 {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
@@ -513,19 +586,12 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
-                            let len = nr - nl;
-                            let score = len.saturating_mul(self.count_for(b, n_alleles));
+                            let score = nr - nl;
                             scratch.push((nl, nr, score));
                         }
                     }
                 }
-
-                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                let keep = scratch.len().min(MAX_RANK_INTERVALS);
-                for i in 0..keep {
-                    next.intervals[i] = (scratch[i].0, scratch[i].1);
-                }
-                next.len = keep;
+                Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
             } else {
                 let b = Self::bin_for_allele(qa, n_alleles);
                 if b < n_bins {
@@ -539,9 +605,9 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
 
                 if next.len == 0 {
-                    // When no matches found in current intervals for the queried allele,
-                    // reset to the FULL panel filtered to that allele, not all alleles.
-                    // This ensures we track haps matching the target after recombination.
+                    // No match inside current beam for queried allele. First reset to
+                    // the full panel interval for that allele (recombination fallback),
+                    // then only broaden if that allele does not exist at this marker.
                     let queried_bin = Self::bin_for_allele(qa, n_alleles);
                     let nl = self.offset_for(queried_bin, n_alleles);
                     let nr = nl + self.count_for(queried_bin, n_alleles);
@@ -549,9 +615,25 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         next.intervals[0] = (nl, nr);
                         next.len = 1;
                     } else {
-                        // Fallback to full panel if queried allele has no occurrences
-                        next = RankBeam::full(n_ref as u32);
+                        scratch.clear();
+                        for &(l, r) in old.intervals() {
+                            for b in 0..n_bins {
+                                let nl = self.offset_for(b, n_alleles)
+                                    + self.rank(b, l, n_ref, n_alleles);
+                                let nr = self.offset_for(b, n_alleles)
+                                    + self.rank(b, r, n_ref, n_alleles);
+                                if nl < nr {
+                                    let score = nr - nl;
+                                    scratch.push((nl, nr, score));
+                                }
+                            }
+                        }
+                        Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
                     }
+                }
+
+                if next.len == 0 {
+                    next = RankBeam::full(n_ref as u32);
                 }
             }
 
@@ -588,19 +670,12 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
-                            let len = nr - nl;
-                            let score = len.saturating_mul(self.count_for(b, n_alleles));
+                            let score = nr - nl;
                             scratch.push((nl, nr, score));
                         }
                     }
                 }
-
-                scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                let keep = scratch.len().min(MAX_RANK_INTERVALS);
-                for i in 0..keep {
-                    next.intervals[i] = (scratch[i].0, scratch[i].1);
-                }
-                next.len = keep;
+                Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
             } else {
                 let b = Self::bin_for_allele(qa, n_alleles);
                 if b < n_bins {
@@ -614,27 +689,28 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
 
                 if next.len == 0 {
-                    scratch.clear();
-                    for &(l, r) in old.intervals() {
-                        for b in 0..n_bins {
-                            let nl =
-                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
-                            let nr =
-                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
-                            if nl < nr {
-                                let len = nr - nl;
-                                let score = len.saturating_mul(self.count_for(b, n_alleles));
-                                scratch.push((nl, nr, score));
+                    let queried_bin = Self::bin_for_allele(qa, n_alleles);
+                    let nl = self.offset_for(queried_bin, n_alleles);
+                    let nr = nl + self.count_for(queried_bin, n_alleles);
+                    if nl < nr {
+                        next.intervals[0] = (nl, nr);
+                        next.len = 1;
+                    } else {
+                        scratch.clear();
+                        for &(l, r) in old.intervals() {
+                            for b in 0..n_bins {
+                                let nl = self.offset_for(b, n_alleles)
+                                    + self.rank(b, l, n_ref, n_alleles);
+                                let nr = self.offset_for(b, n_alleles)
+                                    + self.rank(b, r, n_ref, n_alleles);
+                                if nl < nr {
+                                    let score = nr - nl;
+                                    scratch.push((nl, nr, score));
+                                }
                             }
                         }
+                        Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
                     }
-
-                    scratch.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                    let keep = scratch.len().min(MAX_RANK_INTERVALS);
-                    for i in 0..keep {
-                        next.intervals[i] = (scratch[i].0, scratch[i].1);
-                    }
-                    next.len = keep;
                 }
             }
 

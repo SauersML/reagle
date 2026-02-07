@@ -162,7 +162,8 @@ impl Bref3Reader {
         }
 
         // Create SeqCodedBlock for sequence-coded records
-        let mut seq_block = SeqCodedBlock::new(hap_to_seq.clone());
+        let mut seq_block = SeqCodedBlock::new(hap_to_seq.clone(), n_seq);
+        let mut seq_placeholder_cols: Vec<usize> = Vec::new();
         let block_start_idx = columns.len();
 
         for _ in 0..n_recs {
@@ -171,15 +172,14 @@ impl Bref3Reader {
 
             match flag {
                 SEQ_CODED => {
-                    // Read directly into SeqCodedBlock without expansion
-                    let mut seq_to_allele = vec![0u8; n_seq];
-                    self.reader.read_exact(&mut seq_to_allele)?;
-                    seq_block.push_marker(seq_to_allele);
+                    // Read directly into SeqCodedBlock storage without intermediate buffer.
+                    self.reader.read_exact(seq_block.push_marker_slot())?;
                     self.markers.push(marker);
                     // Placeholder - will be replaced with SeqCoded below
                     columns.push(GenotypeColumn::Dense(
                         crate::data::storage::DenseColumn::new(0, 1),
                     ));
+                    seq_placeholder_cols.push(columns.len() - 1);
                 }
                 ALLELE_CODED => {
                     let alleles = self.read_allele_coded_record(marker.n_alleles())?;
@@ -194,16 +194,12 @@ impl Bref3Reader {
         // Replace placeholder columns with SeqCoded variants
         if seq_block.n_markers() > 0 {
             let block = Arc::new(seq_block);
-            let mut seq_marker_idx = 0;
-            for col_idx in block_start_idx..columns.len() {
-                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0)
-                {
-                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(
-                        Arc::clone(&block),
-                        seq_marker_idx,
-                    ));
-                    seq_marker_idx += 1;
-                }
+            for (seq_marker_idx, &col_idx) in seq_placeholder_cols.iter().enumerate() {
+                assert!(col_idx >= block_start_idx && col_idx < columns.len());
+                columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(
+                    Arc::clone(&block),
+                    seq_marker_idx,
+                ));
             }
         }
 
@@ -212,7 +208,11 @@ impl Bref3Reader {
 
     /// Read marker info
     fn read_marker(&mut self, chrom_idx: ChromIdx) -> Result<Marker> {
-        let pos = read_be_i32(&mut self.reader)? as u32;
+        let pos = read_be_i32(&mut self.reader)?;
+        if pos < 0 {
+            bail!("Invalid marker position in BREF3 record: {}", pos);
+        }
+        let pos = pos as u32;
 
         let n_ids = read_byte(&mut self.reader)? as usize;
         if n_ids > 0 {
@@ -235,6 +235,12 @@ impl Bref3Reader {
         } else {
             let n_alleles = 1 + (allele_code & 0b11) as usize;
             let perm_index = (allele_code >> 2) as usize;
+            if perm_index >= SNV_PERMS.len() {
+                bail!(
+                    "Invalid SNV permutation index in BREF3 record: {}",
+                    perm_index
+                );
+            }
             let allele_strs: Vec<String> = SNV_PERMS[perm_index][..n_alleles]
                 .iter()
                 .map(|s| s.to_string())
@@ -258,15 +264,30 @@ impl Bref3Reader {
 
         for allele_idx in 0..n_alleles {
             let count = read_be_i32(&mut self.reader)?;
+            if count < -1 {
+                bail!(
+                    "Invalid allele count in BREF3 allele-coded record: {}",
+                    count
+                );
+            }
             if count == -1 {
                 continue;
             }
 
             for _ in 0..count {
-                let hap_idx = read_be_i32(&mut self.reader)? as usize;
-                if hap_idx < self.n_haps {
-                    alleles[hap_idx] = allele_idx as u8;
+                let hap_idx = read_be_i32(&mut self.reader)?;
+                if hap_idx < 0 {
+                    bail!("Negative haplotype index in BREF3 record: {}", hap_idx);
                 }
+                let hap_idx = hap_idx as usize;
+                if hap_idx >= self.n_haps {
+                    bail!(
+                        "Haplotype index out of bounds in BREF3 record: {} >= {}",
+                        hap_idx,
+                        self.n_haps
+                    );
+                }
+                alleles[hap_idx] = allele_idx as u8;
             }
         }
 
@@ -307,6 +328,15 @@ fn normalize_chrom(name: &str) -> &str {
         &name[3..]
     } else {
         name
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChromNameKey(String);
+
+impl ChromNameKey {
+    fn new(name: &str) -> Self {
+        Self(normalize_chrom(name).to_ascii_lowercase())
     }
 }
 
@@ -367,17 +397,80 @@ fn read_utf8_string<R: Read>(reader: &mut R) -> Result<String> {
     let len = read_be_u16(reader)? as usize;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
-
-    String::from_utf8(buf).context("Invalid UTF-8 in BREF3 string")
+    decode_modified_utf8(&buf)
 }
 
 fn write_utf8_string<W: Write>(writer: &mut W, value: &str) -> Result<()> {
-    let bytes = value.as_bytes();
+    let bytes = encode_modified_utf8(value);
     let len = u16::try_from(bytes.len())
         .map_err(|_| anyhow::anyhow!("String too long for BREF3 UTF-8 encoding"))?;
     write_be_u16(writer, len)?;
-    writer.write_all(bytes)?;
+    writer.write_all(&bytes)?;
     Ok(())
+}
+
+fn decode_modified_utf8(buf: &[u8]) -> Result<String> {
+    let mut units: Vec<u16> = Vec::with_capacity(buf.len());
+    let mut i = 0usize;
+    while i < buf.len() {
+        let b0 = buf[i];
+        if b0 & 0x80 == 0 {
+            units.push(b0 as u16);
+            i += 1;
+            continue;
+        }
+        if (b0 & 0xE0) == 0xC0 {
+            if i + 1 >= buf.len() {
+                bail!("Invalid modified UTF-8: truncated 2-byte sequence");
+            }
+            let b1 = buf[i + 1];
+            if (b1 & 0xC0) != 0x80 {
+                bail!("Invalid modified UTF-8: bad continuation byte");
+            }
+            let unit = (((b0 & 0x1F) as u16) << 6) | ((b1 & 0x3F) as u16);
+            units.push(unit);
+            i += 2;
+            continue;
+        }
+        if (b0 & 0xF0) == 0xE0 {
+            if i + 2 >= buf.len() {
+                bail!("Invalid modified UTF-8: truncated 3-byte sequence");
+            }
+            let b1 = buf[i + 1];
+            let b2 = buf[i + 2];
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+                bail!("Invalid modified UTF-8: bad continuation byte");
+            }
+            let unit =
+                (((b0 & 0x0F) as u16) << 12) | (((b1 & 0x3F) as u16) << 6) | ((b2 & 0x3F) as u16);
+            units.push(unit);
+            i += 3;
+            continue;
+        }
+        bail!("Invalid modified UTF-8: unsupported 4-byte prefix");
+    }
+
+    String::from_utf16(&units).context("Invalid UTF-16 in modified UTF-8 payload")
+}
+
+fn encode_modified_utf8(value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    for unit in value.encode_utf16() {
+        if unit == 0 {
+            out.push(0xC0);
+            out.push(0x80);
+        } else if unit <= 0x007F {
+            out.push(unit as u8);
+        } else if unit <= 0x07FF {
+            out.push((0xC0 | ((unit >> 6) & 0x1F)) as u8);
+            out.push((0x80 | (unit & 0x3F)) as u8);
+        } else {
+            out.push((0xE0 | ((unit >> 12) & 0x0F)) as u8);
+            out.push((0x80 | ((unit >> 6) & 0x3F)) as u8);
+            out.push((0x80 | (unit & 0x3F)) as u8);
+        }
+    }
+    out
 }
 
 /// Read a string array (length-prefixed)
@@ -566,7 +659,6 @@ pub struct StreamingBref3Reader {
     reader: BufReader<File>,
     samples: Arc<Samples>,
     n_haps: usize,
-    chrom_map: std::collections::HashMap<String, ChromIdx>,
     /// Whether we've reached end of data
     eof: bool,
 }
@@ -595,7 +687,6 @@ impl StreamingBref3Reader {
             reader,
             samples,
             n_haps,
-            chrom_map: std::collections::HashMap::new(),
             eof: false,
         })
     }
@@ -624,7 +715,6 @@ impl StreamingBref3Reader {
 
         let n_recs = n_recs as usize;
         let chrom_name = read_utf8_string(&mut self.reader)?;
-        let chrom_idx = self.get_or_add_chrom(&chrom_name);
 
         let n_seq = read_be_u16(&mut self.reader)? as usize;
 
@@ -634,27 +724,26 @@ impl StreamingBref3Reader {
         }
 
         // Create SeqCodedBlock for sequence-coded records
-        let mut seq_block = SeqCodedBlock::new(hap_to_seq);
+        let mut seq_block = SeqCodedBlock::new(hap_to_seq, n_seq);
         let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
-        markers.add_chrom(&chrom_name);
+        let block_chrom_idx = markers.add_chrom(&chrom_name);
         let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(n_recs);
-        let block_start_idx = 0;
+        let mut seq_placeholder_cols: Vec<usize> = Vec::new();
 
         for _ in 0..n_recs {
-            let marker = self.read_marker(chrom_idx)?;
+            let marker = self.read_marker(block_chrom_idx)?;
 
             let flag = read_byte(&mut self.reader)?;
 
             match flag {
                 SEQ_CODED => {
-                    let mut seq_to_allele = vec![0u8; n_seq];
-                    self.reader.read_exact(&mut seq_to_allele)?;
-                    seq_block.push_marker(seq_to_allele);
+                    self.reader.read_exact(seq_block.push_marker_slot())?;
                     markers.push(marker);
                     // Placeholder - will be replaced with SeqCoded below
                     columns.push(GenotypeColumn::Dense(
                         crate::data::storage::DenseColumn::new(0, 1),
                     ));
+                    seq_placeholder_cols.push(columns.len() - 1);
                 }
                 ALLELE_CODED => {
                     let alleles = self.read_allele_coded_record(marker.n_alleles())?;
@@ -669,16 +758,12 @@ impl StreamingBref3Reader {
         // Replace placeholder columns with SeqCoded variants
         if seq_block.n_markers() > 0 {
             let block = Arc::new(seq_block);
-            let mut seq_marker_idx = 0;
-            for col_idx in block_start_idx..columns.len() {
-                if matches!(columns[col_idx], GenotypeColumn::Dense(ref d) if d.n_haplotypes() == 0)
-                {
-                    columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(
-                        Arc::clone(&block),
-                        seq_marker_idx,
-                    ));
-                    seq_marker_idx += 1;
-                }
+            for (seq_marker_idx, &col_idx) in seq_placeholder_cols.iter().enumerate() {
+                assert!(col_idx < columns.len());
+                columns[col_idx] = GenotypeColumn::SeqCoded(SeqCodedColumn::new(
+                    Arc::clone(&block),
+                    seq_marker_idx,
+                ));
             }
         }
 
@@ -691,7 +776,11 @@ impl StreamingBref3Reader {
 
     /// Read marker info (same as Bref3Reader but uses internal markers)
     fn read_marker(&mut self, chrom_idx: ChromIdx) -> Result<Marker> {
-        let pos = read_be_i32(&mut self.reader)? as u32;
+        let pos = read_be_i32(&mut self.reader)?;
+        if pos < 0 {
+            bail!("Invalid marker position in BREF3 record: {}", pos);
+        }
+        let pos = pos as u32;
 
         let n_ids = read_byte(&mut self.reader)? as usize;
         let id = if n_ids == 0 {
@@ -717,6 +806,12 @@ impl StreamingBref3Reader {
         } else {
             let n_alleles = 1 + (allele_code & 0b11) as usize;
             let perm_index = (allele_code >> 2) as usize;
+            if perm_index >= SNV_PERMS.len() {
+                bail!(
+                    "Invalid SNV permutation index in BREF3 record: {}",
+                    perm_index
+                );
+            }
             let allele_strs: Vec<String> = SNV_PERMS[perm_index][..n_alleles]
                 .iter()
                 .map(|s| s.to_string())
@@ -740,30 +835,34 @@ impl StreamingBref3Reader {
 
         for allele_idx in 0..n_alleles {
             let count = read_be_i32(&mut self.reader)?;
+            if count < -1 {
+                bail!(
+                    "Invalid allele count in BREF3 allele-coded record: {}",
+                    count
+                );
+            }
             if count == -1 {
                 continue;
             }
 
             for _ in 0..count {
-                let hap_idx = read_be_i32(&mut self.reader)? as usize;
-                if hap_idx < self.n_haps {
-                    alleles[hap_idx] = allele_idx as u8;
+                let hap_idx = read_be_i32(&mut self.reader)?;
+                if hap_idx < 0 {
+                    bail!("Negative haplotype index in BREF3 record: {}", hap_idx);
                 }
+                let hap_idx = hap_idx as usize;
+                if hap_idx >= self.n_haps {
+                    bail!(
+                        "Haplotype index out of bounds in BREF3 record: {} >= {}",
+                        hap_idx,
+                        self.n_haps
+                    );
+                }
+                alleles[hap_idx] = allele_idx as u8;
             }
         }
 
         Ok(alleles)
-    }
-
-    /// Get or add a chromosome index
-    fn get_or_add_chrom(&mut self, name: &str) -> ChromIdx {
-        if let Some(&idx) = self.chrom_map.get(name) {
-            idx
-        } else {
-            let idx = ChromIdx::new(self.chrom_map.len() as u16);
-            self.chrom_map.insert(name.to_string(), idx);
-            idx
-        }
     }
 }
 
@@ -778,9 +877,11 @@ struct Bref3BufferedMarker {
 pub struct StreamingBref3WindowReader {
     inner: StreamingBref3Reader,
     buffer: VecDeque<Bref3BufferedMarker>,
+    pending_marker: Option<Bref3BufferedMarker>,
     current_block: Option<(Bref3Block, usize)>,
     pending_block: Option<Bref3Block>,
     current_chrom: Option<Arc<str>>,
+    current_chrom_key: Option<ChromNameKey>,
     window_num: usize,
     global_marker_idx: usize,
     eof: bool,
@@ -791,9 +892,11 @@ impl StreamingBref3WindowReader {
         Self {
             inner,
             buffer: VecDeque::new(),
+            pending_marker: None,
             current_block: None,
             pending_block: None,
             current_chrom: None,
+            current_chrom_key: None,
             window_num: 0,
             global_marker_idx: 0,
             eof: false,
@@ -806,7 +909,11 @@ impl StreamingBref3WindowReader {
         gen_maps: &GeneticMaps,
         target_positions: Option<&TargetMarkerIndex>,
     ) -> Result<Option<RefWindow>> {
-        if self.eof && self.buffer.is_empty() && self.pending_block.is_none() {
+        if self.eof
+            && self.buffer.is_empty()
+            && self.pending_marker.is_none()
+            && self.pending_block.is_none()
+        {
             return Ok(None);
         }
 
@@ -816,12 +923,14 @@ impl StreamingBref3WindowReader {
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
         let mut ref_columns: Vec<GenotypeColumn> = Vec::new();
         let mut next_overlap: VecDeque<Bref3BufferedMarker> = VecDeque::new();
+        let mut included_markers: Vec<Bref3BufferedMarker> = Vec::new();
 
         let mut window_start_gen: Option<f64> = None;
         let mut target_end_gen = 0.0;
         let mut full_window_gen = 0.0;
         let mut output_end: Option<usize> = None;
         let mut window_size = 0usize;
+        let mut truncated_by_marker_cap = false;
         let mut window_chrom_idx: Option<ChromIdx> = None;
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
 
@@ -831,11 +940,14 @@ impl StreamingBref3WindowReader {
                 if output_end.is_none() {
                     output_end = Some(window_size);
                 }
+                truncated_by_marker_cap = true;
                 break;
             }
 
             let next_marker = if let Some(m) = carryover.pop_front() {
                 Some(m)
+            } else if let Some(pending) = self.pending_marker.take() {
+                Some(pending)
             } else {
                 self.read_next_marker(gen_maps, window_size > 0)?
             };
@@ -853,7 +965,7 @@ impl StreamingBref3WindowReader {
             }
 
             if marker.gen_pos >= full_window_gen {
-                next_overlap.push_front(marker);
+                self.pending_marker = Some(marker);
                 break;
             }
 
@@ -885,6 +997,7 @@ impl StreamingBref3WindowReader {
             if output_end.is_some() {
                 next_overlap.push_back(marker.clone());
             }
+            included_markers.push(marker);
 
             window_size += 1;
         }
@@ -892,6 +1005,18 @@ impl StreamingBref3WindowReader {
         if markers.len() == 0 && window_size == 0 {
             self.buffer = carryover;
             return Ok(None);
+        }
+
+        if truncated_by_marker_cap && next_overlap.is_empty() && window_size > 1 {
+            let last_gen = included_markers
+                .last()
+                .map(|m| m.gen_pos)
+                .unwrap_or(target_end_gen);
+            let cutoff = last_gen - config.overlap_cm as f64;
+            let mut split = included_markers.partition_point(|m| m.gen_pos < cutoff);
+            split = split.clamp(1, window_size - 1);
+            output_end = Some(split);
+            next_overlap.extend(included_markers.iter().skip(split).cloned());
         }
 
         let output_end = output_end.unwrap_or(window_size);
@@ -941,7 +1066,7 @@ impl StreamingBref3WindowReader {
                         .expect("BREF3 marker index out of bounds");
                     let column = block.columns[*idx].clone();
                     *idx += 1;
-                    let gen_pos = gen_maps.gen_pos(marker.chrom, marker.pos);
+                    let gen_pos = gen_maps.gen_pos_by_name(&block.chrom, marker.pos);
                     return Ok(Some(Bref3BufferedMarker {
                         marker,
                         column,
@@ -964,18 +1089,21 @@ impl StreamingBref3WindowReader {
             };
 
             let block_chrom: Arc<str> = Arc::from(block.chrom.as_str());
-            if let Some(cur) = self.current_chrom.as_ref() {
-                if cur.as_ref() != block_chrom.as_ref() && has_window_data {
+            let block_chrom_key = ChromNameKey::new(block_chrom.as_ref());
+            if let Some(cur_key) = self.current_chrom_key.as_ref() {
+                if cur_key != &block_chrom_key && has_window_data {
                     self.pending_block = Some(block);
                     return Ok(None);
                 }
-                if cur.as_ref() != block_chrom.as_ref() {
+                if cur_key != &block_chrom_key {
                     self.current_chrom = Some(block_chrom);
+                    self.current_chrom_key = Some(block_chrom_key);
                     self.window_num = 0;
                     self.global_marker_idx = 0;
                 }
             } else {
                 self.current_chrom = Some(block_chrom);
+                self.current_chrom_key = Some(block_chrom_key);
             }
 
             self.current_block = Some((block, 0));
@@ -1042,6 +1170,7 @@ pub struct StreamingRefVcfReader {
     buffer: VecDeque<RefPanelMarker>,
     pending_marker: Option<RefPanelMarker>,
     current_chrom: Option<Arc<str>>,
+    current_chrom_key: Option<ChromNameKey>,
     line_buf: String,
     eof: bool,
     window_num: usize,
@@ -1161,6 +1290,7 @@ impl StreamingRefVcfReader {
             buffer: VecDeque::new(),
             pending_marker: None,
             current_chrom: None,
+            current_chrom_key: None,
             line_buf: String::new(),
             eof: false,
             window_num: 0,
@@ -1189,12 +1319,14 @@ impl StreamingRefVcfReader {
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
         let mut ref_columns: Vec<GenotypeColumn> = Vec::new();
         let mut next_overlap: VecDeque<RefPanelMarker> = VecDeque::new();
+        let mut included_markers: Vec<RefPanelMarker> = Vec::new();
 
         let mut window_start_gen: Option<f64> = None;
         let mut target_end_gen = 0.0;
         let mut full_window_gen = 0.0;
         let mut output_end: Option<usize> = None;
         let mut window_size = 0usize;
+        let mut truncated_by_marker_cap = false;
         let mut window_chrom_idx: Option<ChromIdx> = None;
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
 
@@ -1204,6 +1336,7 @@ impl StreamingRefVcfReader {
                 if output_end.is_none() {
                     output_end = Some(window_size);
                 }
+                truncated_by_marker_cap = true;
                 break;
             }
 
@@ -1220,10 +1353,12 @@ impl StreamingRefVcfReader {
             };
 
             let marker_chrom = self.markers.chrom_name(marker.marker.chrom).unwrap_or("");
-            if let Some(cur) = self.current_chrom.as_ref() {
-                if marker_chrom != cur.as_ref() {
+            let marker_chrom_key = ChromNameKey::new(marker_chrom);
+            if let Some(cur_key) = self.current_chrom_key.as_ref() {
+                if &marker_chrom_key != cur_key {
                     if window_size == 0 {
                         self.current_chrom = Some(Arc::from(marker_chrom));
+                        self.current_chrom_key = Some(marker_chrom_key);
                         self.window_num = 0;
                         self.global_marker_idx = 0;
                     } else {
@@ -1233,6 +1368,7 @@ impl StreamingRefVcfReader {
                 }
             } else {
                 self.current_chrom = Some(Arc::from(marker_chrom));
+                self.current_chrom_key = Some(marker_chrom_key);
             }
 
             if window_start_gen.is_none() {
@@ -1276,6 +1412,7 @@ impl StreamingRefVcfReader {
             if output_end.is_some() {
                 next_overlap.push_back(marker.clone());
             }
+            included_markers.push(marker);
 
             window_size += 1;
         }
@@ -1283,6 +1420,18 @@ impl StreamingRefVcfReader {
         if markers.len() == 0 && window_size == 0 {
             self.buffer = carryover;
             return Ok(None);
+        }
+
+        if truncated_by_marker_cap && next_overlap.is_empty() && window_size > 1 {
+            let last_gen = included_markers
+                .last()
+                .map(|m| m.gen_pos)
+                .unwrap_or(target_end_gen);
+            let cutoff = last_gen - config.overlap_cm as f64;
+            let mut split = included_markers.partition_point(|m| m.gen_pos < cutoff);
+            split = split.clamp(1, window_size - 1);
+            output_end = Some(split);
+            next_overlap.extend(included_markers.iter().skip(split).cloned());
         }
 
         let output_end = output_end.unwrap_or(window_size);
@@ -1354,7 +1503,8 @@ impl StreamingRefVcfReader {
                 continue;
             }
             let mut marker = self.parse_vcf_line(line)?;
-            marker.gen_pos = gen_maps.gen_pos(marker.marker.chrom, marker.marker.pos);
+            let chrom_name = self.markers.chrom_name(marker.marker.chrom).unwrap_or("");
+            marker.gen_pos = gen_maps.gen_pos_by_name(chrom_name, marker.marker.pos);
             self.line_buf = line_buf;
             return Ok(Some(marker));
         }

@@ -544,35 +544,37 @@ impl VcfReader {
             };
 
             let matrix = if has_any_likelihoods && all_likelihoods_pl.len() == columns.len() {
-                let mut marker_strides: Vec<u16> = Vec::with_capacity(all_likelihoods_pl.len());
+                let mut marker_strides: Vec<usize> = Vec::with_capacity(all_likelihoods_pl.len());
                 let mut marker_blocks: Vec<Vec<u16>> = Vec::with_capacity(all_likelihoods_pl.len());
+                let mut marker_missing_blocks: Vec<Vec<u8>> =
+                    Vec::with_capacity(all_likelihoods_pl.len());
                 for pl_opt in all_likelihoods_pl.into_iter() {
                     if let Some(pl_by_sample) = pl_opt {
-                        let stride = pl_by_sample
-                            .get(0)
-                            .map(|v| v.len())
-                            .unwrap_or(0)
-                            .min(u16::MAX as usize) as u16;
+                        let stride = pl_by_sample.get(0).map(|v| v.len()).unwrap_or(0);
                         if stride == 0 {
                             marker_strides.push(0);
                             marker_blocks.push(Vec::new());
+                            marker_missing_blocks.push(Vec::new());
                             continue;
                         }
 
-                        let stride_usize = stride as usize;
-                        let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                        let mut block: Vec<u16> = vec![0u16; stride * n_samples];
+                        let mut missing_block: Vec<u8> = vec![1u8; stride * n_samples];
                         for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
-                            if pls.len() != stride_usize {
+                            if pls.len() != stride {
                                 continue;
                             }
-                            let start = s * stride_usize;
-                            block[start..start + stride_usize].copy_from_slice(&pls);
+                            let start = s * stride;
+                            block[start..start + stride].copy_from_slice(&pls);
+                            missing_block[start..start + stride].fill(0);
                         }
                         marker_strides.push(stride);
                         marker_blocks.push(block);
+                        marker_missing_blocks.push(missing_block);
                     } else {
                         marker_strides.push(0);
                         marker_blocks.push(Vec::new());
+                        marker_missing_blocks.push(Vec::new());
                     }
                 }
 
@@ -580,6 +582,7 @@ impl VcfReader {
                     n_samples,
                     marker_strides,
                     marker_blocks,
+                    marker_missing_blocks,
                 ));
                 GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                     markers,
@@ -2040,10 +2043,18 @@ mod tests {
         assert_eq!(gq_to_confidence(b"0"), Some(0));
         // GQ=10 -> P_correct=0.9 -> high confidence
         let c10 = gq_to_confidence(b"10").unwrap();
-        assert!(c10 >= 200, "expected high confidence for GQ=10, got {}", c10);
+        assert!(
+            c10 >= 200,
+            "expected high confidence for GQ=10, got {}",
+            c10
+        );
         // GQ=20 -> P_correct=0.99 -> near max
         let c20 = gq_to_confidence(b"20").unwrap();
-        assert!(c20 >= 245, "expected near-max confidence for GQ=20, got {}", c20);
+        assert!(
+            c20 >= 245,
+            "expected near-max confidence for GQ=20, got {}",
+            c20
+        );
         // Missing/invalid values should return None
         assert_eq!(gq_to_confidence(b"."), None);
         assert_eq!(gq_to_confidence(b""), None);

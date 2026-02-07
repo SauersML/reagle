@@ -17,7 +17,7 @@ pub struct ThreadWorkspace {
     pub fwd_prior: AVec<f32, ConstAlign<32>>,
     /// Per-marker ref alleles buffer (n_states)
     pub ref_alleles: Vec<u8>,
-    /// Materialized ref alleles buffer (n_markers * n_states)
+    /// Materialized ref alleles buffer (n_markers * n_states), reused across samples/windows.
     pub ref_alleles_flat: Vec<u8>,
     /// Reusable weights buffer for backward sampling (n_states)
     pub weights: Vec<f32>,
@@ -64,14 +64,15 @@ pub struct ThreadWorkspace {
 }
 
 impl ThreadWorkspace {
-    /// Create a new workspace with bounded memory usage
+    /// Create a new workspace with bounded active-HMM memory usage
     ///
-    /// Uses checkpoint-based approach: only stores active HMM state blocks,
-    /// not the entire window. Memory usage is O(checkpoint_interval * n_states).
+    /// Uses checkpoint-based approach for HMM state blocks:
+    /// O(checkpoint_interval * n_states) for `fwd`/`bwd`/`fwd_prior`.
+    /// Some other buffers are O(n_markers) or O(n_markers * n_states) by design.
     pub fn new(checkpoint_interval: usize, n_states: usize) -> Self {
         const DEFAULT_CHECKPOINT_INTERVAL: usize = 64; // L2 cache friendly
         let interval = checkpoint_interval.max(1).min(DEFAULT_CHECKPOINT_INTERVAL);
-        let size = interval * n_states;
+        let size = checked_product(interval, n_states, "initial HMM block length");
 
         Self {
             fwd: AVec::from_iter(32, std::iter::repeat(0.0).take(size)),
@@ -113,10 +114,9 @@ impl ThreadWorkspace {
         }
     }
 
-    /// Resize workspace for a new number of states (keeps memory bounded)
+    /// Resize workspace for a new number of states (keeps active-HMM buffers bounded)
     ///
-    /// Only resizes if needed - doesn't allocate per window size.
-    /// The workspace maintains constant memory regardless of window size.
+    /// Only resizes if needed - doesn't allocate per marker for these three buffers.
     pub fn resize_for_states(&mut self, n_states: usize) {
         if n_states > self.n_states {
             // Only resize if we need more states, not for window size
@@ -125,7 +125,7 @@ impl ThreadWorkspace {
             } else {
                 64
             };
-            let new_size = current_interval * n_states;
+            let new_size = checked_product(current_interval, n_states, "resized HMM block length");
 
             self.fwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
             self.bwd = AVec::from_iter(32, std::iter::repeat(0.0).take(new_size));
@@ -148,7 +148,7 @@ impl ThreadWorkspace {
         if self.ref_alleles.len() < n_states {
             self.ref_alleles.resize(n_states, 0);
         }
-        let flat_len = n_markers.saturating_mul(n_states);
+        let flat_len = checked_product(n_markers, n_states, "ref_alleles_flat length");
         if self.ref_alleles_flat.len() < flat_len {
             self.ref_alleles_flat.resize(flat_len, 0);
         }
@@ -188,12 +188,12 @@ impl ThreadWorkspace {
             self.hap2_hard_match.resize(n_markers, false);
         }
 
-        let block_len = n_states * max_block_len;
+        let block_len = checked_product(n_states, max_block_len, "fwd_block length");
         if self.fwd_block.len() < block_len {
             self.fwd_block.resize(block_len, 0.0);
         }
 
-        let checkpoints_len = n_blocks * n_states;
+        let checkpoints_len = checked_product(n_blocks, n_states, "checkpoint buffer length");
         if self.combined_checkpoint_data.len() < checkpoints_len {
             self.combined_checkpoint_data.resize(checkpoints_len, 0.0);
         }
@@ -216,7 +216,7 @@ impl ThreadWorkspace {
         if self.ffbs_weights.len() < n_states {
             self.ffbs_weights.resize(n_states, 0.0);
         }
-        let needed = n_markers.saturating_mul(n_states);
+        let needed = checked_product(n_markers, n_states, "FFBS marker-state buffer length");
         if self.ffbs_fwd_at_marker.len() < needed {
             self.ffbs_fwd_at_marker.resize(needed, 0.0);
         }
@@ -226,4 +226,14 @@ impl ThreadWorkspace {
     pub fn clear(&mut self) {
         // No need to zero out, as we'll overwrite during fill
     }
+}
+
+#[inline]
+fn checked_product(a: usize, b: usize, context: &str) -> usize {
+    a.checked_mul(b).unwrap_or_else(|| {
+        panic!(
+            "ThreadWorkspace size overflow while computing {} ({} * {})",
+            context, a, b
+        )
+    })
 }

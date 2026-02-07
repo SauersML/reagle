@@ -565,8 +565,9 @@ impl StreamingVcfReader {
                 .take(window_end)
                 .any(|bm| bm.likelihoods_pl.is_some());
 
-            let mut marker_strides: Vec<u16> = Vec::new();
+            let mut marker_strides: Vec<usize> = Vec::new();
             let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
+            let mut marker_missing_blocks: Vec<Vec<u8>> = Vec::new();
 
             for i in 0..window_end {
                 let bm = &self.buffer[i];
@@ -590,30 +591,30 @@ impl StreamingVcfReader {
 
                 if has_any_likelihoods {
                     if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
-                        let stride = pl_by_sample
-                            .get(0)
-                            .map(|v| v.len())
-                            .unwrap_or(0)
-                            .min(u16::MAX as usize) as u16;
+                        let stride = pl_by_sample.get(0).map(|v| v.len()).unwrap_or(0);
                         if stride == 0 {
                             marker_strides.push(0);
                             marker_blocks.push(Vec::new());
+                            marker_missing_blocks.push(Vec::new());
                         } else {
-                            let stride_usize = stride as usize;
-                            let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                            let mut block: Vec<u16> = vec![0u16; stride * n_samples];
+                            let mut missing_block: Vec<u8> = vec![1u8; stride * n_samples];
                             for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
-                                if pls.len() != stride_usize {
+                                if pls.len() != stride {
                                     continue;
                                 }
-                                let start = s * stride_usize;
-                                block[start..start + stride_usize].copy_from_slice(&pls);
+                                let start = s * stride;
+                                block[start..start + stride].copy_from_slice(&pls);
+                                missing_block[start..start + stride].fill(0);
                             }
                             marker_strides.push(stride);
                             marker_blocks.push(block);
+                            marker_missing_blocks.push(missing_block);
                         }
                     } else {
                         marker_strides.push(0);
                         marker_blocks.push(Vec::new());
+                        marker_missing_blocks.push(Vec::new());
                     }
                 }
             }
@@ -638,6 +639,7 @@ impl StreamingVcfReader {
                     n_samples,
                     marker_strides,
                     marker_blocks,
+                    marker_missing_blocks,
                 ));
                 GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                     markers,
@@ -780,8 +782,9 @@ impl StreamingVcfReader {
                 .is_some_and(|bm| bm.likelihoods_pl.is_some())
         });
 
-        let mut marker_strides: Vec<u16> = Vec::new();
+        let mut marker_strides: Vec<usize> = Vec::new();
         let mut marker_blocks: Vec<Vec<u16>> = Vec::new();
+        let mut marker_missing_blocks: Vec<Vec<u8>> = Vec::new();
 
         for &i in &indices {
             let bm = &self.buffer[i];
@@ -805,30 +808,30 @@ impl StreamingVcfReader {
 
             if has_any_likelihoods {
                 if let Some(pl_by_sample) = bm.likelihoods_pl.clone() {
-                    let stride = pl_by_sample
-                        .get(0)
-                        .map(|v| v.len())
-                        .unwrap_or(0)
-                        .min(u16::MAX as usize) as u16;
+                    let stride = pl_by_sample.get(0).map(|v| v.len()).unwrap_or(0);
                     if stride == 0 {
                         marker_strides.push(0);
                         marker_blocks.push(Vec::new());
+                        marker_missing_blocks.push(Vec::new());
                     } else {
-                        let stride_usize = stride as usize;
-                        let mut block: Vec<u16> = vec![u16::MAX; stride_usize * n_samples];
+                        let mut block: Vec<u16> = vec![0u16; stride * n_samples];
+                        let mut missing_block: Vec<u8> = vec![1u8; stride * n_samples];
                         for (s, pls) in pl_by_sample.into_iter().enumerate().take(n_samples) {
-                            if pls.len() != stride_usize {
+                            if pls.len() != stride {
                                 continue;
                             }
-                            let start = s * stride_usize;
-                            block[start..start + stride_usize].copy_from_slice(&pls);
+                            let start = s * stride;
+                            block[start..start + stride].copy_from_slice(&pls);
+                            missing_block[start..start + stride].fill(0);
                         }
                         marker_strides.push(stride);
                         marker_blocks.push(block);
+                        marker_missing_blocks.push(missing_block);
                     }
                 } else {
                     marker_strides.push(0);
                     marker_blocks.push(Vec::new());
+                    marker_missing_blocks.push(Vec::new());
                 }
             }
         }
@@ -843,6 +846,7 @@ impl StreamingVcfReader {
                 n_samples,
                 marker_strides,
                 marker_blocks,
+                marker_missing_blocks,
             ));
             GenotypeMatrix::new_unphased_with_confidence_and_likelihoods(
                 markers,
@@ -1081,8 +1085,8 @@ impl StreamingVcfReader {
         let marker = Marker::new(chrom_idx, pos, id, ref_allele, alt_alleles);
         let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
 
-        // Calculate genetic position
-        let gen_pos = self.gen_maps.gen_pos(chrom_idx, pos);
+        // Calculate genetic position by chromosome name to avoid index-space mismatches.
+        let gen_pos = self.gen_maps.gen_pos_by_name(chrom_name, pos);
 
         Ok(BufferedMarker {
             marker,

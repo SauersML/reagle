@@ -3541,7 +3541,9 @@ fn compare_genotyped_dosages_to_truth(
         // Strictly require the same marker identity in both outputs.
         // This skips positional collisions / representation mismatches
         // (e.g. complex indel normalization differences) from this metric.
-        if rust_rec.ref_allele != java_rec.ref_allele || rust_rec.alt_alleles != java_rec.alt_alleles {
+        if rust_rec.ref_allele != java_rec.ref_allele
+            || rust_rec.alt_alleles != java_rec.alt_alleles
+        {
             continue;
         }
 

@@ -16,18 +16,18 @@ use crate::data::haplotype::{HapIdx, SampleIdx, Samples};
 use crate::data::marker::{AnyMarkerSpace, Marker, MarkerIdx, Markers};
 use crate::data::storage::GenotypeColumn;
 use crate::data::storage::phase_state::{PhaseState, Phased, Unphased};
+use bitvec::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct PlMatrix {
     n_samples: usize,
-    marker_offsets: Vec<u32>,
-    marker_strides: Vec<u16>,
+    marker_offsets: Vec<usize>,
+    marker_strides: Vec<usize>,
     values: Vec<u16>,
+    missing: BitVec<u64, Lsb0>,
 }
 
 impl PlMatrix {
-    const MISSING: u16 = u16::MAX;
-
     pub fn n_samples(&self) -> usize {
         self.n_samples
     }
@@ -41,42 +41,65 @@ impl PlMatrix {
         if marker >= self.marker_strides.len() || sample_idx >= self.n_samples {
             return None;
         }
-        let stride = self.marker_strides[marker] as usize;
+        let stride = self.marker_strides[marker];
         if stride == 0 {
             return None;
         }
-        let base = self.marker_offsets[marker] as usize;
-        let start = base + sample_idx * stride;
-        let end = start + stride;
+        let base = *self.marker_offsets.get(marker)?;
+        let sample_offset = sample_idx.checked_mul(stride)?;
+        let start = base.checked_add(sample_offset)?;
+        let end = start.checked_add(stride)?;
         let slice = self.values.get(start..end)?;
-        if slice.iter().all(|&v| v == Self::MISSING) {
-            None
-        } else {
-            Some(slice)
-        }
+        let missing = self.missing.get(start..end)?;
+        if missing.all() { None } else { Some(slice) }
     }
 
     pub fn from_marker_blocks(
         n_samples: usize,
-        marker_strides: Vec<u16>,
+        marker_strides: Vec<usize>,
         mut marker_blocks: Vec<Vec<u16>>,
+        mut marker_missing_blocks: Vec<Vec<u8>>,
     ) -> Self {
         debug_assert_eq!(marker_strides.len(), marker_blocks.len());
+        debug_assert_eq!(marker_strides.len(), marker_missing_blocks.len());
 
-        let mut marker_offsets: Vec<u32> = Vec::with_capacity(marker_strides.len() + 1);
+        let mut marker_offsets: Vec<usize> = Vec::with_capacity(marker_strides.len() + 1);
         marker_offsets.push(0);
         let mut values: Vec<u16> = Vec::new();
-        let mut running: u32 = 0;
-        for (stride_u16, mut block) in marker_strides.iter().copied().zip(marker_blocks.iter_mut())
+        let mut missing: BitVec<u64, Lsb0> = BitVec::new();
+        let mut running: usize = 0;
+        for ((stride, mut block), missing_block) in marker_strides
+            .iter()
+            .copied()
+            .zip(marker_blocks.iter_mut())
+            .zip(marker_missing_blocks.iter_mut())
         {
-            let stride = stride_u16 as usize;
             if stride == 0 {
                 marker_offsets.push(running);
                 continue;
             }
-            debug_assert_eq!(block.len(), stride * n_samples);
+            let block_len = stride
+                .checked_mul(n_samples)
+                .expect("PL block length overflow");
+            assert_eq!(
+                block.len(),
+                block_len,
+                "PL block length mismatch: expected {} values, found {}",
+                block_len,
+                block.len()
+            );
+            assert_eq!(
+                missing_block.len(),
+                block_len,
+                "PL missing-mask length mismatch: expected {} values, found {}",
+                block_len,
+                missing_block.len()
+            );
             values.append(&mut block);
-            running = running.saturating_add((stride * n_samples) as u32);
+            missing.extend(missing_block.iter().map(|&v| v != 0));
+            running = running
+                .checked_add(block_len)
+                .expect("PL matrix offset overflow");
             marker_offsets.push(running);
         }
         let out = Self {
@@ -84,10 +107,184 @@ impl PlMatrix {
             marker_offsets,
             marker_strides,
             values,
+            missing,
         };
         debug_assert_eq!(out.n_samples(), n_samples);
         debug_assert_eq!(out.n_markers(), out.marker_strides.len());
         out
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FlatU8Matrix {
+    n_rows: usize,
+    n_cols: usize,
+    data: Vec<u8>,
+}
+
+impl FlatU8Matrix {
+    fn from_nested(rows: Vec<Vec<u8>>, n_rows: usize, n_cols: usize, field: &str) -> Self {
+        assert_eq!(
+            rows.len(),
+            n_rows,
+            "{} row count mismatch: expected {}, found {}",
+            field,
+            n_rows,
+            rows.len()
+        );
+        let total = n_rows
+            .checked_mul(n_cols)
+            .expect("flat u8 matrix size overflow");
+        let mut data = Vec::with_capacity(total);
+        for (row_idx, row) in rows.into_iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                n_cols,
+                "{} row {} length mismatch: expected {}, found {}",
+                field,
+                row_idx,
+                n_cols,
+                row.len()
+            );
+            data.extend(row);
+        }
+        Self {
+            n_rows,
+            n_cols,
+            data,
+        }
+    }
+
+    #[inline]
+    fn idx(&self, row: usize, col: usize) -> Option<usize> {
+        if row >= self.n_rows || col >= self.n_cols {
+            return None;
+        }
+        row.checked_mul(self.n_cols)?.checked_add(col)
+    }
+
+    #[inline]
+    fn get(&self, row: usize, col: usize) -> Option<u8> {
+        let idx = self.idx(row, col)?;
+        self.data.get(idx).copied()
+    }
+
+    fn to_nested_clone(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.n_rows);
+        for row in 0..self.n_rows {
+            let start = row * self.n_cols;
+            out.push(self.data[start..start + self.n_cols].to_vec());
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BitMatrix {
+    n_rows: usize,
+    n_cols: usize,
+    bits: BitVec<u64, Lsb0>,
+}
+
+impl BitMatrix {
+    #[inline]
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    fn from_nested(rows: Vec<Vec<u8>>, n_rows: usize, n_cols: usize, field: &str) -> Self {
+        assert_eq!(
+            rows.len(),
+            n_rows,
+            "{} row count mismatch: expected {}, found {}",
+            field,
+            n_rows,
+            rows.len()
+        );
+        let total = n_rows
+            .checked_mul(n_cols)
+            .expect("bit matrix size overflow");
+        let mut bits = BitVec::with_capacity(total);
+        for (row_idx, row) in rows.into_iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                n_cols,
+                "{} row {} length mismatch: expected {}, found {}",
+                field,
+                row_idx,
+                n_cols,
+                row.len()
+            );
+            bits.extend(row.into_iter().map(|v| v != 0));
+        }
+        Self {
+            n_rows,
+            n_cols,
+            bits,
+        }
+    }
+
+    #[inline]
+    fn idx(&self, row: usize, col: usize) -> Option<usize> {
+        if row >= self.n_rows || col >= self.n_cols {
+            return None;
+        }
+        row.checked_mul(self.n_cols)?.checked_add(col)
+    }
+
+    #[inline]
+    pub fn get(&self, row: usize, col: usize) -> Option<u8> {
+        let idx = self.idx(row, col)?;
+        self.bits.get(idx).map(|bit| *bit as u8)
+    }
+
+    #[inline]
+    pub fn row_has_any_set(&self, row: usize) -> bool {
+        if row >= self.n_rows {
+            return false;
+        }
+        let start = row * self.n_cols;
+        let end = start + self.n_cols;
+        self.bits[start..end].any()
+    }
+
+    #[inline]
+    pub fn row_all_set(&self, row: usize) -> bool {
+        if row >= self.n_rows {
+            return false;
+        }
+        let start = row * self.n_cols;
+        let end = start + self.n_cols;
+        self.bits[start..end].all()
+    }
+}
+
+fn build_missing_genotype_mask(
+    columns: &[GenotypeColumn],
+    samples: &Samples,
+    n_markers: usize,
+    n_samples: usize,
+) -> BitMatrix {
+    let total = n_markers
+        .checked_mul(n_samples)
+        .expect("missing-genotype mask size overflow");
+    let mut bits = BitVec::<u64, Lsb0>::with_capacity(total);
+    for m in 0..n_markers {
+        for s in 0..n_samples {
+            let sample = SampleIdx::new(s as u32);
+            let a1 = columns[m].get(sample.hap1());
+            let mut is_missing = GenotypeColumn::is_missing_allele(a1);
+            if !is_missing && samples.is_diploid(sample) {
+                let a2 = columns[m].get(sample.hap2());
+                is_missing = GenotypeColumn::is_missing_allele(a2);
+            }
+            bits.push(is_missing);
+        }
+    }
+    BitMatrix {
+        n_rows: n_markers,
+        n_cols: n_samples,
+        bits,
     }
 }
 
@@ -96,6 +293,7 @@ impl PlMatrix {
 /// Type parameter `State` encodes whether data is phased at compile time,
 /// enabling the compiler to enforce correct pipeline usage.
 #[derive(Debug)]
+#[repr(C)]
 pub struct GenotypeMatrix<State: PhaseState = Unphased, Space = AnyMarkerSpace> {
     /// Marker metadata
     markers: Markers<Space>,
@@ -109,20 +307,24 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased, Space = AnyMarkerSpace> 
     /// Whether markers are in reverse order
     is_reversed: bool,
 
-    /// Optional per-sample genotype confidence scores (from GL or DS).
+    /// Optional per-sample genotype confidence scores (from GL/PL/GQ-derived posterior confidence).
     /// Stored as u8 (0-255) representing confidence 0.0-1.0.
     /// Layout: `confidence[marker][sample]`
     /// None if no confidence information available (assume full confidence).
-    confidence: Option<Vec<Vec<u8>>>,
+    confidence: Option<FlatU8Matrix>,
+
+    /// Precomputed missing-genotype mask used when confidence scores are absent.
+    /// 1 means missing genotype for this marker/sample.
+    missing_genotypes: Option<BitMatrix>,
 
     /// Optional per-sample phase confidence scores (0-255 => 0.0-1.0).
     /// Represents confidence in the current phased orientation at heterozygotes.
     /// Layout: `phase_confidence[marker][sample]`
-    phase_confidence: Option<Vec<Vec<u8>>>,
+    phase_confidence: Option<FlatU8Matrix>,
 
     /// Optional per-sample phasedness mask (1 = phased, 0 = unphased or missing).
     /// Layout: `phase_mask[marker][sample]`
-    phase_mask: Option<Vec<Vec<u8>>>,
+    phase_mask: Option<BitMatrix>,
 
     likelihoods_pl: Option<Arc<PlMatrix>>,
 
@@ -138,6 +340,7 @@ impl<State: PhaseState, Space> Clone for GenotypeMatrix<State, Space> {
             samples: Arc::clone(&self.samples),
             is_reversed: self.is_reversed,
             confidence: self.confidence.clone(),
+            missing_genotypes: self.missing_genotypes.clone(),
             phase_confidence: self.phase_confidence.clone(),
             phase_mask: self.phase_mask.clone(),
             likelihoods_pl: self.likelihoods_pl.clone(),
@@ -209,22 +412,52 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         let confidence_bytes: usize = self
             .confidence
             .as_ref()
-            .map(|c| c.iter().map(|v| v.len()).sum())
+            .map(|c| c.data.capacity() * std::mem::size_of::<u8>())
             .unwrap_or(0);
         let phase_confidence_bytes: usize = self
             .phase_confidence
             .as_ref()
-            .map(|c| c.iter().map(|v| v.len()).sum())
+            .map(|c| c.data.capacity() * std::mem::size_of::<u8>())
             .unwrap_or(0);
         let phase_mask_bytes: usize = self
             .phase_mask
             .as_ref()
-            .map(|c| c.iter().map(|v| v.len()).sum())
+            .map(|c| c.bits.capacity() / 8)
+            .unwrap_or(0);
+        let missing_genotypes_bytes: usize = self
+            .missing_genotypes
+            .as_ref()
+            .map(|c| c.bits.capacity() / 8)
+            .unwrap_or(0);
+        let pl_values_bytes = self
+            .likelihoods_pl
+            .as_ref()
+            .map(|pl| pl.values.capacity() * std::mem::size_of::<u16>())
+            .unwrap_or(0);
+        let pl_missing_bytes = self
+            .likelihoods_pl
+            .as_ref()
+            .map(|pl| pl.missing.capacity() / 8)
+            .unwrap_or(0);
+        let marker_offsets_bytes = self
+            .likelihoods_pl
+            .as_ref()
+            .map(|pl| pl.marker_offsets.capacity() * std::mem::size_of::<usize>())
+            .unwrap_or(0);
+        let marker_strides_bytes = self
+            .likelihoods_pl
+            .as_ref()
+            .map(|pl| pl.marker_strides.capacity() * std::mem::size_of::<usize>())
             .unwrap_or(0);
         column_bytes
             + confidence_bytes
             + phase_confidence_bytes
             + phase_mask_bytes
+            + missing_genotypes_bytes
+            + pl_values_bytes
+            + pl_missing_bytes
+            + marker_offsets_bytes
+            + marker_strides_bytes
             + std::mem::size_of::<Self>()
     }
 
@@ -234,26 +467,32 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
     /// Returns 255 (full confidence) if confidence data is not available.
     #[inline]
     pub fn sample_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
-        if marker.as_usize() >= self.columns.len() {
-            return 0;
-        }
+        let marker_idx = marker.as_usize();
+        assert!(
+            marker_idx < self.columns.len(),
+            "marker index {} out of bounds for {} markers",
+            marker_idx,
+            self.columns.len()
+        );
+        assert!(
+            sample_idx < self.n_samples(),
+            "sample index {} out of bounds for {} samples",
+            sample_idx,
+            self.n_samples()
+        );
         if let Some(conf) = self
             .confidence
             .as_ref()
-            .and_then(|c| c.get(marker.as_usize()))
-            .and_then(|row| row.get(sample_idx))
-            .copied()
+            .and_then(|c| c.get(marker_idx, sample_idx))
         {
             return conf;
         }
-        let sample = SampleIdx::new(sample_idx as u32);
-        let a1 = self.allele(marker, sample.hap1());
-        if a1 == 255 {
-            return 0;
-        }
-        if self.samples.is_diploid(sample) {
-            let a2 = self.allele(marker, sample.hap2());
-            if a2 == 255 {
+        if let Some(is_missing) = self
+            .missing_genotypes
+            .as_ref()
+            .and_then(|m| m.get(marker_idx, sample_idx))
+        {
+            if is_missing != 0 {
                 return 0;
             }
         }
@@ -268,18 +507,29 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
 
     /// Clone the confidence data (for transferring to a new matrix)
     pub fn confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
-        self.confidence.clone()
+        self.confidence.as_ref().map(FlatU8Matrix::to_nested_clone)
     }
 
     /// Get phase confidence score for a sample at a marker (0-255).
     /// Returns 255 (full confidence) if phase confidence is not available.
     #[inline]
     pub fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
+        let marker_idx = marker.as_usize();
+        assert!(
+            marker_idx < self.columns.len(),
+            "marker index {} out of bounds for {} markers",
+            marker_idx,
+            self.columns.len()
+        );
+        assert!(
+            sample_idx < self.n_samples(),
+            "sample index {} out of bounds for {} samples",
+            sample_idx,
+            self.n_samples()
+        );
         self.phase_confidence
             .as_ref()
-            .and_then(|c| c.get(marker.as_usize()))
-            .and_then(|row| row.get(sample_idx))
-            .copied()
+            .and_then(|c| c.get(marker_idx, sample_idx))
             .unwrap_or(255)
     }
 
@@ -291,10 +541,12 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
 
     /// Clone the phase confidence data (for transferring to a new matrix)
     pub fn phase_confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
-        self.phase_confidence.clone()
+        self.phase_confidence
+            .as_ref()
+            .map(FlatU8Matrix::to_nested_clone)
     }
 
-    pub fn phase_mask(&self) -> Option<&Vec<Vec<u8>>> {
+    pub fn phase_mask(&self) -> Option<&BitMatrix> {
         self.phase_mask.as_ref()
     }
 
@@ -302,7 +554,9 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         if let Some(ref mask) = phase_mask {
             debug_assert_eq!(self.markers.len(), mask.len());
         }
-        self.phase_mask = phase_mask;
+        self.phase_mask = phase_mask.map(|m| {
+            BitMatrix::from_nested(m, self.markers.len(), self.samples.len(), "phase_mask")
+        });
         self
     }
 
@@ -330,12 +584,19 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
         samples: Arc<Samples>,
     ) -> Self {
         debug_assert_eq!(markers.len(), columns.len());
+        let missing_genotypes = Some(build_missing_genotype_mask(
+            &columns,
+            &samples,
+            markers.len(),
+            samples.len(),
+        ));
         Self {
             markers,
             columns,
             samples,
             is_reversed: false,
             confidence: None,
+            missing_genotypes,
             phase_confidence: None,
             phase_mask: None,
             likelihoods_pl: None,
@@ -351,13 +612,16 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
         confidence: Vec<Vec<u8>>,
     ) -> Self {
         debug_assert_eq!(markers.len(), columns.len());
-        debug_assert_eq!(markers.len(), confidence.len());
+        let n_markers = markers.len();
+        let n_samples = samples.len();
+        let confidence = FlatU8Matrix::from_nested(confidence, n_markers, n_samples, "confidence");
         Self {
             markers,
             columns,
             samples,
             is_reversed: false,
             confidence: Some(confidence),
+            missing_genotypes: None,
             phase_confidence: None,
             phase_mask: None,
             likelihoods_pl: None,
@@ -373,15 +637,24 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
         likelihoods_pl: Arc<PlMatrix>,
     ) -> Self {
         debug_assert_eq!(markers.len(), columns.len());
-        if let Some(ref conf) = confidence {
-            debug_assert_eq!(markers.len(), conf.len());
-        }
+        let n_markers = markers.len();
+        let n_samples = samples.len();
+        let confidence = confidence
+            .map(|conf| FlatU8Matrix::from_nested(conf, n_markers, n_samples, "confidence"));
+        let missing_genotypes = if confidence.is_none() {
+            Some(build_missing_genotype_mask(
+                &columns, &samples, n_markers, n_samples,
+            ))
+        } else {
+            None
+        };
         Self {
             markers,
             columns,
             samples,
             is_reversed: false,
             confidence,
+            missing_genotypes,
             phase_confidence: None,
             phase_mask: None,
             likelihoods_pl: Some(likelihoods_pl),
@@ -400,6 +673,7 @@ impl<Space> GenotypeMatrix<Unphased, Space> {
             samples: self.samples,
             is_reversed: self.is_reversed,
             confidence: self.confidence,
+            missing_genotypes: self.missing_genotypes,
             phase_confidence: self.phase_confidence,
             phase_mask: self.phase_mask,
             likelihoods_pl: self.likelihoods_pl,
@@ -420,34 +694,19 @@ impl<Space> GenotypeMatrix<Phased, Space> {
         samples: Arc<Samples>,
     ) -> Self {
         debug_assert_eq!(markers.len(), columns.len());
+        let missing_genotypes = Some(build_missing_genotype_mask(
+            &columns,
+            &samples,
+            markers.len(),
+            samples.len(),
+        ));
         Self {
             markers,
             columns,
             samples,
             is_reversed: false,
             confidence: None,
-            phase_confidence: None,
-            phase_mask: None,
-            likelihoods_pl: None,
-            phantom: PhantomData,
-        }
-    }
-
-    /// Create a new phased genotype matrix with confidence scores
-    pub fn new_phased_with_confidence(
-        markers: Markers<Space>,
-        columns: Vec<GenotypeColumn>,
-        samples: Arc<Samples>,
-        confidence: Vec<Vec<u8>>,
-    ) -> Self {
-        debug_assert_eq!(markers.len(), columns.len());
-        debug_assert_eq!(markers.len(), confidence.len());
-        Self {
-            markers,
-            columns,
-            samples,
-            is_reversed: false,
-            confidence: Some(confidence),
+            missing_genotypes,
             phase_confidence: None,
             phase_mask: None,
             likelihoods_pl: None,
@@ -463,13 +722,32 @@ impl<Space> GenotypeMatrix<Phased, Space> {
         likelihoods_pl: Option<Arc<PlMatrix>>,
     ) -> Self {
         debug_assert_eq!(markers.len(), columns.len());
-        if let Some(ref conf) = confidence {
-            debug_assert_eq!(markers.len(), conf.len());
-        }
+        let n_markers = markers.len();
+        let n_samples = samples.len();
+        let confidence = confidence
+            .map(|conf| FlatU8Matrix::from_nested(conf, n_markers, n_samples, "confidence"));
+        let missing_genotypes = if confidence.is_none() {
+            Some(build_missing_genotype_mask(
+                &columns, &samples, n_markers, n_samples,
+            ))
+        } else {
+            None
+        };
 
         if likelihoods_pl.is_none() {
             if let Some(conf) = confidence {
-                return Self::new_phased_with_confidence(markers, columns, samples, conf);
+                return Self {
+                    markers,
+                    columns,
+                    samples,
+                    is_reversed: false,
+                    confidence: Some(conf),
+                    missing_genotypes: None,
+                    phase_confidence: None,
+                    phase_mask: None,
+                    likelihoods_pl: None,
+                    phantom: PhantomData,
+                };
             }
             return Self::new_phased(markers, columns, samples);
         }
@@ -480,6 +758,7 @@ impl<Space> GenotypeMatrix<Phased, Space> {
             samples,
             is_reversed: false,
             confidence,
+            missing_genotypes,
             phase_confidence: None,
             phase_mask: None,
             likelihoods_pl,
@@ -489,10 +768,14 @@ impl<Space> GenotypeMatrix<Phased, Space> {
 
     /// Attach phase confidence data to a phased matrix.
     pub fn with_phase_confidence(mut self, phase_confidence: Option<Vec<Vec<u8>>>) -> Self {
-        if let Some(ref conf) = phase_confidence {
-            debug_assert_eq!(self.markers.len(), conf.len());
-        }
-        self.phase_confidence = phase_confidence;
+        self.phase_confidence = phase_confidence.map(|conf| {
+            FlatU8Matrix::from_nested(
+                conf,
+                self.markers.len(),
+                self.samples.len(),
+                "phase_confidence",
+            )
+        });
         self
     }
 
@@ -500,6 +783,14 @@ impl<Space> GenotypeMatrix<Phased, Space> {
     pub fn as_unphased_ref(&self) -> &GenotypeMatrix<Unphased, Space> {
         // SAFETY: GenotypeMatrix<Phased> and GenotypeMatrix<Unphased> have identical
         // memory layouts (PhantomData is zero-sized), differing only in the type parameter
+        debug_assert_eq!(
+            std::mem::size_of::<GenotypeMatrix<Phased, Space>>(),
+            std::mem::size_of::<GenotypeMatrix<Unphased, Space>>()
+        );
+        debug_assert_eq!(
+            std::mem::align_of::<GenotypeMatrix<Phased, Space>>(),
+            std::mem::align_of::<GenotypeMatrix<Unphased, Space>>()
+        );
         unsafe {
             &*(self as *const GenotypeMatrix<Phased, Space>
                 as *const GenotypeMatrix<Unphased, Space>)

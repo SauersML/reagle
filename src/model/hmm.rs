@@ -682,7 +682,7 @@ pub struct MosaicHmm<
     /// Number of HMM states
     n_states: usize,
     /// Recombination probabilities between consecutive markers
-    p_recomb: Vec<f32>,
+    p_recomb: &'a [f32],
     hap_space: std::marker::PhantomData<HapSpace>,
 }
 impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, HapSpace> {
@@ -691,7 +691,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         ref_gt: impl Into<GenotypeView<'a, TargetSpace, RefSpace>>,
         params: &'a ModelParams,
         n_states: usize,
-        p_recomb: Vec<f32>,
+        p_recomb: &'a [f32],
     ) -> Self {
         Self {
             ref_gt: ref_gt.into(),
@@ -1698,7 +1698,7 @@ mod tests {
         threaded_haps.push_new(HapId::new(4));
         threaded_haps.add_segment(2, HapId::new(5), 2);
 
-        let hmm = MosaicHmm::new(&ref_panel, &params, n_states, p_recomb);
+        let hmm = MosaicHmm::new(&ref_panel, &params, n_states, &p_recomb);
 
         let target_alleles = vec![0, 0, 0, 1, 0]; // Should match haplotype 0 or 4
         let mut fwd = Vec::new();

@@ -48,6 +48,13 @@ pub enum GenotypeColumn {
 }
 
 impl GenotypeColumn {
+    pub const MISSING_ALLELE: u8 = 255;
+
+    #[inline]
+    pub fn is_missing_allele(allele: u8) -> bool {
+        allele == Self::MISSING_ALLELE
+    }
+
     /// Get allele for a specific haplotype (0 = REF, 1+ = ALT)
     #[inline]
     pub fn get(&self, hap: HapIdx) -> u8 {

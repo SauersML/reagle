@@ -5,6 +5,8 @@ use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::PhaseState;
 use std::collections::HashMap;
 
+type PosKey = (u32, u32);
+
 /// Marker alignment between target and reference panels
 #[derive(Debug)]
 pub struct MarkerAlignment<TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
@@ -44,96 +46,61 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
         target_gt: &GenotypeMatrix<S1, TargetSpace>,
         ref_gt: &GenotypeMatrix<S2, RefSpace>,
     ) -> Self {
-        use crate::data::marker::compute_allele_mapping;
-
         let n_ref_markers = ref_gt.n_markers();
         let n_target_markers = target_gt.n_markers();
 
-        // Build position -> target index map (keyed by chrom name for stability)
-        let mut target_pos_map: HashMap<(String, u32), Vec<usize>> = HashMap::new();
-        for m in 0..n_target_markers {
-            let marker = target_gt.marker(MarkerIdx::new(m as u32));
-            let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
-            let chrom_norm = normalize_chrom(chrom_name).to_string();
-            target_pos_map
-                .entry((chrom_norm, marker.pos))
-                .or_default()
-                .push(m);
-        }
+        let target_pos_map = build_target_pos_map(target_gt);
+        let ref_pos_map = build_ref_pos_map_from_gt(ref_gt);
 
-        // Map reference markers to target markers
         let mut ref_to_target = vec![None; n_ref_markers];
         let mut target_to_ref = vec![None; n_target_markers];
         let mut allele_mappings: Vec<Option<AlleleMapping>> = vec![None; n_target_markers];
 
         let mut n_strand_flipped = 0usize;
         let mut n_allele_swapped = 0usize;
+        let mut dropped_ambiguous_flips = 0usize;
 
-        let mut used_targets = vec![false; n_target_markers];
-        for m in 0..n_ref_markers {
-            let ref_marker = ref_gt.marker(MarkerIdx::new(m as u32));
-            let ref_chrom = ref_gt.markers().chrom_name(ref_marker.chrom).unwrap_or("");
-            let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
-            if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
-                let mut best: Option<(usize, AlleleMapping, (usize, usize, usize, usize))> = None;
-                for &target_idx in target_candidates {
-                    if used_targets[target_idx] {
-                        continue;
-                    }
+        for (key, ref_candidates) in &ref_pos_map {
+            let Some(target_candidates) = target_pos_map.get(key) else {
+                continue;
+            };
+            let matches =
+                best_group_matches(ref_candidates, target_candidates, |ref_idx, target_idx| {
+                    let ref_marker = ref_gt.marker(MarkerIdx::new(ref_idx as u32));
                     let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+                    candidate_mapping(target_marker, ref_marker, &mut dropped_ambiguous_flips)
+                });
 
-                    // Compute allele mapping (handles strand flips)
-                    if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
-                        if mapping.is_valid() {
-                            let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count();
-                            let ref_is_ref =
-                                usize::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
-                            let unswapped = usize::from(!mapping.alleles_swapped);
-                            let unflipped = usize::from(!mapping.strand_flipped);
-                            let score = (mapped, ref_is_ref, unswapped, unflipped);
-                            if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
-                                best = Some((target_idx, mapping, score));
-                            }
-                        }
-                    }
+            for (ref_idx, target_idx, mapping) in matches {
+                let ref_marker = ref_gt.marker(MarkerIdx::new(ref_idx as u32));
+                let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+                let strand_flipped = mapping.strand_flipped;
+                let alleles_swapped = mapping.alleles_swapped;
+                ref_to_target[ref_idx] = Some(MarkerIdx::new(target_idx as u32));
+                target_to_ref[target_idx] = Some(MarkerIdx::new(ref_idx as u32));
+                allele_mappings[target_idx] = Some(mapping);
+
+                if strand_flipped {
+                    n_strand_flipped += 1;
                 }
-                if let Some((target_idx, mapping, _)) = best {
-                    let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
-                    let strand_flipped = mapping.strand_flipped;
-                    let alleles_swapped = mapping.alleles_swapped;
-                    ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
-                    target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
-                    allele_mappings[target_idx] = Some(mapping);
-                    used_targets[target_idx] = true;
-
-                    if strand_flipped {
-                        n_strand_flipped += 1;
-                        if crate::data::marker::is_strand_ambiguous(target_marker) {
-                            eprintln!(
-                                "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
-                                target_marker.pos
-                            );
-                        }
-                    }
-                    if alleles_swapped {
-                        n_allele_swapped += 1;
-                        eprintln!(
-                            "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
-                            target_marker.pos,
-                            target_marker.ref_allele,
-                            target_marker
-                                .alt_alleles
-                                .get(0)
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                            ref_marker.ref_allele,
-                            ref_marker
-                                .alt_alleles
-                                .get(0)
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                    }
+                if alleles_swapped {
+                    n_allele_swapped += 1;
+                    eprintln!(
+                        "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                        target_marker.pos,
+                        target_marker.ref_allele,
+                        target_marker
+                            .alt_alleles
+                            .first()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        ref_marker.ref_allele,
+                        ref_marker
+                            .alt_alleles
+                            .first()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
                 }
             }
         }
@@ -142,6 +109,12 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
             eprintln!(
                 "  Allele alignment: {} strand-flipped, {} allele-swapped markers",
                 n_strand_flipped, n_allele_swapped
+            );
+        }
+        if dropped_ambiguous_flips > 0 {
+            eprintln!(
+                "  Dropped {} strand-ambiguous SNV candidates requiring strand flips",
+                dropped_ambiguous_flips
             );
         }
 
@@ -157,21 +130,11 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
         target_gt: &GenotypeMatrix<S, TargetSpace>,
         ref_markers: &Markers<RefSpace>,
     ) -> Self {
-        use crate::data::marker::compute_allele_mapping;
-
         let n_ref_markers = ref_markers.len();
         let n_target_markers = target_gt.n_markers();
 
-        let mut target_pos_map: HashMap<(String, u32), Vec<usize>> = HashMap::new();
-        for m in 0..n_target_markers {
-            let marker = target_gt.marker(MarkerIdx::new(m as u32));
-            let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
-            let chrom_norm = normalize_chrom(chrom_name).to_string();
-            target_pos_map
-                .entry((chrom_norm, marker.pos))
-                .or_default()
-                .push(m);
-        }
+        let target_pos_map = build_target_pos_map(target_gt);
+        let ref_pos_map = build_ref_pos_map(ref_markers);
 
         let mut ref_to_target = vec![None; n_ref_markers];
         let mut target_to_ref = vec![None; n_target_markers];
@@ -179,90 +142,78 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
 
         let mut n_strand_flipped = 0usize;
         let mut n_allele_swapped = 0usize;
-
-        let mut used_targets = vec![false; n_target_markers];
+        let mut dropped_ambiguous_flips = 0usize;
         let mut unaligned_with_candidates = 0usize;
         let mut unaligned_examples: Vec<String> = Vec::new();
-        for m in 0..n_ref_markers {
-            let ref_marker = ref_markers.marker(MarkerIdx::new(m as u32));
-            let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let ref_chrom_norm = normalize_chrom(ref_chrom).to_string();
-            if let Some(target_candidates) = target_pos_map.get(&(ref_chrom_norm, ref_marker.pos)) {
-                let mut best: Option<(usize, AlleleMapping, (usize, usize, usize, usize))> = None;
-                let mut aligned = false;
-                for &target_idx in target_candidates {
-                    if used_targets[target_idx] {
-                        continue;
-                    }
-                    let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
 
-                    if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
-                        if mapping.is_valid() {
-                            let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count();
-                            let ref_is_ref =
-                                usize::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
-                            let unswapped = usize::from(!mapping.alleles_swapped);
-                            let unflipped = usize::from(!mapping.strand_flipped);
-                            let score = (mapped, ref_is_ref, unswapped, unflipped);
-                            if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
-                                best = Some((target_idx, mapping, score));
-                            }
-                        }
-                    }
-                }
-                if let Some((target_idx, mapping, _)) = best {
+        for (key, ref_candidates) in &ref_pos_map {
+            let Some(target_candidates) = target_pos_map.get(key) else {
+                continue;
+            };
+            let matches =
+                best_group_matches(ref_candidates, target_candidates, |ref_idx, target_idx| {
+                    let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
                     let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
-                    let strand_flipped = mapping.strand_flipped;
-                    let alleles_swapped = mapping.alleles_swapped;
-                    ref_to_target[m] = Some(MarkerIdx::new(target_idx as u32));
-                    target_to_ref[target_idx] = Some(MarkerIdx::new(m as u32));
-                    allele_mappings[target_idx] = Some(mapping);
-                    used_targets[target_idx] = true;
-                    aligned = true;
+                    candidate_mapping(target_marker, ref_marker, &mut dropped_ambiguous_flips)
+                });
 
-                    if strand_flipped {
-                        n_strand_flipped += 1;
-                        if crate::data::marker::is_strand_ambiguous(target_marker) {
-                            eprintln!(
-                                "  Warning: Strand-ambiguous marker at pos {} (A/T or C/G SNV) was strand-flipped",
-                                target_marker.pos
-                            );
-                        }
-                    }
-                    if alleles_swapped {
-                        n_allele_swapped += 1;
-                        eprintln!(
-                            "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
-                            target_marker.pos,
-                            target_marker.ref_allele,
-                            target_marker
-                                .alt_alleles
-                                .get(0)
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                            ref_marker.ref_allele,
-                            ref_marker
-                                .alt_alleles
-                                .get(0)
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                    }
+            let mut aligned_refs = vec![false; ref_candidates.len()];
+            for (ref_idx, target_idx, mapping) in matches {
+                let Some(ref_local_idx) = ref_candidates.iter().position(|&v| v == ref_idx) else {
+                    continue;
+                };
+                aligned_refs[ref_local_idx] = true;
+
+                let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
+                let target_marker = target_gt.marker(MarkerIdx::new(target_idx as u32));
+                let strand_flipped = mapping.strand_flipped;
+                let alleles_swapped = mapping.alleles_swapped;
+                ref_to_target[ref_idx] = Some(MarkerIdx::new(target_idx as u32));
+                target_to_ref[target_idx] = Some(MarkerIdx::new(ref_idx as u32));
+                allele_mappings[target_idx] = Some(mapping);
+
+                if strand_flipped {
+                    n_strand_flipped += 1;
                 }
-                if !aligned {
-                    unaligned_with_candidates += 1;
-                    if unaligned_examples.len() < 5 {
-                        let ref_alt = ref_marker
+                if alleles_swapped {
+                    n_allele_swapped += 1;
+                    eprintln!(
+                        "  Allele swapped at pos {}: target {}>{}, ref {}>{}",
+                        target_marker.pos,
+                        target_marker.ref_allele,
+                        target_marker
                             .alt_alleles
-                            .iter()
+                            .first()
                             .map(|a| a.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        unaligned_examples.push(format!(
-                            "{}:{} {}>{}",
-                            ref_chrom, ref_marker.pos, ref_marker.ref_allele, ref_alt
-                        ));
-                    }
+                            .unwrap_or_else(|| "-".to_string()),
+                        ref_marker.ref_allele,
+                        ref_marker
+                            .alt_alleles
+                            .first()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
+                }
+            }
+
+            for (i, &ref_idx) in ref_candidates.iter().enumerate() {
+                if aligned_refs[i] {
+                    continue;
+                }
+                unaligned_with_candidates += 1;
+                if unaligned_examples.len() < 5 {
+                    let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
+                    let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
+                    let ref_alt = ref_marker
+                        .alt_alleles
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    unaligned_examples.push(format!(
+                        "{}:{} {}>{}",
+                        ref_chrom, ref_marker.pos, ref_marker.ref_allele, ref_alt
+                    ));
                 }
             }
         }
@@ -271,6 +222,12 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
             eprintln!(
                 "  Allele alignment: {} strand-flipped, {} allele-swapped markers",
                 n_strand_flipped, n_allele_swapped
+            );
+        }
+        if dropped_ambiguous_flips > 0 {
+            eprintln!(
+                "  Dropped {} strand-ambiguous SNV candidates requiring strand flips",
+                dropped_ambiguous_flips
             );
         }
         if unaligned_with_candidates > 0 {
@@ -297,20 +254,8 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
     }
 
     /// Build a reference position index for fast streaming alignment.
-    pub fn build_ref_pos_index(
-        ref_markers: &Markers<RefSpace>,
-    ) -> HashMap<(String, u32), Vec<usize>> {
-        let mut ref_pos_map: HashMap<(String, u32), Vec<usize>> = HashMap::new();
-        for m in 0..ref_markers.len() {
-            let marker = ref_markers.marker(MarkerIdx::new(m as u32));
-            let chrom_name = ref_markers.chrom_name(marker.chrom).unwrap_or("");
-            let chrom_norm = normalize_chrom(chrom_name).to_string();
-            ref_pos_map
-                .entry((chrom_norm, marker.pos))
-                .or_default()
-                .push(m);
-        }
-        ref_pos_map
+    pub fn build_ref_pos_index(ref_markers: &Markers<RefSpace>) -> HashMap<PosKey, Vec<usize>> {
+        build_ref_pos_map(ref_markers)
     }
 
     /// Create alignment against a pre-built reference position index.
@@ -321,7 +266,7 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
     pub fn new_with_ref_index<S: PhaseState>(
         target_gt: &GenotypeMatrix<S, TargetSpace>,
         ref_markers: &Markers<RefSpace>,
-        ref_pos_map: &HashMap<(String, u32), Vec<usize>>,
+        ref_pos_map: &HashMap<PosKey, Vec<usize>>,
     ) -> (Self, AlignmentStats) {
         use crate::data::marker::compute_allele_mapping;
 
@@ -336,22 +281,28 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                 .markers()
                 .chrom_name(target_marker.chrom)
                 .unwrap_or("");
-            let chrom_norm = normalize_chrom(chrom_name).to_string();
-            if let Some(ref_candidates) = ref_pos_map.get(&(chrom_norm, target_marker.pos)) {
-                let mut best: Option<(usize, AlleleMapping, (usize, usize, usize, usize))> = None;
+            let chrom_code = chrom_to_code(chrom_name);
+            if let Some(ref_candidates) = ref_pos_map.get(&(chrom_code, target_marker.pos)) {
+                let mut best: Option<(usize, AlleleMapping, u32)> = None;
                 for &ref_idx in ref_candidates {
                     let ref_marker = ref_markers.marker(MarkerIdx::new(ref_idx as u32));
                     if let Some(mapping) = compute_allele_mapping(target_marker, ref_marker) {
-                        if mapping.is_valid() {
-                            let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count();
-                            let ref_is_ref =
-                                usize::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
-                            let unswapped = usize::from(!mapping.alleles_swapped);
-                            let unflipped = usize::from(!mapping.strand_flipped);
-                            let score = (mapped, ref_is_ref, unswapped, unflipped);
-                            if best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true) {
-                                best = Some((ref_idx, mapping, score));
-                            }
+                        if !mapping.is_valid() {
+                            continue;
+                        }
+                        if mapping.strand_flipped
+                            && (crate::data::marker::is_strand_ambiguous(target_marker)
+                                || crate::data::marker::is_strand_ambiguous(ref_marker))
+                        {
+                            continue;
+                        }
+                        let score = mapping_score(&mapping);
+                        if best
+                            .as_ref()
+                            .map(|(_, _, best_score)| score > *best_score)
+                            .unwrap_or(true)
+                        {
+                            best = Some((ref_idx, mapping, score));
                         }
                     }
                 }
@@ -371,13 +322,13 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
                             target_marker.ref_allele,
                             target_marker
                                 .alt_alleles
-                                .get(0)
+                                .first()
                                 .map(|a| a.to_string())
                                 .unwrap_or_else(|| "-".to_string()),
                             ref_marker.ref_allele,
                             ref_marker
                                 .alt_alleles
-                                .get(0)
+                                .first()
                                 .map(|a| a.to_string())
                                 .unwrap_or_else(|| "-".to_string()),
                         );
@@ -430,7 +381,7 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
         target_marker: MarkerIdx<TargetSpace>,
     ) -> Option<MarkerIdx<RefSpace>> {
         // Check allele_mappings to ensure the marker actually aligns.
-        // The raw target_to_ref vector initializes with 0s, which is ambiguous.
+        // `target_to_ref` stores Option and unaligned markers remain None.
         if self
             .allele_mappings
             .get(target_marker.as_usize())
@@ -451,6 +402,74 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
     }
 }
 
+fn build_target_pos_map<S: PhaseState, Space>(
+    target_gt: &GenotypeMatrix<S, Space>,
+) -> HashMap<PosKey, Vec<usize>> {
+    let mut target_pos_map: HashMap<PosKey, Vec<usize>> = HashMap::new();
+    for m in 0..target_gt.n_markers() {
+        let marker = target_gt.marker(MarkerIdx::new(m as u32));
+        let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
+        let chrom_code = chrom_to_code(chrom_name);
+        target_pos_map
+            .entry((chrom_code, marker.pos))
+            .or_default()
+            .push(m);
+    }
+    target_pos_map
+}
+
+fn build_ref_pos_map<Space>(ref_markers: &Markers<Space>) -> HashMap<PosKey, Vec<usize>> {
+    let mut ref_pos_map: HashMap<PosKey, Vec<usize>> = HashMap::new();
+    for m in 0..ref_markers.len() {
+        let marker = ref_markers.marker(MarkerIdx::new(m as u32));
+        let chrom_name = ref_markers.chrom_name(marker.chrom).unwrap_or("");
+        let chrom_code = chrom_to_code(chrom_name);
+        ref_pos_map
+            .entry((chrom_code, marker.pos))
+            .or_default()
+            .push(m);
+    }
+    ref_pos_map
+}
+
+fn build_ref_pos_map_from_gt<S: PhaseState, Space>(
+    ref_gt: &GenotypeMatrix<S, Space>,
+) -> HashMap<PosKey, Vec<usize>> {
+    let mut ref_pos_map: HashMap<PosKey, Vec<usize>> = HashMap::new();
+    for m in 0..ref_gt.n_markers() {
+        let marker = ref_gt.marker(MarkerIdx::new(m as u32));
+        let chrom_name = ref_gt.markers().chrom_name(marker.chrom).unwrap_or("");
+        let chrom_code = chrom_to_code(chrom_name);
+        ref_pos_map
+            .entry((chrom_code, marker.pos))
+            .or_default()
+            .push(m);
+    }
+    ref_pos_map
+}
+
+fn candidate_mapping(
+    target_marker: &crate::data::marker::Marker,
+    ref_marker: &crate::data::marker::Marker,
+    dropped_ambiguous_flips: &mut usize,
+) -> Option<(u32, AlleleMapping)> {
+    use crate::data::marker::compute_allele_mapping;
+
+    compute_allele_mapping(target_marker, ref_marker).and_then(|mapping| {
+        if !mapping.is_valid() {
+            return None;
+        }
+        if mapping.strand_flipped
+            && (crate::data::marker::is_strand_ambiguous(target_marker)
+                || crate::data::marker::is_strand_ambiguous(ref_marker))
+        {
+            *dropped_ambiguous_flips += 1;
+            return None;
+        }
+        Some((mapping_score(&mapping), mapping))
+    })
+}
+
 #[inline]
 fn normalize_chrom(name: &str) -> &str {
     if name.len() >= 3 && name[..3].eq_ignore_ascii_case("chr") {
@@ -458,4 +477,183 @@ fn normalize_chrom(name: &str) -> &str {
     } else {
         name
     }
+}
+
+#[inline]
+fn chrom_to_code(name: &str) -> u32 {
+    let norm = normalize_chrom(name);
+    if let Ok(parsed) = norm.parse::<u32>() {
+        return parsed;
+    }
+    if norm.eq_ignore_ascii_case("X") {
+        return 23;
+    }
+    if norm.eq_ignore_ascii_case("Y") {
+        return 24;
+    }
+    if norm.eq_ignore_ascii_case("XY") {
+        return 25;
+    }
+    if norm.eq_ignore_ascii_case("M") || norm.eq_ignore_ascii_case("MT") {
+        return 26;
+    }
+
+    let mut hash = 2166136261u32;
+    for b in norm.bytes() {
+        hash ^= b.to_ascii_lowercase() as u32;
+        hash = hash.wrapping_mul(16777619u32);
+    }
+    hash | (1u32 << 31)
+}
+
+#[inline]
+fn mapping_score(mapping: &AlleleMapping) -> u32 {
+    let mapped = mapping.targ_to_ref.iter().filter(|&&v| v >= 0).count() as u32;
+    let ref_is_ref = u32::from(mapping.targ_to_ref.first().copied().unwrap_or(-1) == 0);
+    let unswapped = u32::from(!mapping.alleles_swapped);
+    let unflipped = u32::from(!mapping.strand_flipped);
+    (mapped << 3) | (ref_is_ref << 2) | (unswapped << 1) | unflipped
+}
+
+#[derive(Clone, Copy)]
+struct MatchScore {
+    aligned: usize,
+    weight: u64,
+}
+
+impl MatchScore {
+    fn zero() -> Self {
+        Self {
+            aligned: 0,
+            weight: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GroupEdge {
+    target_local_idx: usize,
+    score: u32,
+    mapping: AlleleMapping,
+}
+
+fn score_better(left: MatchScore, right: MatchScore) -> bool {
+    left.aligned > right.aligned || (left.aligned == right.aligned && left.weight > right.weight)
+}
+
+fn solve_group_dp(
+    ref_local_idx: usize,
+    used_target_mask: u64,
+    edges_by_ref: &[Vec<GroupEdge>],
+    memo: &mut HashMap<(usize, u64), (MatchScore, Option<usize>)>,
+) -> MatchScore {
+    if ref_local_idx == edges_by_ref.len() {
+        return MatchScore::zero();
+    }
+    if let Some((score, _)) = memo.get(&(ref_local_idx, used_target_mask)) {
+        return *score;
+    }
+
+    let mut best = solve_group_dp(ref_local_idx + 1, used_target_mask, edges_by_ref, memo);
+    let mut best_choice = None;
+
+    for edge in &edges_by_ref[ref_local_idx] {
+        let bit = 1u64 << edge.target_local_idx;
+        if (used_target_mask & bit) != 0 {
+            continue;
+        }
+        let mut candidate = solve_group_dp(
+            ref_local_idx + 1,
+            used_target_mask | bit,
+            edges_by_ref,
+            memo,
+        );
+        candidate.aligned += 1;
+        candidate.weight += edge.score as u64;
+        if score_better(candidate, best) {
+            best = candidate;
+            best_choice = Some(edge.target_local_idx);
+        }
+    }
+
+    memo.insert((ref_local_idx, used_target_mask), (best, best_choice));
+    best
+}
+
+fn best_group_matches<F>(
+    ref_indices: &[usize],
+    target_indices: &[usize],
+    mut build_edge: F,
+) -> Vec<(usize, usize, AlleleMapping)>
+where
+    F: FnMut(usize, usize) -> Option<(u32, AlleleMapping)>,
+{
+    let mut edges_by_ref: Vec<Vec<GroupEdge>> = vec![Vec::new(); ref_indices.len()];
+    for (ref_local_idx, &ref_idx) in ref_indices.iter().enumerate() {
+        for (target_local_idx, &target_idx) in target_indices.iter().enumerate() {
+            if let Some((score, mapping)) = build_edge(ref_idx, target_idx) {
+                edges_by_ref[ref_local_idx].push(GroupEdge {
+                    target_local_idx,
+                    score,
+                    mapping,
+                });
+            }
+        }
+    }
+
+    if target_indices.len() <= 63 {
+        let mut memo: HashMap<(usize, u64), (MatchScore, Option<usize>)> = HashMap::new();
+        let _ = solve_group_dp(0, 0, &edges_by_ref, &mut memo);
+
+        let mut out = Vec::new();
+        let mut used_target_mask = 0u64;
+        for ref_local_idx in 0..ref_indices.len() {
+            if let Some((_, choice)) = memo.get(&(ref_local_idx, used_target_mask)) {
+                if let Some(target_local_idx) = *choice {
+                    if let Some(edge) = edges_by_ref[ref_local_idx]
+                        .iter()
+                        .find(|edge| edge.target_local_idx == target_local_idx)
+                    {
+                        out.push((
+                            ref_indices[ref_local_idx],
+                            target_indices[target_local_idx],
+                            edge.mapping.clone(),
+                        ));
+                        used_target_mask |= 1u64 << target_local_idx;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    let mut all_edges: Vec<(usize, usize, u32, AlleleMapping)> = Vec::new();
+    for (ref_local_idx, ref_edges) in edges_by_ref.iter().enumerate() {
+        for edge in ref_edges {
+            all_edges.push((
+                ref_local_idx,
+                edge.target_local_idx,
+                edge.score,
+                edge.mapping.clone(),
+            ));
+        }
+    }
+    all_edges.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let mut used_refs = vec![false; ref_indices.len()];
+    let mut used_targets = vec![false; target_indices.len()];
+    let mut out = Vec::new();
+    for (ref_local_idx, target_local_idx, _, mapping) in all_edges {
+        if used_refs[ref_local_idx] || used_targets[target_local_idx] {
+            continue;
+        }
+        used_refs[ref_local_idx] = true;
+        used_targets[target_local_idx] = true;
+        out.push((
+            ref_indices[ref_local_idx],
+            target_indices[target_local_idx],
+            mapping,
+        ));
+    }
+    out
 }

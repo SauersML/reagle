@@ -151,9 +151,9 @@ fn interval_support_at_window(intervals: &HapIntervals, window_idx: usize) -> Op
     let mut best_span = 0u32;
     let mut found = false;
     for &(start, end) in intervals.intervals.iter() {
-        if idx >= start && idx <= end {
+        if idx >= start && idx < end {
             found = true;
-            let span = end.saturating_sub(start).saturating_add(1);
+            let span = end.saturating_sub(start);
             if span > best_span {
                 best_span = span;
             }
@@ -1192,8 +1192,14 @@ fn prepare_reference_data(
             let end_idx = output_end.saturating_sub(1);
             let start_marker = ref_window.markers.marker(MarkerIdx::new(start_idx as u32));
             let end_marker = ref_window.markers.marker(MarkerIdx::new(end_idx as u32));
-            let start_chrom = ref_window.markers.chrom_name(start_marker.chrom).unwrap_or("");
-            let end_chrom = ref_window.markers.chrom_name(end_marker.chrom).unwrap_or("");
+            let start_chrom = ref_window
+                .markers
+                .chrom_name(start_marker.chrom)
+                .unwrap_or("");
+            let end_chrom = ref_window
+                .markers
+                .chrom_name(end_marker.chrom)
+                .unwrap_or("");
             let start_gen = gen_maps.gen_pos_by_name(start_chrom, start_marker.pos);
             let end_gen = gen_maps.gen_pos_by_name(end_chrom, end_marker.pos);
             window_handoff.push((start_gen, end_gen));
@@ -2087,7 +2093,7 @@ fn build_imputation_plan(
                 let (intervals, core) = if per_window_cap_min >= n_ref_haps {
                     let mut intervals = Vec::new();
                     let mut core = Vec::new();
-                    let end = num_windows.saturating_sub(1) as u32;
+                    let end = num_windows as u32;
                     for h in 0..n_ref_haps {
                         if abyss[h] {
                             continue;
@@ -2124,7 +2130,7 @@ fn build_imputation_plan(
                     }
                     intervals.sort_unstable_by_key(|hi| hi.hap.as_u32());
                     let mut core = Vec::new();
-                    let need_end = window_scores_matrix.len().saturating_sub(1) as u32;
+                    let need_end = window_scores_matrix.len() as u32;
                     for hi in intervals.iter() {
                         if hi.intervals.len() == 1 && hi.intervals[0] == (0, need_end) {
                             core.push(hi.hap);
@@ -3567,6 +3573,11 @@ impl crate::pipelines::ImputationPipeline {
                         .allele_mappings
                         .get(target_m)
                         .and_then(|m| m.as_ref());
+                    let mut pl_probs_buf: Vec<f32> = Vec::new();
+                    let mut cond_probs_buf: Vec<f32> = Vec::new();
+                    let mut mapped_buf: Vec<f32> = Vec::new();
+                    let mut weights_buf: Vec<f32> = Vec::new();
+                    let mut target_priors_buf: Vec<f32> = Vec::new();
 
                     // If the input is unphased, avoid conditioning on a partner
                     // allele. Use unconditional allele probabilities from PL
@@ -3574,11 +3585,15 @@ impl crate::pipelines::ImputationPipeline {
                     if !local_phase_conf_valid {
                         if let Some(pl) = pl {
                             if !pl.is_empty() {
-                                let mut pl_probs: Vec<f32> = Vec::new();
-                                if allele_probs_uncond_from_pl(pl, None, &mut pl_probs).is_some() {
-                                    if pl_probs.len() == n_alleles {
-                                        aligned1 = pl_probs.clone();
-                                        aligned2 = pl_probs;
+                                pl_probs_buf.clear();
+                                if allele_probs_uncond_from_pl(pl, None, &mut pl_probs_buf)
+                                    .is_some()
+                                {
+                                    if pl_probs_buf.len() == n_alleles {
+                                        aligned1.clear();
+                                        aligned2.clear();
+                                        aligned1.extend_from_slice(&pl_probs_buf);
+                                        aligned2.extend_from_slice(&pl_probs_buf);
                                         use1 = true;
                                         use2 = true;
                                     }
@@ -3587,9 +3602,9 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    let compute_from_pl =
+                    let mut compute_from_pl =
                         |partner_allele: u8, out: &mut Vec<f32>, used: &mut bool| {
-                            let mut pl_probs: Vec<f32> = Vec::new();
+                            pl_probs_buf.clear();
                             if let Some(pl) = pl {
                                 if !pl.is_empty() {
                                     let n_pl_alleles =
@@ -3606,28 +3621,29 @@ impl crate::pipelines::ImputationPipeline {
                                                     sample_idx,
                                                 )
                                                 .clamp(0.0, 1.0);
-                                            let mut weights = vec![0.0f32; n_pl_alleles];
+                                            weights_buf.clear();
+                                            weights_buf.resize(n_pl_alleles, 0.0);
                                             let mut denom = 0.0f32;
                                             for i in 0..n_pl_alleles {
                                                 if i != partner_allele as usize {
                                                     denom += 1.0;
                                                 }
                                             }
-                                            weights[partner_allele as usize] = phase_conf;
+                                            weights_buf[partner_allele as usize] = phase_conf;
                                             if denom > 0.0 {
                                                 let scale = (1.0 - phase_conf) / denom;
                                                 for i in 0..n_pl_alleles {
                                                     if i != partner_allele as usize {
-                                                        weights[i] = scale;
+                                                        weights_buf[i] = scale;
                                                     }
                                                 }
                                             }
 
-                                            let mut cond_probs: Vec<f32> = Vec::new();
-                                            pl_probs.resize(n_pl_alleles, 0.0);
+                                            cond_probs_buf.clear();
+                                            pl_probs_buf.resize(n_pl_alleles, 0.0);
                                             let mut weight_sum = 0.0f32;
                                             for b in 0..n_pl_alleles {
-                                                let w = weights[b];
+                                                let w = weights_buf[b];
                                                 if w <= 0.0 {
                                                     continue;
                                                 }
@@ -3635,37 +3651,43 @@ impl crate::pipelines::ImputationPipeline {
                                                     pl,
                                                     b as u8,
                                                     None,
-                                                    &mut cond_probs,
+                                                    &mut cond_probs_buf,
                                                 )
                                                 .is_some()
                                                 {
-                                                    for (a, &p) in cond_probs.iter().enumerate() {
-                                                        if a < pl_probs.len() {
-                                                            pl_probs[a] += w * p;
+                                                    for (a, &p) in cond_probs_buf.iter().enumerate()
+                                                    {
+                                                        if a < pl_probs_buf.len() {
+                                                            pl_probs_buf[a] += w * p;
                                                         }
                                                     }
                                                     weight_sum += w;
                                                 }
                                             }
                                             if weight_sum > 0.0 {
-                                                normalize_probs(&mut pl_probs);
+                                                normalize_probs(&mut pl_probs_buf);
                                                 if let Some(mapping) = mapping {
-                                                    let mut mapped = vec![0.0f32; n_alleles];
-                                                    for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                                    mapped_buf.clear();
+                                                    mapped_buf.resize(n_alleles, 0.0);
+                                                    for (t_idx, &p) in
+                                                        pl_probs_buf.iter().enumerate()
+                                                    {
                                                         if t_idx < mapping.targ_to_ref.len() {
                                                             let r = mapping.targ_to_ref[t_idx];
                                                             if r >= 0 && (r as usize) < n_alleles {
-                                                                mapped[r as usize] += p;
+                                                                mapped_buf[r as usize] += p;
                                                             }
                                                         }
                                                     }
-                                                    if normalize_probs(&mut mapped) {
-                                                        *out = mapped;
+                                                    if normalize_probs(&mut mapped_buf) {
+                                                        out.clear();
+                                                        out.extend_from_slice(&mapped_buf);
                                                         *used = true;
                                                         used_conditional = true;
                                                     }
-                                                } else if pl_probs.len() == n_alleles {
-                                                    *out = pl_probs.clone();
+                                                } else if pl_probs_buf.len() == n_alleles {
+                                                    out.clear();
+                                                    out.extend_from_slice(&pl_probs_buf);
                                                     *used = true;
                                                     used_conditional = true;
                                                 }
@@ -3673,49 +3695,60 @@ impl crate::pipelines::ImputationPipeline {
                                         }
 
                                         if !used_conditional
-                                            && allele_probs_uncond_from_pl(pl, None, &mut pl_probs)
-                                                .is_some()
+                                            && allele_probs_uncond_from_pl(
+                                                pl,
+                                                None,
+                                                &mut pl_probs_buf,
+                                            )
+                                            .is_some()
                                         {
                                             if let Some(mapping) = mapping {
-                                                let mut mapped = vec![0.0f32; n_alleles];
-                                                for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                                mapped_buf.clear();
+                                                mapped_buf.resize(n_alleles, 0.0);
+                                                for (t_idx, &p) in pl_probs_buf.iter().enumerate() {
                                                     if t_idx < mapping.targ_to_ref.len() {
                                                         let r = mapping.targ_to_ref[t_idx];
                                                         if r >= 0 && (r as usize) < n_alleles {
-                                                            mapped[r as usize] += p;
+                                                            mapped_buf[r as usize] += p;
                                                         }
                                                     }
                                                 }
-                                                if normalize_probs(&mut mapped) {
-                                                    *out = mapped;
+                                                if normalize_probs(&mut mapped_buf) {
+                                                    out.clear();
+                                                    out.extend_from_slice(&mapped_buf);
                                                     *used = true;
                                                 }
-                                            } else if pl_probs.len() == n_alleles {
-                                                *out = pl_probs.clone();
+                                            } else if pl_probs_buf.len() == n_alleles {
+                                                out.clear();
+                                                out.extend_from_slice(&pl_probs_buf);
                                                 *used = true;
                                             }
                                         } else if !used_conditional {
                                             let uniform = 1.0 / n_pl_alleles as f32;
-                                            let target_priors = vec![uniform; n_pl_alleles];
+                                            target_priors_buf.clear();
+                                            target_priors_buf.resize(n_pl_alleles, uniform);
 
                                             let conf = conf_base.clamp(0.0, 1.0);
-                                            let mut weights = vec![0.0f32; n_pl_alleles];
+                                            weights_buf.clear();
+                                            weights_buf.resize(n_pl_alleles, 0.0);
                                             if partner_allele != 255
                                                 && (partner_allele as usize) < n_pl_alleles
                                             {
                                                 let partner_idx = partner_allele as usize;
                                                 let mut denom = 0.0f32;
-                                                for (i, &p) in target_priors.iter().enumerate() {
+                                                for (i, &p) in target_priors_buf.iter().enumerate()
+                                                {
                                                     if i != partner_idx {
                                                         denom += p;
                                                     }
                                                 }
-                                                weights[partner_idx] = conf;
+                                                weights_buf[partner_idx] = conf;
                                                 if denom > 0.0 {
                                                     let scale = (1.0 - conf) / denom;
                                                     for i in 0..n_pl_alleles {
                                                         if i != partner_idx {
-                                                            weights[i] = target_priors[i] * scale;
+                                                            weights_buf[i] =
+                                                                target_priors_buf[i] * scale;
                                                         }
                                                     }
                                                 } else if n_pl_alleles > 1 {
@@ -3723,19 +3756,19 @@ impl crate::pipelines::ImputationPipeline {
                                                         (1.0 - conf) / (n_pl_alleles as f32 - 1.0);
                                                     for i in 0..n_pl_alleles {
                                                         if i != partner_idx {
-                                                            weights[i] = uniform;
+                                                            weights_buf[i] = uniform;
                                                         }
                                                     }
                                                 }
                                             } else {
-                                                weights.copy_from_slice(&target_priors);
+                                                weights_buf.copy_from_slice(&target_priors_buf);
                                             }
 
-                                            let mut cond_probs: Vec<f32> = Vec::new();
-                                            pl_probs.resize(n_pl_alleles, 0.0);
+                                            cond_probs_buf.clear();
+                                            pl_probs_buf.resize(n_pl_alleles, 0.0);
                                             let mut weight_sum = 0.0f32;
                                             for b in 0..n_pl_alleles {
-                                                let w = weights[b];
+                                                let w = weights_buf[b];
                                                 if w <= 0.0 {
                                                     continue;
                                                 }
@@ -3743,36 +3776,42 @@ impl crate::pipelines::ImputationPipeline {
                                                     pl,
                                                     b as u8,
                                                     None,
-                                                    &mut cond_probs,
+                                                    &mut cond_probs_buf,
                                                 )
                                                 .is_some()
                                                 {
-                                                    for (a, &p) in cond_probs.iter().enumerate() {
-                                                        if a < pl_probs.len() {
-                                                            pl_probs[a] += w * p;
+                                                    for (a, &p) in cond_probs_buf.iter().enumerate()
+                                                    {
+                                                        if a < pl_probs_buf.len() {
+                                                            pl_probs_buf[a] += w * p;
                                                         }
                                                     }
                                                     weight_sum += w;
                                                 }
                                             }
                                             if weight_sum > 0.0 {
-                                                normalize_probs(&mut pl_probs);
+                                                normalize_probs(&mut pl_probs_buf);
                                                 if let Some(mapping) = mapping {
-                                                    let mut mapped = vec![0.0f32; n_alleles];
-                                                    for (t_idx, &p) in pl_probs.iter().enumerate() {
+                                                    mapped_buf.clear();
+                                                    mapped_buf.resize(n_alleles, 0.0);
+                                                    for (t_idx, &p) in
+                                                        pl_probs_buf.iter().enumerate()
+                                                    {
                                                         if t_idx < mapping.targ_to_ref.len() {
                                                             let r = mapping.targ_to_ref[t_idx];
                                                             if r >= 0 && (r as usize) < n_alleles {
-                                                                mapped[r as usize] += p;
+                                                                mapped_buf[r as usize] += p;
                                                             }
                                                         }
                                                     }
-                                                    if normalize_probs(&mut mapped) {
-                                                        *out = mapped;
+                                                    if normalize_probs(&mut mapped_buf) {
+                                                        out.clear();
+                                                        out.extend_from_slice(&mapped_buf);
                                                         *used = true;
                                                     }
-                                                } else if pl_probs.len() == n_alleles {
-                                                    *out = pl_probs.clone();
+                                                } else if pl_probs_buf.len() == n_alleles {
+                                                    out.clear();
+                                                    out.extend_from_slice(&pl_probs_buf);
                                                     *used = true;
                                                 }
                                             }

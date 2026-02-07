@@ -22,10 +22,33 @@ use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 #[inline(always)]
 fn prefetch_read<T>(ptr: *const T) {
-    std::hint::black_box(ptr);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        std::hint::black_box(ptr);
+    }
+}
+
+#[inline(always)]
+fn pbwt_bin_for_allele(allele: u8, n_alleles: usize) -> usize {
+    if n_alleles == 2 {
+        if allele == 0 {
+            0
+        } else if allele == 1 {
+            2
+        } else {
+            1
+        }
+    } else if allele == 0 {
+        0
+    } else if allele == 255 || (allele as usize) >= n_alleles {
+        // Dedicated missing/invalid bin lives at index 1.
+        1
+    } else {
+        (allele as usize) + 1
     }
 }
 
@@ -99,6 +122,10 @@ pub struct PbwtDivUpdater<I: PbwtIndex = u32> {
     word_base1: Vec<usize>,
     /// Word-level base offsets for missing bin
     word_base_miss: Vec<usize>,
+    /// Per-word ALT1 counts for biallelic packed words
+    word_count1: Vec<u8>,
+    /// Per-word missing counts for biallelic packed words
+    word_count_miss: Vec<u8>,
     /// Propagation array for tracking max/min divergence across alleles
     p: Vec<i32>,
     /// Helper for counting sort: counts per allele
@@ -123,6 +150,8 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             word_base0: Vec::new(),
             word_base1: Vec::new(),
             word_base_miss: Vec::new(),
+            word_count1: Vec::new(),
+            word_count_miss: Vec::new(),
             p: vec![0; max_alleles],
             counts: vec![0; max_alleles],
             offsets: vec![0; max_alleles + 1],
@@ -150,6 +179,8 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             self.word_base0.resize(n_words, 0);
             self.word_base1.resize(n_words, 0);
             self.word_base_miss.resize(n_words, 0);
+            self.word_count1.resize(n_words, 0);
+            self.word_count_miss.resize(n_words, 0);
             // Also initialize 'a' and 'd' if empty (lazy init)
             if self.a.is_empty() {
                 self.a.resize(self.n_haps, I::from_usize(0));
@@ -167,6 +198,8 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             self.word_base0.resize(n_words, 0);
             self.word_base1.resize(n_words, 0);
             self.word_base_miss.resize(n_words, 0);
+            self.word_count1.resize(n_words, 0);
+            self.word_count_miss.resize(n_words, 0);
         }
 
         let mut count1 = 0usize;
@@ -191,8 +224,12 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
             self.permuted_bits[w] = bits;
             self.permuted_missing_bits[w] = miss;
-            count1 += bits.count_ones() as usize;
-            count_miss += miss.count_ones() as usize;
+            let c1 = bits.count_ones() as usize;
+            let cm = miss.count_ones() as usize;
+            self.word_count1[w] = c1 as u8;
+            self.word_count_miss[w] = cm as u8;
+            count1 += c1;
+            count_miss += cm;
         }
 
         (count1, count_miss)
@@ -215,9 +252,9 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         for w in 0..n_words {
             let block_end = (idx + 64).min(self.n_haps);
             let block_len = block_end - idx;
-            let count1 = self.permuted_bits[w].count_ones() as usize;
+            let count1 = self.word_count1[w] as usize;
             let count_m = if has_missing {
-                self.permuted_missing_bits[w].count_ones() as usize
+                self.word_count_miss[w] as usize
             } else {
                 0
             };
@@ -254,9 +291,9 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
     ///
     /// # Missing Data Handling
     ///
-    /// Missing data (allele >= n_alleles, typically 255) is placed in its own bin
-    /// at index n_alleles. This prevents reference bias that would occur from
-    /// grouping missing data with the reference allele.
+    /// Missing data (allele 255, or invalid allele >= n_alleles) is placed in
+    /// its own bin at index 1. This keeps missing separate from both REF (0)
+    /// and ALT bins.
     ///
     /// # Arguments
     /// * `alleles` - Allele for each haplotype
@@ -281,8 +318,14 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             assert_eq!(alleles.len(), self.n_haps);
             assert_eq!(prefix.len(), self.n_haps);
             assert!(divergence.len() >= self.n_haps);
+            assert!(n_alleles >= 2, "PBWT requires at least 2 alleles");
+            assert!(
+                n_alleles <= 255,
+                "PBWT n_alleles={} exceeds u8 allele contract (max 255 with 255 reserved for missing)",
+                n_alleles
+            );
 
-            // Use n_alleles + 1 bins: 0..n_alleles for valid alleles, n_alleles for missing
+            // Use n_alleles + 1 bins with Bin 1 reserved for missing/invalid.
             let n_bins = n_alleles + 1;
             self.ensure_capacity(n_bins);
 
@@ -305,15 +348,8 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
                 for i in 0..self.n_haps {
                     let allele = self.permuted_alleles[i] as usize;
-                    // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
-                    // Shift other alleles up by 1 (0->0, 1->2, 2->3...)
-                    let bin = if allele == 0 {
-                        0
-                    } else if allele >= n_alleles {
-                        1
-                    } else {
-                        allele + 1
-                    };
+                    // Map missing/invalid alleles to dedicated Bin 1.
+                    let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
                     self.counts[bin] += 1;
                 }
             }
@@ -329,7 +365,9 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             // This lets us use a faster 2-bin path when there's no missing data
             // Missing data is now in Bin 1
             let has_missing = self.counts[1] > 0;
-            self.compute_biallelic_word_bases(has_missing);
+            if n_alleles == 2 {
+                self.compute_biallelic_word_bases(has_missing);
+            }
 
             // 4. Initialize p array and reset counts for scatter pass
             let init_value = (marker + 1) as i32;
@@ -447,15 +485,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
                     let hap = prefix[i];
                     let div = divergence[i];
                     let allele = self.permuted_alleles[i] as usize; // Sequential access
-                    // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
-                    // Shift other alleles up by 1
-                    let bin = if allele == 0 {
-                        0
-                    } else if allele >= n_alleles {
-                        1
-                    } else {
-                        allele + 1
-                    };
+                    let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
 
                     // Update p (Max Divergence Propagation) for ALL bins
                     for j in 0..n_bins {
@@ -502,9 +532,9 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
     ///
     /// # Missing Data Handling
     ///
-    /// Missing data (allele >= n_alleles, typically 255) is placed in its own bin
-    /// at index n_alleles. This prevents reference bias that would occur from
-    /// grouping missing data with the reference allele.
+    /// Missing data (allele 255, or invalid allele >= n_alleles) is placed in
+    /// its own bin at index 1. This keeps missing separate from both REF (0)
+    /// and ALT bins.
     ///
     /// This matches the Java Beagle implementation in PbwtDivUpdater.bwdUpdate.
     pub fn bwd_update(
@@ -518,8 +548,14 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         assert_eq!(alleles.len(), self.n_haps);
         assert_eq!(prefix.len(), self.n_haps);
         assert!(divergence.len() >= self.n_haps);
+        assert!(n_alleles >= 2, "PBWT requires at least 2 alleles");
+        assert!(
+            n_alleles <= 255,
+            "PBWT n_alleles={} exceeds u8 allele contract (max 255 with 255 reserved for missing)",
+            n_alleles
+        );
 
-        // Use n_alleles + 1 bins: 0..n_alleles for valid alleles, n_alleles for missing
+        // Use n_alleles + 1 bins with Bin 1 reserved for missing/invalid.
         let n_bins = n_alleles + 1;
         self.ensure_capacity(n_bins);
 
@@ -549,15 +585,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
             for i in 0..self.n_haps {
                 let allele = self.permuted_alleles[i] as usize;
-                // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
-                // Shift other alleles up by 1
-                let bin = if allele == 0 {
-                    0
-                } else if allele >= n_alleles {
-                    1
-                } else {
-                    allele + 1
-                };
+                let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
                 self.counts[bin] += 1;
             }
         }
@@ -571,7 +599,9 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
         // 4. Check if there's any missing data (before resetting counts)
         let has_missing = self.counts[1] > 0;
-        self.compute_biallelic_word_bases(has_missing);
+        if n_alleles == 2 {
+            self.compute_biallelic_word_bases(has_missing);
+        }
 
         // 5. Scatter with MIN propagation for backward PBWT
         // p[j] tracks the minimum divergence seen since last output for allele j
@@ -686,15 +716,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
                 let hap = prefix[i];
                 let div = divergence[i];
                 let allele = self.permuted_alleles[i] as usize; // Sequential access
-                // Map missing/invalid alleles to the dedicated missing bin (Bin 1)
-                // Shift other alleles up by 1
-                let bin = if allele == 0 {
-                    0
-                } else if allele >= n_alleles {
-                    1
-                } else {
-                    allele + 1
-                };
+                let bin = pbwt_bin_for_allele(allele as u8, n_alleles);
 
                 // Update p: min(p, div) for backward PBWT
                 // Smaller divergence = earlier end point = shorter match
