@@ -1357,9 +1357,8 @@ fn build_imputation_plan(
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();
 
-    // Keep LMS/prescan active by default. In sparse-target regimes, a pure
-    // full-panel LS pass can overfit sparse anchors and collapse AF away from
-    // locally-matching donors.
+    // Keep LMS allocation path; full-panel mode can degrade calibration
+    // when donor-guided and overlap handoff logic are active.
     let can_full_panel = false;
     if can_full_panel {
         let num_windows = per_window_caps.len();
@@ -4701,7 +4700,7 @@ impl crate::pipelines::ImputationPipeline {
                         && plan.n_ref_haps > 32
                         && !donors_h1.is_empty()
                         && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                        && (subsetted_states || informative_ratio <= 0.20)
+                        && subsetted_states
                     {
                         let donor_posts = posts_from_donors(&donors_h1)?;
                         let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
@@ -4766,7 +4765,7 @@ impl crate::pipelines::ImputationPipeline {
                         && plan.n_ref_haps > 32
                         && !donors_h2.is_empty()
                         && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                        && (subsetted_states || informative_ratio <= 0.20)
+                        && subsetted_states
                     {
                         let donor_posts = posts_from_donors(&donors_h2)?;
                         let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)

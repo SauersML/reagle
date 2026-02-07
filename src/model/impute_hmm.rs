@@ -217,17 +217,34 @@ impl<'a> DictPatternAlleles<'a> {
 /// Reference haplotype count metadata for imputation HMM transitions.
 pub struct RefAlleleFreqs {
     n_ref_haps: usize,
+    biallelic_alt_freq: Vec<f32>,
 }
 
 impl RefAlleleFreqs {
     pub fn new(ref_columns: &[GenotypeColumn]) -> Self {
         let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
-        Self { n_ref_haps }
+        let mut biallelic_alt_freq = Vec::with_capacity(ref_columns.len());
+        if n_ref_haps > 0 {
+            let denom = n_ref_haps as f32;
+            for col in ref_columns {
+                let alt = col.alt_count() as f32;
+                biallelic_alt_freq.push((alt / denom).clamp(0.0, 1.0));
+            }
+        }
+        Self {
+            n_ref_haps,
+            biallelic_alt_freq,
+        }
     }
 
     #[inline]
     pub fn n_ref_haps(&self) -> usize {
         self.n_ref_haps
+    }
+
+    #[inline]
+    pub fn biallelic_alt_freq(&self, marker_idx: usize) -> Option<f32> {
+        self.biallelic_alt_freq.get(marker_idx).copied()
     }
 }
 
@@ -653,6 +670,7 @@ fn adjusted_recomb_rate(
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
     subset_prior_probs: &[f32],
+    global_prior_probs: Option<&[f32]>,
     total_mass: f32,
     state_prob_sq_sum: f32,
     untyped_uniform_marker: bool,
@@ -694,9 +712,21 @@ fn smooth_allele_posteriors_subset(
     }
 
     let denom = 1.0 + prior_mass;
+    let k_eff = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
+    let prior_concentration = 6.0f32;
     for (i, p) in allele_probs.iter_mut().enumerate() {
         let local_prior = subset_prior_probs.get(i).copied().unwrap_or(0.0).max(0.0);
-        *p = (*p + prior_mass * local_prior) / denom;
+        let merged_prior = if let Some(global) = global_prior_probs {
+            // Truncated state sets can miss real ALT support at untyped markers.
+            // Blend local subset prior with global panel prior using an
+            // effective-sample Bayesian update. When posterior support is
+            // concentrated (small k_eff), shrink more toward panel AF.
+            let g = global.get(i).copied().unwrap_or(0.0).max(0.0);
+            ((k_eff * local_prior) + (prior_concentration * g)) / (k_eff + prior_concentration)
+        } else {
+            local_prior
+        };
+        *p = (*p + prior_mass * merged_prior) / denom;
     }
     normalize_probs(allele_probs);
 }
@@ -726,14 +756,22 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
 }
 
 #[inline]
-fn subset_transition_params(recomb_rate: f32, active_states: usize, n_ref_haps: usize) -> (f32, f32, f32) {
+fn subset_transition_params(
+    recomb_rate: f32,
+    active_states: usize,
+    n_ref_haps: usize,
+) -> (f32, f32, f32) {
     if active_states == 0 {
         return (0.0, 0.0, 1.0);
     }
     let r = recomb_rate.clamp(0.0, 1.0);
     let k = active_states as f32;
     let n = n_ref_haps.max(1) as f32;
-    let switch_full = r / n;
+    // Condition Li-Stephens transitions on the active-state support.
+    // In subset HMM mode the active support is the tractable state space;
+    // scaling by k prevents under-switching when k << n.
+    let effective = if k < n { k } else { n };
+    let switch_full = r / effective.max(1.0);
     let z = ((1.0 - r) + k * switch_full).max(1e-30);
     let stay_gap = (1.0 - r) / z;
     let shift = switch_full / z;
@@ -1240,9 +1278,18 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
                                     }
+                                    let biallelic_global_prior = if ws.allele_probs.len() == 2 {
+                                        ref_allele_freqs.biallelic_alt_freq(m_rev).map(|af| {
+                                            let clamped = af.clamp(0.0, 1.0);
+                                            [1.0 - clamped, clamped]
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         &subset_counts,
+                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
@@ -1512,9 +1559,18 @@ fn run_impute_hmm_seqcoded(
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
                                     }
+                                    let biallelic_global_prior = if ws.allele_probs.len() == 2 {
+                                        ref_allele_freqs.biallelic_alt_freq(m_rev).map(|af| {
+                                            let clamped = af.clamp(0.0, 1.0);
+                                            [1.0 - clamped, clamped]
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         &subset_counts,
+                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
@@ -1783,9 +1839,18 @@ fn run_impute_hmm_dict(
                                     for p in subset_counts.iter_mut() {
                                         *p *= inv_subset;
                                     }
+                                    let biallelic_global_prior = if ws.allele_probs.len() == 2 {
+                                        ref_allele_freqs.biallelic_alt_freq(m_rev).map(|af| {
+                                            let clamped = af.clamp(0.0, 1.0);
+                                            [1.0 - clamped, clamped]
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         &subset_counts,
+                                        biallelic_global_prior.as_ref().map(|x| x.as_slice()),
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),

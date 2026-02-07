@@ -23,7 +23,8 @@ impl WeightedHmmUpdater {
         let r = recomb_rate.clamp(0.0, 1.0);
         let n = n_ref_haps.max(1) as f32;
         let k = active_haps.max(1.0);
-        let switch_full = r / n;
+        let effective = if k < n { k } else { n };
+        let switch_full = r / effective.max(1.0);
         let z = ((1.0 - r) + k * switch_full).max(1e-30);
         let scale = (1.0 - r) / (z * fwd_sum.max(1e-30));
         let base_shift = switch_full / z;
