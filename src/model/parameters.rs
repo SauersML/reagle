@@ -48,7 +48,12 @@ impl ModelParams {
     pub const DEFAULT_INITIAL_LR: f32 = 10000.0;
 
     /// Maximum recombination intensity
-    pub const MAX_RECOMB_INTENSITY: f32 = 15.0;
+    ///
+    /// Safety cap to prevent numerical issues with extreme Ne/n_haps ratios.
+    /// The Li-Stephens formula 0.04*Ne/n_haps can exceed 40 with small panels
+    /// (e.g. Ne=200K, 200 haps → 40.0). A low cap like 15.0 makes the HMM
+    /// too "sticky", causing AF collapse and poor dosage calibration.
+    pub const MAX_RECOMB_INTENSITY: f32 = 10000.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;

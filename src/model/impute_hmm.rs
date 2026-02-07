@@ -106,7 +106,6 @@ pub struct TargetAlleleProbs {
     probs: Vec<f32>,
     uniform: Vec<bool>,
     observed: Vec<bool>,
-    nearest_observed: Vec<u16>,
 }
 
 impl TargetAlleleProbs {
@@ -121,13 +120,11 @@ impl TargetAlleleProbs {
                 uniform.push(is_uniform_probs(slice));
             }
         }
-        let nearest_observed = compute_nearest_observed_dist(&observed);
         Self {
             offsets,
             probs,
             uniform,
             observed,
-            nearest_observed,
         }
     }
 
@@ -158,45 +155,6 @@ impl TargetAlleleProbs {
         self.is_uniform_marker(marker_idx) && !self.is_observed_marker(marker_idx)
     }
 
-    #[inline]
-    pub fn is_missing_observed_marker(&self, marker_idx: usize) -> bool {
-        self.is_uniform_marker(marker_idx) && self.is_observed_marker(marker_idx)
-    }
-
-    #[inline]
-    pub fn observed_distance(&self, marker_idx: usize) -> usize {
-        self.nearest_observed
-            .get(marker_idx)
-            .copied()
-            .unwrap_or(u16::MAX) as usize
-    }
-}
-
-#[inline]
-fn compute_nearest_observed_dist(observed: &[bool]) -> Vec<u16> {
-    let n = observed.len();
-    let mut out = vec![u16::MAX; n];
-    let mut last_obs: Option<usize> = None;
-    for i in 0..n {
-        if observed[i] {
-            out[i] = 0;
-            last_obs = Some(i);
-        } else if let Some(j) = last_obs {
-            out[i] = (i - j).min(u16::MAX as usize) as u16;
-        }
-    }
-    let mut next_obs: Option<usize> = None;
-    for i in (0..n).rev() {
-        if observed[i] {
-            next_obs = Some(i);
-        } else if let Some(j) = next_obs {
-            let d = (j - i).min(u16::MAX as usize) as u16;
-            if d < out[i] {
-                out[i] = d;
-            }
-        }
-    }
-    out
 }
 
 /// Workspace for per-haplotype imputation HMM.

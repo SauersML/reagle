@@ -777,14 +777,6 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             shift_by_marker[m] = p * inv_n_states;
             one_minus_by_marker[m] = 1.0 - p;
         }
-        let inv_n_states = 1.0 / n_states as f32;
-        let mut shift_by_marker = vec![0.0f32; n_markers];
-        let mut one_minus_by_marker = vec![0.0f32; n_markers];
-        for m in 0..n_markers {
-            let p = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            shift_by_marker[m] = p * inv_n_states;
-            one_minus_by_marker[m] = 1.0 - p;
-        }
 
         let mut req_allele = vec![255u8; n_markers];
         let mut p_match = vec![1.0f32; n_markers];
