@@ -4599,14 +4599,9 @@ impl crate::pipelines::ImputationPipeline {
                     bb.add_samples(1);
                 }
 
-                let need_sm_h1 = hap1_posts.is_none();
-                let need_sm_h2 = hap2_posts.is_none();
-                if need_sm_h1 {
-                    sm_needed[h1_idx.as_usize()].store(true, Ordering::Relaxed);
-                }
-                if need_sm_h2 {
-                    sm_needed[h2_idx.as_usize()].store(true, Ordering::Relaxed);
-                }
+                // Always compute local PBWT probabilities for smoothing/blending
+                sm_needed[h1_idx.as_usize()].store(true, Ordering::Relaxed);
+                sm_needed[h2_idx.as_usize()].store(true, Ordering::Relaxed);
 
                 Ok(ImputeResult {
                     result: SampleImputationResult {
@@ -4798,25 +4793,62 @@ impl crate::pipelines::ImputationPipeline {
             let sample_idx = item.result.sample_idx;
             let h1 = sample_idx * 2;
             let h2 = h1 + 1;
-            let need1 = sm_alt_probs_by_hap
-                .get(h1)
-                .and_then(|v| v.as_ref())
-                .is_some();
-            let need2 = sm_alt_probs_by_hap
-                .get(h2)
-                .and_then(|v| v.as_ref())
-                .is_some();
-            if (need1 || need2) && output_markers > 0 {
-                let p1 = sm_alt_probs_by_hap
-                    .get_mut(h1)
-                    .and_then(|v| v.take())
-                    .unwrap_or_default();
-                let p2 = sm_alt_probs_by_hap
-                    .get_mut(h2)
-                    .and_then(|v| v.take())
-                    .unwrap_or_default();
-                item.result.hap_alt_probs = Some((p1, p2));
+
+            let pbwt1 = sm_alt_probs_by_hap
+                .get_mut(h1)
+                .and_then(|v| v.take());
+            let pbwt2 = sm_alt_probs_by_hap
+                .get_mut(h2)
+                .and_then(|v| v.take());
+
+            if output_markers > 0 {
+                if let Some((hmm1, hmm2)) = &mut item.result.hap_posteriors {
+                    let w = 0.1f32; // Local smoothing weight
+                    if let Some(p1) = &pbwt1 {
+                        for (h, &p) in hmm1.iter_mut().zip(p1.iter()) {
+                            match h {
+                                AllelePosteriors::Biallelic(v) => *v = (1.0 - w) * *v + w * p,
+                                AllelePosteriors::Multiallelic(probs) => {
+                                    if probs.len() >= 2 {
+                                        probs[1] = (1.0 - w) * probs[1] + w * p;
+                                        probs[0] = (1.0 - w) * probs[0] + w * (1.0 - p);
+                                        let sum: f32 = probs.iter().sum();
+                                        if sum > 0.0 {
+                                            for x in probs.iter_mut() {
+                                                *x /= sum;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(p2) = &pbwt2 {
+                        for (h, &p) in hmm2.iter_mut().zip(p2.iter()) {
+                            match h {
+                                AllelePosteriors::Biallelic(v) => *v = (1.0 - w) * *v + w * p,
+                                AllelePosteriors::Multiallelic(probs) => {
+                                    if probs.len() >= 2 {
+                                        probs[1] = (1.0 - w) * probs[1] + w * p;
+                                        probs[0] = (1.0 - w) * probs[0] + w * (1.0 - p);
+                                        let sum: f32 = probs.iter().sum();
+                                        if sum > 0.0 {
+                                            for x in probs.iter_mut() {
+                                                *x /= sum;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if pbwt1.is_some() || pbwt2.is_some() {
+                    // Fallback to PBWT if HMM failed
+                    item.result.hap_alt_probs =
+                        Some((pbwt1.unwrap_or_default(), pbwt2.unwrap_or_default()));
+                }
             }
+
             all_results.push(item.result);
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
