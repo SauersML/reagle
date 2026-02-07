@@ -4602,6 +4602,7 @@ impl crate::pipelines::ImputationPipeline {
                         && plan.n_ref_haps > 32
                         && !donors_h1.is_empty()
                         && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
+                        && false
                     {
                         let donor_posts = posts_from_donors(&donors_h1)?;
                         let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
@@ -4661,6 +4662,7 @@ impl crate::pipelines::ImputationPipeline {
                         && plan.n_ref_haps > 32
                         && !donors_h2.is_empty()
                         && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
+                        && false
                     {
                         let donor_posts = posts_from_donors(&donors_h2)?;
                         let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
