@@ -8751,9 +8751,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // 1. Heuristic initialization (always try this)
     // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
     // found by the beam search, especially in small windows where aliases exist.
+    //
+    // Critical: Restrict search to reference haplotypes only (panel_haps).
+    // If we search n_states_usize (which includes target haps), we might find a
+    // "perfect match" by copying the target itself (self-copying), which just
+    // reinforces the random initialization and prevents convergence to the true phase.
+    let search_states = ref_provider.ref_gt.n_haps().min(n_states_usize);
     let mut heuristic_paths = find_best_constant_pair_with_buffer(
         n_markers,
-        n_states_usize,
+        search_states,
         seq1,
         seq2,
         &mut ref_provider,
