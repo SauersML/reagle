@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use bitvec::prelude::*;
 use rayon::prelude::*;
 use tracing::{info_span, instrument, warn};
 
@@ -125,7 +126,7 @@ struct ImputationPlan {
     n_ref_haps: usize,
     core_states: Vec<Vec<RefHapId>>, // per target hap (derived)
     window_intervals: Vec<Vec<HapIntervals>>, // per target hap (sparse)
-    abyss_mask: Vec<Vec<bool>>,      // per target hap
+    abyss_mask: Vec<BitVec<u64, Lsb0>>, // per target hap
     per_window_cap: usize,
     per_window_caps: Vec<usize>, // per window (global, same for all target haps)
     full_panel: bool,
