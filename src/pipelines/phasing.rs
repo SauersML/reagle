@@ -10649,6 +10649,7 @@ mod tests {
             seed: 12345,
             nthreads: None,
             profile: false,
+            fast_beam_fix_threshold: None,
         };
 
         let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
@@ -10738,6 +10739,7 @@ mod tests {
             seed: 12345,
             nthreads: Some(2),
             profile: false,
+            fast_beam_fix_threshold: None,
         };
 
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
