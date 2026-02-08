@@ -1291,15 +1291,20 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         );
         for (h1, c1, e1) in scratch.hap1_allele.iter() {
             for (h2, c2, e2) in scratch.hap2_allele.iter() {
-                let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
+                let score_no_flip = path.score as i64
+                    + *c1 as i64
+                    + *c2 as i64
+                    + *e1 as i64
+                    + *e2 as i64;
                 let flip_penalty = if call_idx == 0 {
-                    0
+                    0i64
                 } else if swapped != path.last_swapped {
-                    call.flip_cost
+                    call.flip_cost as i64
                 } else {
-                    0
+                    0i64
                 };
                 let score = score_no_flip + flip_penalty;
+                let score_i32 = score.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 let logp = -(score as f64) / 1_000_000.0;
                 if swapped {
                     logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp);
@@ -1308,7 +1313,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 }
                 let (history_bits, history_len) =
                     push_history_bits(path.history_bits, path.history_len, swapped);
-                if score <= cutoff {
+                if score_i32 <= cutoff {
                     let c1 = active_pool
                         .pbwt_meta(hap1_al, *h1, pbwt_version as u32)
                         .map(|m| m.cluster_id)
@@ -1322,7 +1327,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         hap2: *h2,
                         cluster1: c1,
                         cluster2: c2,
-                        score,
+                        score: score_i32,
                         last_swapped: swapped,
                         history_bits,
                         history_len,
