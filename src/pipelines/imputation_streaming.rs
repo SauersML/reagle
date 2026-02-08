@@ -4179,6 +4179,56 @@ impl crate::pipelines::ImputationPipeline {
         let dbg_few_donors = AtomicUsize::new(0);
         let dbg_has_priors = AtomicUsize::new(0);
         let dbg_fallback_ref_freq = AtomicUsize::new(0);
+        let build_full_panel_posts = || -> Vec<AllelePosteriors> {
+            let mut out: Vec<AllelePosteriors> =
+                Vec::with_capacity(output_end.saturating_sub(output_start));
+            for ref_m in output_start..output_end {
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(ref_m as u32))
+                    .n_alleles()
+                    .max(1);
+                let col = &ref_columns[ref_m];
+                if n_alleles == 2 {
+                    let n_haps = col.n_haplotypes().max(1);
+                    let alt_count = col.alt_count();
+                    let alt_freq =
+                        (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
+                    out.push(AllelePosteriors::Biallelic(alt_freq));
+                } else {
+                    let mut probs = vec![0.0f32; n_alleles];
+                    let n_haps = col.n_haplotypes();
+                    for h in 0..n_haps {
+                        let allele = col.get(HapIdx::new(h as u32));
+                        if allele == 255 {
+                            continue;
+                        }
+                        let idx = allele as usize;
+                        if idx < probs.len() {
+                            probs[idx] += 1.0;
+                        }
+                    }
+                    let mut sum = 0.0f32;
+                    for p in probs.iter() {
+                        sum += *p;
+                    }
+                    if sum <= 0.0 {
+                        let uniform = 1.0 / n_alleles as f32;
+                        for p in probs.iter_mut() {
+                            *p = uniform;
+                        }
+                    } else {
+                        let inv = 1.0 / sum;
+                        for p in probs.iter_mut() {
+                            *p *= inv;
+                        }
+                    }
+                    out.push(AllelePosteriors::Multiallelic(probs));
+                }
+            }
+            out
+        };
+        let full_panel_posts = std::sync::OnceLock::new();
+
         let sample_results: Vec<ImputeResult> = sample_error_rates
             .par_iter_mut()
             .enumerate()
@@ -4770,7 +4820,12 @@ impl crate::pipelines::ImputationPipeline {
                 let mut p1_out = HaplotypePriors::empty();
                 let mut p2_out = HaplotypePriors::empty();
 
-                if no_info_h1 && has_priors_h1 {
+                if no_info_h1 && !has_priors_h1 {
+                    let posts = full_panel_posts.get_or_init(build_full_panel_posts);
+                    hap1_posts = Some(posts.clone());
+                    p1_out = HaplotypePriors::empty();
+                    dbg_fallback_ref_freq.fetch_add(1, Ordering::Relaxed);
+                } else if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         let decayed = decay_prior(p);
                         hap1_posts = Some(posts_from_priors(&decayed)?);
@@ -4813,7 +4868,12 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
 
-                if no_info_h2 && has_priors_h2 {
+                if no_info_h2 && !has_priors_h2 {
+                    let posts = full_panel_posts.get_or_init(build_full_panel_posts);
+                    hap2_posts = Some(posts.clone());
+                    p2_out = HaplotypePriors::empty();
+                    dbg_fallback_ref_freq.fetch_add(1, Ordering::Relaxed);
+                } else if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         let decayed = decay_prior(p);
                         hap2_posts = Some(posts_from_priors(&decayed)?);
