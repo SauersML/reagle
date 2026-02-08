@@ -86,7 +86,7 @@ const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
-const SM_MATCH_MIN_DONORS: usize = 1;
+const SM_MATCH_MIN_DONORS: usize = 2;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
@@ -3338,8 +3338,14 @@ impl crate::pipelines::ImputationPipeline {
             .count() as f32
             / n_ref_markers.max(1) as f32)
             .clamp(0.0, 1.0);
-        let err_floor = if genotyped_fraction < 0.01 {
-            0.005f32
+        let err_floor = if self.config.err.is_some() {
+            // Respect user override if provided
+            self.params.p_mismatch
+        } else if genotyped_fraction < 0.01 {
+            // For sparse data, allow a lower floor (1e-4) to enable better precision
+            // on small/clean panels, but keep it above machine epsilon.
+            // Beagle uses very low error rates for clean data.
+            1e-4f32
         } else {
             self.params.p_mismatch
         };
