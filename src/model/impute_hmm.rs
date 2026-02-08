@@ -809,7 +809,7 @@ fn smooth_allele_posteriors_subset(
     let k_linear = total_mass * total_mass / state_prob_sq_sum;
 
     // Heuristic: Scale effective states to trust larger panels more.
-    // Small panels (e.g. N=50 synthetic) get weaker priors (quadratic scaling) to avoid
+    // Small panels (e.g. N=20 synthetic) get weaker priors (quadratic scaling) to avoid
     // overpowering the HMM signal when the prior is noisy.
     // Large panels (e.g. N=200 HGDP) get full linear priors to utilize the robust AF.
     // The threshold 200.0 is based on the HGDP reference panel size.
@@ -1423,13 +1423,18 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
-                                    // Use full-panel allele frequency (stored in
-                                    // TargetAlleleProbs) as the smoothing prior instead
-                                    // of subset AF, so that abyss haplotypes' allele
-                                    // distribution is properly represented.
                                     let prior_counts = &mut ws.subset_counts[..n_alleles];
-                                    for idx in 0..n_alleles {
-                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0);
+                                    // Normalize the subset counts (representing state mass)
+                                    // into a probability distribution for use as a prior.
+                                    let mut sum = 0.0;
+                                    for c in prior_counts.iter() {
+                                        sum += *c;
+                                    }
+                                    if sum > 0.0 {
+                                        let inv = 1.0 / sum;
+                                        for c in prior_counts.iter_mut() {
+                                            *c *= inv;
+                                        }
                                     }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
