@@ -5305,7 +5305,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
 
                             let mut forced_result: Option<(Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths)> = None;
-                            let has_anchor = false;
+                            let has_anchor = het_positions.iter().any(|&m| {
+                                let orig_m = hi_freq_to_orig[m];
+                                !sp.is_unphased(orig_m)
+                            });
                             if !has_anchor && n_hi_freq <= 2000 && n_states <= 512 && !het_positions.is_empty() {
                                 let mut ref_provider = RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
                                 let mut ref_alleles = vec![255u8; n_states];

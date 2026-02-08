@@ -1323,9 +1323,11 @@ fn test_phasing_multi_window_long_map_vs_java() {
     let gt_path = work_dir.path().join("target.vcf.gz");
     fs::copy(&files.target_vcf, &gt_path).expect("Copy target VCF");
 
-    // Create a linear genetic map with a modest span to keep runtime bounded.
-    let map_path = work_dir.path().join("long_span.map");
-    write_linear_map_for_span(&gt_path, &map_path, 10.0);
+    // Create separate genetic maps for Java (PLINK format) and Rust.
+    let map_path_java = work_dir.path().join("long_span_java.map");
+    let map_path_rust = work_dir.path().join("long_span_rust.map");
+    write_linear_map_for_span_java(&gt_path, &map_path_java, 10.0);
+    write_linear_map_for_span(&gt_path, &map_path_rust, 10.0);
 
     // Run Java BEAGLE phasing with map
     let java_out = work_dir.path().join("java_phased_long");
@@ -1333,7 +1335,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
         &files.beagle_jar,
         &[
             ("gt", gt_path.to_str().unwrap()),
-            ("map", map_path.to_str().unwrap()),
+            ("map", map_path_java.to_str().unwrap()),
             ("window", "2.2"),
             ("overlap", "1.0"),
             ("out", java_out.to_str().unwrap()),
@@ -1348,7 +1350,7 @@ fn test_phasing_multi_window_long_map_vs_java() {
     // Run Rust phasing with the same map and window sizing.
     let gt_vcf = decompress_vcf_for_rust(&gt_path, work_dir.path());
     let rust_out = work_dir.path().join("rust_phased_long");
-    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path, &rust_out, 42, 2.2, 1.0);
+    let rust_result = run_rust_phasing_with_map(&gt_vcf, &map_path_rust, &rust_out, 42, 2.2, 1.0);
     assert!(
         rust_result.is_ok(),
         "Rust phasing failed: {:?}",
