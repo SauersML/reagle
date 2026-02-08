@@ -2500,6 +2500,13 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        // Explicitly enforce a strict mismatch probability if not overridden by the user.
+        // The default Li-Stephens formula can be too lenient for large reference panels,
+        // causing over-smoothing and loss of local haplotype structure.
+        if self.config.err.is_none() {
+            self.params.p_mismatch = 0.0001;
+        }
+
         let mut impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
@@ -4200,7 +4207,6 @@ impl crate::pipelines::ImputationPipeline {
         struct ImputeResult {
             result: SampleImputationResult,
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
-            last_info_idx: Option<usize>,
         }
 
         let telemetry = self.telemetry.clone();
@@ -4973,12 +4979,6 @@ impl crate::pipelines::ImputationPipeline {
                         },
                     },
                     priors: Some((p1_out, p2_out)),
-                    last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    },
                 }
                 )
             })
@@ -5149,7 +5149,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut all_results = Vec::with_capacity(n_target_samples);
         let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
-        let mut handoff_marker_idx: Option<usize> = None;
+        let handoff_marker_idx: Option<usize> = None;
 
         for mut item in sample_results {
             let sample_idx = item.result.sample_idx;
@@ -5181,12 +5181,6 @@ impl crate::pipelines::ImputationPipeline {
                     next_priors_vec[base] = p1;
                     next_priors_vec[base + 1] = p2;
                 }
-            }
-            if let Some(idx) = item.last_info_idx {
-                handoff_marker_idx = Some(match handoff_marker_idx {
-                    Some(prev) => prev.max(idx),
-                    None => idx,
-                });
             }
         }
 
