@@ -5000,11 +5000,11 @@ fn test_dosage_by_distance_from_genotyped() {
             imputed_count += bucket.len();
         }
 
-        let status = if mean_mad_rust > 0.08 { " FAIL" } else { "" };
-        if mean_mad_rust > 0.08 {
+        let status = if mean_mad_rust > 0.05 { " FAIL" } else { "" };
+        if mean_mad_rust > 0.05 {
             any_bucket_failed = true;
         }
-        if mean_mad_rust > mean_mad_java + 0.01 {
+        if mean_mad_rust > mean_mad_java {
             any_bucket_failed = true;
         }
 
