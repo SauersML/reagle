@@ -54,14 +54,6 @@ impl ModelParams {
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
 
-    /// Calculate label switch probability for phasing
-    ///
-    /// Phase label switches are NOT recombination events. Use a tiny, fixed
-    /// switch prior to avoid artificial oscillations when evidence is symmetric.
-    pub fn label_switch_prob() -> f32 {
-        Self::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12)
-    }
-
     /// Create default parameters
     pub fn new() -> Self {
         Self {

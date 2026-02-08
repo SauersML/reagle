@@ -8237,7 +8237,7 @@ fn sample_dynamic_mcmc(
         swap_probs.push(p_swap.clamp(0.0, 1.0));
     }
     if !swap_probs.is_empty() {
-        let label_switch = ModelParams::label_switch_prob();
+        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
         let stay = (1.0 - label_switch).ln();
         let sw = label_switch.ln();
         let mut dp0 = vec![f32::NEG_INFINITY; swap_probs.len()];
@@ -9720,7 +9720,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         // Phase label switches are NOT recombination events. Use a tiny, fixed
         // switch prior to avoid artificial oscillations when evidence is symmetric.
-        let label_switch = ModelParams::label_switch_prob();
+        let label_switch = ModelParams::MIN_RECOMB_PROB.clamp(1e-12, 1.0 - 1e-12);
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];

@@ -2431,6 +2431,10 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        if self.config.err.is_none() {
+            // For imputation, copy-mismatch reflects mutation rather than panel size.
+            self.params.p_mismatch = crate::model::parameters::ModelParams::new().p_mismatch;
+        }
         self.params.recomb_intensity = self
             .params
             .recomb_intensity
@@ -3340,11 +3344,7 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = if genotyped_fraction < 0.01 {
             0.005f32
         } else {
-            if let Some(err) = self.config.err {
-                err
-            } else {
-                1e-5f32
-            }
+            self.params.p_mismatch
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let overlap_size = 1000.min(output_end);
