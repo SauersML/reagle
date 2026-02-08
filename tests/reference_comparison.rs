@@ -3062,6 +3062,9 @@ fn run_rust_phasing(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Res
         out_prefix.to_str().unwrap(),
         "--seed",
         &seed.to_string(),
+        // Align default Ne with Beagle for fair comparison
+        "--ne",
+        "50000.0",
     ])
     .expect("config");
     let mut pipeline = PhasingPipeline::new(config, None);
@@ -3084,6 +3087,8 @@ fn run_rust_phasing_with_map(
     config.seed = seed;
     config.window = window_cm;
     config.overlap = overlap_cm;
+    // Align default Ne with Beagle for fair comparison
+    config.ne = 50000.0;
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -3100,6 +3105,8 @@ fn run_rust_imputation(
     config.r#ref = Some(ref_path.to_path_buf());
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
+    // Align default Ne with Beagle for fair comparison
+    config.ne = 50000.0;
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }

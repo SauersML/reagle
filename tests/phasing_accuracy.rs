@@ -210,75 +210,25 @@ fn test_ser_switching_all0_all1_reference() {
     );
 
     // Calculate Switch Error Rate relative to the hero hap from the reference.
-    // This is invariant to global hap1/hap2 label swaps.
-    //
-    // However, in this specific test (all 0/1 hets), the "anti-hero" (complementary)
-    // pattern is also a perfect solution. The phaser might converge to either the
-    // hero (all 0s) or anti-hero (all 1s). A global flip (converging to anti-hero)
-    // appears as ~0 switch errors relative to the anti-hero, but might look like
-    // high error relative to the hero if we naiveley compare.
-    //
-    // Actually, pure SER (checking if phase relationship is maintained) handles
-    // global flips automatically: if H1 is all 0s, switches=0. If H1 is all 1s,
-    // switches=0. The failure mode "SER ~ 0.5" means it is *switching* between
-    // hero and anti-hero states frequently.
-    //
-    // Wait - if H1 matches hero at m-1 and matches anti-hero at m, that IS a switch.
-    // The previous failure "SER 0.51" implies it was flipping back and forth every
-    // ~2 markers.
-    //
-    // To be robust, we calculate SER against the best-matching reference haplotype
-    // (hero or anti-hero) found in the final output, or just standard SER.
-    // Standard SER handles global inversion fine. The high SER means actual instability.
-    //
-    // But let's verify if the "anti-hero" (index 199) is being used.
-    // The test constructs hero=000... and anti=111...
-    // If the phaser jumps between them, SER is high.
-    //
-    // Maybe the issue is that standard SER calculation assumes we are tracking
-    // a single haplotype. If the phaser outputs H1=Hero for half and H1=Anti for half,
-    // that is 1 switch error (SER ~ 1/50 = 0.02).
-    // An SER of 0.5 means it's random guessing.
-    //
-    // Let's relax the threshold slightly to 0.10 to account for stochasticity,
-    // but 0.51 is definitely random.
-    //
-    // Re-reading the failure log: "Switch Error Rate: 0.5102"
-    // This means 25 switches in 49 intervals. It's essentially random phase.
-    //
-    // This happens because both Hero and Anti-Hero are perfect matches for the target.
-    // If the model can't distinguish them (priors are identical), it might mix them.
-    // However, the transition penalty *should* favor staying in one state.
-    //
-    // Constraint relaxation: This test is an "existence proof" that the model *can*
-    // find the stable path. If it fails stochastically, we can try multiple seeds
-    // or relax the check.
-    //
-    // Let's implement a multi-seed retry here to ensure robustness against
-    // bad starting points in this highly symmetric landscape.
+    // We check both the hero pattern and the anti-hero pattern (complement),
+    // because for a symmetric heterozygote target (0/1 everywhere) with symmetric
+    // reference patterns (all 0s vs all 1s), the phaser can validly converge
+    // to either global orientation.
 
     let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+    let anti_hero_pattern: Vec<u8> = hero_pattern.iter().map(|&x| 1 - x).collect();
 
-    // Standard Switch Error Calculation
-    // Iterate and compare phase of (m-1, m)
-    //
-    // Robustness: Calculate SER against both Hero and Anti-Hero patterns.
-    // If the phaser converged to Anti-Hero (all 1s), that is also a valid
-    // phasing for this symmetric problem. We take the minimum SER.
-
-    let anti_hero_pattern: Vec<u8> = hero_pattern.iter().map(|&a| 1 - a).collect();
-
-    let calc_ser = |target_pattern: &[u8]| -> f32 {
+    let calc_ser = |pattern: &[u8]| -> f32 {
         let mut switch_errors = 0;
         for m in 1..n_markers {
-            let t_prev = target_pattern[m - 1];
-            let t_curr = target_pattern[m];
+            let p_prev = pattern[m - 1];
+            let p_curr = pattern[m];
 
             let (h1_prev, _) = phased_haps[m - 1];
             let (h1_curr, _) = phased_haps[m];
 
-            let prev_match = h1_prev == t_prev;
-            let curr_match = h1_curr == t_curr;
+            let prev_match = h1_prev == p_prev;
+            let curr_match = h1_curr == p_curr;
 
             if prev_match != curr_match {
                 switch_errors += 1;
@@ -292,13 +242,14 @@ fn test_ser_switching_all0_all1_reference() {
     let ser = ser_hero.min(ser_anti);
 
     println!("Marker Count: {}", n_markers);
-    println!("SER Hero: {:.4}, SER Anti: {:.4}, Final SER: {:.4}", ser_hero, ser_anti, ser);
+    println!("SER Hero: {:.4}, SER Anti: {:.4}, Best: {:.4}", ser_hero, ser_anti, ser);
 
-    // Relaxed threshold for this stress test
+    // The setup is inherently ambiguous; we still expect low switching if the
+    // phaser maintains a stable path in this regime.
     assert!(
-        ser < 0.20,
-        "Stability Trap Triggered! SER is too high: {:.4}",
-        ser
+        ser < 0.05,
+        "Stability Trap Triggered! SER is too high: {:.4} (Hero: {:.4}, Anti: {:.4})",
+        ser, ser_hero, ser_anti
     );
 }
 
@@ -411,6 +362,120 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
     assert!(ser < 0.05, "SER too high in dense map: {:.4}", ser);
 }
 
+#[test]
+fn test_ser_not_fixed_by_high_state_count_all0_all1() {
+    let n_markers = 50;
+    let n_ref_haps = 100;
+    let hero_idx = 99;
+
+    let ref_file = NamedTempFile::new().unwrap();
+    let ref_path = ref_file.path().to_path_buf();
+
+    let mut ref_samples = Vec::new();
+    let mut ref_haps = Vec::new();
+
+    for i in 0..n_ref_haps {
+        ref_samples.push(format!("R{}", i));
+        ref_haps.push(vec![0u8; n_markers]);
+        ref_haps.push(vec![0u8; n_markers]);
+    }
+
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    for h in 0..ref_haps.len() {
+        for m in 0..n_markers {
+            ref_haps[h][m] = if rng.random_bool(0.5) { 1 } else { 0 };
+        }
+    }
+
+    let hero_hap_idx = hero_idx * 2;
+    for m in 0..n_markers {
+        ref_haps[hero_hap_idx][m] = 0;
+    }
+
+    let anti_hero_hap_idx = hero_idx * 2 + 1;
+    for m in 0..n_markers {
+        ref_haps[anti_hero_hap_idx][m] = 1;
+    }
+
+    let marker_pos = make_marker_pos(n_markers, 1_000);
+    write_vcf(&ref_path, &ref_samples, &ref_haps, &marker_pos);
+
+    let target_file = NamedTempFile::new().unwrap();
+    let target_path = target_file.path().to_path_buf();
+    write_target_vcf(&target_path, &marker_pos);
+
+    let out_file = NamedTempFile::new().unwrap();
+    let out_path = out_file.path().to_path_buf();
+
+    let mut config = Config::default();
+    config.target = target_path.clone();
+    config.r#ref = Some(ref_path.clone());
+    config.out = out_path.clone();
+    config.phase_states = 0;
+    config.burnin = 0;
+    config.iterations = 2;
+    config.nthreads = Some(1);
+    config.ne = 10000.0;
+    config.err = Some(0.0001);
+
+    let mut pipeline = PhasingPipeline::new(config, None);
+    pipeline.run().expect("Pipeline run failed");
+
+    let expected_out_path = out_path.with_extension("vcf.gz");
+    assert!(expected_out_path.exists());
+
+    use flate2::read::MultiGzDecoder;
+    use std::io::BufRead;
+    use std::io::BufReader;
+
+    let file = File::open(&expected_out_path).unwrap();
+    let decoder = MultiGzDecoder::new(file);
+    let reader = BufReader::new(decoder);
+
+    let mut phased_haps: Vec<(u8, u8)> = Vec::new();
+    for line in reader.lines() {
+        let line = line.unwrap();
+        if line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split('\t').collect();
+        let sample_field = parts[9];
+        let gt_str = sample_field.split(':').next().unwrap();
+        let alleles: Vec<u8> = gt_str
+            .split(['|', '/'])
+            .map(|s| s.parse().unwrap_or(0))
+            .collect();
+
+        if alleles.len() >= 2 {
+            phased_haps.push((alleles[0], alleles[1]));
+        }
+    }
+
+    assert_eq!(phased_haps.len(), n_markers);
+
+    let hero_pattern = hero_pattern_from_ref_hap(&ref_haps, hero_hap_idx);
+
+    let mut switch_errors = 0;
+    for m in 1..n_markers {
+        let hero_prev = hero_pattern[m - 1];
+        let hero_curr = hero_pattern[m];
+        let (h1_prev, _) = phased_haps[m - 1];
+        let (h1_curr, _) = phased_haps[m];
+
+        let prev_match = h1_prev == hero_prev;
+        let curr_match = h1_curr == hero_curr;
+
+        if prev_match != curr_match {
+            switch_errors += 1;
+        }
+    }
+
+    let ser = switch_errors as f32 / (n_markers - 1) as f32;
+
+    assert!(ser < 0.05, "SER too high with max_states=200: {:.4}", ser);
+}
 
 #[test]
 fn test_small_panel_all0_all1_perfect_match_ser() {
