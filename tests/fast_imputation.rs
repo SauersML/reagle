@@ -629,13 +629,13 @@ fn test_synthetic_recombination() {
 
     // Marker 15 (in 0-region, should be 0)
     assert!(
-        dosages[15][0] < 0.2,
+        dosages[15][0] < 0.1,
         "Marker 15 should be 0, got {}",
         dosages[15][0]
     );
     // Marker 25 (in 1-region, should be 2 for diploid 1|1)
     assert!(
-        dosages[25][0] > 1.8,
+        dosages[25][0] > 1.9,
         "Marker 25 should be 2, got {}",
         dosages[25][0]
     );
