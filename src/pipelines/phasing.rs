@@ -147,7 +147,6 @@ const INVALID_ALLELE: u8 = 254;
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
-    offset: usize,
     state_buf: Vec<CombinedHapId>,
     state_haps: Vec<HapIdx>,
 }
@@ -156,13 +155,11 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
     fn new(
         ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
         threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
-        offset: usize,
     ) -> Self {
         let n_states = threaded_haps.n_states();
         Self {
             ref_gt,
             threaded_haps,
-            offset,
             state_buf: vec![CombinedHapId::from(0u32); n_states],
             state_haps: vec![HapIdx::new(0); n_states],
         }
@@ -181,18 +178,7 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
             .materialize_at(marker, &mut self.state_buf);
         let marker_idx = MarkerIdx::new(marker as u32);
         for i in 0..n_states {
-            self.state_haps[i] = HapIdx::new(
-                self.state_buf[i]
-                    .as_u32()
-                    .checked_sub(self.offset as u32)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "RefAlleleProvider: haplotype ID {} is smaller than offset {}.",
-                            self.state_buf[i].as_u32(),
-                            self.offset
-                        )
-                    }),
-            );
+            self.state_haps[i] = HapIdx::new(self.state_buf[i].as_u32());
         }
         self.ref_gt.fill_batch(
             marker_idx,
@@ -4744,7 +4730,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 }
                                 let ws = workspace.as_mut().unwrap();
                                 ws.clear(); // Explicit reset between samples to prevent state contamination
-                                let ref_provider = RefAlleleProvider::new(ref_view, &threaded_haps, 0);
+                                let ref_provider = RefAlleleProvider::new(ref_view, &threaded_haps);
                                 let (anchor_h1, anchor_h2) =
                                     build_anchor_constraints(&sample_phase_view[s]);
 
@@ -5074,16 +5060,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         // Identify unresolved heterozygotes in hi-freq space.
                         let mut het_positions: Vec<usize> = Vec::new();
-                        let mut all_het_positions: Vec<usize> = Vec::new();
                         for i in 0..n_hi_freq {
                             let m = hi_freq_to_orig[i];
+                            if !sp.is_unphased(m) {
+                                continue;
+                            }
                             let a1 = seq1[i];
                             let a2 = seq2[i];
                             if a1 != 255 && a2 != 255 && a1 != a2 {
-                                all_het_positions.push(i);
-                                if sp.is_unphased(m) {
-                                    het_positions.push(i);
-                                }
+                                het_positions.push(i);
                             }
                         }
 
@@ -5098,12 +5083,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 het_updates: Vec::new(),
                                 paths: None,
                             };
-                        }
-
-                        let perfect_ref_pair =
-                            find_unique_perfect_reference_pair(subset_view, &seq1, &seq2);
-                        if perfect_ref_pair.is_some() {
-                            het_positions = all_het_positions.clone();
                         }
 
                         let p_err = self.params.p_mismatch;
@@ -5265,7 +5244,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
                                 path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
                             });
-                            let mut deterministic_pair: Option<ConstantPairSearch> = None;
                             if prior_local.is_none() {
                                 let mut rp = RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
                                 if let Some(local_best) = find_best_constant_pair_with_buffer(
@@ -5280,51 +5258,35 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &mut ws.scores,
                                     None,
                                 ) {
-                                    if local_best.is_unique_perfect() {
-                                        deterministic_pair = Some(local_best);
-                                    } else {
-                                        let global_best = local_to_global_paths(
-                                            &local_best.paths,
-                                            threaded_haps.as_ref(),
-                                            n_hi_freq,
+                                    let global_best =
+                                        local_to_global_paths(&local_best, threaded_haps.as_ref(), n_hi_freq);
+                                    prior_local = Some(MosaicPaths {
+                                        path1: global_best
+                                            .path1
+                                            .iter()
+                                            .map(|id: &CombinedHapId| id.as_u32())
+                                            .collect(),
+                                        path2: global_best
+                                            .path2
+                                            .iter()
+                                            .map(|id: &CombinedHapId| id.as_u32())
+                                            .collect(),
+                                    });
+                                    if s == 0 && n_hi_freq <= 600 {
+                                        let p1 = prior_local
+                                            .as_ref()
+                                            .and_then(|p| p.path1.first().copied())
+                                            .unwrap_or(0);
+                                        let p2 = prior_local
+                                            .as_ref()
+                                            .and_then(|p| p.path2.first().copied())
+                                            .unwrap_or(0);
+                                        eprintln!(
+                                            "[dynamic init] sample=0 best_constant_pair_first=({}, {})",
+                                            p1, p2
                                         );
-                                        prior_local = Some(MosaicPaths {
-                                            path1: global_best
-                                                .path1
-                                                .iter()
-                                                .map(|id: &CombinedHapId| id.as_u32())
-                                                .collect(),
-                                            path2: global_best
-                                                .path2
-                                                .iter()
-                                                .map(|id: &CombinedHapId| id.as_u32())
-                                                .collect(),
-                                        });
                                     }
                                 }
-                            }
-                            if let Some(best) = deterministic_pair.as_ref() {
-                                if s == 0 && n_hi_freq <= 600 {
-                                    let p1 = best.paths.path1.first().copied().unwrap_or(0);
-                                    let p2 = best.paths.path2.first().copied().unwrap_or(0);
-                                    eprintln!(
-                                        "[dynamic init] sample=0 deterministic_constant_pair=({}, {})",
-                                        p1, p2
-                                    );
-                                }
-                            } else if s == 0 && n_hi_freq <= 600 {
-                                let p1 = prior_local
-                                    .as_ref()
-                                    .and_then(|p| p.path1.first().copied())
-                                    .unwrap_or(0);
-                                let p2 = prior_local
-                                    .as_ref()
-                                    .and_then(|p| p.path2.first().copied())
-                                    .unwrap_or(0);
-                                eprintln!(
-                                    "[dynamic init] sample=0 best_constant_pair_first=({}, {})",
-                                    p1, p2
-                                );
                             }
                             // Do not inject per-marker phase anchors into dynamic MCMC.
                             // In unanchored/symmetric regimes this can create circular
@@ -5346,270 +5308,90 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 );
                             }
 
-                        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) =
-                            if let Some((hap1, hap2)) = perfect_ref_pair {
-                                let (swap_bits, swap_lr, swap_probs, swap_probs_conf) =
-                                    derive_swap_bits_from_reference_pair(
-                                        subset_view,
-                                        &seq1,
-                                        &seq2,
-                                        hap1,
-                                        hap2,
-                                        &het_positions,
-                                    );
-                                let new_paths = MosaicPaths {
-                                    path1: vec![hap1; n_hi_freq],
-                                    path2: vec![hap2; n_hi_freq],
-                                };
-                                (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths)
-                            } else if let Some(best) = deterministic_pair.as_ref() {
-                                let mut rp =
-                                    RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
-                                let result = derive_swap_bits_from_constant_pair(
-                                    &seq1,
-                                    &seq2,
-                                    &sample_conf,
-                                    p_no_err,
-                                    p_err,
-                                    &mut rp,
-                                    &best.paths,
-                                    &het_positions,
-                                );
-                                result
-                            } else if self.config.profile {
+                            let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if self.config.profile {
                                 info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
-                                    sample_dynamic_mcmc(
-                                        n_hi_freq,
-                                        &seq1,
-                                        &seq2,
-                                        &sample_conf,
-                                        p_no_err,
-                                        p_err,
-                                        phase_ibs,
-                                        hap1_idx,
-                                        hap2_idx,
-                                    );
-                                    if let Some((paths, perfect)) = best_global {
-                                        if prior_local.is_none() || perfect {
-                                            prior_local = Some(paths);
-                                            if perfect {
-                                                force_full_phase = true;
-                                            }
-                                            if s == 0 && n_hi_freq <= 600 {
-                                                let p1 = prior_local
-                                                    .as_ref()
-                                                    .and_then(|p| p.path1.first().copied())
-                                                    .unwrap_or(0);
-                                                let p2 = prior_local
-                                                    .as_ref()
-                                                    .and_then(|p| p.path2.first().copied())
-                                                    .unwrap_or(0);
-                                                eprintln!(
-                                                    "[dynamic init] sample=0 best_global_pair=({}, {}) perfect={}",
-                                                    p1, p2, perfect
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                if prior_local.is_none() {
-                                    let mut rp =
-                                        RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
-                                    if let Some(local_best) = find_best_constant_pair_with_buffer(
-                                        n_hi_freq,
-                                        n_states,
-                                        &seq1,
-                                        &seq2,
-                                        &sample_conf,
-                                        p_no_err,
-                                        p_err,
-                                        &mut rp,
-                                        &mut ws.scores,
-                                        None,
-                                    ) {
-                                        let global_best = local_to_global_paths(
-                                            &local_best,
-                                            threaded_haps.as_ref(),
-                                            n_hi_freq,
-                                        );
-                                        prior_local = Some(MosaicPaths {
-                                            path1: global_best
-                                                .path1
-                                                .iter()
-                                                .map(|id: &CombinedHapId| id.as_u32())
-                                                .collect(),
-                                            path2: global_best
-                                                .path2
-                                                .iter()
-                                                .map(|id: &CombinedHapId| id.as_u32())
-                                                .collect(),
-                                        });
-                                        if s == 0 && n_hi_freq <= 600 {
-                                            let p1 = prior_local
-                                                .as_ref()
-                                                .and_then(|p| p.path1.first().copied())
-                                                .unwrap_or(0);
-                                            let p2 = prior_local
-                                                .as_ref()
-                                                .and_then(|p| p.path2.first().copied())
-                                                .unwrap_or(0);
-                                            eprintln!(
-                                                "[dynamic init] sample=0 best_constant_pair_first=({}, {})",
-                                                p1, p2
-                                            );
-                                        }
-                                    }
-                                }
-                                // Do not inject per-marker phase anchors into dynamic MCMC.
-                                // In unanchored/symmetric regimes this can create circular
-                                // self-conditioning against the current phase assignment.
-                                if s == 0 && n_hi_freq <= 600 {
-                                    let p1 = prior_local
-                                        .as_ref()
-                                        .and_then(|p| p.path1.first().copied())
-                                        .unwrap_or(0);
-                                    let p2 = prior_local
-                                        .as_ref()
-                                        .and_then(|p| p.path2.first().copied())
-                                        .unwrap_or(0);
-                                    eprintln!(
-                                        "[dynamic prior] sample=0 have_prior={} first_pair=({}, {})",
-                                        prior_local.is_some(),
-                                        p1,
-                                        p2
-                                    );
-                                }
-
-                                let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) =
-                                    if self.config.profile {
-                                        info_span!("run_dynamic_mcmc", sample = s).in_scope(|| {
-                                            sample_dynamic_mcmc(
-                                                n_hi_freq,
-                                                dyn_k,
-                                                stage1_p_recomb,
-                                                &seq1,
-                                                &seq2,
-                                                &sample_conf,
-                                                phase_ibs.as_ref().expect("phase_ibs"),
-                                                ibs2,
-                                                s as u32,
-                                                &het_positions,
-                                                sample_seed,
-                                                self.config.mcmc_steps,
-                                                p_no_err,
-                                                p_err,
-                                                prior_local.as_ref(),
-                                                None,
-                                                None,
-                                                telemetry.as_deref(),
-                                                ws,
-                                            )
-                                        })
-                                    } else {
                                         sample_dynamic_mcmc(
-                                            n_hi_freq,
-                                            dyn_k,
-                                            stage1_p_recomb,
-                                            &seq1,
-                                            &seq2,
-                                            &sample_conf,
-                                            phase_ibs.as_ref().expect("phase_ibs"),
-                                            ibs2,
-                                            s as u32,
-                                            &het_positions,
-                                            sample_seed,
-                                            self.config.mcmc_steps,
-                                            p_no_err,
-                                            p_err,
-                                            prior_local.as_ref(),
-                                            None,
-                                            None,
-                                            telemetry.as_deref(),
-                                            ws,
-                                        )
-                                    };
-                                let global_paths = GlobalMosaicPaths {
-                                    path1: new_paths.path1.into_iter().map(CombinedHapId::from).collect(),
-                                    path2: new_paths.path2.into_iter().map(CombinedHapId::from).collect(),
-                                };
-                                (swap_bits, swap_lr, swap_probs, swap_probs_conf, Some(global_paths))
-                            } else {
-                                // Classic Beagle-style: static state space MCMC with thread-local workspace
-                                let ref_provider = if self.config.profile {
-                                    info_span!("prep_allele_provider", sample = s).in_scope(|| {
-                                        RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
-                                    })
-                                } else {
-                                    RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
-                                };
-
-                                let local_prior_raw = prior_paths[s]
-                                    .as_ref()
-                                    .and_then(|gp| {
-                                        global_to_local_paths(gp, threaded_haps.as_ref(), n_hi_freq)
-                                    });
-                                let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
-                                let has_anchors = anchor_h1_full.iter().any(|&a| a != 255)
-                                    || anchor_h2_full.iter().any(|&a| a != 255);
-                                let local_prior = if has_anchors {
-                                    None
-                                } else {
-                                    local_prior_raw.as_ref()
-                                };
-                                let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
-                                let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
-                                for &m in hi_freq_to_orig {
-                                    anchor_h1.push(anchor_h1_full[m]);
-                                    anchor_h2.push(anchor_h2_full[m]);
-                                }
-
-                            let block_starts = block_starts.clone();
-                            let result = if let Some((hap1, hap2)) = perfect_ref_pair {
-                                let (swap_bits, swap_lr, swap_probs, swap_probs_conf) =
-                                    derive_swap_bits_from_reference_pair(
-                                        subset_view,
-                                        &seq1,
-                                        &seq2,
-                                        hap1,
-                                        hap2,
-                                        &het_positions,
-                                    );
-                                let global_paths = GlobalMosaicPaths {
-                                    path1: vec![CombinedHapId::from(hap1); n_hi_freq],
-                                    path2: vec![CombinedHapId::from(hap2); n_hi_freq],
-                                };
-                                if let Some(local_paths) =
-                                    global_to_local_paths(&global_paths, threaded_haps.as_ref(), n_hi_freq)
-                                {
-                                    (swap_bits, swap_lr, swap_probs, swap_probs_conf, local_paths)
-                                } else {
-                                    sample_swap_bits_mosaic(
                                         n_hi_freq,
-                                        n_states,
+                                        dyn_k,
                                         stage1_p_recomb,
                                         &seq1,
                                         &seq2,
                                         &sample_conf,
-                                        ref_provider,
-                                        Some(PlProvider {
-                                            gt: target_gt,
-                                            sample: s,
-                                            subset_to_orig: Some(hi_freq_to_orig),
-                                        }),
-                                        block_starts,
+                                        phase_ibs.as_ref().expect("phase_ibs"),
+                                        ibs2,
+                                        s as u32,
                                         &het_positions,
-                                        local_prior,
-                                        Some(&anchor_h1),
-                                        Some(&anchor_h2),
                                         sample_seed,
-                                        self.config.mcmc_burnin,
-                                        self.config.mcmc_lr_samples,
+                                        self.config.mcmc_steps,
                                         p_no_err,
                                         p_err,
+                                        prior_local.as_ref(),
+                                        None,
+                                        None,
+                                        telemetry.as_deref(),
                                         ws,
                                     )
-                                }
-                            } else if self.config.profile {
+                                })
+                            } else {
+                                sample_dynamic_mcmc(
+                                    n_hi_freq,
+                                    dyn_k,
+                                    stage1_p_recomb,
+                                    &seq1,
+                                    &seq2,
+                                    &sample_conf,
+                                    phase_ibs.as_ref().expect("phase_ibs"),
+                                    ibs2,
+                                    s as u32,
+                                    &het_positions,
+                                    sample_seed,
+                                    self.config.mcmc_steps,
+                                    p_no_err,
+                                    p_err,
+                                    prior_local.as_ref(),
+                                    None,
+                                    None,
+                                    telemetry.as_deref(),
+                                    ws,
+                                )
+                            };
+                            let global_paths = GlobalMosaicPaths {
+                                path1: new_paths.path1.into_iter().map(CombinedHapId::from).collect(),
+                                path2: new_paths.path2.into_iter().map(CombinedHapId::from).collect(),
+                            };
+                            (swap_bits, swap_lr, swap_probs, swap_probs_conf, Some(global_paths))
+                        } else {
+                            // Classic Beagle-style: static state space MCMC with thread-local workspace
+                            let ref_provider = if self.config.profile {
+                                info_span!("prep_allele_provider", sample = s).in_scope(|| {
+                                    RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
+                                })
+                            } else {
+                                RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
+                            };
+
+                            let local_prior_raw = prior_paths[s]
+                                .as_ref()
+                                .and_then(|gp| {
+                                    global_to_local_paths(gp, threaded_haps.as_ref(), n_hi_freq)
+                                });
+                            let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
+                            let has_anchors = anchor_h1_full.iter().any(|&a| a != 255)
+                                || anchor_h2_full.iter().any(|&a| a != 255);
+                            let local_prior = if has_anchors {
+                                None
+                            } else {
+                                local_prior_raw.as_ref()
+                            };
+                            let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
+                            let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
+                            for &m in hi_freq_to_orig {
+                                anchor_h1.push(anchor_h1_full[m]);
+                                anchor_h2.push(anchor_h2_full[m]);
+                            }
+
+                            let block_starts = block_starts.clone();
+                            let result = if self.config.profile {
                                 info_span!("run_mcmc_math", sample = s).in_scope(|| {
                                     sample_swap_bits_mosaic(
                                         n_hi_freq,
@@ -5636,10 +5418,37 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         p_err,
                                         ws,
                                     )
-                                };
-                                let global_paths =
-                                    local_to_global_paths(&result.4, threaded_haps.as_ref(), n_hi_freq);
-                                (result.0, result.1, result.2, result.3, Some(global_paths))
+                                })
+                            } else {
+                                sample_swap_bits_mosaic(
+                                    n_hi_freq,
+                                    n_states,
+                                    stage1_p_recomb,
+                                    &seq1,
+                                    &seq2,
+                                    &sample_conf,
+                                    ref_provider,
+                                    Some(PlProvider {
+                                        gt: target_gt,
+                                        sample: s,
+                                        subset_to_orig: Some(hi_freq_to_orig),
+                                    }),
+                                    block_starts,
+                                    &het_positions,
+                                    local_prior,
+                                    Some(&anchor_h1),
+                                    Some(&anchor_h2),
+                                    sample_seed,
+                                    self.config.mcmc_burnin,
+                                    self.config.mcmc_lr_samples,
+                                    p_no_err,
+                                    p_err,
+                                    ws,
+                                )
+                            };
+                            let global_paths =
+                                local_to_global_paths(&result.4, threaded_haps.as_ref(), n_hi_freq);
+                            (result.0, result.1, result.2, result.3, Some(global_paths))
                         };
 
                         let t_mcmc = t_mcmc_start.elapsed();
@@ -8135,174 +7944,6 @@ fn sample_dynamic_mcmc(
         a1 != 255 || a2 != 255
     });
 
-    if !has_anchor && n_markers <= 2000 && n_states <= 512 {
-        let mut informative_markers = Vec::new();
-        for m in 0..n_markers {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 != 255 && a2 != 255 && a1 != a2 {
-                informative_markers.push(m);
-            }
-        }
-        if informative_markers.len() >= 8 {
-            let n_haps = phase_ibs.n_haps() as u32;
-            let mut best_pair: Option<(u32, u32)> = None;
-            for i in 0..n_haps {
-                for j in 0..i {
-                    let mut perfect = true;
-                    for &m in &informative_markers {
-                        let a1 = seq1[m];
-                        let a2 = seq2[m];
-                        let r1 = phase_ibs.allele(m, i);
-                        let r2 = phase_ibs.allele(m, j);
-                        if r1 == 255 || r2 == 255 {
-                            perfect = false;
-                            break;
-                        }
-                        if !((r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1)) {
-                            perfect = false;
-                            break;
-                        }
-                    }
-                    if perfect {
-                        best_pair = Some((i, j));
-                        break;
-                    }
-                }
-                if best_pair.is_some() {
-                    break;
-                }
-            }
-
-            if let Some((h1_idx, h2_idx)) = best_pair {
-                let mut swap_bits = Vec::with_capacity(het_positions.len());
-                let mut swap_lr = Vec::with_capacity(het_positions.len());
-                let mut swap_probs = Vec::with_capacity(het_positions.len());
-                for &m in het_positions {
-                    let a1 = seq1[m];
-                    let a2 = seq2[m];
-                    if a1 == 255 || a2 == 255 || a1 == a2 {
-                        swap_bits.push(0);
-                        swap_lr.push(1.0);
-                        swap_probs.push(0.5);
-                        continue;
-                    }
-                    let ref1 = phase_ibs.allele(m, h1_idx);
-                    let ref2 = phase_ibs.allele(m, h2_idx);
-                    let conf_m = conf[m].clamp(0.0, 1.0);
-                    let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                        * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-                    let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                        * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-                    let denom = keep + swap;
-                    let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
-                    let p_keep = 1.0 - p_swap;
-                    let chosen_swap = p_swap > 0.5;
-                    swap_bits.push(chosen_swap as u8);
-                    let (max_p, min_p) = if p_swap >= p_keep {
-                        (p_swap, p_keep)
-                    } else {
-                        (p_keep, p_swap)
-                    };
-                    let lr = if min_p < 1e-30 {
-                        1e6_f32
-                    } else {
-                        (max_p / min_p).min(1e6_f32)
-                    };
-                    swap_lr.push(lr);
-                    swap_probs.push(p_swap.clamp(0.0, 1.0));
-                }
-                let swap_probs_conf = swap_probs.clone();
-                let path1 = vec![h1_idx as u32; n_markers];
-                let path2 = vec![h2_idx as u32; n_markers];
-                return (
-                    swap_bits,
-                    swap_lr,
-                    swap_probs,
-                    swap_probs_conf,
-                    MosaicPaths {
-                        path1,
-                        path2,
-                    },
-                );
-            }
-        }
-    }
-
-    if !has_anchor {
-        if let Some(paths) = initial_paths {
-            if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
-                let mut match_count = 0usize;
-                let mut match_total = 0usize;
-                let mut swap_bits = Vec::with_capacity(het_positions.len());
-                let mut swap_lr = Vec::with_capacity(het_positions.len());
-                let mut swap_probs = Vec::with_capacity(het_positions.len());
-                for &m in het_positions {
-                    let a1 = seq1[m];
-                    let a2 = seq2[m];
-                    if a1 == 255 || a2 == 255 || a1 == a2 {
-                        swap_bits.push(0);
-                        swap_lr.push(1.0);
-                        swap_probs.push(0.5);
-                        continue;
-                    }
-                    let h1_idx = paths.path1[m] as usize;
-                    let h2_idx = paths.path2[m] as usize;
-                    if h1_idx >= phase_ibs.n_haps() || h2_idx >= phase_ibs.n_haps() {
-                        swap_bits.push(0);
-                        swap_lr.push(1.0);
-                        swap_probs.push(0.5);
-                        continue;
-                    }
-                    let ref1 = phase_ibs.allele(m, h1_idx as u32);
-                    let ref2 = phase_ibs.allele(m, h2_idx as u32);
-                    match_total += 1;
-                    if (ref1 == a1 && ref2 == a2) || (ref1 == a2 && ref2 == a1) {
-                        match_count += 1;
-                    }
-                    let conf_m = conf[m].clamp(0.0, 1.0);
-                    let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                        * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-                    let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                        * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-                    let denom = keep + swap;
-                    let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
-                    let p_keep = 1.0 - p_swap;
-                    let chosen_swap = p_swap > 0.5;
-                    swap_bits.push(chosen_swap as u8);
-                    let (max_p, min_p) = if p_swap >= p_keep {
-                        (p_swap, p_keep)
-                    } else {
-                        (p_keep, p_swap)
-                    };
-                    let lr = if min_p < 1e-30 {
-                        1e6_f32
-                    } else {
-                        (max_p / min_p).min(1e6_f32)
-                    };
-                    swap_lr.push(lr);
-                    swap_probs.push(p_swap.clamp(0.0, 1.0));
-                }
-
-                let match_rate = if match_total > 0 {
-                    match_count as f32 / match_total as f32
-                } else {
-                    0.0
-                };
-                if match_rate >= 0.98 {
-                    let swap_probs_conf = swap_probs.clone();
-                    return (
-                        swap_bits,
-                        swap_lr,
-                        swap_probs,
-                        swap_probs_conf,
-                        paths.clone(),
-                    );
-                }
-            }
-        }
-    }
-
     // Initialize H1, H2 alleles from genotype (random phase at hets)
     let mut h1_alleles = vec![0u8; n_markers];
     let mut h2_alleles = vec![0u8; n_markers];
@@ -8400,64 +8041,6 @@ fn sample_dynamic_mcmc(
     for (i, &m) in het_positions.iter().enumerate() {
         if m < n_markers {
             het_index[m] = i;
-        }
-    }
-
-    // Seed alleles and reference paths from initial paths if available.
-    // This ensures MCMC starts in a high-probability region and keeps
-    // latent states aligned with the heuristic's best constant pair.
-    if let Some(paths) = initial_paths {
-        if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
-            let mut all_valid = true;
-            for m in 0..n_markers {
-                let h1_idx = paths.path1[m] as usize;
-                let h2_idx = paths.path2[m] as usize;
-                if h1_idx >= phase_ibs.n_haps() || h2_idx >= phase_ibs.n_haps() {
-                    all_valid = false;
-                    break;
-                }
-            }
-
-            if all_valid {
-                path1_ref.copy_from_slice(&paths.path1);
-                path2_ref.copy_from_slice(&paths.path2);
-            } else {
-                for m in 0..n_markers {
-                    let h1_idx = paths.path1[m] as usize;
-                    let h2_idx = paths.path2[m] as usize;
-                    if h1_idx < phase_ibs.n_haps() && h2_idx < phase_ibs.n_haps() {
-                        path1_ref[m] = paths.path1[m];
-                        path2_ref[m] = paths.path2[m];
-                    }
-                }
-            }
-
-            for m in 0..n_markers {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    continue;
-                }
-
-                let h1_idx = path1_ref[m] as usize;
-                let h2_idx = path2_ref[m] as usize;
-
-                if h1_idx < phase_ibs.n_haps() && h2_idx < phase_ibs.n_haps() {
-                    let ref1 = phase_ibs.allele(m, h1_idx as u32);
-                    let ref2 = phase_ibs.allele(m, h2_idx as u32);
-
-                    let matches_orient1 = ref1 == a1 && ref2 == a2;
-                    let matches_orient2 = ref1 == a2 && ref2 == a1;
-
-                    if matches_orient1 && !matches_orient2 {
-                        h1_alleles[m] = a1;
-                        h2_alleles[m] = a2;
-                    } else if matches_orient2 && !matches_orient1 {
-                        h1_alleles[m] = a2;
-                        h2_alleles[m] = a1;
-                    }
-                }
-            }
         }
     }
     let mut swap_counts = vec![0f32; het_positions.len()];
@@ -8588,10 +8171,7 @@ fn sample_dynamic_mcmc(
             }
         }
 
-        let max_attempts = n_haps.saturating_mul(10).max(1000);
-        let mut attempts = 0;
-        while neighbors.len() < target && attempts < max_attempts {
-            attempts += 1;
+        while neighbors.len() < target {
             let h = rng.random_range(0..n_haps);
             if h == hap1_idx || h == hap1_idx + 1 {
                 continue;
@@ -9146,18 +8726,6 @@ fn sample_dynamic_mcmc(
 /// This breaks the symmetry of the Combined HMM initialization (which cannot distinguish
 /// between phasing configurations at 0/1 sites) and helps the Gibbs sampler escape
 /// "Mosaic Traps" where H1 and H2 lock each other into high-switching local optima.
-struct ConstantPairSearch {
-    paths: MosaicPaths,
-    perfect_pairs: usize,
-    best_is_perfect: bool,
-}
-
-impl ConstantPairSearch {
-    fn is_unique_perfect(&self) -> bool {
-        self.best_is_perfect && self.perfect_pairs == 1
-    }
-}
-
 fn find_best_constant_pair_with_buffer<RefSpace>(
     n_markers: usize,
     n_states: usize,
@@ -9169,7 +8737,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
-) -> Option<ConstantPairSearch> {
+) -> Option<MosaicPaths> {
     if n_states < 2 {
         return None;
     }
@@ -9190,34 +8758,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             }
         }
     }
-    let n_target_haps = match ref_provider.ref_gt {
-        GenotypeView::Composite { n_target_haps, .. }
-        | GenotypeView::CompositeSubset { n_target_haps, .. } => n_target_haps,
-        _ => 0,
-    };
-    let mut state_is_ref = vec![true; n_states];
-    if n_target_haps > 0 {
-        if ref_provider.state_buf.len() < n_states {
-            ref_provider
-                .state_buf
-                .resize(n_states, CombinedHapId::from(0u32));
-        }
-        ref_provider
-            .threaded_haps
-            .materialize_at(0, &mut ref_provider.state_buf);
-        let mut ref_count = 0usize;
-        for i in 0..n_states {
-            let hap_id = ref_provider.state_buf[i].as_u32();
-            let is_ref = hap_id >= n_target_haps as u32;
-            state_is_ref[i] = is_ref;
-            if is_ref {
-                ref_count += 1;
-            }
-        }
-        if ref_count < 2 {
-            state_is_ref.fill(true);
-        }
-    }
 
     let mut ref_alleles = vec![255u8; n_states];
     let mut informative = 0usize;
@@ -9234,16 +8774,10 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
 
         ref_provider.fill_ref_alleles(m, &mut ref_alleles);
         for i in 0..n_states {
-            if !state_is_ref[i] {
-                continue;
-            }
             let r1 = ref_alleles[i];
             // Symmetric scan: only check j < i (lower triangle)
             // We can infer upper triangle or just pick best from lower.
             for j in 0..i {
-                if !state_is_ref[j] {
-                    continue;
-                }
                 let r2 = ref_alleles[j];
                 let prob = if is_het {
                     // Unordered diploid genotype likelihood under both phase orientations.
@@ -9264,19 +8798,13 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
     }
 
-    // Find best pair and runner-up.
+    // Find best pair
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (0, 1);
 
     for i in 0..n_states {
-        if !state_is_ref[i] {
-            continue;
-        }
         let bonus_i = state_bonus[i];
         for j in 0..i {
-            if !state_is_ref[j] {
-                continue;
-            }
             let bonus = bonus_i + state_bonus[j];
             let s = scores[i * n_states + j] + bonus;
             if s > best_score {
@@ -9299,271 +8827,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
-    let mut ref_alleles = vec![255u8; n_states];
-    let mut perfect = vec![true; n_states * n_states];
-    for m in 0..n_markers {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            continue;
-        }
-        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
-        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
-        if is_het {
-            for i in 0..n_states {
-                if !state_is_ref[i] {
-                    continue;
-                }
-                let r1 = ref_alleles[i];
-                for j in 0..i {
-                    if !state_is_ref[j] {
-                        continue;
-                    }
-                    let idx = i * n_states + j;
-                    if !perfect[idx] {
-                        continue;
-                    }
-                    let r2 = ref_alleles[j];
-                    let ok = (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1);
-                    if !ok {
-                        perfect[idx] = false;
-                    }
-                }
-            }
-        } else {
-            let obs = if a1 != 255 { a1 } else { a2 };
-            for i in 0..n_states {
-                if !state_is_ref[i] {
-                    continue;
-                }
-                let r1 = ref_alleles[i];
-                for j in 0..i {
-                    if !state_is_ref[j] {
-                        continue;
-                    }
-                    let idx = i * n_states + j;
-                    if !perfect[idx] {
-                        continue;
-                    }
-                    let r2 = ref_alleles[j];
-                    let ok = r1 == obs && r2 == obs;
-                    if !ok {
-                        perfect[idx] = false;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut perfect_pairs = 0usize;
-    for i in 0..n_states {
-        if !state_is_ref[i] {
-            continue;
-        }
-        for j in 0..i {
-            if !state_is_ref[j] {
-                continue;
-            }
-            let idx = i * n_states + j;
-            if perfect[idx] {
-                perfect_pairs += 1;
-            }
-        }
-    }
-    let best_idx = best_pair.0 * n_states + best_pair.1;
-    let best_is_perfect = best_idx < perfect.len() && perfect[best_idx];
-
-    Some(ConstantPairSearch {
-        paths: MosaicPaths { path1, path2 },
-        perfect_pairs,
-        best_is_perfect,
-    })
-}
-
-fn derive_swap_bits_from_constant_pair<RefSpace>(
-    seq1: &[u8],
-    seq2: &[u8],
-    conf: &[f32],
-    p_no_err: f32,
-    p_err: f32,
-    ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
-    paths: &MosaicPaths,
-    het_positions: &[usize],
-) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths) {
-    let n_states = ref_provider.threaded_haps.n_states();
-    let mut ref_alleles = vec![255u8; n_states];
-    let mut swap_bits = Vec::with_capacity(het_positions.len());
-    let mut swap_lr = Vec::with_capacity(het_positions.len());
-    let mut swap_probs = Vec::with_capacity(het_positions.len());
-    let mut swap_probs_conf = Vec::with_capacity(het_positions.len());
-
-    for &m in het_positions {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 || a2 == 255 || a1 == a2 {
-            swap_bits.push(0);
-            swap_lr.push(1.0);
-            swap_probs.push(0.5);
-            swap_probs_conf.push(0.5);
-            continue;
-        }
-        let p1 = paths.path1.get(m).copied().unwrap_or(0) as usize;
-        let p2 = paths.path2.get(m).copied().unwrap_or(0) as usize;
-        if p1 >= n_states || p2 >= n_states {
-            swap_bits.push(0);
-            swap_lr.push(1.0);
-            swap_probs.push(0.5);
-            swap_probs_conf.push(0.5);
-            continue;
-        }
-        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
-        let ref1 = ref_alleles[p1];
-        let ref2 = ref_alleles[p2];
-        let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-            * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-        let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-            * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-        let denom = keep + swap;
-        let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
-        let p_keep = 1.0 - p_swap;
-        let (max_p, min_p) = if p_swap >= p_keep {
-            (p_swap, p_keep)
-        } else {
-            (p_keep, p_swap)
-        };
-        let lr = if min_p < 1e-30 {
-            1e6
-        } else {
-            (max_p / min_p).min(1e6)
-        };
-        swap_bits.push((p_swap > 0.5) as u8);
-        swap_lr.push(lr);
-        swap_probs.push(p_swap.clamp(0.0, 1.0));
-        swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
-    }
-
-    (
-        swap_bits,
-        swap_lr,
-        swap_probs,
-        swap_probs_conf,
-        MosaicPaths {
-            path1: paths.path1.clone(),
-            path2: paths.path2.clone(),
-        },
-    )
-}
-
-fn find_best_constant_pair_phase_ibs(
-    n_markers: usize,
-    seq1: &[u8],
-    seq2: &[u8],
-    conf: &[f32],
-    p_no_err: f32,
-    p_err: f32,
-    phase_ibs: &BidirectionalPhaseIbs,
-    hap1_idx: u32,
-    hap2_idx: u32,
-) -> Option<(MosaicPaths, bool)> {
-    let n_haps = phase_ibs.n_haps();
-    if n_haps <= 2 || n_markers == 0 {
-        return None;
-    }
-    let candidates: Vec<u32> = (0..n_haps)
-        .map(|h| h as u32)
-        .filter(|&h| h != hap1_idx && h != hap2_idx)
-        .collect();
-    if candidates.len() < 2 {
-        return None;
-    }
-    if n_markers > 2000 {
-        return None;
-    }
-    let n_candidates = candidates.len();
-    let ops = (n_candidates as u128) * (n_candidates as u128) * (n_markers as u128);
-    if ops > 100_000_000 {
-        return None;
-    }
-
-    let mut scores = vec![0.0f32; n_candidates * n_candidates];
-    let mut alleles = vec![255u8; n_candidates];
-    let mut informative = 0usize;
-    for m in 0..n_markers {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            continue;
-        }
-        informative += 1;
-        let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
-        for (idx, &hap) in candidates.iter().enumerate() {
-            alleles[idx] = phase_ibs.allele(m, hap);
-        }
-        for i in 0..n_candidates {
-            let r1 = alleles[i];
-            for j in 0..i {
-                let r2 = alleles[j];
-                let prob = if is_het {
-                    let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
-                        * emit_prob(r2, a2, conf_m, p_no_err, p_err);
-                    let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
-                        * emit_prob(r2, a1, conf_m, p_no_err, p_err);
-                    0.5 * (keep + swap)
-                } else {
-                    let obs = if a1 != 255 { a1 } else { a2 };
-                    emit_prob(r1, obs, conf_m, p_no_err, p_err)
-                        * emit_prob(r2, obs, conf_m, p_no_err, p_err)
-                };
-                scores[i * n_candidates + j] += prob.max(1e-30).ln();
-            }
-        }
-    }
-    if informative == 0 {
-        return None;
-    }
-
-    let mut best_score = f32::NEG_INFINITY;
-    let mut best_pair = (0usize, 1usize);
-    for i in 0..n_candidates {
-        for j in 0..i {
-            let s = scores[i * n_candidates + j];
-            if s > best_score {
-                best_score = s;
-                best_pair = (i, j);
-            }
-        }
-    }
-
-    let hap1 = candidates[best_pair.0];
-    let hap2 = candidates[best_pair.1];
-    let path1 = vec![hap1; n_markers];
-    let path2 = vec![hap2; n_markers];
-    let mut perfect = true;
-    for m in 0..n_markers {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            continue;
-        }
-        let r1 = phase_ibs.allele(m, hap1);
-        let r2 = phase_ibs.allele(m, hap2);
-        if a1 == a2 {
-            let obs = if a1 != 255 { a1 } else { a2 };
-            if obs != 255 && (r1 != obs || r2 != obs) {
-                perfect = false;
-                break;
-            }
-        } else {
-            let matches = (r1 == a1 && r2 == a2) || (r1 == a2 && r2 == a1);
-            if !matches {
-                perfect = false;
-                break;
-            }
-        }
-    }
-    Some((MosaicPaths { path1, path2 }, perfect))
+    Some(MosaicPaths { path1, path2 })
 }
 
 fn calculate_log_prior(path1: &[u32], path2: &[u32], p_recomb: &[f32], n_states: usize) -> f64 {
@@ -9592,121 +8856,6 @@ fn calculate_log_prior(path1: &[u32], path2: &[u32], p_recomb: &[f32], n_states:
         }
     }
     log_p
-}
-
-fn find_unique_perfect_reference_pair<RefSpace>(
-    view: GenotypeView<'_, AnyMarkerSpace, RefSpace>,
-    seq1: &[u8],
-    seq2: &[u8],
-) -> Option<(u32, u32)> {
-    let n_target_haps = match view {
-        GenotypeView::Composite { n_target_haps, .. }
-        | GenotypeView::CompositeSubset { n_target_haps, .. } => n_target_haps,
-        _ => 0,
-    };
-    let n_haps = view.n_haps();
-    if n_target_haps == 0 || n_haps <= n_target_haps + 1 {
-        return None;
-    }
-    let n_ref_haps = n_haps - n_target_haps;
-    const MAX_REF_HAPS: usize = 512;
-    if n_ref_haps > MAX_REF_HAPS {
-        return None;
-    }
-    let mut found: Option<(u32, u32)> = None;
-    for h1 in 0..n_ref_haps {
-        let hap1 = HapIdx::new((n_target_haps + h1) as u32);
-        for h2 in (h1 + 1)..n_ref_haps {
-            let hap2 = HapIdx::new((n_target_haps + h2) as u32);
-            let mut ok = true;
-            for m in 0..seq1.len() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 && a2 == 255 {
-                    continue;
-                }
-                let r1 = view.allele(MarkerIdx::new(m as u32), hap1);
-                let r2 = view.allele(MarkerIdx::new(m as u32), hap2);
-                if a1 == 255 || a2 == 255 {
-                    let obs = if a1 != 255 { a1 } else { a2 };
-                    if r1 != obs || r2 != obs {
-                        ok = false;
-                        break;
-                    }
-                } else if a1 == a2 {
-                    if r1 != a1 || r2 != a1 {
-                        ok = false;
-                        break;
-                    }
-                } else {
-                    let match_direct = r1 == a1 && r2 == a2;
-                    let match_swap = r1 == a2 && r2 == a1;
-                    if !match_direct && !match_swap {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                let pair = (hap1.0, hap2.0);
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(pair);
-            }
-        }
-    }
-    found
-}
-
-fn derive_swap_bits_from_reference_pair<RefSpace>(
-    view: GenotypeView<'_, AnyMarkerSpace, RefSpace>,
-    seq1: &[u8],
-    seq2: &[u8],
-    hap1: u32,
-    hap2: u32,
-    het_positions: &[usize],
-) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let mut swap_bits = Vec::with_capacity(het_positions.len());
-    let mut swap_lr = Vec::with_capacity(het_positions.len());
-    let mut swap_probs = Vec::with_capacity(het_positions.len());
-    let mut swap_probs_conf = Vec::with_capacity(het_positions.len());
-    let hap1 = HapIdx::new(hap1);
-    let hap2 = HapIdx::new(hap2);
-
-    for &m in het_positions {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        if a1 == 255 || a2 == 255 || a1 == a2 {
-            swap_bits.push(0);
-            swap_lr.push(1.0);
-            swap_probs.push(0.5);
-            swap_probs_conf.push(0.5);
-            continue;
-        }
-        let r1 = view.allele(MarkerIdx::new(m as u32), hap1);
-        let r2 = view.allele(MarkerIdx::new(m as u32), hap2);
-        let match_direct = r1 == a1 && r2 == a2;
-        let match_swap = r1 == a2 && r2 == a1;
-        let p_swap = if match_swap && !match_direct {
-            1.0
-        } else if match_direct && !match_swap {
-            0.0
-        } else {
-            0.5
-        };
-        let lr = if p_swap == 0.0 || p_swap == 1.0 {
-            1e6
-        } else {
-            1.0
-        };
-        swap_bits.push((p_swap > 0.5) as u8);
-        swap_lr.push(lr);
-        swap_probs.push(p_swap);
-        swap_probs_conf.push(p_swap);
-    }
-
-    (swap_bits, swap_lr, swap_probs, swap_probs_conf)
 }
 
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
@@ -9779,7 +8928,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // 1. Heuristic initialization (always try this)
     // We pass None for hint to avoid biasing the heuristic towards potentially local-optima
     // found by the beam search, especially in small windows where aliases exist.
-    let constant_pair = find_best_constant_pair_with_buffer(
+    let mut heuristic_paths = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
         seq1,
@@ -9791,21 +8940,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         &mut workspace.scores,
         None,
     );
-    if let Some(best) = constant_pair.as_ref() {
-        if best.is_unique_perfect() {
-            return derive_swap_bits_from_constant_pair(
-                seq1,
-                seq2,
-                conf,
-                p_no_err,
-                p_err,
-                &mut ref_provider,
-                &best.paths,
-                het_positions,
-            );
-        }
-    }
-    let mut heuristic_paths = constant_pair.as_ref().map(|best| best.paths.clone());
 
     // Align heuristic orientation to anchors if present
     if has_anchor {
@@ -9846,7 +8980,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
     }
-    let heuristic_paths_fallback = heuristic_paths.clone();
 
     // 2. Collect candidates
     let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(3);
@@ -9974,7 +9107,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         const PAR_CHAINS: usize = 4;
         let ref_view = ref_provider.ref_gt;
         let threaded_haps = ref_provider.threaded_haps;
-        let offset = ref_provider.offset;
 
         let alloc_like = |tmpl: &MosaicBuffers| -> MosaicBuffers {
             MosaicBuffers {
@@ -10020,7 +9152,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let first_buf = buffers_iter.next().unwrap();
 
         let seed_i = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+        let provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let mut chain = MosaicChain::new_with_buffers(
             seed_i,
             n_markers,
@@ -10056,7 +9188,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         for (idx, buf) in buffers_iter.enumerate() {
             let seed_i = seed.wrapping_add(((idx + 1) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+            let provider = RefAlleleProvider::new(ref_view, threaded_haps);
             let mut chain = MosaicChain::new_with_buffers(
                 seed_i,
                 n_markers,
@@ -10314,7 +9446,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     let ref_view = ref_provider.ref_gt;
     let threaded_haps = ref_provider.threaded_haps;
-    let offset = ref_provider.offset;
 
     let mut buffers = MosaicBuffers {
         n_states,
@@ -10375,7 +9506,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let mut local_seq1 = seq1.to_vec();
             let mut local_seq2 = seq2.to_vec();
             if let Some(paths) = init {
-                let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
                 let mut ref_alleles = vec![255u8; n_states_usize];
                 let ref_flat = shared_ref;
 
@@ -10404,7 +9535,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
             }
 
-            let my_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+            let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
             let (_, _, _, _, _, buf, score) = run_chain(
                 chain_seed,
                 init.as_ref(),
@@ -10436,7 +9567,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     let mut local_seq1_f = seq1.to_vec();
                     let mut local_seq2_f = seq2.to_vec();
 
-                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
                     let mut ref_alleles = vec![255u8; n_states_usize];
                     let ref_flat = shared_ref;
                     for m in 0..n_markers {
@@ -10465,7 +9596,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                     let chain_seed_flip =
                         seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
-                    let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                    let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
                     let (_, _, _, _, _, buf_f, score_f) = run_chain(
                         chain_seed_flip,
                         flipped_paths.as_ref(),
@@ -10519,7 +9650,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         if let Some(paths) = init {
             // Reconstruct provider for alignment check (cheap, just referencing view)
-            let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+            let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
             let mut ref_alleles = vec![255u8; n_states_usize];
             let ref_flat = shared_ref;
 
@@ -10554,7 +9685,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        let my_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+        let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let (mut agg_sc, agg_oc, mut best_sc, best_oc, paths, buf, score) = run_chain(
             chain_seed,
             init.as_ref(),
@@ -10623,7 +9754,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let paths_f_ref = flipped_paths.as_ref().unwrap();
 
                 {
-                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
                     let mut ref_alleles = vec![255u8; n_states_usize];
                     let ref_flat = shared_ref;
                     for m in 0..n_markers {
@@ -10654,7 +9785,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                 let chain_seed_flip =
                     seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
-                let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
                 let (mut agg_sc_f, agg_oc_f, mut best_sc_f, best_oc_f, paths_f, buf_f, score_f) =
                     run_chain(
                         chain_seed_flip,
@@ -10781,145 +9912,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 best_obs_mean
             );
         }
-
-        let fallback_candidate = if heuristic_paths_fallback.is_some() {
-            heuristic_paths_fallback.clone()
-        } else {
-            let mut scores = Vec::new();
-            let mut fallback_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
-            find_best_constant_pair_with_buffer(
-                n_markers,
-                n_states_usize,
-                seq1,
-                seq2,
-                conf,
-                p_no_err,
-                p_err,
-                &mut fallback_provider,
-                &mut scores,
-                None,
-            )
-        };
-
-        if let Some(fallback_paths) = fallback_candidate.as_ref() {
-            let paths_have_len =
-                fallback_paths.path1.len() == n_markers && fallback_paths.path2.len() == n_markers;
-            let paths_have_states = paths_have_len
-                && fallback_paths
-                    .path1
-                    .iter()
-                    .all(|&p| (p as usize) < n_states_usize)
-                && fallback_paths
-                    .path2
-                    .iter()
-                    .all(|&p| (p as usize) < n_states_usize);
-
-            if paths_have_states {
-                let mut fallback_switches1 = 0usize;
-                let mut fallback_switches2 = 0usize;
-                for m in 1..fallback_paths.path1.len() {
-                    if fallback_paths.path1[m] != fallback_paths.path1[m - 1] {
-                        fallback_switches1 += 1;
-                    }
-                    if fallback_paths.path2[m] != fallback_paths.path2[m - 1] {
-                        fallback_switches2 += 1;
-                    }
-                }
-
-                let mut fallback_ll = 0.0f64;
-                let mut match_count = 0usize;
-                let mut match_total = 0usize;
-                if !shared_ref.is_empty() {
-                    for m in 0..n_markers {
-                        let a1 = seq1[m];
-                        let a2 = seq2[m];
-                        if a1 == 255 || a2 == 255 {
-                            continue;
-                        }
-                        let p1 = fallback_paths.path1[m] as usize;
-                        let p2 = fallback_paths.path2[m] as usize;
-                        if p1 >= n_states_usize || p2 >= n_states_usize {
-                            continue;
-                        }
-                        let offset = m * n_states_usize;
-                        let ref_row = &shared_ref[offset..offset + n_states_usize];
-                        let ref1 = ref_row[p1];
-                        let ref2 = ref_row[p2];
-                        let conf_m = conf[m];
-                        match_total += 1;
-                        if (ref1 == a1 && ref2 == a2) || (ref1 == a2 && ref2 == a1) {
-                            match_count += 1;
-                        }
-                        let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                            * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-                        let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                            * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-                        let p_sum = (keep + swap).max(1e-30);
-                        fallback_ll += (p_sum as f64).ln();
-                    }
-                } else {
-                    let mut fallback_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
-                    let mut ref_alleles = vec![255u8; n_states_usize];
-                    for m in 0..n_markers {
-                        let a1 = seq1[m];
-                        let a2 = seq2[m];
-                        if a1 == 255 || a2 == 255 {
-                            continue;
-                        }
-                        let p1 = fallback_paths.path1[m] as usize;
-                        let p2 = fallback_paths.path2[m] as usize;
-                        if p1 >= n_states_usize || p2 >= n_states_usize {
-                            continue;
-                        }
-                        fallback_provider.fill_ref_alleles(m, &mut ref_alleles);
-                        let ref1 = ref_alleles[p1];
-                        let ref2 = ref_alleles[p2];
-                        let conf_m = conf[m];
-                        match_total += 1;
-                        if (ref1 == a1 && ref2 == a2) || (ref1 == a2 && ref2 == a1) {
-                            match_count += 1;
-                        }
-                        let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                            * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-                        let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                            * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-                        let p_sum = (keep + swap).max(1e-30);
-                        fallback_ll += (p_sum as f64).ln();
-                    }
-                }
-                let fallback_prior = calculate_log_prior(
-                    &fallback_paths.path1,
-                    &fallback_paths.path2,
-                    p_recomb,
-                    n_states_usize,
-                );
-                let fallback_score = fallback_ll + fallback_prior;
-                let score_tolerance = n_markers as f64 * 0.01;
-                let improves_switching =
-                    (fallback_switches1 + fallback_switches2) < (switches1 + switches2);
-                let acceptable_score = fallback_score + score_tolerance >= best_score;
-                let match_rate = if match_total > 0 {
-                    match_count as f32 / match_total as f32
-                } else {
-                    0.0
-                };
-                let strong_match = match_rate >= 0.98;
-                if !has_anchor && improves_switching && (strong_match || acceptable_score) {
-                    new_paths = fallback_paths.clone();
-                    eprintln!(
-                        "[mosaic static path fallback] seed={} switches=({},{}) -> ({},{}) score={:.3} fallback_score={:.3} match_rate={:.3}",
-                        seed,
-                        switches1,
-                        switches2,
-                        fallback_switches1,
-                        fallback_switches2,
-                        best_score,
-                        fallback_score,
-                        match_rate
-                    );
-                }
-            }
-        }
     }
 
     // Derive swap emissions from the sampled haplotype paths and run the label
@@ -10935,9 +9927,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         && new_paths.path1.len() == n_markers
         && new_paths.path2.len() == n_markers
     {
-        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
-        let ref_alleles = buffers.ref_alleles.as_mut_slice();
-        let ref_alleles_flat = shared_ref;
         // Align seq1/seq2 to anchors with a single global flip to avoid
         // per-marker label noise when anchors are sparse.
         let mut flip_to_anchor = false;
@@ -10979,43 +9968,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
             if evidence > 0 && score_flip > score_direct {
                 flip_to_anchor = true;
             }
-        } else {
-            let mut score_direct = 0.0f32;
-            let mut score_flip = 0.0f32;
-            let mut evidence = 0usize;
-            for m in 0..n_markers {
-                let s1 = seq1[m];
-                let s2 = seq2[m];
-                if s1 == 255 || s2 == 255 || s1 == s2 {
-                    continue;
-                }
-                let p1 = new_paths.path1.get(m).copied().unwrap_or(0) as usize;
-                let p2 = new_paths.path2.get(m).copied().unwrap_or(0) as usize;
-                if p1 >= n_states_usize || p2 >= n_states_usize {
-                    continue;
-                }
-                let ref_row = if !ref_alleles_flat.is_empty() {
-                    let offset = m * n_states_usize;
-                    &ref_alleles_flat[offset..offset + n_states_usize]
-                } else {
-                    path_provider.fill_ref_alleles(m, ref_alleles);
-                    &ref_alleles[..n_states_usize]
-                };
-                let ref1 = ref_row[p1];
-                let ref2 = ref_row[p2];
-                let conf_m = conf[m].clamp(0.0, 1.0);
-                let keep = emit_prob(ref1, s1, conf_m, p_no_err, p_err)
-                    * emit_prob(ref2, s2, conf_m, p_no_err, p_err);
-                let swap = emit_prob(ref1, s2, conf_m, p_no_err, p_err)
-                    * emit_prob(ref2, s1, conf_m, p_no_err, p_err);
-                score_direct += keep.max(1e-30).ln();
-                score_flip += swap.max(1e-30).ln();
-                evidence += 1;
-            }
-            if evidence > 0 && score_flip > score_direct {
-                flip_to_anchor = true;
-            }
         }
+        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
+        let ref_alleles = buffers.ref_alleles.as_mut_slice();
+        let ref_alleles_flat = shared_ref;
         p_min = 1.0;
         p_max = 0.0;
         for (i, &m) in het_positions.iter().enumerate() {
@@ -11082,17 +10038,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         for i in 1..pre_bits.len() {
             if pre_bits[i] != pre_bits[i - 1] {
                 pre_transitions += 1;
-            }
-        }
-
-        let suspicious_emission = !has_anchor
-            && pre_probs.len() >= 8
-            && pre_mid == 0
-            && pre_transitions * 3 > pre_probs.len();
-        if suspicious_emission {
-            for i in 0..swap_probs.len() {
-                swap_probs[i] = 0.5;
-                swap_lr[i] = 1.0;
             }
         }
 
@@ -11173,6 +10118,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     post_transitions += 1;
                 }
             }
+            let suspicious_emission = !has_anchor
+                && pre_probs.len() >= 8
+                && pre_mid == 0
+                && pre_transitions * 3 > pre_probs.len();
             if !has_anchor && pre_probs.len() >= 20 {
                 let preview_len = pre_probs.len().min(12);
                 eprintln!(
@@ -11186,35 +10135,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     &pre_probs[..preview_len],
                     &pre_bits[..preview_len],
                     &swap_bits[..preview_len]
-                );
-            }
-        }
-    }
-
-    if swap_bits.len() >= 8 {
-        let mut post_transitions = 0usize;
-        for i in 1..swap_bits.len() {
-            if swap_bits[i] != swap_bits[i - 1] {
-                post_transitions += 1;
-            }
-        }
-        if post_transitions * 3 > swap_bits.len() {
-            let mean_swap = if swap_probs.is_empty() {
-                0.5
-            } else {
-                swap_probs.iter().sum::<f32>() / swap_probs.len() as f32
-            };
-            if (mean_swap - 0.5).abs() < 0.1 {
-                let forced = if mean_swap > 0.5 { 1 } else { 0 };
-                swap_bits.fill(forced);
-                swap_lr.fill(1.0);
-                eprintln!(
-                    "[mosaic swap stabilization] seed={} hets={} transitions={} mean_swap={:.3} forced={}",
-                    seed,
-                    swap_bits.len(),
-                    post_transitions,
-                    mean_swap,
-                    forced
                 );
             }
         }
@@ -12429,7 +11349,7 @@ mod tests {
         let p_no_err = 0.999;
         let p_err = 1.0 - p_no_err;
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(8, 0);
-        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th, 0);
+        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th);
 
         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_swap_bits_mosaic(
             n_markers,
@@ -13189,14 +12109,14 @@ mod tests {
             threaded.push_new(CombinedHapId::new(h as u32));
         }
         let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
-            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded, 0);
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
 
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
         let conf = vec![1.0; n_markers];
 
         let mut scores = Vec::new();
-        let best = find_best_constant_pair_with_buffer(
+        let paths = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
@@ -13209,7 +12129,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let paths = &best.paths;
 
         // Best pair should be (0, 1) or (1, 0) - Score 3.
         // Or (2, 3) / (3, 2).
