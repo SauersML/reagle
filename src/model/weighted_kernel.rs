@@ -12,6 +12,36 @@ use std::arch::x86_64::*;
 /// HMM Updater that weights transitions by pattern counts
 pub struct WeightedHmmUpdater;
 
+#[derive(Clone, Copy)]
+pub struct PatternCounts<'a>(&'a [f32]);
+
+impl<'a> PatternCounts<'a> {
+    #[inline]
+    pub fn new(values: &'a [f32]) -> Self {
+        Self(values)
+    }
+
+    #[inline]
+    fn as_slice(self) -> &'a [f32] {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct EmissionProbs<'a>(&'a [f32]);
+
+impl<'a> EmissionProbs<'a> {
+    #[inline]
+    pub fn new(values: &'a [f32]) -> Self {
+        Self(values)
+    }
+
+    #[inline]
+    fn as_slice(self) -> &'a [f32] {
+        self.0
+    }
+}
+
 impl WeightedHmmUpdater {
     #[inline(always)]
     fn sanitize_count(c: f32) -> f32 {
@@ -185,10 +215,12 @@ impl WeightedHmmUpdater {
         fwd_sum: f32,
         recomb_rate: f32,
         n_ref_haps: usize,
-        pattern_counts: &[f32],
-        emissions: &[f32],
+        pattern_counts: PatternCounts<'_>,
+        emissions: EmissionProbs<'_>,
         n_patterns: usize,
     ) -> f32 {
+        let pattern_counts = pattern_counts.as_slice();
+        let emissions = emissions.as_slice();
         let (active_haps, has_invalid_counts) = Self::count_stats(pattern_counts, n_patterns);
         let (scale, base_shift) =
             Self::conditioned_transition_params(recomb_rate, n_ref_haps, active_haps, fwd_sum);
@@ -315,8 +347,8 @@ mod tests {
             fwd_sum,
             recomb_rate,
             n_ref_haps,
-            &pattern_counts,
-            &emissions,
+            PatternCounts::new(&pattern_counts),
+            EmissionProbs::new(&emissions),
             n_patterns,
         );
 
@@ -380,8 +412,8 @@ mod tests {
             fwd_sum,
             recomb_rate,
             n_ref_haps,
-            &pattern_counts,
-            &emissions,
+            PatternCounts::new(&pattern_counts),
+            EmissionProbs::new(&emissions),
             n_patterns,
         );
 

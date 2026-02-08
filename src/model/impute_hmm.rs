@@ -10,7 +10,7 @@ use crate::data::storage::{
 };
 use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
-use crate::model::weighted_kernel::WeightedHmmUpdater;
+use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1051,8 +1051,8 @@ fn forward_update_impl<C: RefColumnLike>(
                     1.0,
                     recomb_rate,
                     transition_haps,
-                    &ws.weights,
-                    &ws.emissions,
+                    PatternCounts::new(&ws.weights[..active_states]),
+                    EmissionProbs::new(&ws.emissions[..active_states]),
                     active_states,
                 )
             } else {
@@ -1067,8 +1067,8 @@ fn forward_update_impl<C: RefColumnLike>(
                 1.0,
                 recomb_rate,
                 transition_haps,
-                &ws.weights,
-                &ws.emissions,
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
         }
@@ -1133,8 +1133,8 @@ fn forward_update_seqcoded(
                     1.0,
                     recomb_rate,
                     transition_haps,
-                    &ws.weights,
-                    &ws.emissions,
+                    PatternCounts::new(&ws.weights[..active_states]),
+                    EmissionProbs::new(&ws.emissions[..active_states]),
                     active_states,
                 )
             } else {
@@ -1149,8 +1149,8 @@ fn forward_update_seqcoded(
                 1.0,
                 recomb_rate,
                 transition_haps,
-                &ws.weights,
-                &ws.emissions,
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
         }
@@ -1220,8 +1220,8 @@ fn forward_update_dict(
                     1.0,
                     recomb_rate,
                     transition_haps,
-                    &ws.weights,
-                    &ws.emissions,
+                    PatternCounts::new(&ws.weights[..active_states]),
+                    EmissionProbs::new(&ws.emissions[..active_states]),
                     active_states,
                 )
             } else {
@@ -1236,8 +1236,8 @@ fn forward_update_dict(
                 1.0,
                 recomb_rate,
                 transition_haps,
-                &ws.weights,
-                &ws.emissions,
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
         }
