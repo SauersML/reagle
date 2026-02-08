@@ -843,7 +843,7 @@ fn smooth_allele_posteriors_subset(
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
-    const SMOOTHING_GAIN: f32 = 2.0;
+    const SMOOTHING_GAIN: f32 = 8.0;
     if allele_probs.is_empty() {
         return;
     }

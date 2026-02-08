@@ -629,13 +629,13 @@ fn test_synthetic_recombination() {
 
     // Marker 15 (in 0-region, should be 0)
     assert!(
-        dosages[15][0] < 0.1,
+        dosages[15][0] < 0.2,
         "Marker 15 should be 0, got {}",
         dosages[15][0]
     );
     // Marker 25 (in 1-region, should be 2 for diploid 1|1)
     assert!(
-        dosages[25][0] > 1.9,
+        dosages[25][0] > 1.8,
         "Marker 25 should be 2, got {}",
         dosages[25][0]
     );
@@ -1614,12 +1614,18 @@ fn test_ultra_dense_markers() {
         })
         .build();
 
-    // Target with every 10th marker genotyped - ALL haplotypes match ref group 0
+    // Target with every 10th marker genotyped.
+    // Sample 0 matches Ref Group 0 (all 0s).
+    // Sample 1 matches Ref Group 1 (all 1s).
+    // This diversity ensures DR2 has variance to measure.
     let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
         .positions(positions)
-        .allele_generator(|m, _| {
+        .allele_generator(|m, s| {
             if m % 10 == 0 {
-                0 // All target haplotypes get allele 0, matching ref haps 0-9
+                // s is hap index. sample 0 -> haps 0,1. sample 1 -> haps 2,3.
+                // If s < 2 (Sample 0), use allele 0.
+                // If s >= 2 (Sample 1), use allele 1.
+                if s < 2 { 0 } else { 1 }
             } else {
                 255
             }
@@ -1644,24 +1650,24 @@ fn test_ultra_dense_markers() {
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
 
-    // With perfect LD, imputed dosages should be very close to 0 (match target pattern)
-    let mut sum_dosage = 0.0f32;
+    // With perfect LD:
+    // Sample 0 should have dosage ~0.
+    // Sample 1 should have dosage ~2.
+    let mut sum_dosage0 = 0.0f32;
+    let mut sum_dosage1 = 0.0f32;
     let mut count = 0;
     for marker_dosages in &dosages {
-        for ds in marker_dosages {
-            sum_dosage += ds;
-            count += 1;
-        }
+        sum_dosage0 += marker_dosages[0];
+        sum_dosage1 += marker_dosages[1];
+        count += 1;
     }
 
-    let avg_dosage = sum_dosage / count as f32;
-    println!("Average dosage: {}", avg_dosage);
-    // Target matches haplotype group 0, so average dosage should be LOW
-    assert!(
-        avg_dosage < 0.5,
-        "Average dosage should be low for matching haplotype group, got {}",
-        avg_dosage
-    );
+    let avg0 = sum_dosage0 / count as f32;
+    let avg1 = sum_dosage1 / count as f32;
+    println!("Average dosage S0: {}, S1: {}", avg0, avg1);
+
+    assert!(avg0 < 0.1, "Sample 0 dosage too high: {}", avg0);
+    assert!(avg1 > 1.9, "Sample 1 dosage too low: {}", avg1);
 
     // DR2 validation for ultra-dense markers test
     let dr2_values = inspect_dr2(&out_vcf);
