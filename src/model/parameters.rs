@@ -94,6 +94,24 @@ impl ModelParams {
         }
     }
 
+    /// Create parameters for imputation.
+    ///
+    /// Uses Li-Stephens recombination intensity based on the reference
+    /// haplotype count only (copying states), not target+reference.
+    pub fn for_imputation(n_ref_haps: usize, ne: f32, err: Option<f32>) -> Self {
+        let recomb_intensity = (0.04 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps));
+        Self {
+            p_mismatch,
+            recomb_intensity,
+            n_states: Self::DEFAULT_PHASE_STATES.min(n_ref_haps.saturating_sub(2)),
+            burnin: Self::DEFAULT_BURNIN,
+            iterations: Self::DEFAULT_ITERATIONS,
+            lr_threshold: f32::INFINITY,
+            initial_lr: Self::DEFAULT_INITIAL_LR,
+        }
+    }
+
     /// Li-Stephens approximation for allele mismatch probability
     ///
     /// From Java `Par.liStephensPMismatch`:

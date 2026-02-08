@@ -249,16 +249,25 @@ pub struct RefAlleleFreqs {
 impl RefAlleleFreqs {
     pub fn new(ref_columns: &[GenotypeColumn]) -> Self {
         let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
-        Self {
-            n_ref_haps,
-        }
+        Self { n_ref_haps }
     }
 
     #[inline]
     pub fn n_ref_haps(&self) -> usize {
         self.n_ref_haps
     }
+}
 
+#[derive(Clone, Copy)]
+struct NormalizedAlleleProbs<'a> {
+    probs: &'a [f32],
+}
+
+impl<'a> NormalizedAlleleProbs<'a> {
+    #[inline]
+    fn as_slice(self) -> &'a [f32] {
+        self.probs
+    }
 }
 
 impl ImputeWorkspace {
@@ -783,16 +792,16 @@ fn compute_nearest_observed_lambda(
 #[inline]
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
-    subset_prior_probs: &[f32],
+    subset_prior_probs: NormalizedAlleleProbs<'_>,
     nearest_obs_lambda: f32,
-    total_mass: f32,
-    state_prob_sq_sum: f32,
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
-    if allele_probs.is_empty() || total_mass <= 0.0 || state_prob_sq_sum <= 0.0 {
+    const MIN_SMOOTH_LAMBDA: f32 = 0.02;
+    if allele_probs.is_empty() {
         return;
     }
+    let subset_prior_probs = subset_prior_probs.as_slice();
     if subset_prior_probs.len() != allele_probs.len() {
         return;
     }
@@ -802,13 +811,26 @@ fn smooth_allele_posteriors_subset(
     if !untyped_uniform_marker {
         return;
     }
+    if nearest_obs_lambda <= MIN_SMOOTH_LAMBDA {
+        return;
+    }
 
     // Bayesian shrinkage based on genetic-distance information decay.
-    // When far from observed markers, local copy evidence should carry less
-    // confidence and panel prior should carry more.
-    let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(2.0);
+    // Use allele-level effective support (not state-level support), because many
+    // equivalent states can represent the same allele without increasing allele
+    // uncertainty at a marker.
+    let mut allele_sq_sum = 0.0f32;
+    for &p in allele_probs.iter() {
+        let q = p.max(0.0);
+        allele_sq_sum += q * q;
+    }
+    if allele_sq_sum <= 0.0 {
+        return;
+    }
+    let max_effective = allele_probs.len().max(1) as f32;
+    let effective_alleles = (1.0 / allele_sq_sum).clamp(1.0, max_effective);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
-    let prior_mass = (effective_states * (1.0 - retain) / retain).max(0.0);
+    let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
@@ -849,7 +871,7 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
 fn normalized_allele_prior<'a>(
     out: &'a mut Vec<f32>,
     target_probs: &[f32],
-) -> &'a [f32] {
+) -> NormalizedAlleleProbs<'a> {
     let n = target_probs.len();
     if out.len() < n {
         out.resize(n, 0.0);
@@ -867,13 +889,13 @@ fn normalized_allele_prior<'a>(
     if sum <= 0.0 {
         let uniform = 1.0 / n.max(1) as f32;
         prior.fill(uniform);
-        return prior;
+        return NormalizedAlleleProbs { probs: prior };
     }
     let inv = 1.0 / sum;
     for p in prior.iter_mut() {
         *p *= inv;
     }
-    prior
+    NormalizedAlleleProbs { probs: prior }
 }
 
 #[inline]
@@ -1378,12 +1400,10 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                             subset_counts.fill(0.0);
                             let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
-                            let mut sq_sum = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
-                                sq_sum += state_prob * state_prob;
                                 let ref_allele = ref_alleles.get(i);
                                 if ref_allele == 255 {
                                     missing_mass += state_prob;
@@ -1403,7 +1423,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                         probs,
                                     );
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                        *p += missing_mass * prior[i];
+                                        *p += missing_mass * prior.as_slice()[i];
                                     }
                                 }
                                 for p in ws.allele_probs.iter_mut() {
@@ -1418,17 +1438,15 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     // TargetAlleleProbs) as the smoothing prior instead
                                     // of subset AF, so that abyss haplotypes' allele
                                     // distribution is properly represented.
-                                    let prior_counts = &mut ws.subset_counts[..n_alleles];
-                                    for idx in 0..n_alleles {
-                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
-                                            * active_states as f32;
-                                    }
+                                    let prior_probs =
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        prior_counts,
-                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(f32::INFINITY),
-                                        total,
-                                        sq_sum,
+                                        prior_probs,
+                                        ws.nearest_obs_lambda
+                                            .get(m_rev)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
                                     );
                                 }
@@ -1688,12 +1706,10 @@ fn run_impute_hmm_seqcoded(
                             subset_counts.fill(0.0);
                             let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
-                            let mut sq_sum = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
-                                sq_sum += state_prob * state_prob;
                                 let ref_allele = seq_patterns.allele_for_state(i);
                                 if ref_allele == 255 {
                                     missing_mass += state_prob;
@@ -1713,7 +1729,7 @@ fn run_impute_hmm_seqcoded(
                                         probs,
                                     );
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                        *p += missing_mass * prior[i];
+                                        *p += missing_mass * prior.as_slice()[i];
                                     }
                                 }
                                 for p in ws.allele_probs.iter_mut() {
@@ -1724,17 +1740,15 @@ fn run_impute_hmm_seqcoded(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
-                                    let prior_counts = &mut ws.subset_counts[..n_alleles];
-                                    for idx in 0..n_alleles {
-                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
-                                            * active_states as f32;
-                                    }
+                                    let prior_probs =
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        prior_counts,
-                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(f32::INFINITY),
-                                        total,
-                                        sq_sum,
+                                        prior_probs,
+                                        ws.nearest_obs_lambda
+                                            .get(m_rev)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
                                     );
                                 }
@@ -1992,12 +2006,10 @@ fn run_impute_hmm_dict(
                             subset_counts.fill(0.0);
                             let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
-                            let mut sq_sum = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
-                                sq_sum += state_prob * state_prob;
                                 let ref_allele = dict_patterns.allele_for_state(i);
                                 if ref_allele == 255 {
                                     missing_mass += state_prob;
@@ -2017,7 +2029,7 @@ fn run_impute_hmm_dict(
                                         probs,
                                     );
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                        *p += missing_mass * prior[i];
+                                        *p += missing_mass * prior.as_slice()[i];
                                     }
                                 }
                                 for p in ws.allele_probs.iter_mut() {
@@ -2032,17 +2044,15 @@ fn run_impute_hmm_dict(
                                     // TargetAlleleProbs) as the smoothing prior instead
                                     // of subset AF, so that abyss haplotypes' allele
                                     // distribution is properly represented.
-                                    let prior_counts = &mut ws.subset_counts[..n_alleles];
-                                    for idx in 0..n_alleles {
-                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
-                                            * active_states as f32;
-                                    }
+                                    let prior_probs =
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        prior_counts,
-                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(f32::INFINITY),
-                                        total,
-                                        sq_sum,
+                                        prior_probs,
+                                        ws.nearest_obs_lambda
+                                            .get(m_rev)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
                                     );
                                 }

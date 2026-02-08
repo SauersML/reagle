@@ -128,6 +128,41 @@ fn estimate_per_state_bytes(window_markers: usize) -> usize {
     16usize.saturating_add(window_markers.saturating_mul(5))
 }
 
+#[inline]
+fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f32) -> f32 {
+    let mut residual_sum = 0.0f32;
+    let mut informative_obs = 0usize;
+    for m in 0..input_probs.n_markers() {
+        if !input_probs.is_observed_marker(m) || input_probs.is_uniform_marker(m) {
+            continue;
+        }
+        let probs = input_probs.probs_for_marker(m);
+        if probs.is_empty() {
+            continue;
+        }
+        let mut max_prob = 0.0f32;
+        let mut any_finite = false;
+        for &p in probs {
+            if p.is_finite() {
+                any_finite = true;
+                if p > max_prob {
+                    max_prob = p;
+                }
+            }
+        }
+        if !any_finite {
+            continue;
+        }
+        residual_sum += (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
+        informative_obs += 1;
+    }
+    if informative_obs == 0 {
+        return base_error_rate.clamp(1e-6, 0.5);
+    }
+    let empirical_error = (residual_sum / informative_obs as f32).clamp(1e-6, 0.5);
+    base_error_rate.min(empirical_error).clamp(1e-6, 0.5)
+}
+
 #[derive(Clone, Debug)]
 struct ImputationPlan {
     n_ref_haps: usize,
@@ -321,8 +356,8 @@ fn estimate_scan_batch_size(
         acc.saturating_add(top_m)
     });
     // `Vec<Vec<(usize, f32)>>` header bytes per window for one hap entry.
-    let vec_header_bytes =
-        (per_window_caps.len() as u64).saturating_mul(std::mem::size_of::<Vec<(usize, f32)>>() as u64);
+    let vec_header_bytes = (per_window_caps.len() as u64)
+        .saturating_mul(std::mem::size_of::<Vec<(usize, f32)>>() as u64);
     let per_hap_bytes = dense_per_hap_bytes
         .saturating_add(sparse_pairs_per_hap.saturating_mul(pair_bytes))
         .saturating_add(vec_header_bytes);
@@ -1423,12 +1458,8 @@ fn build_imputation_plan(
             prescan_avail / (1024 * 1024)
         );
     }
-    let batch_size = estimate_scan_batch_size(
-        prescan_avail,
-        n_ref_haps,
-        n_target_haps,
-        &per_window_caps,
-    );
+    let batch_size =
+        estimate_scan_batch_size(prescan_avail, n_ref_haps, n_target_haps, &per_window_caps);
     let mut batch_start = 0usize;
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();
@@ -2335,8 +2366,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
-        // NOTE: imputation uses its own mismatch prior; we do not carry phasing error rates.
-        let mut phased_recomb_intensity: Option<f32> = None;
+        // NOTE: imputation uses its own mismatch/recombination priors.
         if !is_vcf_fully_phased(&phased_target_path)? {
             eprintln!("Target is unphased; running phasing before pre-scan...");
             let phased_prefix = if self.config.out.as_os_str() != "-" {
@@ -2361,7 +2391,6 @@ impl crate::pipelines::ImputationPipeline {
                 self.telemetry.clone(),
             );
             phasing.run()?;
-            phased_recomb_intensity = Some(phasing.params().recomb_intensity);
             phased_target_path = phased_prefix.with_extension("vcf.gz");
             if phased_tmp.is_none() {
                 eprintln!("Phased target saved at {:?}", phased_target_path);
@@ -2519,31 +2548,18 @@ impl crate::pipelines::ImputationPipeline {
         // Imputation HMM copies from the reference panel; align LS parameters
         // to the donor pool size (reference haplotypes), not target+reference.
         let n_ref_pool = plan.n_ref_haps.max(1);
-        self.params = crate::model::parameters::ModelParams::for_phasing(
+        self.params = crate::model::parameters::ModelParams::for_imputation(
             n_ref_pool,
             self.config.ne,
             self.config.err,
         );
-        let mut impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
-        if let Some(phased_rho) = phased_recomb_intensity {
-            if phased_rho.is_finite() && phased_rho > 0.0 {
-                impute_recomb_intensity = phased_rho.clamp(1e-6, ModelParams::MAX_RECOMB_INTENSITY);
-            }
-        }
         self.params.recomb_intensity = impute_recomb_intensity;
         eprintln!(
-            "Imputation recomb_intensity: {:.6} (source={})",
+            "Imputation recomb_intensity: {:.6} (source=config-ne)",
             self.params.recomb_intensity,
-            if phased_recomb_intensity
-                .map(|v| v.is_finite() && v > 0.0)
-                .unwrap_or(false)
-            {
-                "phasing-estimated"
-            } else {
-                "config-ne"
-            }
         );
         // Do not inherit phasing mismatch estimates for imputation. Imputation
         // should use the Li-Stephens mismatch prior (or user override) tied to
@@ -2608,10 +2624,28 @@ impl crate::pipelines::ImputationPipeline {
                         window_idx += 1;
                         continue;
                     };
-                    let target_window_pl = if let Some(reader_pl) = target_reader_pl.as_mut() {
-                        reader_pl.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                    let target_window_source = if use_phased_for_impute {
+                        let reader_pl = target_reader_pl.as_mut().ok_or_else(|| {
+                            ReagleError::vcf(
+                                "Internal error: missing original target reader for imputation"
+                                    .to_string(),
+                            )
+                        })?;
+                        match reader_pl.load_window_for_region(
+                            &chrom_candidates,
+                            start_pos,
+                            end_pos,
+                        )? {
+                            Some(window) => window,
+                            None => {
+                                return Err(ReagleError::vcf(format!(
+                                    "Original target window missing while phased window exists: chrom={} start={} end={}",
+                                    ref_chrom, start_pos, end_pos
+                                )));
+                            }
+                        }
                     } else {
-                        None
+                        target_window.clone()
                     };
 
                     // Align using the phased target markers; PL/GL lookups share the same
@@ -2622,10 +2656,9 @@ impl crate::pipelines::ImputationPipeline {
                     );
 
                     let phased_target = target_window.genotypes.clone().into_phased();
-                    let phased_target_pl = target_window_pl
-                        .as_ref()
-                        .map(|w| w.genotypes.clone().into_phased());
-                    let target_missing = target_window_pl.as_ref().map(|w| &w.genotypes);
+                    let phased_target_pl =
+                        Some(target_window_source.genotypes.clone().into_phased());
+                    let target_missing = Some(&target_window_source.genotypes);
                     if !header_written {
                         writer.write_header_extended(
                             &ref_window.markers,
@@ -2932,10 +2965,28 @@ impl crate::pipelines::ImputationPipeline {
                         window_idx += 1;
                         continue;
                     };
-                    let target_window_pl = if let Some(reader_pl) = target_reader_pl.as_mut() {
-                        reader_pl.load_window_for_region(&chrom_candidates, start_pos, end_pos)?
+                    let target_window_source = if use_phased_for_impute {
+                        let reader_pl = target_reader_pl.as_mut().ok_or_else(|| {
+                            ReagleError::vcf(
+                                "Internal error: missing original target reader for imputation"
+                                    .to_string(),
+                            )
+                        })?;
+                        match reader_pl.load_window_for_region(
+                            &chrom_candidates,
+                            start_pos,
+                            end_pos,
+                        )? {
+                            Some(window) => window,
+                            None => {
+                                return Err(ReagleError::vcf(format!(
+                                    "Original target window missing while phased window exists: chrom={} start={} end={}",
+                                    ref_chrom, start_pos, end_pos
+                                )));
+                            }
+                        }
                     } else {
-                        None
+                        target_window.clone()
                     };
 
                     // Align using the phased target markers; PL/GL lookups share the same
@@ -2946,10 +2997,9 @@ impl crate::pipelines::ImputationPipeline {
                     );
 
                     let phased_target = target_window.genotypes.clone().into_phased();
-                    let phased_target_pl = target_window_pl
-                        .as_ref()
-                        .map(|w| w.genotypes.clone().into_phased());
-                    let target_missing = target_window_pl.as_ref().map(|w| &w.genotypes);
+                    let phased_target_pl =
+                        Some(target_window_source.genotypes.clone().into_phased());
+                    let target_missing = Some(&target_window_source.genotypes);
                     if !header_written {
                         writer.write_header_extended(
                             &ref_window.markers,
@@ -3972,36 +4022,22 @@ impl crate::pipelines::ImputationPipeline {
                         observed2_marker = true;
                     } else if has_hard {
                         observed1_marker = mapped1 != 255;
-                        observed2_marker = if is_diploid { mapped2 != 255 } else { mapped1 != 255 };
+                        observed2_marker = if is_diploid {
+                            mapped2 != 255
+                        } else {
+                            mapped1 != 255
+                        };
                     }
                 }
 
                 if !use1 || !use2 {
-                    // For untyped markers, store full-panel allele frequency
-                    // instead of uniform. This provides the correct population
-                    // prior for posterior smoothing, preventing AF collapse when
-                    // the HMM state subset is biased.
-                    let n_haps = ref_columns[ref_m].n_haplotypes();
-                    if n_haps > 0 && n_alleles == 2 {
-                        let alt_count = ref_columns[ref_m].alt_count();
-                        let alt_freq = (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
-                        if !use1 {
-                            aligned1.resize(2, 0.0);
-                            aligned1[0] = 1.0 - alt_freq;
-                            aligned1[1] = alt_freq;
-                        }
-                        if !use2 {
-                            aligned2.resize(2, 0.0);
-                            aligned2[0] = 1.0 - alt_freq;
-                            aligned2[1] = alt_freq;
-                        }
-                    } else {
-                        if !use1 {
-                            aligned1.resize(n_alleles.max(1), 1.0);
-                        }
-                        if !use2 {
-                            aligned2.resize(n_alleles.max(1), 1.0);
-                        }
+                    // Untyped target marker: no direct evidence. Keep emissions
+                    // neutral and let transitions + nearby typed sites drive inference.
+                    if !use1 {
+                        aligned1.resize(n_alleles.max(1), 1.0);
+                    }
+                    if !use2 {
+                        aligned2.resize(n_alleles.max(1), 1.0);
                     }
                 }
 
@@ -4257,8 +4293,7 @@ impl crate::pipelines::ImputationPipeline {
                 if n_alleles == 2 {
                     let n_haps = col.n_haplotypes().max(1);
                     let alt_count = col.alt_count();
-                    let alt_freq =
-                        (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
+                    let alt_freq = (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
                     out.push(AllelePosteriors::Biallelic(alt_freq));
                 } else {
                     let mut probs = vec![0.0f32; n_alleles];
@@ -4817,12 +4852,13 @@ impl crate::pipelines::ImputationPipeline {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
                         }
                         let ws = ws_opt.as_mut().unwrap();
+                        let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
                         run_impute_hmm(
                             &state_haps,
                             ref_columns,
                             input_probs,
                             &p_recomb,
-                            error_rate,
+                            effective_error_rate,
                             prior_marker_idx,
                             state_priors_slice.take(),
                             &ref_allele_freqs,
@@ -4884,7 +4920,7 @@ impl crate::pipelines::ImputationPipeline {
                 let mut p1_out = HaplotypePriors::empty();
                 let mut p2_out = HaplotypePriors::empty();
 
-                if no_info_h1 && !has_priors_h1 {
+                if no_info_h1 && !has_priors_h1 && !use_hmm_h1 {
                     let posts = full_panel_posts.get_or_init(build_full_panel_posts);
                     hap1_posts = Some(posts.clone());
                     p1_out = HaplotypePriors::empty();
@@ -4900,7 +4936,7 @@ impl crate::pipelines::ImputationPipeline {
                         h1_idx,
                         priors_h1,
                         &input_probs_h1,
-                        (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
+                        (*prior_error_rate).clamp(1e-6, 0.5),
                         handoff_capture_idx_h1,
                         &donors_h1,
                     )?;
@@ -4932,7 +4968,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
 
-                if no_info_h2 && !has_priors_h2 {
+                if no_info_h2 && !has_priors_h2 && !use_hmm_h2 {
                     let posts = full_panel_posts.get_or_init(build_full_panel_posts);
                     hap2_posts = Some(posts.clone());
                     p2_out = HaplotypePriors::empty();
@@ -4948,7 +4984,7 @@ impl crate::pipelines::ImputationPipeline {
                         h2_idx,
                         priors_h2,
                         &input_probs_h2,
-                        (*prior_error_rate).max(err_floor).clamp(1e-6, 0.5),
+                        (*prior_error_rate).clamp(1e-6, 0.5),
                         handoff_capture_idx_h2,
                         &donors_h2,
                     )?;
@@ -5666,10 +5702,7 @@ impl crate::pipelines::ImputationPipeline {
             Some(|marker_idx: usize, sample_idx: usize| {
                 let local_m = marker_idx.saturating_sub(output_start);
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                    let biallelic = ref_is_biallelic
-                        .get(marker_idx)
-                        .copied()
-                        .unwrap_or(false);
+                    let biallelic = ref_is_biallelic.get(marker_idx).copied().unwrap_or(false);
                     let post1 = result
                         .hap_posteriors
                         .0
@@ -5888,28 +5921,25 @@ impl crate::pipelines::ImputationPipeline {
             let local_m = marker_idx.saturating_sub(output_start);
 
             let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                let hap_dosage = |posts: &Option<Vec<AllelePosteriors>>,
-                                  alt: &Option<Vec<f32>>|
-                 -> f32 {
-                    if let Some(posts) = posts {
-                        if let Some(p) = posts.get(local_m) {
-                            return match p {
-                                AllelePosteriors::Biallelic(p_alt) => *p_alt,
-                                AllelePosteriors::Multiallelic(probs) => probs
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, p)| i as f32 * p)
-                                    .sum(),
-                            };
+                let hap_dosage =
+                    |posts: &Option<Vec<AllelePosteriors>>, alt: &Option<Vec<f32>>| -> f32 {
+                        if let Some(posts) = posts {
+                            if let Some(p) = posts.get(local_m) {
+                                return match p {
+                                    AllelePosteriors::Biallelic(p_alt) => *p_alt,
+                                    AllelePosteriors::Multiallelic(probs) => {
+                                        probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum()
+                                    }
+                                };
+                            }
                         }
-                    }
-                    if n_alleles <= 2 {
-                        if let Some(alt) = alt.as_ref().and_then(|p| p.get(local_m).copied()) {
-                            return alt;
+                        if n_alleles <= 2 {
+                            if let Some(alt) = alt.as_ref().and_then(|p| p.get(local_m).copied()) {
+                                return alt;
+                            }
                         }
-                    }
-                    0.0
-                };
+                        0.0
+                    };
                 let d1 = hap_dosage(&result.hap_posteriors.0, &result.hap_alt_probs.0);
                 let d2 = hap_dosage(&result.hap_posteriors.1, &result.hap_alt_probs.1);
                 d1 + d2
@@ -5991,9 +6021,10 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         (0, 0)
                     }
-                } else if let (Some(p1), Some(p2)) =
-                    (result.hap_posteriors.0.as_ref(), result.hap_posteriors.1.as_ref())
-                {
+                } else if let (Some(p1), Some(p2)) = (
+                    result.hap_posteriors.0.as_ref(),
+                    result.hap_posteriors.1.as_ref(),
+                ) {
                     let mut best = (0u8, 0u8);
                     let mut best_prob = -1.0f32;
                     for i in 0..n_alleles {
@@ -6471,6 +6502,40 @@ mod tests {
             })
             .collect();
         GenotypeMatrix::new_unphased(markers, columns, samples)
+    }
+
+    #[test]
+    fn test_calibrated_emission_error_sharp_observations_lower_error() {
+        // 3 observed, informative markers: near-certain hard calls.
+        let offsets = vec![0, 2, 4, 6];
+        let probs = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
+        let observed = vec![true, true, true];
+        let input = TargetAlleleProbs::new(offsets, probs, observed);
+
+        let out = calibrated_emission_error(&input, 0.01);
+        assert!(
+            out <= 1.1e-6,
+            "expected near-min calibrated error for hard observations, got {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_calibrated_emission_error_never_exceeds_base() {
+        // Informative but uncertain markers should not inflate beyond base.
+        let offsets = vec![0, 2, 4];
+        let probs = vec![0.55, 0.45, 0.52, 0.48];
+        let observed = vec![true, true];
+        let input = TargetAlleleProbs::new(offsets, probs, observed);
+
+        let base = 0.02;
+        let out = calibrated_emission_error(&input, base);
+        assert!(
+            (out - base).abs() <= 1e-6,
+            "expected calibration capped by base error {}, got {}",
+            base,
+            out
+        );
     }
 
     #[test]
