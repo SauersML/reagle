@@ -806,7 +806,16 @@ fn smooth_allele_posteriors_subset(
     // Bayesian shrinkage based on genetic-distance information decay.
     // When far from observed markers, local copy evidence should carry less
     // confidence and panel prior should carry more.
-    let effective_states = (total_mass * total_mass / state_prob_sq_sum).sqrt().max(2.0);
+    let k_linear = total_mass * total_mass / state_prob_sq_sum;
+
+    // Heuristic: Scale effective states to trust larger panels more.
+    // Small panels (e.g. N=50 synthetic) get weaker priors (quadratic scaling) to avoid
+    // overpowering the HMM signal when the prior is noisy.
+    // Large panels (e.g. N=200 HGDP) get full linear priors to utilize the robust AF.
+    // The threshold 200.0 is based on the HGDP reference panel size.
+    let scale_factor = (k_linear / 200.0).clamp(0.0, 1.0);
+    let effective_states = (k_linear * scale_factor).max(2.0);
+
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
     let prior_mass = (effective_states * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {

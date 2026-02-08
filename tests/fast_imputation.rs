@@ -557,7 +557,7 @@ fn test_synthetic_slam_dunk() {
     }
     // Clear haplotype structure should give high DR2
     assert!(
-        mean_dr2 > 0.45,
+        mean_dr2 > 0.6,
         "Mean DR2 too low for slam dunk test: {:.4}",
         mean_dr2
     );
@@ -635,7 +635,7 @@ fn test_synthetic_recombination() {
     );
     // Marker 25 (in 1-region, should be 2 for diploid 1|1)
     assert!(
-        dosages[25][0] > 1.8,
+        dosages[25][0] > 1.9,
         "Marker 25 should be 2, got {}",
         dosages[25][0]
     );
