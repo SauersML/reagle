@@ -4727,7 +4727,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 }
                                 let ws = workspace.as_mut().unwrap();
                                 ws.clear(); // Explicit reset between samples to prevent state contamination
-                                let ref_provider = RefAlleleProvider::new(ref_view, &threaded_haps, 0);
+                                let ref_provider = RefAlleleProvider::new(ref_view, &threaded_haps);
                                 let (anchor_h1, anchor_h2) =
                                     build_anchor_constraints(&sample_phase_view[s]);
 
@@ -5240,7 +5240,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 path2: gp.path2.iter().map(|id| id.as_u32()).collect(),
                             });
                             if prior_local.is_none() {
-                                let mut rp = RefAlleleProvider::new(subset_view, threaded_haps.as_ref(), 0);
+                                let mut rp = RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
                                 if let Some(local_best) = find_best_constant_pair_with_buffer(
                                     n_hi_freq,
                                     n_states,
@@ -5359,10 +5359,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             // Classic Beagle-style: static state space MCMC with thread-local workspace
                             let ref_provider = if self.config.profile {
                                 info_span!("prep_allele_provider", sample = s).in_scope(|| {
-                                    RefAlleleProvider::new(subset_view, threaded_haps.as_ref(), 0)
+                                    RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
                                 })
                             } else {
-                                RefAlleleProvider::new(subset_view, threaded_haps.as_ref(), 0)
+                                RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
                             };
 
                             let local_prior_raw = prior_paths[s]
@@ -9083,7 +9083,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
         const PAR_CHAINS: usize = 4;
         let ref_view = ref_provider.ref_gt;
         let threaded_haps = ref_provider.threaded_haps;
-        let offset = ref_provider.offset;
 
         let alloc_like = |tmpl: &MosaicBuffers| -> MosaicBuffers {
             MosaicBuffers {
@@ -9129,7 +9128,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let first_buf = buffers_iter.next().unwrap();
 
         let seed_i = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+        let provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let mut chain = MosaicChain::new_with_buffers(
             seed_i,
             n_markers,
@@ -9165,7 +9164,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         for (idx, buf) in buffers_iter.enumerate() {
             let seed_i = seed.wrapping_add(((idx + 1) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+            let provider = RefAlleleProvider::new(ref_view, threaded_haps);
             let mut chain = MosaicChain::new_with_buffers(
                 seed_i,
                 n_markers,
@@ -9423,7 +9422,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     let ref_view = ref_provider.ref_gt;
     let threaded_haps = ref_provider.threaded_haps;
-    let offset = ref_provider.offset;
 
     let mut buffers = MosaicBuffers {
         n_states,
@@ -9484,7 +9482,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let mut local_seq1 = seq1.to_vec();
             let mut local_seq2 = seq2.to_vec();
             if let Some(paths) = init {
-                let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
                 let mut ref_alleles = vec![255u8; n_states_usize];
                 let ref_flat = shared_ref;
 
@@ -9513,7 +9511,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
             }
 
-            let my_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+            let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
             let (_, _, _, _, _, buf, score) = run_chain(
                 chain_seed,
                 init.as_ref(),
@@ -9545,7 +9543,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     let mut local_seq1_f = seq1.to_vec();
                     let mut local_seq2_f = seq2.to_vec();
 
-                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
                     let mut ref_alleles = vec![255u8; n_states_usize];
                     let ref_flat = shared_ref;
                     for m in 0..n_markers {
@@ -9574,7 +9572,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                     let chain_seed_flip =
                         seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
-                    let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                    let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
                     let (_, _, _, _, _, buf_f, score_f) = run_chain(
                         chain_seed_flip,
                         flipped_paths.as_ref(),
@@ -9628,7 +9626,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
         if let Some(paths) = init {
             // Reconstruct provider for alignment check (cheap, just referencing view)
-            let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+            let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
             let mut ref_alleles = vec![255u8; n_states_usize];
             let ref_flat = shared_ref;
 
@@ -9663,7 +9661,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
         }
 
-        let my_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+        let my_provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let (mut agg_sc, agg_oc, mut best_sc, best_oc, paths, buf, score) = run_chain(
             chain_seed,
             init.as_ref(),
@@ -9732,7 +9730,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let paths_f_ref = flipped_paths.as_ref().unwrap();
 
                 {
-                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                    let mut align_provider = RefAlleleProvider::new(ref_view, threaded_haps);
                     let mut ref_alleles = vec![255u8; n_states_usize];
                     let ref_flat = shared_ref;
                     for m in 0..n_markers {
@@ -9763,7 +9761,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
                 let chain_seed_flip =
                     seed.wrapping_add(0xBAD_CAFE_F00Du64.wrapping_mul((i + 1) as u64));
-                let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+                let my_provider_flip = RefAlleleProvider::new(ref_view, threaded_haps);
                 let (mut agg_sc_f, agg_oc_f, mut best_sc_f, best_oc_f, paths_f, buf_f, score_f) =
                     run_chain(
                         chain_seed_flip,
@@ -9947,7 +9945,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 flip_to_anchor = true;
             }
         }
-        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps, offset);
+        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
         let ref_alleles = buffers.ref_alleles.as_mut_slice();
         let ref_alleles_flat = shared_ref;
         p_min = 1.0;
@@ -11327,7 +11325,7 @@ mod tests {
         let p_no_err = 0.999;
         let p_err = 1.0 - p_no_err;
         let mut workspace = crate::utils::workspace::ThreadWorkspace::new(8, 0);
-        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th, 0);
+        let ref_provider = RefAlleleProvider::new(GenotypeView::from(&ref_gt), &th);
 
         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_swap_bits_mosaic(
             n_markers,
@@ -12087,7 +12085,7 @@ mod tests {
             threaded.push_new(CombinedHapId::new(h as u32));
         }
         let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
-            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded, 0);
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
 
         let seq1 = vec![0, 0, 0];
         let seq2 = vec![1, 1, 1];
