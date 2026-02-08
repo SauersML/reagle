@@ -107,8 +107,7 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        // Clamp to a reasonable maximum for small panels to prevent explosion
-        val.max(1e-8).min(0.001)
+        val.max(1e-8)
     }
 
     /// Calculate LR threshold for a given iteration
