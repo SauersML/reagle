@@ -103,7 +103,9 @@ where
     #[inline]
     fn marker_allele_row(&self, marker_idx: usize) -> &[u8] {
         let start = marker_idx.saturating_mul(self.n_haps);
-        let end = start.saturating_add(self.n_haps).min(self.alleles_flat.len());
+        let end = start
+            .saturating_add(self.n_haps)
+            .min(self.alleles_flat.len());
         &self.alleles_flat[start..end]
     }
 

@@ -3085,7 +3085,11 @@ fn write_linear_map_for_span(vcf_gz: &Path, map_path: &Path, total_cm: f64) -> (
 
 /// Write a Java/PLINK-style map:
 ///   CHROM  ID  cM  bp
-fn write_linear_map_for_span_java(vcf_gz: &Path, map_path: &Path, total_cm: f64) -> (String, u64, u64) {
+fn write_linear_map_for_span_java(
+    vcf_gz: &Path,
+    map_path: &Path,
+    total_cm: f64,
+) -> (String, u64, u64) {
     use flate2::read::MultiGzDecoder;
     use std::io::Read;
 

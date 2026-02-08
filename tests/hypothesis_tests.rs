@@ -353,8 +353,8 @@ fn test_missing_confidence_is_not_full_by_default() {
     // Create a single-marker, single-sample matrix where the genotype is
     // missing (both alleles = 255). The missing_genotypes mask should flag
     // this, causing sample_confidence to return 0 rather than 255.
-    use reagle::data::marker::{Allele, Marker};
     use reagle::data::ChromIdx;
+    use reagle::data::marker::{Allele, Marker};
     use reagle::data::storage::GenotypeColumn;
     let mut markers = reagle::data::marker::Markers::<reagle::data::AnyMarkerSpace>::new();
     markers.push(Marker::new(
@@ -369,8 +369,7 @@ fn test_missing_confidence_is_not_full_by_default() {
     ]));
     // Both haplotype alleles = 255 (missing)
     let col = GenotypeColumn::from_alleles(&[255, 255], 2);
-    let matrix =
-        reagle::data::storage::GenotypeMatrix::new_unphased(markers, vec![col], samples);
+    let matrix = reagle::data::storage::GenotypeMatrix::new_unphased(markers, vec![col], samples);
     let conf = matrix.sample_confidence_f32(MarkerIdx::new(0), 0);
     eprintln!("default sample_confidence_f32 = {}", conf);
     assert!(
@@ -494,6 +493,61 @@ fn test_debug_hmm_all_missing_target_still_uses_hmm() {
     assert_eq!(
         fallback_ref_freq, 0,
         "Expected no ref-frequency fallback in this all-missing setup"
+    );
+}
+
+#[test]
+fn test_imputation_recomb_intensity_decoupled_from_phasing_estimate() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_vcf = work_dir.path().join("ref.vcf");
+    let target_vcf = work_dir.path().join("target.vcf");
+
+    // Sparse unphased target triggers pre-imputation phasing.
+    let n_ref_markers = 400usize;
+    let ref_names: Vec<String> = (0..50).map(|i| format!("R{}", i + 1)).collect();
+    let ref_name_refs: Vec<&str> = ref_names.iter().map(|s| s.as_str()).collect();
+    write_synthetic_vcf(&ref_vcf, n_ref_markers, &ref_name_refs, |_, s| {
+        if s % 2 == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
+    });
+
+    let target_markers = 8usize;
+    write_synthetic_vcf(&target_vcf, target_markers, &["T1"], |i, _| {
+        if i % 2 == 0 {
+            "0/0".to_string()
+        } else {
+            "1/1".to_string()
+        }
+    });
+
+    let out_prefix = work_dir.path().join("out");
+    let output = run_cli_imputation_capture(&target_vcf, &ref_vcf, &out_prefix);
+    assert!(
+        output.status.success(),
+        "CLI run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Target is unphased; running phasing before pre-scan"),
+        "Expected pre-imputation phasing path. stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Imputation recomb_intensity:")
+            && stderr.contains("(source=config-ne)"),
+        "Expected imputation recombination intensity sourced from config-ne. stderr:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("source=phasing-estimated"),
+        "Imputation should not reuse phasing-estimated recombination intensity. stderr:\n{}",
+        stderr
     );
 }
 

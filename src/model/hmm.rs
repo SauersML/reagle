@@ -1264,10 +1264,11 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     lut.fill(unknown_prob);
                                     for a in 0..255usize {
                                         if a < n_alleles {
-                                            let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
-                                            lut[a] =
-                                                (p_no_err * p_true + p_err_other * (1.0 - p_true))
-                                                    .max(1e-30);
+                                            let p_true =
+                                                allele_probs.get(a).copied().unwrap_or(0.0);
+                                            lut[a] = (p_no_err * p_true
+                                                + p_err_other * (1.0 - p_true))
+                                                .max(1e-30);
                                         }
                                     }
                                     let used_pattern = try_fill_pattern_emissions(

@@ -253,8 +253,9 @@ fn estimate_phase_state_budget(
     let bytes_state_id = std::mem::size_of::<u32>();
     let bytes_allele = std::mem::size_of::<u8>();
     let bytes_prob = std::mem::size_of::<f32>();
-    let bytes_path =
-        bytes_state_id.saturating_add(bytes_allele).saturating_add(bytes_prob.saturating_mul(2));
+    let bytes_path = bytes_state_id
+        .saturating_add(bytes_allele)
+        .saturating_add(bytes_prob.saturating_mul(2));
     let per_state_bytes = 64usize.saturating_add(window_markers.saturating_mul(bytes_path));
     if per_state_bytes == 0 {
         return 0;
@@ -1634,11 +1635,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
     }
 
-    /// Access current model parameters (after EM updates).
-    pub fn params(&self) -> &ModelParams {
-        &self.params
-    }
-
     /// Set reference panel for reference-guided phasing
     ///
     /// When a reference panel is provided, the phasing algorithm uses it to:
@@ -1659,6 +1655,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 impl PhasingPipeline<crate::data::AnyMarkerSpace> {
     /// Run the phasing pipeline
     pub fn run(&mut self) -> Result<()> {
+        THREAD_WORKSPACE.with(|ws| *ws.borrow_mut() = None);
         eprintln!("Loading VCF...");
 
         // Load exclusion lists
@@ -1764,6 +1761,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
         // Initialize parameters based on TOTAL haplotype count (target + ref)
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
+        // Keep LR-threshold schedule consistent with the configured iteration plan.
+        self.params.burnin = self.config.burnin;
+        self.params.iterations = self.config.iterations.max(1);
         if self.config.phase_states > 0 {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
@@ -2676,6 +2676,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
     /// Run the phasing pipeline in streaming mode for large datasets
     pub fn run_streaming(&mut self) -> Result<()> {
+        THREAD_WORKSPACE.with(|ws| *ws.borrow_mut() = None);
         eprintln!("Opening VCF for streaming...");
 
         // Configure streaming (genetic maps loaded lazily by StreamingVcfReader)
@@ -3022,6 +3023,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         self.params = ModelParams::for_phasing(n_total_haps, self.config.ne, self.config.err);
+        // Keep LR-threshold schedule consistent with the configured iteration plan.
+        self.params.burnin = self.config.burnin;
+        self.params.iterations = self.config.iterations.max(1);
         if self.config.phase_states > 0 {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
@@ -8738,6 +8742,11 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
 ) -> Option<MosaicPaths> {
+    // This heuristic is O(n_markers * n_states^2). For long windows we skip it
+    // entirely and rely on the other initialization paths.
+    if n_markers > 2000 {
+        return None;
+    }
     if n_states < 2 {
         return None;
     }
@@ -8818,9 +8827,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
     if informative == 0 {
-        return None;
-    }
-    if n_markers > 2000 {
         return None;
     }
 

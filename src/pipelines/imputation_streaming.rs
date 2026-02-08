@@ -130,8 +130,18 @@ fn estimate_per_state_bytes(window_markers: usize) -> usize {
 
 #[inline]
 fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f32) -> f32 {
-    let mut residual_sum = 0.0f32;
-    let mut informative_obs = 0usize;
+    // Empirical-Bayes calibration:
+    // Treat residual r = 1 - max_a p(a) at informative typed markers as a
+    // noisy observation of per-marker emission error epsilon.
+    // Posterior mean under Beta(alpha, beta) prior:
+    //   eps_post = (alpha + sum(w*r)) / (alpha + beta + sum(w))
+    // with prior mean anchored to base_error_rate and prior strength m0.
+    // We weight each marker by normalized information content:
+    //   w = 1 - H(p)/log(K), K = number of alleles
+    // so near-uniform markers contribute little evidence.
+    const PRIOR_STRENGTH_MARKERS: f32 = 16.0;
+    let mut weighted_residual_sum = 0.0f32;
+    let mut weight_sum = 0.0f32;
     for m in 0..input_probs.n_markers() {
         if !input_probs.is_observed_marker(m) || input_probs.is_uniform_marker(m) {
             continue;
@@ -142,9 +152,15 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
         }
         let mut max_prob = 0.0f32;
         let mut any_finite = false;
+        let mut entropy = 0.0f32;
+        let mut n_alleles = 0usize;
         for &p in probs {
             if p.is_finite() {
                 any_finite = true;
+                if p > 0.0 {
+                    entropy -= p * p.ln();
+                }
+                n_alleles += 1;
                 if p > max_prob {
                     max_prob = p;
                 }
@@ -153,14 +169,27 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
         if !any_finite {
             continue;
         }
-        residual_sum += (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
-        informative_obs += 1;
+        let max_entropy = (n_alleles.max(2) as f32).ln();
+        let info_weight = if max_entropy > 0.0 {
+            (1.0 - (entropy / max_entropy)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if info_weight <= 0.0 {
+            continue;
+        }
+        let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
+        weighted_residual_sum += info_weight * residual;
+        weight_sum += info_weight;
     }
-    if informative_obs == 0 {
+    if weight_sum <= 0.0 {
         return base_error_rate.clamp(1e-6, 0.5);
     }
-    let empirical_error = (residual_sum / informative_obs as f32).clamp(1e-6, 0.5);
-    base_error_rate.min(empirical_error).clamp(1e-6, 0.5)
+    let base = base_error_rate.clamp(1e-6, 0.5);
+    let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
+    let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
+    let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
+    posterior.clamp(1e-6, 0.5)
 }
 
 #[derive(Clone, Debug)]
@@ -6513,27 +6542,34 @@ mod tests {
         let input = TargetAlleleProbs::new(offsets, probs, observed);
 
         let out = calibrated_emission_error(&input, 0.01);
+        assert!(out < 0.01, "expected lower-than-base calibrated error, got {}", out);
         assert!(
-            out <= 1.1e-6,
-            "expected near-min calibrated error for hard observations, got {}",
+            (out - 0.008421053).abs() < 1e-5,
+            "expected beta-shrunk posterior around 0.00842, got {}",
             out
         );
     }
 
     #[test]
-    fn test_calibrated_emission_error_never_exceeds_base() {
-        // Informative but uncertain markers should not inflate beyond base.
+    fn test_calibrated_emission_error_can_exceed_base_with_noisy_observations() {
+        // Informative noisy markers (far from uniform) should raise posterior
+        // error above a too-optimistic base rate under Beta shrinkage.
         let offsets = vec![0, 2, 4];
-        let probs = vec![0.55, 0.45, 0.52, 0.48];
+        let probs = vec![0.9, 0.1, 0.88, 0.12];
         let observed = vec![true, true];
         let input = TargetAlleleProbs::new(offsets, probs, observed);
 
         let base = 0.02;
         let out = calibrated_emission_error(&input, base);
         assert!(
-            (out - base).abs() <= 1e-6,
-            "expected calibration capped by base error {}, got {}",
+            out > base,
+            "expected calibration to raise error above base {}, got {}",
             base,
+            out
+        );
+        assert!(
+            (out - 0.024241116).abs() < 1e-5,
+            "expected info-weighted beta posterior around 0.02424, got {}",
             out
         );
     }
