@@ -2737,6 +2737,11 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
+                    // If we expected missing data (target_was_unphased) but target_missing is None
+                    // (e.g. alignment failure on the original file), we cannot trust the hard calls
+                    // in phased_target because they might be imputed. In that case, disable hard calls.
+                    let trust_hard_calls = !target_was_unphased_for_impute || target_missing.is_some();
+
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
                         phased_target_pl.as_ref(),
@@ -2756,6 +2761,7 @@ impl crate::pipelines::ImputationPipeline {
                         // phase confidence for heterozygotes, which we should leverage
                         // to preserve LD signal in imputation emissions.
                         true,
+                        trust_hard_calls,
                         &mut sample_error_rates,
                     )?;
 
@@ -3028,6 +3034,7 @@ impl crate::pipelines::ImputationPipeline {
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
+                    let trust_hard_calls = !target_was_unphased_for_impute || target_missing.is_some();
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
                         phased_target_pl.as_ref(),
@@ -3047,6 +3054,7 @@ impl crate::pipelines::ImputationPipeline {
                         // phase confidence for heterozygotes, which we should leverage
                         // to preserve LD signal in imputation emissions.
                         true,
+                        trust_hard_calls,
                         &mut sample_error_rates,
                     )?;
 
@@ -3194,6 +3202,7 @@ impl crate::pipelines::ImputationPipeline {
         output_start: usize,
         output_end: usize,
         phase_conf_valid: bool,
+        trust_hard_calls: bool,
         sample_error_rates: &mut [f32],
     ) -> Result<Option<ImputationWindowResults>> {
         let window_span = if self.config.profile {
@@ -3601,7 +3610,8 @@ impl crate::pipelines::ImputationPipeline {
                     let is_diploid = target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
                     let has_hard = mapped1 != 255
                         && (mapped1 as usize) < n_alleles
-                        && (!is_diploid || (mapped2 != 255 && (mapped2 as usize) < n_alleles));
+                        && (!is_diploid || (mapped2 != 255 && (mapped2 as usize) < n_alleles))
+                        && trust_hard_calls;
                     let input_phased = target_win
                         .phase_mask()
                         .and_then(|mask| mask.get(target_m, sample_idx))
