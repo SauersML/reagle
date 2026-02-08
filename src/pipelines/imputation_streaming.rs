@@ -4617,14 +4617,12 @@ impl crate::pipelines::ImputationPipeline {
                         // state spaces when mixed sources do not cover `k`.
                         let abyss = plan
                             .abyss_mask
-                            .get(hap_idx.as_usize())
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]);
+                            .get(hap_idx.as_usize());
                         for h in 0..plan.n_ref_haps {
                             if out.len() >= k {
                                 break;
                             }
-                            if abyss.get(h).copied().unwrap_or(false) {
+                            if abyss.and_then(|v| v.get(h).as_deref().copied()).unwrap_or(false) {
                                 continue;
                             }
                             let hap = RefHapId::new(h as u32);
