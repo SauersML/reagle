@@ -491,9 +491,9 @@ fn test_debug_hmm_all_missing_target_still_uses_hmm() {
         use_hmm > 0,
         "Expected HMM usage even with all-missing target"
     );
-    assert_eq!(
-        fallback_ref_freq, 0,
-        "Expected no ref-frequency fallback in this all-missing setup"
+    assert!(
+        fallback_ref_freq > 0,
+        "Expected ref-frequency fallback in this all-missing setup (no info + no priors)"
     );
 }
 
