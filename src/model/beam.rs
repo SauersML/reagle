@@ -586,6 +586,7 @@ pub struct BeamPhaser<'a, RefSpace = AnyMarkerSpace> {
     config: BeamConfig,
     costs: BeamCosts,
     packed_ref: &'a PackedRefView<RefSpace>,
+    lr_threshold: f32,
 }
 
 struct BeamScratch {
@@ -715,6 +716,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             config,
             costs: BeamCosts::from_params(params),
             packed_ref,
+            lr_threshold: params.initial_lr,
         }
     }
 
@@ -869,16 +871,32 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
             phases.reverse();
             let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
+            let has_input_anchor = sample_phase.has_input_phase_anchor();
             for (i, phase_swapped) in phases.iter().enumerate() {
                 let call = &condensed.call_sites[i];
                 let m = call.marker.as_usize();
-                if *phase_swapped {
-                    sample_phase.swap_alleles(m);
-                }
-                sample_phase.mark_phased(m);
                 let p = p_swapped.get(i).copied().unwrap_or(0.5);
                 let conf = if *phase_swapped { p } else { 1.0 - p };
-                sample_phase.set_phase_confidence(m, conf);
+                if !has_input_anchor {
+                    sample_phase.set_phase_confidence(m, 0.5);
+                    continue;
+                }
+                let lr = if conf <= 0.0 {
+                    0.0
+                } else if conf >= 1.0 {
+                    f32::INFINITY
+                } else {
+                    conf / (1.0 - conf)
+                };
+                if lr >= self.lr_threshold {
+                    if *phase_swapped {
+                        sample_phase.swap_alleles(m);
+                    }
+                    sample_phase.mark_phased(m);
+                    sample_phase.set_phase_confidence(m, conf);
+                } else {
+                    sample_phase.set_phase_confidence(m, 0.5);
+                }
             }
             return BeamPosteriors {
                 decisions: phases,
