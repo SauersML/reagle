@@ -3965,10 +3965,9 @@ fn test_diverse_mask_scenarios() {
             "Mean truth GP", java_gp_truth, rust_gp_truth
         );
 
-        // Strict assertions (relaxed tolerance for small N=57)
-        // One genotype difference is ~1.75%, so allow 2.5% gap
+        // Strict assertions (zero tolerance)
         assert!(
-            rust_acc.concordance() >= java_acc.concordance() - 0.025,
+            rust_acc.concordance() >= java_acc.concordance(),
             "{}: Rust concordance ({:.4}%) worse than Java ({:.4}%)",
             scenario_name,
             rust_acc.concordance() * 100.0,
@@ -4782,16 +4781,15 @@ fn test_dosage_genotyped_vs_imputed() {
     }
 
     // Imputed dosage accuracy: Rust should not be worse more often than Java
-    // Relaxed for small-sample stochasticity (N=57)
     assert!(
-        rust_worse_dosage < (java_worse_dosage as f64 * 1.5) as usize,
+        rust_worse_dosage < java_worse_dosage,
         "IMPUTED DOSAGE FAIL: Rust worse than Java on {}/{} markers (Java worse on {})",
         rust_worse_dosage,
         imputed_dosage_gaps.len(),
         java_worse_dosage
     );
     assert!(
-        rust_much_worse_dosage < (java_much_worse_dosage as f64 * 1.5) as usize,
+        rust_much_worse_dosage < java_much_worse_dosage,
         "IMPUTED DOSAGE FAIL: Rust much worse than Java on {}/{} markers (Java much worse on {})",
         rust_much_worse_dosage,
         imputed_dosage_gaps.len(),
@@ -5018,11 +5016,11 @@ fn test_dosage_by_distance_from_genotyped() {
             imputed_count += bucket.len();
         }
 
-        let status = if mean_mad_rust > 0.08 { " FAIL" } else { "" };
-        if mean_mad_rust > 0.08 {
+        let status = if mean_mad_rust > 0.05 { " FAIL" } else { "" };
+        if mean_mad_rust > 0.05 {
             any_bucket_failed = true;
         }
-        if mean_mad_rust > mean_mad_java + 0.01 {
+        if mean_mad_rust > mean_mad_java {
             any_bucket_failed = true;
         }
 
