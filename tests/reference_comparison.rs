@@ -3965,11 +3965,10 @@ fn test_diverse_mask_scenarios() {
             "Mean truth GP", java_gp_truth, rust_gp_truth
         );
 
-        // Strict assertions (with tolerance for small sample stochasticity)
-        // 57 masked genotypes -> 1 difference is ~1.75%, so 2.5% tolerance covers 1 mismatch.
+        // Strict assertions (zero tolerance)
         assert!(
-            rust_acc.concordance() >= java_acc.concordance() - 0.025,
-            "{}: Rust concordance ({:.4}%) worse than Java ({:.4}%) (tol=2.5%)",
+            rust_acc.concordance() >= java_acc.concordance(),
+            "{}: Rust concordance ({:.4}%) worse than Java ({:.4}%)",
             scenario_name,
             rust_acc.concordance() * 100.0,
             java_acc.concordance() * 100.0
@@ -4782,15 +4781,12 @@ fn test_dosage_genotyped_vs_imputed() {
     }
 
     // Imputed dosage accuracy: Rust should not be worse more often than Java
-    // Relaxed: Allow Rust to be worse on up to 10% more markers than Java, as long as it's not catastrophic
-    let threshold_count = (java_worse_dosage as f64 * 1.5) as usize; // Allow 50% margin
     assert!(
-        rust_worse_dosage < threshold_count,
-        "IMPUTED DOSAGE FAIL: Rust worse than Java on {}/{} markers (Java worse on {}, threshold {})",
+        rust_worse_dosage < java_worse_dosage,
+        "IMPUTED DOSAGE FAIL: Rust worse than Java on {}/{} markers (Java worse on {})",
         rust_worse_dosage,
         imputed_dosage_gaps.len(),
-        java_worse_dosage,
-        threshold_count
+        java_worse_dosage
     );
     assert!(
         rust_much_worse_dosage < java_much_worse_dosage,
@@ -5020,15 +5016,11 @@ fn test_dosage_by_distance_from_genotyped() {
             imputed_count += bucket.len();
         }
 
-        // Relaxed threshold: 0.05 -> 0.08 to account for stochasticity
-        let threshold = 0.08;
-        let margin = 0.01; // Allow Rust to be slightly worse than Java (0.01)
-
-        let status = if mean_mad_rust > threshold { " FAIL" } else { "" };
-        if mean_mad_rust > threshold {
+        let status = if mean_mad_rust > 0.05 { " FAIL" } else { "" };
+        if mean_mad_rust > 0.05 {
             any_bucket_failed = true;
         }
-        if mean_mad_rust > mean_mad_java + margin {
+        if mean_mad_rust > mean_mad_java {
             any_bucket_failed = true;
         }
 
@@ -5059,7 +5051,7 @@ fn test_dosage_by_distance_from_genotyped() {
         imputed_mad - genotyped_mad
     );
 
-    // Strict: No bucket should have mean MAD > 0.08 and Rust must not be worse than Java + 0.01
+    // Strict: No bucket should have mean MAD > 0.05 and Rust must not be worse than Java
     assert!(
         !any_bucket_failed,
         "DISTANCE TEST FAIL: Rust bucket MAD worse than Java or above threshold"
