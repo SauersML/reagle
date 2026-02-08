@@ -713,10 +713,11 @@ fn adjusted_recomb_rate(recomb_rate: f32) -> f32 {
 
 #[inline]
 fn marker_recomb_rate(p_recomb: &[f32], marker_idx: usize) -> f32 {
+    let rate = p_recomb.get(marker_idx).copied().unwrap_or(0.0);
     if marker_idx == 0 {
-        0.0
+        adjusted_recomb_rate(rate)
     } else {
-        adjusted_recomb_rate(p_recomb.get(marker_idx).copied().unwrap_or(0.0))
+        adjusted_recomb_rate(rate)
     }
 }
 
@@ -1242,6 +1243,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
+    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let current_error = error_rate;
 
     let final_pass = 0usize;
@@ -1277,6 +1279,11 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                 let cp = (m / checkpoint_stride) * active_states;
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
+            }
+            if prior_marker_idx == Some(m) {
+                let mut snapshot = ws.fwd[..active_states].to_vec();
+                normalize_probs(&mut snapshot);
+                forward_prior_state_post = Some(snapshot);
             }
         }
 
@@ -1335,7 +1342,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
-                    if prior_marker_idx == Some(m_rev) {
+                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -1511,6 +1518,9 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
         }
     }
 
+    if forward_prior_state_post.is_some() {
+        final_prior_state_post = forward_prior_state_post;
+    }
     Ok((final_posteriors, final_prior_state_post))
 }
 
@@ -1549,6 +1559,7 @@ fn run_impute_hmm_seqcoded(
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
+    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let current_error = error_rate;
 
     let final_pass = 0usize;
@@ -1586,6 +1597,11 @@ fn run_impute_hmm_seqcoded(
                 let cp = (m / checkpoint_stride) * active_states;
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
+            }
+            if prior_marker_idx == Some(m) {
+                let mut snapshot = ws.fwd[..active_states].to_vec();
+                normalize_probs(&mut snapshot);
+                forward_prior_state_post = Some(snapshot);
             }
         }
 
@@ -1655,7 +1671,7 @@ fn run_impute_hmm_seqcoded(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
-                    if prior_marker_idx == Some(m_rev) {
+                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -1806,6 +1822,9 @@ fn run_impute_hmm_seqcoded(
         }
     }
 
+    if forward_prior_state_post.is_some() {
+        final_prior_state_post = forward_prior_state_post;
+    }
     Ok((final_posteriors, final_prior_state_post))
 }
 
@@ -1844,6 +1863,7 @@ fn run_impute_hmm_dict(
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
+    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let current_error = error_rate;
     let final_pass = 0usize;
     for pass in 0..1 {
@@ -1880,6 +1900,11 @@ fn run_impute_hmm_dict(
                 let cp = (m / checkpoint_stride) * active_states;
                 ws.fwd_checkpoints[cp..cp + active_states]
                     .copy_from_slice(&ws.fwd[..active_states]);
+            }
+            if prior_marker_idx == Some(m) {
+                let mut snapshot = ws.fwd[..active_states].to_vec();
+                normalize_probs(&mut snapshot);
+                forward_prior_state_post = Some(snapshot);
             }
         }
 
@@ -1950,7 +1975,7 @@ fn run_impute_hmm_dict(
 
                     let start = (m_rev - block_start) * active_states;
                     let fwd_slice = &ws.fwd_history[start..start + active_states];
-                    if prior_marker_idx == Some(m_rev) {
+                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -2107,6 +2132,9 @@ fn run_impute_hmm_dict(
         }
     }
 
+    if forward_prior_state_post.is_some() {
+        final_prior_state_post = forward_prior_state_post;
+    }
     Ok((final_posteriors, final_prior_state_post))
 }
 
