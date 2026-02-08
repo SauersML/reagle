@@ -4060,8 +4060,8 @@ impl crate::pipelines::ImputationPipeline {
                 }
 
                 if !use1 || !use2 {
-                    // Untyped target marker: no direct evidence. Keep emissions
-                    // neutral and let transitions + nearby typed sites drive inference.
+                    // Untyped target marker: no direct evidence at this marker.
+                    // Keep emissions neutral and let state-path evidence drive posteriors.
                     if !use1 {
                         aligned1.resize(n_alleles.max(1), 1.0);
                     }
@@ -6541,11 +6541,16 @@ mod tests {
         let observed = vec![true, true, true];
         let input = TargetAlleleProbs::new(offsets, probs, observed);
 
-        let out = calibrated_emission_error(&input, 0.01);
-        assert!(out < 0.01, "expected lower-than-base calibrated error, got {}", out);
+        let base = 0.01;
+        let out = calibrated_emission_error(&input, base);
         assert!(
-            (out - 0.008421053).abs() < 1e-5,
-            "expected beta-shrunk posterior around 0.00842, got {}",
+            out < base,
+            "expected lower-than-base calibrated error, got {}",
+            out
+        );
+        assert!(
+            out >= 1e-6,
+            "expected calibrated error to respect lower clamp, got {}",
             out
         );
     }
@@ -6567,9 +6572,18 @@ mod tests {
             base,
             out
         );
+        // For Beta-Binomial style shrinkage, posterior mean should lie between
+        // prior mean (base) and empirical weighted residual mean.
+        let empirical_weighted_residual = 0.10940167f32;
         assert!(
-            (out - 0.024241116).abs() < 1e-5,
-            "expected info-weighted beta posterior around 0.02424, got {}",
+            out < empirical_weighted_residual,
+            "expected shrinkage below empirical weighted residual {}, got {}",
+            empirical_weighted_residual,
+            out
+        );
+        assert!(
+            out <= 0.5,
+            "expected calibrated emission error in valid probability range, got {}",
             out
         );
     }

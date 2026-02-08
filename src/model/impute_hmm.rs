@@ -1293,6 +1293,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut forward_prior_state_post: Option<Vec<f32>> = None;
+    let mut warned_af_fallback = false;
     let current_error = error_rate;
 
     let final_pass = 0usize;
@@ -1423,7 +1424,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
+                                let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
@@ -1437,16 +1438,31 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
-                                    subset_counts[idx] += 1.0;
-                                    subset_total += 1.0;
+                                    subset_counts[idx] += state_prob;
+                                    subset_total += state_prob;
                                 }
                             }
                             if total > 0.0 {
                                 if missing_mass > 0.0 {
-                                    let prior = normalized_allele_prior(
-                                        &mut ws.allele_prior_scratch,
-                                        probs,
-                                    );
+                                    let prior = if subset_total > 0.0 {
+                                        let inv = 1.0 / subset_total;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
+                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
+                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                            );
+                                            warned_af_fallback = true;
+                                        }
+                                        normalized_allele_prior(
+                                            &mut ws.allele_prior_scratch,
+                                            probs,
+                                        )
+                                    };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
                                     }
@@ -1457,14 +1473,27 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                 if use_prior_smoothing
                                     && uniform
                                     && recomb_rate > 0.0
-                                    && subset_total > 0.0
                                 {
-                                    // Use full-panel allele frequency (stored in
-                                    // TargetAlleleProbs) as the smoothing prior instead
-                                    // of subset AF, so that abyss haplotypes' allele
-                                    // distribution is properly represented.
-                                    let prior_probs =
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
+                                    let mut sum = 0.0f32;
+                                    for v in subset_counts.iter() {
+                                        sum += *v;
+                                    }
+                                    let prior_probs = if sum > 0.0 {
+                                        let inv = 1.0 / sum;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
+                                                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
+                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                            );
+                                            warned_af_fallback = true;
+                                        }
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
+                                    };
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         prior_probs,
@@ -1595,6 +1624,7 @@ fn run_impute_hmm_seqcoded(
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut forward_prior_state_post: Option<Vec<f32>> = None;
+    let mut warned_af_fallback = false;
     let current_error = error_rate;
 
     let final_pass = 0usize;
@@ -1729,7 +1759,7 @@ fn run_impute_hmm_seqcoded(
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
+                                let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
@@ -1743,16 +1773,31 @@ fn run_impute_hmm_seqcoded(
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
-                                    subset_counts[idx] += 1.0;
-                                    subset_total += 1.0;
+                                    subset_counts[idx] += state_prob;
+                                    subset_total += state_prob;
                                 }
                             }
                             if total > 0.0 {
                                 if missing_mass > 0.0 {
-                                    let prior = normalized_allele_prior(
-                                        &mut ws.allele_prior_scratch,
-                                        probs,
-                                    );
+                                    let prior = if subset_total > 0.0 {
+                                        let inv = 1.0 / subset_total;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
+                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
+                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                            );
+                                            warned_af_fallback = true;
+                                        }
+                                        normalized_allele_prior(
+                                            &mut ws.allele_prior_scratch,
+                                            probs,
+                                        )
+                                    };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
                                     }
@@ -1763,10 +1808,27 @@ fn run_impute_hmm_seqcoded(
                                 if use_prior_smoothing
                                     && uniform
                                     && recomb_rate > 0.0
-                                    && subset_total > 0.0
                                 {
-                                    let prior_probs =
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
+                                    let mut sum = 0.0f32;
+                                    for v in subset_counts.iter() {
+                                        sum += *v;
+                                    }
+                                    let prior_probs = if sum > 0.0 {
+                                        let inv = 1.0 / sum;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
+                                                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
+                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                            );
+                                            warned_af_fallback = true;
+                                        }
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
+                                    };
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         prior_probs,
@@ -1895,6 +1957,7 @@ fn run_impute_hmm_dict(
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut forward_prior_state_post: Option<Vec<f32>> = None;
+    let mut warned_af_fallback = false;
     let current_error = error_rate;
     let final_pass = 0usize;
     for pass in 0..1 {
@@ -2029,7 +2092,7 @@ fn run_impute_hmm_dict(
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
+                                let mut subset_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
@@ -2043,16 +2106,31 @@ fn run_impute_hmm_dict(
                                 let idx = ref_allele as usize;
                                 if idx < ws.allele_probs.len() {
                                     ws.allele_probs[idx] += state_prob;
-                                    subset_counts[idx] += 1.0;
-                                    subset_total += 1.0;
+                                    subset_counts[idx] += state_prob;
+                                    subset_total += state_prob;
                                 }
                             }
                             if total > 0.0 {
                                 if missing_mass > 0.0 {
-                                    let prior = normalized_allele_prior(
-                                        &mut ws.allele_prior_scratch,
-                                        probs,
-                                    );
+                                    let prior = if subset_total > 0.0 {
+                                        let inv = 1.0 / subset_total;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
+                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
+                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                            );
+                                            warned_af_fallback = true;
+                                        }
+                                        normalized_allele_prior(
+                                            &mut ws.allele_prior_scratch,
+                                            probs,
+                                        )
+                                    };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
                                     }
@@ -2063,14 +2141,27 @@ fn run_impute_hmm_dict(
                                 if use_prior_smoothing
                                     && uniform
                                     && recomb_rate > 0.0
-                                    && subset_total > 0.0
                                 {
-                                    // Use full-panel allele frequency (stored in
-                                    // TargetAlleleProbs) as the smoothing prior instead
-                                    // of subset AF, so that abyss haplotypes' allele
-                                    // distribution is properly represented.
-                                    let prior_probs =
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
+                                    let mut sum = 0.0f32;
+                                    for v in subset_counts.iter() {
+                                        sum += *v;
+                                    }
+                                    let prior_probs = if sum > 0.0 {
+                                        let inv = 1.0 / sum;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
+                                                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
+                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                            );
+                                            warned_af_fallback = true;
+                                        }
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
+                                    };
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         prior_probs,
