@@ -804,9 +804,8 @@ fn smooth_allele_posteriors_subset(
     // Bayesian shrinkage based on genetic-distance information decay.
     // When far from observed markers, local copy evidence should carry less
     // confidence and panel prior should carry more.
-    let effective_states = (total_mass * total_mass / state_prob_sq_sum).max(1.0);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
-    let prior_mass = (effective_states * (1.0 - retain) / retain).max(0.0);
+    let prior_mass = ((1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
@@ -1410,12 +1409,20 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     // TargetAlleleProbs) as the smoothing prior instead
                                     // of subset AF, so that abyss haplotypes' allele
                                     // distribution is properly represented.
-                                    // Scale to count magnitude (sum ≈ active_states) so
-                                    // the Bayesian smoothing strength is preserved.
                                     let prior_counts = &mut ws.subset_counts[..n_alleles];
                                     for idx in 0..n_alleles {
-                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
-                                            * active_states as f32;
+                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0);
+                                    }
+                                    normalize_probs(prior_counts);
+                                    if prior_counts.iter().all(|v| !v.is_finite()) {
+                                        return Err(ReagleError::vcf(format!(
+                                            "Non-finite allele prior in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                            context.window_idx,
+                                            context.sample_idx,
+                                            context.hap_idx,
+                                            m_rev,
+                                            active_states
+                                        )));
                                     }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
