@@ -584,23 +584,27 @@ fn test_synthetic_slam_dunk() {
 #[serial]
 fn test_synthetic_recombination() {
     // Test imputation across a recombination breakpoint.
-    // Use 100kb marker spacing to create ~5 cM total genetic distance,
+    // Use 50kb marker spacing to create ~5 cM total genetic distance,
     // ensuring multiple steps for proper local state selection.
-    let n_markers = 50;
-    let positions: Vec<usize> = (0..n_markers).map(|m| m * 100000 + 1).collect();
+    let n_markers = 100;
+    let positions: Vec<usize> = (0..n_markers).map(|m| m * 50000 + 1).collect();
 
-    let ref_file = SyntheticVcfBuilder::new(n_markers, 50)
+    // Double haplotype count per ancestry group:
+    // h < 100 => allele 0, h >= 100 => allele 1 (200 reference haplotypes total).
+    let ref_file = SyntheticVcfBuilder::new(n_markers, 100)
         .positions(positions.clone())
-        .allele_generator(|_, h| if h < 50 { 0 } else { 1 })
+        .allele_generator(|_, h| if h < 100 { 0 } else { 1 })
         .build();
 
     let target_file = SyntheticVcfBuilder::new(n_markers, 1)
         .positions(positions)
         .unphased()
         .allele_generator(|m, _| {
-            if m == 15 || m == 25 {
+            // Keep overall breakpoint pattern from the 50-marker version, scaled by 2:
+            // old missing markers 15/25 -> 30/50, old breakpoint 20 -> 40.
+            if m == 30 || m == 50 {
                 255
-            } else if m < 20 {
+            } else if m < 40 {
                 0
             } else {
                 1
@@ -627,17 +631,17 @@ fn test_synthetic_recombination() {
     let out_vcf = temp_dir.path().join("output_rec.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 1);
 
-    // Marker 15 (in 0-region, should be 0)
+    // Marker 30 (in 0-region, should be 0)
     assert!(
-        dosages[15][0] < 0.1,
-        "Marker 15 should be 0, got {}",
-        dosages[15][0]
+        dosages[30][0] < 0.1,
+        "Marker 30 should be 0, got {}",
+        dosages[30][0]
     );
-    // Marker 25 (in 1-region, should be 2 for diploid 1|1)
+    // Marker 50 (in 1-region, should be 2 for diploid 1|1)
     assert!(
-        dosages[25][0] > 1.9,
-        "Marker 25 should be 2, got {}",
-        dosages[25][0]
+        dosages[50][0] > 1.9,
+        "Marker 50 should be 2, got {}",
+        dosages[50][0]
     );
 
     // DR2 validation
@@ -664,31 +668,31 @@ fn test_synthetic_recombination() {
 
     // SEN Validation
     // Target:
-    // m < 20: 0
-    // m >= 20: 1
-    // Missing at 15 (should be 0) and 25 (should be 1 -> dosage 2.0 for diploid?)
+    // m < 40: 0
+    // m >= 40: 1
+    // Missing at 30 (should be 0) and 50 (should be 1 -> dosage 2.0 for diploid?)
     // Note: The allele generator says:
-    // if m == 15 || m == 25 { 255 }
-    // else if m < 20 { 0 }
+    // if m == 30 || m == 50 { 255 }
+    // else if m < 40 { 0 }
     // else { 1 }
     // Wait, target is diploid (n_ploidy=2 default in Builder).
     // The allele generator returns u8 per haplotype.
     // Haps 0 and 1 (sample 0).
     // So for m < 20: allele 0 + allele 0 = dosage 0.
     // For m >= 20: allele 1 + allele 1 = dosage 2.
-    // Missing at 15: expected dosage 0.
-    // Missing at 25: expected dosage 2.
+    // Missing at 30: expected dosage 0.
+    // Missing at 50: expected dosage 2.
 
     let mut truth_vec = Vec::new();
     let mut imp_vec = Vec::new();
 
-    // Check marker 15
+    // Check marker 30
     truth_vec.push(0.0);
-    imp_vec.push(dosages[15][0] as f64);
+    imp_vec.push(dosages[30][0] as f64);
 
-    // Check marker 25
+    // Check marker 50
     truth_vec.push(2.0);
-    imp_vec.push(dosages[25][0] as f64);
+    imp_vec.push(dosages[50][0] as f64);
 
     let sen = calculate_sen(&truth_vec, &imp_vec);
     println!("Recombination test - SEN: {:.4}", sen);

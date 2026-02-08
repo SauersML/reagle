@@ -830,7 +830,7 @@ fn compute_nearest_observed_lambda(
         ws.nearest_obs_lambda[m] = raw_lambda * cluster_scale;
         // When no typed marker is reachable in either direction, lambda stays
         // Infinity. smooth_allele_posteriors_subset handles this correctly:
-        // exp(-Inf) = 0 -> clamped to MIN_RETAIN -> maximum smoothing, which is
+        // exp(-Inf) = 0 -> maximum smoothing, which is
         // the right behavior for markers with zero LD anchor.
     }
 }
@@ -843,7 +843,7 @@ fn smooth_allele_posteriors_subset(
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
-    const SMOOTHING_GAIN: f32 = 8.0;
+    const SMOOTHING_GAIN: f32 = 10.0;
     if allele_probs.is_empty() {
         return;
     }
@@ -876,7 +876,6 @@ fn smooth_allele_posteriors_subset(
     if prior_mass <= 0.0 {
         return;
     }
-
     let denom = 1.0 + prior_mass;
     for (i, p) in allele_probs.iter_mut().enumerate() {
         let local_prior = subset_prior_probs.get(i).copied().unwrap_or(0.0).max(0.0);
@@ -1272,9 +1271,9 @@ fn forward_update_dict(
 }
 
 /// Monomorphized HMM core over a concrete genotype column type.
-fn run_impute_hmm_impl<C: RefColumnLike>(
+fn run_impute_hmm_impl(
     state_haps: &[RefHapId],
-    ref_columns: &[C],
+    ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
     error_rate: f32,
@@ -1398,7 +1397,6 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
 
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
-                    let uniform = target_probs.is_uniform_marker(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
                     if prior_marker_idx == Some(m_rev) {
@@ -1499,7 +1497,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     *p /= total;
                                 }
                                 if use_prior_smoothing
-                                    && uniform
+                                    && target_probs.is_untyped_uniform_marker(m_rev)
                                     && recomb_rate > 0.0
                                 {
                                     // Smoothing prior must be independent of the
@@ -1565,7 +1563,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                     //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
                     // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
                     // at marker t (sum of unnormalized alpha_t).
-                    if uniform {
+                    if target_probs.is_uniform_marker(m_rev) {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -1744,7 +1742,6 @@ fn run_impute_hmm_seqcoded(
 
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
-                    let uniform = target_probs.is_uniform_marker(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
                     if prior_marker_idx == Some(m_rev) {
@@ -1844,7 +1841,7 @@ fn run_impute_hmm_seqcoded(
                                     *p /= total;
                                 }
                                 if use_prior_smoothing
-                                    && uniform
+                                    && target_probs.is_untyped_uniform_marker(m_rev)
                                     && recomb_rate > 0.0
                                 {
                                     let prior_probs = if smoothing_prior_total > 0.0 {
@@ -1902,7 +1899,7 @@ fn run_impute_hmm_seqcoded(
                         }
                     }
 
-                    if uniform {
+                    if target_probs.is_uniform_marker(m_rev) {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2083,7 +2080,6 @@ fn run_impute_hmm_dict(
 
                 for m_rev in (block_start..block_end).rev() {
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
-                    let uniform = target_probs.is_uniform_marker(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
                     if prior_marker_idx == Some(m_rev) {
@@ -2184,7 +2180,7 @@ fn run_impute_hmm_dict(
                                     *p /= total;
                                 }
                                 if use_prior_smoothing
-                                    && uniform
+                                    && target_probs.is_untyped_uniform_marker(m_rev)
                                     && recomb_rate > 0.0
                                 {
                                     let prior_probs = if smoothing_prior_total > 0.0 {
@@ -2242,7 +2238,7 @@ fn run_impute_hmm_dict(
                         }
                     }
 
-                    if uniform {
+                    if target_probs.is_uniform_marker(m_rev) {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,

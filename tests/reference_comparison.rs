@@ -4604,14 +4604,15 @@ fn test_dosage_genotyped_vs_imputed() {
     println!("  Rust mean DR2: {:.4}", rust_imp_mean);
     println!("  Gap: {:.4}", rust_imp_mean - java_imp_mean);
 
-    // Find worst imputed markers (Rust << Java)
+    // Diagnostic DR2 deltas only: lower DR2 is not inherently worse without
+    // checking calibration against truth (handled in strict calibration tests).
     let mut imputed_gaps: Vec<(u64, f64, f64)> = Vec::new();
     for ((j_pos, j_dr2), (_, r_dr2)) in imputed_java_dr2.iter().zip(imputed_rust_dr2.iter()) {
         imputed_gaps.push((*j_pos, *j_dr2, *r_dr2));
     }
     imputed_gaps.sort_by(|a, b| (a.2 - a.1).partial_cmp(&(b.2 - b.1)).unwrap());
 
-    println!("\n  Top 20 imputed markers where Rust DR2 is WORSE:");
+    println!("\n  Top 20 imputed markers where Rust DR2 is LOWER:");
     println!(
         "  {:>12} {:>10} {:>10} {:>10}",
         "Position", "Java DR2", "Rust DR2", "Gap"
@@ -4656,9 +4657,9 @@ fn test_dosage_genotyped_vs_imputed() {
         }
     }
 
-    // Assertions for DR2 quality
+    // DR2 diagnostics
     println!("\n{}", "=".repeat(70));
-    println!("ASSERTIONS:");
+    println!("DR2 DIAGNOSTICS:");
 
     // Count POLYMORPHIC genotyped markers (DR2 > 0 means there's variance)
     // Monomorphic markers correctly have DR2=0, so we exclude them from the >=0.9 check
@@ -4675,7 +4676,7 @@ fn test_dosage_genotyped_vs_imputed() {
     );
     println!("  Polymorphic with DR2 < 0.9: {}", polymorphic_low.len());
 
-    // Imputed markers: compare how often each implementation is worse
+    // Imputed markers: compare relative DR2 level only (diagnostic).
     let worse_imp_count = imputed_gaps
         .iter()
         .filter(|(_, j, r)| *r < *j - 0.01)
@@ -4685,12 +4686,12 @@ fn test_dosage_genotyped_vs_imputed() {
         .filter(|(_, j, r)| *j < *r - 0.01)
         .count();
     println!(
-        "  Imputed markers where Rust DR2 significantly worse: {}/{}",
+        "  Imputed markers where Rust DR2 is significantly lower: {}/{}",
         worse_imp_count,
         imputed_gaps.len()
     );
     println!(
-        "  Imputed markers where Java DR2 significantly worse: {}/{}",
+        "  Imputed markers where Java DR2 is significantly lower: {}/{}",
         worse_java_count,
         imputed_gaps.len()
     );
@@ -4871,7 +4872,8 @@ fn test_dosage_genotyped_vs_imputed() {
     }
 
     // For polymorphic genotyped markers (non-zero variance), DR2 should be ~1.0
-    // because we know the true values and output them as dosages
+    // because these sites are directly observed (not imputed) and emitted dosages
+    // should match the known typed genotypes. Keep a small tolerance for numerics.
     if !polymorphic_rust.is_empty() {
         let poly_mean: f64 =
             polymorphic_rust.iter().map(|(_, d)| *d).sum::<f64>() / polymorphic_rust.len() as f64;
