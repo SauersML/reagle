@@ -135,6 +135,7 @@ const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
+const ENABLE_FAST_BEAM_FIX: bool = false;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
@@ -2243,12 +2244,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         if !sp.is_unphased(m) {
                             continue;
                         }
+                        if !ENABLE_FAST_BEAM_FIX {
+                            continue;
+                        }
                         let conf = p.max(1.0 - p);
-                        let threshold = self
-                            .config
-                            .fast_beam_fix_threshold
-                            .unwrap_or(FAST_BEAM_FIX_CONF);
-                        if conf < threshold {
+                        if conf < FAST_BEAM_FIX_CONF {
                             continue;
                         }
                         let want_swapped = p >= 0.5;
@@ -10649,7 +10649,6 @@ mod tests {
             seed: 12345,
             nthreads: None,
             profile: false,
-            fast_beam_fix_threshold: None,
         };
 
         let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
@@ -10739,7 +10738,6 @@ mod tests {
             seed: 12345,
             nthreads: Some(2),
             profile: false,
-            fast_beam_fix_threshold: None,
         };
 
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);

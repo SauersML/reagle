@@ -2289,7 +2289,6 @@ fn test_phasing_confidence() {
         seed: 12345,
         nthreads: Some(1),
         profile: false,
-        fast_beam_fix_threshold: None,
     };
 
     let mut pipeline = PhasingPipeline::new(config, None);

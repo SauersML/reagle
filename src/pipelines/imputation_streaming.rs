@@ -4206,94 +4206,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     Ok(out)
                 };
-                let blend_posts = |base: &mut [AllelePosteriors],
-                                   donor: &[AllelePosteriors],
-                                   w: f32| {
-                    if w <= 0.0 {
-                        return;
-                    }
-                    let ww = w.clamp(0.0, 1.0);
-                    for (b, d) in base.iter_mut().zip(donor.iter()) {
-                        match (b, d) {
-                            (AllelePosteriors::Biallelic(pb), AllelePosteriors::Biallelic(pd)) => {
-                                let conf = (*pb - 0.5).abs() * 2.0;
-                                let local_w = ww * (1.0 - conf);
-                                *pb = ((1.0 - local_w) * *pb + local_w * *pd).clamp(0.0, 1.0);
-                            }
-                            (
-                                AllelePosteriors::Multiallelic(pb),
-                                AllelePosteriors::Multiallelic(pd),
-                            ) => {
-                                if pb.len() == pd.len() && !pb.is_empty() {
-                                    let mut max_p = 0.0f32;
-                                    for &p in pb.iter() {
-                                        if p > max_p {
-                                            max_p = p;
-                                        }
-                                    }
-                                    let conf = if pb.len() > 1 {
-                                        let uniform = 1.0 / pb.len() as f32;
-                                        ((max_p - uniform) / (1.0 - uniform)).clamp(0.0, 1.0)
-                                    } else {
-                                        1.0
-                                    };
-                                    let local_w = ww * (1.0 - conf);
-                                    let mut sum = 0.0f32;
-                                    for i in 0..pb.len() {
-                                        pb[i] = (1.0 - local_w) * pb[i] + local_w * pd[i];
-                                        if pb[i] < 0.0 {
-                                            pb[i] = 0.0;
-                                        }
-                                        sum += pb[i];
-                                    }
-                                    if sum > 0.0 {
-                                        let inv = 1.0 / sum;
-                                        for v in pb.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                };
-                let temper_posts = |base: &mut [AllelePosteriors], tau: f32| {
-                    // Temperature smoothing in weak-signal regimes to reduce
-                    // overconfident posteriors before donor fusion.
-                    let tau = tau.max(1.0);
-                    if tau <= 1.000_001 {
-                        return;
-                    }
-                    let inv_tau = 1.0 / tau;
-                    for b in base.iter_mut() {
-                        match b {
-                            AllelePosteriors::Biallelic(p_alt) => {
-                                let p = (*p_alt).clamp(1e-9, 1.0 - 1e-9);
-                                let logit = (p / (1.0 - p)).ln();
-                                let scaled = logit * inv_tau;
-                                *p_alt = 1.0 / (1.0 + (-scaled).exp());
-                            }
-                            AllelePosteriors::Multiallelic(probs) => {
-                                if probs.is_empty() {
-                                    continue;
-                                }
-                                let mut sum = 0.0f32;
-                                for v in probs.iter_mut() {
-                                    let p = (*v).max(1e-12);
-                                    *v = p.powf(inv_tau);
-                                    sum += *v;
-                                }
-                                if sum > 0.0 {
-                                    let inv = 1.0 / sum;
-                                    for v in probs.iter_mut() {
-                                        *v *= inv;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                };
+                // [REMOVED] Helper closures blend_posts/temper_posts were removed along with their usage.
 
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
@@ -4612,21 +4525,7 @@ impl crate::pipelines::ImputationPipeline {
                         handoff_capture_idx_h1,
                         &donors_h1,
                     )?;
-                    let mut posts = posts;
-                    if !has_priors_h1
-                        && plan.n_ref_haps > 32
-                        && !donors_h1.is_empty()
-                        && conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                    {
-                        let donor_posts = posts_from_donors(&donors_h1)?;
-                        let t = ((conf_ratio_h1 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
-                        .clamp(0.0, 1.0);
-                        let tau = 1.0 + 0.1 * t;
-                        temper_posts(&mut posts, tau);
-                        let w = 1.00f32 * t;
-                        blend_posts(&mut posts, &donor_posts, w);
-                    }
+                    // [REMOVED] Donor blending logic was overriding local HMM signals during recombination.
                     hap1_posts = Some(posts);
                     p1_out = out;
                     // Keep imputation emissions stationary across windows.
@@ -4671,21 +4570,7 @@ impl crate::pipelines::ImputationPipeline {
                         handoff_capture_idx_h2,
                         &donors_h2,
                     )?;
-                    let mut posts = posts;
-                    if !has_priors_h2
-                        && plan.n_ref_haps > 32
-                        && !donors_h2.is_empty()
-                        && conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                    {
-                        let donor_posts = posts_from_donors(&donors_h2)?;
-                        let t = ((conf_ratio_h2 - SM_MATCH_LOW_CONF_FRAC)
-                            / (1.0 - SM_MATCH_LOW_CONF_FRAC).max(1e-6))
-                        .clamp(0.0, 1.0);
-                        let tau = 1.0 + 0.1 * t;
-                        temper_posts(&mut posts, tau);
-                        let w = 1.00f32 * t;
-                        blend_posts(&mut posts, &donor_posts, w);
-                    }
+                    // [REMOVED] Donor blending logic was overriding local HMM signals during recombination.
                     hap2_posts = Some(posts);
                     p2_out = out;
                     let _ = (stats.expected_mismatches, stats.informative_sites);
