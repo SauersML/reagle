@@ -616,7 +616,7 @@ fn test_synthetic_recombination() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 100;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 10.0;
     config.overlap = 2.0;
     config.nthreads = Some(1);
@@ -716,7 +716,7 @@ fn test_private_variant_genotyped_not_imputed() {
     config.r#ref = Some(ref_path);
     config.out = out_prefix.clone();
     config.nthreads = Some(1);
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.err = Some(0.0001);
     config.window = 0.1;
     config.overlap = 0.01;
@@ -904,7 +904,7 @@ fn test_population_structure() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 20.0;
     config.nthreads = Some(1);
 
@@ -994,7 +994,7 @@ fn test_hotspot_switching() {
     config.map = Some(map_path);
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 100.0;
     config.nthreads = Some(1);
 
@@ -1066,7 +1066,7 @@ fn test_phase_switch_torture() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1137,7 +1137,7 @@ fn test_error_injection() {
     config.out = out_prefix.clone();
     config.err = Some(0.01);
     config.imp_states = 50;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1213,7 +1213,7 @@ fn test_rare_variant() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 
@@ -1308,7 +1308,7 @@ fn test_dr2_validation() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.imp_states = 50;
-    config.ne = 1000.0;
+    config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
 

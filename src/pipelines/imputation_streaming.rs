@@ -4228,41 +4228,15 @@ impl crate::pipelines::ImputationPipeline {
                     .marker(MarkerIdx::new(ref_m as u32))
                     .n_alleles()
                     .max(1);
-                let col = &ref_columns[ref_m];
+                // For untyped markers where HMM is skipped (no_info), return uniform
+                // probabilities (neutral) rather than population frequency. This avoids
+                // injecting a strong prior (e.g. 0.0/1.0) when we have no local information,
+                // preventing "stickiness" or bias towards the population mean.
                 if n_alleles == 2 {
-                    let n_haps = col.n_haplotypes().max(1);
-                    let alt_count = col.alt_count();
-                    let alt_freq =
-                        (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
-                    out.push(AllelePosteriors::Biallelic(alt_freq));
+                    out.push(AllelePosteriors::Biallelic(0.5));
                 } else {
-                    let mut probs = vec![0.0f32; n_alleles];
-                    let n_haps = col.n_haplotypes();
-                    for h in 0..n_haps {
-                        let allele = col.get(HapIdx::new(h as u32));
-                        if allele == 255 {
-                            continue;
-                        }
-                        let idx = allele as usize;
-                        if idx < probs.len() {
-                            probs[idx] += 1.0;
-                        }
-                    }
-                    let mut sum = 0.0f32;
-                    for p in probs.iter() {
-                        sum += *p;
-                    }
-                    if sum <= 0.0 {
-                        let uniform = 1.0 / n_alleles as f32;
-                        for p in probs.iter_mut() {
-                            *p = uniform;
-                        }
-                    } else {
-                        let inv = 1.0 / sum;
-                        for p in probs.iter_mut() {
-                            *p *= inv;
-                        }
-                    }
+                    let uniform = 1.0 / n_alleles.max(1) as f32;
+                    let probs = vec![uniform; n_alleles];
                     out.push(AllelePosteriors::Multiallelic(probs));
                 }
             }
