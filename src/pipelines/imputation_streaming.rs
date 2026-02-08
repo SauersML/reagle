@@ -3550,6 +3550,8 @@ impl crate::pipelines::ImputationPipeline {
 
             for (ref_m, target_m_idx) in alignment.ref_to_target.iter().enumerate() {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles();
+                let mut observed1_marker = false;
+                let mut observed2_marker = false;
                 let mut aligned1: Vec<f32> = Vec::new();
                 let mut aligned2: Vec<f32> = Vec::new();
                 let mut use1 = false;
@@ -3613,6 +3615,7 @@ impl crate::pipelines::ImputationPipeline {
 
                     let pl =
                         target_pl_matrix.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
+                    let has_pl = pl.map_or(false, |vals| !vals.is_empty());
                     let mapping = alignment
                         .allele_mappings
                         .get(target_m)
@@ -3941,6 +3944,14 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         use2 = true;
                     }
+
+                    if has_pl {
+                        observed1_marker = true;
+                        observed2_marker = true;
+                    } else if has_hard {
+                        observed1_marker = mapped1 != 255;
+                        observed2_marker = if is_diploid { mapped2 != 255 } else { mapped1 != 255 };
+                    }
                 }
 
                 if !use1 || !use2 {
@@ -3974,10 +3985,6 @@ impl crate::pipelines::ImputationPipeline {
 
                 normalize_probs(&mut aligned1);
                 normalize_probs(&mut aligned2);
-
-                let observed1_marker = use1;
-                let observed2_marker = use2;
-
                 if observed1_marker && !is_uniform(&aligned1) && ref_m >= overlap_start {
                     last_info1 = Some(ref_m);
                 }
