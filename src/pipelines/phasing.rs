@@ -8339,6 +8339,40 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    // Seed alleles from initial paths if available (from heuristic)
+    // This ensures MCMC starts in a high-probability region rather than drifting
+    // from a random start.
+    if let Some(paths) = initial_paths {
+        if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
+                }
+
+                let h1_idx = paths.path1[m] as usize;
+                let h2_idx = paths.path2[m] as usize;
+
+                if h1_idx < phase_ibs.n_haps() && h2_idx < phase_ibs.n_haps() {
+                    let ref1 = phase_ibs.allele(m, h1_idx as u32);
+                    let ref2 = phase_ibs.allele(m, h2_idx as u32);
+
+                    let matches_orient1 = ref1 == a1 && ref2 == a2;
+                    let matches_orient2 = ref1 == a2 && ref2 == a1;
+
+                    if matches_orient1 && !matches_orient2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if matches_orient2 && !matches_orient1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
+                }
+            }
+        }
+    }
+
     // Initialize path with starting states from standard neighbor finding
     // This gives the first iteration something to work with
     let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
