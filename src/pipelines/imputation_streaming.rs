@@ -4896,6 +4896,7 @@ impl crate::pipelines::ImputationPipeline {
                                 sample_idx: s,
                                 hap_idx: hap_idx.as_usize(),
                             },
+                            self.config.cluster,
                             ws,
                         )
                     })?;

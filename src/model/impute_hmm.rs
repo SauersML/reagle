@@ -776,7 +776,9 @@ fn compute_nearest_observed_lambda(
     ws: &mut ImputeWorkspace,
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
+    smoothing_cluster_cm: f32,
 ) {
+    const BASE_CLUSTER_CM: f32 = 0.005;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);
@@ -814,11 +816,21 @@ fn compute_nearest_observed_lambda(
         ws.nearest_obs_bwd[m_rev] = dist;
     }
 
+    let cluster_scale = (smoothing_cluster_cm.max(1e-6) / BASE_CLUSTER_CM).max(0.0);
     for m in 0..n {
-        ws.nearest_obs_lambda[m] = ws.nearest_obs_fwd[m].min(ws.nearest_obs_bwd[m]);
+        let left = ws.nearest_obs_fwd[m];
+        let right = ws.nearest_obs_bwd[m];
+        let raw_lambda = if left.is_finite() && right.is_finite() {
+            // In an untyped interval bracketed by typed anchors, uncertainty is
+            // governed by the full bracket span rather than the nearest side.
+            left + right
+        } else {
+            left.min(right)
+        };
+        ws.nearest_obs_lambda[m] = raw_lambda * cluster_scale;
         // When no typed marker is reachable in either direction, lambda stays
-        // Infinity.  smooth_allele_posteriors_subset handles this correctly:
-        // exp(-Inf) = 0 → clamped to MIN_RETAIN → maximum smoothing, which is
+        // Infinity. smooth_allele_posteriors_subset handles this correctly:
+        // exp(-Inf) = 0 -> clamped to MIN_RETAIN -> maximum smoothing, which is
         // the right behavior for markers with zero LD anchor.
     }
 }
@@ -831,6 +843,7 @@ fn smooth_allele_posteriors_subset(
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
+    const SMOOTHING_GAIN: f32 = 8.0;
     if allele_probs.is_empty() {
         return;
     }
@@ -859,7 +872,7 @@ fn smooth_allele_posteriors_subset(
     let max_effective = allele_probs.len().max(1) as f32;
     let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
-    let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
+    let prior_mass = (SMOOTHING_GAIN * effective_alleles * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
@@ -1269,6 +1282,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
+    smoothing_cluster_cm: f32,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "dense/sparse")?;
@@ -1284,7 +1298,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb);
+        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
     } else {
         ws.nearest_obs_lambda.clear();
     }
@@ -1611,6 +1625,7 @@ fn run_impute_hmm_seqcoded(
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
+    smoothing_cluster_cm: f32,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "seqcoded")?;
@@ -1626,7 +1641,7 @@ fn run_impute_hmm_seqcoded(
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb);
+        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
     } else {
         ws.nearest_obs_lambda.clear();
     }
@@ -1950,6 +1965,7 @@ fn run_impute_hmm_dict(
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
+    smoothing_cluster_cm: f32,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "dictionary")?;
@@ -1965,7 +1981,7 @@ fn run_impute_hmm_dict(
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb);
+        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
     } else {
         ws.nearest_obs_lambda.clear();
     }
@@ -2292,6 +2308,7 @@ pub fn run_impute_hmm(
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
+    smoothing_cluster_cm: f32,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_reference_marker_count(ref_columns.len(), target_probs, context, "dispatch")?;
@@ -2322,6 +2339,7 @@ pub fn run_impute_hmm(
             state_priors,
             ref_allele_freqs,
             context,
+            smoothing_cluster_cm,
             ws,
         );
     }
@@ -2340,6 +2358,7 @@ pub fn run_impute_hmm(
             state_priors,
             ref_allele_freqs,
             context,
+            smoothing_cluster_cm,
             ws,
         );
     }
@@ -2358,6 +2377,7 @@ pub fn run_impute_hmm(
             state_priors,
             ref_allele_freqs,
             context,
+            smoothing_cluster_cm,
             ws,
         );
     }
@@ -2376,6 +2396,7 @@ pub fn run_impute_hmm(
             state_priors,
             ref_allele_freqs,
             context,
+            smoothing_cluster_cm,
             ws,
         );
     }
@@ -2390,6 +2411,7 @@ pub fn run_impute_hmm(
         state_priors,
         ref_allele_freqs,
         context,
+        smoothing_cluster_cm,
         ws,
     )
 }
