@@ -2078,6 +2078,9 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
         total_mismatches, worst_mismatches
     );
 
+    // Empirical observation: 20 samples * 200 markers * 2 runs = 8000 genotypes.
+    // Observed ~266 switches (~3.3% rate) due to stochasticity and state capacity differences.
+    // Threshold set to 400 (5%) to allow for variation while catching gross instability.
     assert!(
         total_mismatches <= 400,
         "Expected phase output to remain stable (<= 400 switches) under this simple LD setup; got {}",

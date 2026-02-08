@@ -217,7 +217,7 @@ impl Default for Config {
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
-            cluster: 0.005,
+            cluster: 0.00001,
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
