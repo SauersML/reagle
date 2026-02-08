@@ -2431,6 +2431,9 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        if self.config.err.is_none() {
+            self.params.p_mismatch = 0.0001;
+        }
         self.params.recomb_intensity = self
             .params
             .recomb_intensity
