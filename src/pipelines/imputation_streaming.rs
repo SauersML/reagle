@@ -3882,8 +3882,19 @@ impl crate::pipelines::ImputationPipeline {
                                         sample_idx,
                                     )
                                     .clamp(0.0, 1.0);
-                                aligned1[mapped1 as usize] = phase_conf;
-                                aligned1[mapped2 as usize] = 1.0 - phase_conf;
+                                // Use hard-called phase direction with high confidence,
+                                // matching Beagle 5's approach where phased genotypes are
+                                // used definitively for per-haplotype imputation. Soft
+                                // phase_conf near 0.5 produces flat emissions that give the
+                                // HMM zero information at HET typed markers.
+                                let c = conf1.clamp(0.0, 1.0);
+                                if phase_conf >= 0.5 {
+                                    aligned1[mapped1 as usize] = c;
+                                    aligned1[mapped2 as usize] = 1.0 - c;
+                                } else {
+                                    aligned1[mapped2 as usize] = c;
+                                    aligned1[mapped1 as usize] = 1.0 - c;
+                                }
                             } else {
                                 aligned1[mapped1 as usize] = 0.5;
                                 aligned1[mapped2 as usize] = 0.5;
@@ -3909,8 +3920,15 @@ impl crate::pipelines::ImputationPipeline {
                                         sample_idx,
                                     )
                                     .clamp(0.0, 1.0);
-                                aligned2[mapped2 as usize] = phase_conf;
-                                aligned2[mapped1 as usize] = 1.0 - phase_conf;
+                                // Hard-called phase for hap2 (complementary to hap1).
+                                let c = conf2.clamp(0.0, 1.0);
+                                if phase_conf >= 0.5 {
+                                    aligned2[mapped2 as usize] = c;
+                                    aligned2[mapped1 as usize] = 1.0 - c;
+                                } else {
+                                    aligned2[mapped1 as usize] = c;
+                                    aligned2[mapped2 as usize] = 1.0 - c;
+                                }
                             } else {
                                 aligned2[mapped2 as usize] = 0.5;
                                 aligned2[mapped1 as usize] = 0.5;
