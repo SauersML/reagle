@@ -38,8 +38,10 @@ pub struct GeneticMap {
 impl GeneticMap {
     /// Load from PLINK format map file
     ///
-    /// Format: chrom position_bp rate_cM_per_Mb position_cM
-    /// (Note: rate column is ignored, we use the cumulative position)
+    /// Supported formats:
+    /// - Java/PLINK: `chrom id cM bp`
+    /// - Reagle linear-map helper: `chrom bp rate_cM_per_Mb cM`
+    /// (rate column is ignored when present)
     pub fn from_plink_file(path: &Path, target_chrom: &str) -> Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
@@ -67,17 +69,25 @@ impl GeneticMap {
                 continue;
             }
 
-            // PLINK map format:
-            // 1) chrom
-            // 2) id
-            // 3) genetic position (cM)
-            // 4) physical position (bp)
-            let gen_pos: f64 = parts[2]
-                .parse()
-                .map_err(|_| ReagleError::parse(line_num + 1, "Invalid genetic position"))?;
-            let pos: u32 = parts[3]
-                .parse()
-                .map_err(|_| ReagleError::parse(line_num + 1, "Invalid position"))?;
+            let java_like = (
+                parts[2].parse::<f64>(),
+                parts[3].parse::<u32>(),
+            );
+            let rust_linear_like = (
+                parts[1].parse::<u32>(),
+                parts[3].parse::<f64>(),
+            );
+
+            let (pos, gen_pos) = match (java_like, rust_linear_like) {
+                ((Ok(gen_pos), Ok(pos)), _) => (pos, gen_pos),
+                (_, (Ok(pos), Ok(gen_pos))) => (pos, gen_pos),
+                _ => {
+                    return Err(ReagleError::parse(
+                        line_num + 1,
+                        "Invalid map row: expected either `chrom id cM bp` or `chrom bp rate cM`",
+                    ));
+                }
+            };
 
             if !gen_pos.is_finite() {
                 return Err(ReagleError::parse(
@@ -459,6 +469,17 @@ mod tests {
         file
     }
 
+    fn create_test_map_file_rust_linear() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        // Reagle linear-map helper format: chrom bp rate cM
+        writeln!(file, "chr1 1000000 0.0 0.0").unwrap();
+        writeln!(file, "chr1 2000000 0.0 1.0").unwrap();
+        writeln!(file, "chr1 3000000 0.0 2.5").unwrap();
+        file.flush().unwrap();
+        file
+    }
+
     fn make_test_markers() -> Markers {
         let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
         markers.add_chrom("chr1");
@@ -490,6 +511,18 @@ mod tests {
 
         // Interpolated position
         assert!((map.gen_pos(1_500_000) - 0.5).abs() < 0.001);
+        assert!((map.gen_pos(2_500_000) - 1.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_interpolation_rust_linear_format() {
+        let map_file = create_test_map_file_rust_linear();
+        let map =
+            GeneticMap::from_plink_file(map_file.path(), "chr1").expect("Failed to load map");
+
+        assert!((map.gen_pos(1_000_000) - 0.0).abs() < 0.001);
+        assert!((map.gen_pos(2_000_000) - 1.0).abs() < 0.001);
+        assert!((map.gen_pos(3_000_000) - 2.5).abs() < 0.001);
         assert!((map.gen_pos(2_500_000) - 1.75).abs() < 0.001);
     }
 
