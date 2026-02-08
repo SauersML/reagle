@@ -2102,6 +2102,19 @@ fn build_imputation_plan(
                     .copied()
                     .min()
                     .unwrap_or(per_window_cap.max(1));
+                // When the per-window budget can hold the entire reference
+                // panel, the abyss serves no memory purpose — it only removes
+                // haplotypes from the HMM state space, biasing allele posteriors
+                // at untyped markers (causing AF collapse at markers where all
+                // ALT carriers land in the abyss).  Clear it so every haplotype
+                // participates in the Li-Stephens HMM; irrelevant haplotypes
+                // naturally receive low posterior weight from emissions at typed
+                // markers, while per-state switching drops (ρ/K), improving IBD
+                // signal preservation.
+                if per_window_cap_min >= n_ref_haps {
+                    abyss.fill(false);
+                    abyss_count = 0;
+                }
                 let (intervals, core) = if per_window_cap_min >= n_ref_haps {
                     let mut intervals = Vec::new();
                     let mut core = Vec::new();

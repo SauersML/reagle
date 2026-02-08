@@ -773,9 +773,10 @@ fn compute_nearest_observed_lambda(
 
     for m in 0..n {
         ws.nearest_obs_lambda[m] = ws.nearest_obs_fwd[m].min(ws.nearest_obs_bwd[m]);
-        if !ws.nearest_obs_lambda[m].is_finite() {
-            ws.nearest_obs_lambda[m] = 0.0;
-        }
+        // When no typed marker is reachable in either direction, lambda stays
+        // Infinity.  smooth_allele_posteriors_subset handles this correctly:
+        // exp(-Inf) = 0 → clamped to MIN_RETAIN → maximum smoothing, which is
+        // the right behavior for markers with zero LD anchor.
     }
 }
 
@@ -1434,7 +1435,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         prior_counts,
-                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
+                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(f32::INFINITY),
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
@@ -1740,7 +1741,7 @@ fn run_impute_hmm_seqcoded(
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         prior_counts,
-                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
+                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(f32::INFINITY),
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
@@ -2050,7 +2051,7 @@ fn run_impute_hmm_dict(
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
                                         prior_counts,
-                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
+                                        ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(f32::INFINITY),
                                         total,
                                         sq_sum,
                                         target_probs.is_untyped_uniform_marker(m_rev),
