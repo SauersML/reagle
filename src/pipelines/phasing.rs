@@ -2301,6 +2301,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         if !sp.is_unphased(m) {
                             continue;
                         }
+                        if !sp.has_input_phase_anchor() {
+                            continue;
+                        }
                         let conf = p.max(1.0 - p);
                         if conf < FAST_BEAM_FIX_CONF {
                             continue;
@@ -5085,12 +5088,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let p_err = self.params.p_mismatch;
                         let p_no_err = 1.0 - p_err;
 
+                        let has_phase_anchors = sp.has_input_phase_anchor();
+
                         let t_anchor_start = Instant::now();
-                        if self.reference_gt.is_some() {
+                        if self.reference_gt.is_some() && has_phase_anchors {
                             let threaded_haps = threaded_haps.to_mut();
                             let mut anchors: Vec<(usize, u8, u8)> = Vec::new();
                             for (i, &m) in hi_freq_to_orig.iter().enumerate() {
-                                if sp.is_unphased(m) {
+                                if !sp.is_input_phased_het(m) {
                                     continue;
                                 }
                                 let a1 = sp.allele1(m);
@@ -5232,7 +5237,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
 
                         let t_mcmc_start = Instant::now();
-                            let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
+                        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
                             let dyn_k = self.config.dynamic_k.max(1).min(n_states.max(1));
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
@@ -5450,54 +5455,71 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let swap_probs_sum: f32 = swap_probs.iter().sum();
                         assert!(swap_probs_sum.is_finite());
                         let orientation = if use_dynamic_mcmc {
-                            let mut desired_hap1: Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)> =
-                                Vec::with_capacity(het_positions.len());
-                            if let Some(paths) = new_paths.as_ref() {
-                                for &idx in &het_positions {
-                                    let a1 = seq1[idx];
-                                    let a2 = seq2[idx];
-                                    if a1 == 255 || a2 == 255 || a1 == a2 {
-                                        continue;
-                                    }
-                                    let h1 = paths
-                                        .path1
-                                        .get(idx)
-                                        .copied()
-                                        .map(|h| h.as_u32())
-                                        .unwrap_or(u32::MAX);
-                                    let h2 = paths
-                                        .path2
-                                        .get(idx)
-                                        .copied()
-                                        .map(|h| h.as_u32())
-                                        .unwrap_or(u32::MAX);
-                                    let desired = if h1 == u32::MAX || h2 == u32::MAX {
-                                        // Preserve current orientation if path is unavailable at this marker.
-                                        a1
-                                    } else {
-                                        let r1 =
-                                            subset_view.allele(MarkerIdx::new(idx as u32), HapIdx::new(h1));
-                                        let r2 =
-                                            subset_view.allele(MarkerIdx::new(idx as u32), HapIdx::new(h2));
-                                        if r1 == a1 && r2 == a2 {
-                                            a1
-                                        } else if r1 == a2 && r2 == a1 {
-                                            a2
-                                        } else if r1 == a1 || r1 == a2 {
-                                            r1
-                                        } else if r2 == a1 {
-                                            a2
-                                        } else if r2 == a2 {
+                            if has_phase_anchors {
+                                let mut desired_hap1: Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)> =
+                                    Vec::with_capacity(het_positions.len());
+                                if let Some(paths) = new_paths.as_ref() {
+                                    for &idx in &het_positions {
+                                        let a1 = seq1[idx];
+                                        let a2 = seq2[idx];
+                                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                                            continue;
+                                        }
+                                        let h1 = paths
+                                            .path1
+                                            .get(idx)
+                                            .copied()
+                                            .map(|h| h.as_u32())
+                                            .unwrap_or(u32::MAX);
+                                        let h2 = paths
+                                            .path2
+                                            .get(idx)
+                                            .copied()
+                                            .map(|h| h.as_u32())
+                                            .unwrap_or(u32::MAX);
+                                        let desired = if h1 == u32::MAX || h2 == u32::MAX {
+                                            // Preserve current orientation if path is unavailable at this marker.
                                             a1
                                         } else {
-                                            a1
-                                        }
-                                    };
-                                    desired_hap1
-                                        .push((HiFreqMarkerIdx(idx), AbsoluteHap1Allele(desired)));
+                                            let r1 = subset_view.allele(
+                                                MarkerIdx::new(idx as u32),
+                                                HapIdx::new(h1),
+                                            );
+                                            let r2 = subset_view.allele(
+                                                MarkerIdx::new(idx as u32),
+                                                HapIdx::new(h2),
+                                            );
+                                            if r1 == a1 && r2 == a2 {
+                                                a1
+                                            } else if r1 == a2 && r2 == a1 {
+                                                a2
+                                            } else if r1 == a1 || r1 == a2 {
+                                                r1
+                                            } else if r2 == a1 {
+                                                a2
+                                            } else if r2 == a2 {
+                                                a1
+                                            } else {
+                                                a1
+                                            }
+                                        };
+                                        desired_hap1
+                                            .push((HiFreqMarkerIdx(idx), AbsoluteHap1Allele(desired)));
+                                    }
                                 }
+                                Stage1OrientationUpdate::AbsoluteHap1(desired_hap1)
+                            } else {
+                                let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
+                                let lr_threshold = self.params.lr_threshold;
+                                for (idx, &pos) in het_positions.iter().enumerate() {
+                                    let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
+                                    let lr = *swap_lr.get(idx).unwrap_or(&1.0);
+                                    if lr >= lr_threshold && swap_bit == 1 {
+                                        swap_mask[pos] = RelativeSwapBit(true);
+                                    }
+                                }
+                                Stage1OrientationUpdate::RelativeSwapMask(swap_mask)
                             }
-                            Stage1OrientationUpdate::AbsoluteHap1(desired_hap1)
                         } else {
                             let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
                             for (idx, &pos) in het_positions.iter().enumerate() {
@@ -7942,13 +7964,18 @@ fn sample_dynamic_mcmc(
             h1_alleles[m] = a1;
             h2_alleles[m] = a1;
         } else {
-            // Het: random initial phase
-            if rng.random::<bool>() {
+            // Het: if unanchored, keep input orientation to avoid label drift.
+            if has_anchor {
+                if rng.random::<bool>() {
+                    h1_alleles[m] = a1;
+                    h2_alleles[m] = a2;
+                } else {
+                    h1_alleles[m] = a2;
+                    h2_alleles[m] = a1;
+                }
+            } else {
                 h1_alleles[m] = a1;
                 h2_alleles[m] = a2;
-            } else {
-                h1_alleles[m] = a2;
-                h2_alleles[m] = a1;
             }
         }
     }
