@@ -198,6 +198,7 @@ pub struct ImputeWorkspace {
     pub pattern_emissions: Vec<f32>,
     pub allele_probs: Vec<f32>,
     subset_counts: Vec<f32>,
+    smoothing_prior_counts: Vec<f32>,
     state_posterior_scratch: Vec<f32>,
     allele_prior_scratch: Vec<f32>,
     dict_pattern_alleles: Vec<u8>,
@@ -311,6 +312,7 @@ impl ImputeWorkspace {
             pattern_emissions: Vec::new(),
             allele_probs: Vec::new(),
             subset_counts: Vec::new(),
+            smoothing_prior_counts: Vec::new(),
             state_posterior_scratch: Vec::new(),
             allele_prior_scratch: Vec::new(),
             dict_pattern_alleles: Vec::new(),
@@ -390,6 +392,13 @@ impl ImputeWorkspace {
     fn ensure_subset_counts(&mut self, n_alleles: usize) {
         if self.subset_counts.len() < n_alleles {
             self.subset_counts.resize(n_alleles, 0.0);
+        }
+    }
+
+    #[inline]
+    fn ensure_smoothing_prior_counts(&mut self, n_alleles: usize) {
+        if self.smoothing_prior_counts.len() < n_alleles {
+            self.smoothing_prior_counts.resize(n_alleles, 0.0);
         }
     }
 }
@@ -822,7 +831,6 @@ fn smooth_allele_posteriors_subset(
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
-    const MIN_SMOOTH_LAMBDA: f32 = 0.02;
     if allele_probs.is_empty() {
         return;
     }
@@ -836,24 +844,20 @@ fn smooth_allele_posteriors_subset(
     if !untyped_uniform_marker {
         return;
     }
-    if nearest_obs_lambda <= MIN_SMOOTH_LAMBDA {
-        return;
-    }
-
     // Bayesian shrinkage based on genetic-distance information decay.
-    // Use allele-level effective support (not state-level support), because many
-    // equivalent states can represent the same allele without increasing allele
-    // uncertainty at a marker.
-    let mut allele_sq_sum = 0.0f32;
-    for &p in allele_probs.iter() {
+    // Estimate effective support from the smoothing prior, not the current
+    // posterior. Using the posterior here underweights smoothing precisely in
+    // collapse cases where the posterior has already degenerated.
+    let mut prior_sq_sum = 0.0f32;
+    for &p in subset_prior_probs.iter() {
         let q = p.max(0.0);
-        allele_sq_sum += q * q;
+        prior_sq_sum += q * q;
     }
-    if allele_sq_sum <= 0.0 {
+    if prior_sq_sum <= 0.0 {
         return;
     }
     let max_effective = allele_probs.len().max(1) as f32;
-    let effective_alleles = (1.0 / allele_sq_sum).clamp(1.0, max_effective);
+    let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
     let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
@@ -1388,6 +1392,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                     }
                     if is_final && n_alleles > 0 {
                         ws.ensure_subset_counts(n_alleles);
+                        ws.ensure_smoothing_prior_counts(n_alleles);
                     }
 
                     let start = (m_rev - block_start) * active_states;
@@ -1423,8 +1428,12 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
+                            smoothing_prior_counts.fill(0.0);
+                            let mut subset_total = 0.0f32;
+                            let mut smoothing_prior_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
@@ -1440,6 +1449,11 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     ws.allele_probs[idx] += state_prob;
                                     subset_counts[idx] += state_prob;
                                     subset_total += state_prob;
+                                    let w = ws.weights[i].max(0.0);
+                                    if w > 0.0 {
+                                        smoothing_prior_counts[idx] += w;
+                                        smoothing_prior_total += w;
+                                    }
                                 }
                             }
                             if total > 0.0 {
@@ -1474,16 +1488,15 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     && uniform
                                     && recomb_rate > 0.0
                                 {
-                                    let mut sum = 0.0f32;
-                                    for v in subset_counts.iter() {
-                                        sum += *v;
-                                    }
-                                    let prior_probs = if sum > 0.0 {
-                                        let inv = 1.0 / sum;
-                                        for v in subset_counts.iter_mut() {
+                                    // Smoothing prior must be independent of the
+                                    // marker posterior; otherwise smoothing is a no-op.
+                                    // Use the active state-set allele composition.
+                                    let prior_probs = if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
                                             *v *= inv;
                                         }
-                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
                                     } else {
                                         if !warned_af_fallback {
                                             eprintln!(
@@ -1724,6 +1737,7 @@ fn run_impute_hmm_seqcoded(
                     }
                     if is_final && n_alleles > 0 {
                         ws.ensure_subset_counts(n_alleles);
+                        ws.ensure_smoothing_prior_counts(n_alleles);
                     }
 
                     let col = seqcoded_col(&ref_columns[m_rev]);
@@ -1758,8 +1772,12 @@ fn run_impute_hmm_seqcoded(
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
+                            smoothing_prior_counts.fill(0.0);
+                            let mut subset_total = 0.0f32;
+                            let mut smoothing_prior_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
@@ -1775,6 +1793,11 @@ fn run_impute_hmm_seqcoded(
                                     ws.allele_probs[idx] += state_prob;
                                     subset_counts[idx] += state_prob;
                                     subset_total += state_prob;
+                                    let w = ws.weights[i].max(0.0);
+                                    if w > 0.0 {
+                                        smoothing_prior_counts[idx] += w;
+                                        smoothing_prior_total += w;
+                                    }
                                 }
                             }
                             if total > 0.0 {
@@ -1809,16 +1832,12 @@ fn run_impute_hmm_seqcoded(
                                     && uniform
                                     && recomb_rate > 0.0
                                 {
-                                    let mut sum = 0.0f32;
-                                    for v in subset_counts.iter() {
-                                        sum += *v;
-                                    }
-                                    let prior_probs = if sum > 0.0 {
-                                        let inv = 1.0 / sum;
-                                        for v in subset_counts.iter_mut() {
+                                    let prior_probs = if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
                                             *v *= inv;
                                         }
-                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
                                     } else {
                                         if !warned_af_fallback {
                                             eprintln!(
@@ -2056,6 +2075,7 @@ fn run_impute_hmm_dict(
                     }
                     if is_final && n_alleles > 0 {
                         ws.ensure_subset_counts(n_alleles);
+                        ws.ensure_smoothing_prior_counts(n_alleles);
                     }
 
                     let col = dict_col_ref(&ref_columns[m_rev]);
@@ -2091,8 +2111,12 @@ fn run_impute_hmm_dict(
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
                             let subset_counts = &mut ws.subset_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
                             subset_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
+                            smoothing_prior_counts.fill(0.0);
+                            let mut subset_total = 0.0f32;
+                            let mut smoothing_prior_total = 0.0f32;
                             let mut total = 0.0f32;
                             let mut missing_mass = 0.0f32;
                             for i in 0..active_states {
@@ -2108,6 +2132,11 @@ fn run_impute_hmm_dict(
                                     ws.allele_probs[idx] += state_prob;
                                     subset_counts[idx] += state_prob;
                                     subset_total += state_prob;
+                                    let w = ws.weights[i].max(0.0);
+                                    if w > 0.0 {
+                                        smoothing_prior_counts[idx] += w;
+                                        smoothing_prior_total += w;
+                                    }
                                 }
                             }
                             if total > 0.0 {
@@ -2142,16 +2171,12 @@ fn run_impute_hmm_dict(
                                     && uniform
                                     && recomb_rate > 0.0
                                 {
-                                    let mut sum = 0.0f32;
-                                    for v in subset_counts.iter() {
-                                        sum += *v;
-                                    }
-                                    let prior_probs = if sum > 0.0 {
-                                        let inv = 1.0 / sum;
-                                        for v in subset_counts.iter_mut() {
+                                    let prior_probs = if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
                                             *v *= inv;
                                         }
-                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
                                     } else {
                                         if !warned_af_fallback {
                                             eprintln!(
