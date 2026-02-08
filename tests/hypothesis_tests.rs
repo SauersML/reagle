@@ -125,8 +125,10 @@ fn run_rust_imputation_with_window_toml(
     overlap: f32,
     window_markers: usize,
 ) -> reagle::Result<()> {
+    // Enforce low error rate for hypothesis tests to match theoretical expectations
+    // derived from recombination decay alone, avoiding noise from small-panel Li-Stephens estimates.
     let toml = format!(
-        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n"
+        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\nerr = 0.0001\n"
     );
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
     let config = Config::parse_from([
