@@ -8645,8 +8645,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Instead of picking one initialization strategy, we collect all valid strategies
     // and run them competitively, selecting the one that yields the best likelihood.
 
+    // 1. Heuristic initialization (always try this)
+    // Scan for best constant pair - helps break symmetry in low-info regions
+    // where Combined HMM might get stuck in local optima.
+    let heuristic_result = find_best_constant_pair_with_buffer(
+        n_markers,
+        n_states_usize,
+        seq1,
+        seq2,
+        &mut ref_provider,
+        &mut workspace.scores,
+        None,
+    );
+
     // 2. Collect candidates
-    let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(2);
+    let mut candidate_inits: Vec<Option<MosaicPaths>> = Vec::with_capacity(3);
 
     // Candidate A: Standard/Default initialization (Combined HMM checkpoints).
     // We prioritize this (put it first) so it wins ties against heuristic/beam if likelihoods are equal.
@@ -8656,6 +8669,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // Candidate B: Initial paths provided by caller (e.g. from Beam Search)
     if let Some(p) = initial_paths {
         candidate_inits.push(Some(p.clone()));
+    }
+
+    // Candidate C: Heuristic paths
+    if let Some((p, _, _)) = heuristic_result {
+        candidate_inits.push(Some(p));
     }
 
     // Build Combined HMM checkpoints. This is required if ANY candidate is None,

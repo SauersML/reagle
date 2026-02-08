@@ -782,7 +782,7 @@ fn test_priors_use_recent_context_across_window_boundary() {
     write_synthetic_vcf(&target_vcf, n_markers, &target_samples, |i, _| {
         if i < 100 {
             "0|0".to_string()
-        } else if i == 1098 || i == 1099 {
+        } else if i == 1099 {
             "1|1".to_string()
         } else {
             "./.".to_string()
@@ -1646,11 +1646,10 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
         let step_keep = (-recomb_intensity as f64 * gen_dist_m).exp();
         expected_no_switch *= step_keep;
     }
-    let expected_min = (expected_no_switch - 0.03).max(0.0);
     assert!(
-        gp[2] >= expected_min,
+        gp[2] >= expected_no_switch,
         "Expected boundary GP to respect recombination decay (min {:.4}); GP={:?}",
-        expected_min,
+        expected_no_switch,
         gp
     );
 }
