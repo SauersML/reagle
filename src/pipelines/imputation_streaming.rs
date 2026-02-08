@@ -5156,6 +5156,19 @@ impl crate::pipelines::ImputationPipeline {
         let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
         let mut handoff_marker_idx: Option<usize> = None;
 
+        // 1. Determine handoff marker index (max of all samples)
+        for item in &sample_results {
+            if let Some(idx) = item.last_info_idx {
+                handoff_marker_idx = Some(match handoff_marker_idx {
+                    Some(prev) => prev.max(idx),
+                    None => idx,
+                });
+            }
+        }
+
+        let target_handoff_idx = handoff_marker_idx.or(prior_marker_idx);
+
+        // 2. Populate and decay priors
         for mut item in sample_results {
             let sample_idx = item.result.sample_idx;
             let h1 = sample_idx * 2;
@@ -5188,15 +5201,46 @@ impl crate::pipelines::ImputationPipeline {
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
                 if base + 1 < next_priors_vec.len() {
-                    next_priors_vec[base] = p1;
-                    next_priors_vec[base + 1] = p2;
+                    let source_idx = item.last_info_idx.or(prior_marker_idx);
+
+                    let decay_fn = |p: &HaplotypePriors, dist: f64| -> HaplotypePriors {
+                        if dist <= 1e-9 { return p.clone(); }
+                        let p_recomb = self.params.p_recomb(dist);
+                        let k = p.ids().len();
+                        if k == 0 { return p.clone(); }
+
+                        let retain = 1.0 - p_recomb * (1.0 - 1.0 / k as f32);
+                        let uniform = (1.0 - retain) / k as f32;
+
+                        let new_probs: Vec<f32> = p.probs().iter().map(|&prob| prob * retain + uniform).collect();
+                        HaplotypePriors::new(p.ids().to_vec(), new_probs)
+                    };
+
+                    let p1_final = if let (Some(src), Some(dst)) = (source_idx, target_handoff_idx) {
+                        if src < dst {
+                            let dist = gen_positions[dst] - gen_positions[src];
+                            decay_fn(&p1, dist)
+                        } else {
+                            p1
+                        }
+                    } else {
+                        p1
+                    };
+
+                    let p2_final = if let (Some(src), Some(dst)) = (source_idx, target_handoff_idx) {
+                        if src < dst {
+                            let dist = gen_positions[dst] - gen_positions[src];
+                            decay_fn(&p2, dist)
+                        } else {
+                            p2
+                        }
+                    } else {
+                        p2
+                    };
+
+                    next_priors_vec[base] = p1_final;
+                    next_priors_vec[base + 1] = p2_final;
                 }
-            }
-            if let Some(idx) = item.last_info_idx {
-                handoff_marker_idx = Some(match handoff_marker_idx {
-                    Some(prev) => prev.max(idx),
-                    None => idx,
-                });
             }
         }
 
