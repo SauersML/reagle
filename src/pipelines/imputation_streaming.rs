@@ -3966,31 +3966,18 @@ impl crate::pipelines::ImputationPipeline {
                 }
 
                 if !use1 || !use2 {
-                    // For untyped markers, store full-panel allele frequency
-                    // instead of uniform. This provides the correct population
-                    // prior for posterior smoothing, preventing AF collapse when
-                    // the HMM state subset is biased.
-                    let n_haps = ref_columns[ref_m].n_haplotypes();
-                    if n_haps > 0 && n_alleles == 2 {
-                        let alt_count = ref_columns[ref_m].alt_count();
-                        let alt_freq = (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
-                        if !use1 {
-                            aligned1.resize(2, 0.0);
-                            aligned1[0] = 1.0 - alt_freq;
-                            aligned1[1] = alt_freq;
-                        }
-                        if !use2 {
-                            aligned2.resize(2, 0.0);
-                            aligned2[0] = 1.0 - alt_freq;
-                            aligned2[1] = alt_freq;
-                        }
-                    } else {
-                        if !use1 {
-                            aligned1.resize(n_alleles.max(1), 1.0);
-                        }
-                        if !use2 {
-                            aligned2.resize(n_alleles.max(1), 1.0);
-                        }
+                    // For untyped markers, use uniform emission probabilities (neutral).
+                    // We must NOT use population allele frequencies here, because doing so
+                    // asserts that we "observed" a genotype matching the population average.
+                    // That would penalize rare-haplotype states exponentially at every
+                    // untyped marker (since P(rare|rare) = 1.0, but P(pop_freq|rare) ~ small).
+                    // The HMM must be driven purely by transition probabilities (LD) across
+                    // untyped regions.
+                    if !use1 {
+                        aligned1.resize(n_alleles.max(1), 1.0);
+                    }
+                    if !use2 {
+                        aligned2.resize(n_alleles.max(1), 1.0);
                     }
                 }
 
