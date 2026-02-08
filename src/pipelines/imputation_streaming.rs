@@ -4862,7 +4862,7 @@ impl crate::pipelines::ImputationPipeline {
                 let mut p1_out = HaplotypePriors::empty();
                 let mut p2_out = HaplotypePriors::empty();
 
-                if no_info_h1 && !has_priors_h1 {
+                if no_info_h1 && !has_priors_h1 && !use_hmm_h1 {
                     let posts = full_panel_posts.get_or_init(build_full_panel_posts);
                     hap1_posts = Some(posts.clone());
                     p1_out = HaplotypePriors::empty();
@@ -4910,7 +4910,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
 
-                if no_info_h2 && !has_priors_h2 {
+                if no_info_h2 && !has_priors_h2 && !use_hmm_h2 {
                     let posts = full_panel_posts.get_or_init(build_full_panel_posts);
                     hap2_posts = Some(posts.clone());
                     p2_out = HaplotypePriors::empty();
