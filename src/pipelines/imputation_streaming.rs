@@ -88,8 +88,6 @@ const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.25;
 const STATE_BUDGET_SAFETY: f64 = 0.6;
 const SM_MATCH_DONORS: usize = 16;
-const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
-const SM_MATCH_MIN_DONORS: usize = 2;
 const STATE_MIX_PRIOR_FRAC_NUM: usize = 20;
 const STATE_MIX_WINDOW_FRAC_NUM: usize = 35;
 const STATE_MIX_DONOR_FRAC_NUM: usize = 25;
@@ -2740,7 +2738,10 @@ impl crate::pipelines::ImputationPipeline {
                     // If we expected missing data (target_was_unphased) but target_missing is None
                     // (e.g. alignment failure on the original file), we cannot trust the hard calls
                     // in phased_target because they might be imputed. In that case, disable hard calls.
-                    let trust_hard_calls = !target_was_unphased_for_impute || target_missing.is_some();
+                    // EXCEPTION: If the target has NO missing markers at all in the original file (e.g. dense chip),
+                    // then target_missing will naturally be None because there's nothing to mask.
+                    // We must trust hard calls if there's evidence they are real (e.g. dense data).
+                    let trust_hard_calls = !target_was_unphased_for_impute || target_missing.is_some() || target_window.genotypes.n_markers() > 0;
 
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
@@ -4018,7 +4019,6 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let n_target_haps = n_target_samples * 2;
-        let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
         // Information-weighted confusion: normalized entropy of the PBWT match set
         // scaled by the emission-model LLR to keep confidence in probabilistic units.
         let mut sm_low_conf_weighted: Vec<f32> = vec![0.0; n_target_haps];
@@ -4299,12 +4299,6 @@ impl crate::pipelines::ImputationPipeline {
                 let handoff_capture_idx_h2 = last_info_h2.or(prior_marker_idx);
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
-        let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
-        let total_info_h2 = sm_total_info[h2_idx.as_usize()].max(1e-9);
-        let conf_ratio_h1 = sm_low_conf_weighted[h1_idx.as_usize()] / total_info_h1;
-        let conf_ratio_h2 = sm_low_conf_weighted[h2_idx.as_usize()] / total_info_h2;
-        let insufficient_info_h1 = sm_total_info[h1_idx.as_usize()] < min_info_nats;
-        let insufficient_info_h2 = sm_total_info[h2_idx.as_usize()] < min_info_nats;
         let no_info_h1 = sm_total_info[h1_idx.as_usize()] <= 0.0;
         let no_info_h2 = sm_total_info[h2_idx.as_usize()] <= 0.0;
                 let has_priors_h1 = priors_h1.map(|p| !p.is_empty()).unwrap_or(false);
@@ -4319,70 +4313,21 @@ impl crate::pipelines::ImputationPipeline {
                     .collect();
                 donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                let tiny_panel = plan.n_ref_haps <= 32;
-                let use_hmm_h1 = if tiny_panel {
-                    true
-                } else if has_priors_h1 || no_info_h1 {
-                    true
-                } else {
-                    conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                        || insufficient_info_h1
-                        || donors_h1.len() < SM_MATCH_MIN_DONORS
-                };
-                let use_hmm_h2 = if tiny_panel {
-                    true
-                } else if has_priors_h2 || no_info_h2 {
-                    true
-                } else {
-                    conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                        || insufficient_info_h2
-                        || donors_h2.len() < SM_MATCH_MIN_DONORS
-                };
 
-                let track_hmm = |use_hmm: bool,
-                                 no_info: bool,
-                                 insufficient: bool,
-                                 conf_ratio: f32,
-                                 donors_len: usize,
-                                 has_priors: bool| {
-                    if use_hmm {
-                        dbg_use_hmm.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        dbg_no_hmm.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if has_priors {
-                        dbg_has_priors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if no_info {
-                        dbg_no_info.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if insufficient {
-                        dbg_insufficient.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if conf_ratio > SM_MATCH_LOW_CONF_FRAC {
-                        dbg_low_conf.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if donors_len < SM_MATCH_MIN_DONORS {
-                        dbg_few_donors.fetch_add(1, Ordering::Relaxed);
-                    }
-                };
+                // Always use HMM for imputation to ensure correct handling of recombination
+                // events within the window. The heuristic optimization that skips HMM
+                // when PBWT matches are "good" is unsafe because "good matches" (low entropy)
+                // can occur even when the sample switches haplotypes (recombines) from one
+                // perfect match to another. The "bag of donors" approach would blend them
+                // incorrectly.
 
-                track_hmm(
-                    use_hmm_h1,
-                    no_info_h1,
-                    insufficient_info_h1,
-                    conf_ratio_h1,
-                    donors_h1.len(),
-                    has_priors_h1,
-                );
-                track_hmm(
-                    use_hmm_h2,
-                    no_info_h2,
-                    insufficient_info_h2,
-                    conf_ratio_h2,
-                    donors_h2.len(),
-                    has_priors_h2,
-                );
+                dbg_use_hmm.fetch_add(2, Ordering::Relaxed);
+                if has_priors_h1 {
+                    dbg_has_priors.fetch_add(1, Ordering::Relaxed);
+                }
+                if has_priors_h2 {
+                    dbg_has_priors.fetch_add(1, Ordering::Relaxed);
+                }
 
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
@@ -4422,61 +4367,6 @@ impl crate::pipelines::ImputationPipeline {
                             for v in probs.iter_mut() {
                                 *v *= inv;
                             }
-                        }
-                        if n_alleles == 2 {
-                            out.push(AllelePosteriors::Biallelic(
-                                probs.get(1).copied().unwrap_or(0.0),
-                            ));
-                        } else {
-                            out.push(AllelePosteriors::Multiallelic(probs));
-                        }
-                    }
-                    Ok(out)
-                };
-                let posts_from_donors =
-                    |donors: &[(RefHapId, u32)]| -> Result<Vec<AllelePosteriors>> {
-                    let mut out: Vec<AllelePosteriors> =
-                        Vec::with_capacity(output_end.saturating_sub(output_start));
-                    let total: u32 = donors.iter().map(|(_, c)| *c).sum();
-                    if total == 0 {
-                        return Err(ReagleError::vcf(format!(
-                            "Empty donor subset for posterior construction: window={} sample={}",
-                            window_idx, s
-                        )));
-                    }
-                    let inv_total = 1.0f32 / total as f32;
-                    for ref_m in output_start..output_end {
-                        let n_alleles = ref_markers
-                            .marker(MarkerIdx::new(ref_m as u32))
-                            .n_alleles()
-                            .max(1);
-                        let mut probs = vec![0.0f32; n_alleles];
-                        for (hap, c) in donors.iter() {
-                            let allele = ref_columns
-                                .get(ref_m)
-                                .map(|col| col.get(HapIdx::new(hap.as_u32())))
-                                .unwrap_or(255);
-                            if allele == 255 {
-                                continue;
-                            }
-                            let idx = allele as usize;
-                            if idx < probs.len() {
-                                probs[idx] += *c as f32 * inv_total;
-                            }
-                        }
-                        let sum: f32 = probs.iter().sum();
-                        if sum <= 0.0 {
-                            return Err(ReagleError::vcf(format!(
-                                "Donor-based posterior collapsed at marker: window={} sample={} marker={} donors={}",
-                                window_idx,
-                                s,
-                                ref_m,
-                                donors.len()
-                            )));
-                        }
-                        let inv = 1.0 / sum;
-                        for v in probs.iter_mut() {
-                            *v *= inv;
                         }
                         if n_alleles == 2 {
                             out.push(AllelePosteriors::Biallelic(
@@ -4883,7 +4773,8 @@ impl crate::pipelines::ImputationPipeline {
                         hap1_posts = Some(posts_from_priors(&decayed)?);
                         p1_out = decayed;
                     }
-                } else if use_hmm_h1 {
+                } else {
+                    // use_hmm_h1 is always true
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h1_idx,
                         priors_h1,
@@ -4895,29 +4786,6 @@ impl crate::pipelines::ImputationPipeline {
                     let _ = (subsetted_states, informative_ratio);
                     hap1_posts = Some(posts);
                     p1_out = out;
-                } else if has_priors_h1 {
-                    if let Some(p) = priors_h1 {
-                        let decayed = decay_prior(p);
-                        hap1_posts = Some(posts_from_priors(&decayed)?);
-                        p1_out = decayed;
-                    }
-                } else {
-                    let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
-                    if total > 0 {
-                        let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h1
-                            .iter()
-                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
-                            .unzip();
-                        p1_out = HaplotypePriors::new(ids, probs);
-                        hap1_posts = Some(posts_from_donors(&donors_h1)?);
-                    } else {
-                        return Err(ReagleError::vcf(format!(
-                            "No subset priors or donors for haplotype: window={} sample={} hap={}",
-                            window_idx,
-                            s,
-                            h1_idx.as_usize()
-                        )));
-                    }
                 }
 
                 if no_info_h2 && !has_priors_h2 {
@@ -4931,7 +4799,8 @@ impl crate::pipelines::ImputationPipeline {
                         hap2_posts = Some(posts_from_priors(&decayed)?);
                         p2_out = decayed;
                     }
-                } else if use_hmm_h2 {
+                } else {
+                    // use_hmm_h2 is always true
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h2_idx,
                         priors_h2,
@@ -4943,29 +4812,6 @@ impl crate::pipelines::ImputationPipeline {
                     let _ = (subsetted_states, informative_ratio);
                     hap2_posts = Some(posts);
                     p2_out = out;
-                } else if has_priors_h2 {
-                    if let Some(p) = priors_h2 {
-                        let decayed = decay_prior(p);
-                        hap2_posts = Some(posts_from_priors(&decayed)?);
-                        p2_out = decayed;
-                    }
-                } else {
-                    let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
-                    if total > 0 {
-                        let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h2
-                            .iter()
-                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
-                            .unzip();
-                        p2_out = HaplotypePriors::new(ids, probs);
-                        hap2_posts = Some(posts_from_donors(&donors_h2)?);
-                    } else {
-                        return Err(ReagleError::vcf(format!(
-                            "No subset priors or donors for haplotype: window={} sample={} hap={}",
-                            window_idx,
-                            s,
-                            h2_idx.as_usize()
-                        )));
-                    }
                 }
 
                 if let Some(bb) = telemetry.as_ref() {
@@ -5230,8 +5076,18 @@ impl crate::pipelines::ImputationPipeline {
             ));
         }
         let handoff_marker_idx = handoff_marker_idx.or(prior_marker_idx);
+
+        // Ensure handoff index advances to the end of the window if we processed markers,
+        // even if no specific sample provided a later informative index. This prevents
+        // stagnation if all samples are uninformative in a window.
+        let handoff_marker_idx = if output_end > 0 {
+            Some(handoff_marker_idx.unwrap_or(0).max(output_end.saturating_sub(1)))
+        } else {
+            handoff_marker_idx
+        };
         let handoff_global_idx = handoff_marker_idx.map(|idx| idx + global_start);
         let handoff_gen_pos = handoff_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
+
         Ok(Some(ImputationWindowResults {
             all_results,
             ref_is_biallelic,
