@@ -303,12 +303,29 @@ fn estimate_scan_batch_size(
     available_bytes: u64,
     n_ref_haps: usize,
     n_target_haps: usize,
+    per_window_caps: &[usize],
 ) -> usize {
     if available_bytes == 0 || n_ref_haps == 0 || n_target_haps == 0 {
         return 1;
     }
-    // global_scores + window_scores + best_window_scores + window_rank_hits
-    let per_hap_bytes = (n_ref_haps as u64).saturating_mul(20);
+    // Dense score vectors: global_scores + window_scores + best_window_scores + window_rank_hits.
+    let dense_per_hap_bytes = (n_ref_haps as u64).saturating_mul(16);
+    // Sparse per-window score store used by LMS allocator (`scores_by_window`).
+    // Each stored score is `(usize, f32)` from `select_top_k`.
+    let pair_bytes = std::mem::size_of::<(usize, f32)>() as u64;
+    let sparse_pairs_per_hap = per_window_caps.iter().fold(0u64, |acc, &cap| {
+        let top_m = cap
+            .saturating_mul(PBWT_PER_WINDOW_MULT)
+            .max(cap)
+            .min(n_ref_haps.max(1)) as u64;
+        acc.saturating_add(top_m)
+    });
+    // `Vec<Vec<(usize, f32)>>` header bytes per window for one hap entry.
+    let vec_header_bytes =
+        (per_window_caps.len() as u64).saturating_mul(std::mem::size_of::<Vec<(usize, f32)>>() as u64);
+    let per_hap_bytes = dense_per_hap_bytes
+        .saturating_add(sparse_pairs_per_hap.saturating_mul(pair_bytes))
+        .saturating_add(vec_header_bytes);
     if per_hap_bytes == 0 {
         return 1;
     }
@@ -1406,7 +1423,12 @@ fn build_imputation_plan(
             prescan_avail / (1024 * 1024)
         );
     }
-    let batch_size = estimate_scan_batch_size(prescan_avail, n_ref_haps, n_target_haps);
+    let batch_size = estimate_scan_batch_size(
+        prescan_avail,
+        n_ref_haps,
+        n_target_haps,
+        &per_window_caps,
+    );
     let mut batch_start = 0usize;
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();

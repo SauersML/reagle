@@ -1309,7 +1309,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         );
         for (h1, c1, e1) in scratch.hap1_allele.iter() {
             for (h2, c2, e2) in scratch.hap2_allele.iter() {
-                let score_no_flip = path.score + *c1 + *c2 + *e1 + *e2;
+                let score_no_flip = path
+                    .score
+                    .saturating_add(*c1)
+                    .saturating_add(*c2)
+                    .saturating_add(*e1)
+                    .saturating_add(*e2);
                 let flip_penalty = if call_idx == 0 {
                     0
                 } else if swapped != path.last_swapped {
@@ -1317,7 +1322,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 } else {
                     0
                 };
-                let score = score_no_flip + flip_penalty;
+                let score = score_no_flip.saturating_add(flip_penalty);
                 let logp = -(score as f64) / 1_000_000.0;
                 if swapped {
                     logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp);
