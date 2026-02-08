@@ -806,8 +806,9 @@ fn smooth_allele_posteriors_subset(
     // Bayesian shrinkage based on genetic-distance information decay.
     // When far from observed markers, local copy evidence should carry less
     // confidence and panel prior should carry more.
+    let effective_states = (total_mass * total_mass / state_prob_sq_sum).sqrt().max(2.0);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
-    let prior_mass = ((1.0 - retain) / retain).max(0.0);
+    let prior_mass = (effective_states * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }

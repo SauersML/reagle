@@ -1659,6 +1659,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 impl PhasingPipeline<crate::data::AnyMarkerSpace> {
     /// Run the phasing pipeline
     pub fn run(&mut self) -> Result<()> {
+        THREAD_WORKSPACE.with(|ws| *ws.borrow_mut() = None);
         eprintln!("Loading VCF...");
 
         // Load exclusion lists
@@ -2676,6 +2677,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
     /// Run the phasing pipeline in streaming mode for large datasets
     pub fn run_streaming(&mut self) -> Result<()> {
+        THREAD_WORKSPACE.with(|ws| *ws.borrow_mut() = None);
         eprintln!("Opening VCF for streaming...");
 
         // Configure streaming (genetic maps loaded lazily by StreamingVcfReader)
