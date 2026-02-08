@@ -4191,8 +4191,8 @@ impl crate::pipelines::ImputationPipeline {
 
                 let (input_probs_h1, input_probs_h2, last_info_h1, last_info_h2) =
                     build_input_probs_pair(h1_idx, h2_idx, s);
-                let handoff_capture_idx_h1 = prior_marker_idx;
-                let handoff_capture_idx_h2 = prior_marker_idx;
+                let handoff_capture_idx_h1 = last_info_h1.or(prior_marker_idx);
+                let handoff_capture_idx_h2 = last_info_h2.or(prior_marker_idx);
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
         let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
@@ -4879,7 +4879,7 @@ impl crate::pipelines::ImputationPipeline {
                         },
                     },
                     priors: Some((p1_out, p2_out)),
-                    last_info_idx: match (last_info_h1, last_info_h2) {
+                    last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
                         (Some(a), Some(b)) => Some(a.max(b)),
                         (Some(a), None) => Some(a),
                         (None, Some(b)) => Some(b),
