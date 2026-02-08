@@ -871,6 +871,12 @@ fn open_ref_reader(path: &Path) -> Result<RefPanelReader> {
 }
 
 const BREF3_CONVERT_MIN_BYTES: u64 = 500 * 1024 * 1024;
+const IMPUTE_WINDOW_LOG_INTERVAL: usize = 250;
+
+#[inline]
+fn should_log_impute_window(window_idx: usize) -> bool {
+    window_idx < 3 || window_idx % IMPUTE_WINDOW_LOG_INTERVAL == 0
+}
 
 fn should_convert_ref_to_bref3(config: &Config, ref_path: &Path) -> bool {
     if ref_path.extension().and_then(|e| e.to_str()) == Some("bref3") {
@@ -1060,6 +1066,9 @@ fn compute_per_window_cap(
     force_full_panel: bool,
     desired_cap: Option<usize>,
 ) -> usize {
+    if let Some(requested) = desired_cap {
+        return requested.max(1).min(n_ref_haps.max(1));
+    }
     if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS {
         return n_ref_haps.max(1);
     }
@@ -1086,13 +1095,8 @@ fn compute_per_window_cap(
         }
         cap
     };
-    let mut cap = n_ref_haps.max(1);
-    if let Some(requested) = desired_cap {
-        cap = requested.max(1).min(n_ref_haps.max(1));
-        per_window_cap_window = cap;
-    } else {
-        per_window_cap_window = per_window_cap_window.min(cap).max(1);
-    }
+    let cap = n_ref_haps.max(1);
+    per_window_cap_window = per_window_cap_window.min(cap).max(1);
     per_window_cap_window
 }
 
@@ -2595,7 +2599,7 @@ impl crate::pipelines::ImputationPipeline {
                         header_written = true;
                     }
 
-                    let should_log = phased_target.n_markers() >= 100 || window_idx % 1000 == 0;
+                    let should_log = should_log_impute_window(window_idx);
                     if should_log {
                         eprintln!(
                             "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
@@ -2700,7 +2704,7 @@ impl crate::pipelines::ImputationPipeline {
                             }
                         }
                     }
-                    if dbg_pos_not_aligned > 0 {
+                    if dbg_pos_not_aligned > 0 && should_log {
                         eprintln!(
                             "    [alignment] genotyped-by-position={} aligned={} pos_not_aligned={}",
                             dbg_pos_present, dbg_aligned_present, dbg_pos_not_aligned
@@ -2919,7 +2923,7 @@ impl crate::pipelines::ImputationPipeline {
                         header_written = true;
                     }
 
-                    let should_log = phased_target.n_markers() >= 100 || window_idx % 1000 == 0;
+                    let should_log = should_log_impute_window(window_idx);
                     if should_log {
                         eprintln!(
                             "  Imputing Window {} ({} markers, ref global {}..{}, output {}..{})",
@@ -3197,6 +3201,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
+        let should_log = should_log_impute_window(window_idx);
         let output_markers = output_end.saturating_sub(output_start);
 
         if output_start >= output_end || n_ref_markers == 0 {
@@ -3254,13 +3259,15 @@ impl crate::pipelines::ImputationPipeline {
                     .to_vec()
             }
         };
-        if let (Some(first), Some(last)) = (gen_positions.first(), gen_positions.last()) {
-            let total_cm = (last - first).abs();
-            eprintln!(
-                "    genetic span: {:.6} cM across {} markers",
-                total_cm,
-                gen_positions.len()
-            );
+        if should_log {
+            if let (Some(first), Some(last)) = (gen_positions.first(), gen_positions.last()) {
+                let total_cm = (last - first).abs();
+                eprintln!(
+                    "    genetic span: {:.6} cM across {} markers",
+                    total_cm,
+                    gen_positions.len()
+                );
+            }
         }
         let mut p_recomb: Vec<f32> = Vec::with_capacity(n_ref_markers);
         p_recomb.push(0.0f32);
@@ -3269,13 +3276,15 @@ impl crate::pipelines::ImputationPipeline {
             p_recomb.push(self.params.p_recomb(dist_cm));
         }
 
-        if let Some(min) = p_recomb.iter().copied().reduce(f32::min) {
-            let max = p_recomb.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mean = p_recomb.iter().copied().sum::<f32>() / p_recomb.len().max(1) as f32;
-            eprintln!(
-                "    p_recomb stats: min={:.6} mean={:.6} max={:.6}",
-                min, mean, max
-            );
+        if should_log {
+            if let Some(min) = p_recomb.iter().copied().reduce(f32::min) {
+                let max = p_recomb.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mean = p_recomb.iter().copied().sum::<f32>() / p_recomb.len().max(1) as f32;
+                eprintln!(
+                    "    p_recomb stats: min={:.6} mean={:.6} max={:.6}",
+                    min, mean, max
+                );
+            }
         }
 
         if let Some(overlap) = imp_overlap {
@@ -4045,14 +4054,15 @@ impl crate::pipelines::ImputationPipeline {
                 pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 
                 // Donor/confusion evidence should be collected where the target
-                // is informative in this window, not only at the tail overlap.
-                // Overlap markers are still included to preserve handoff behavior.
+                // is informative in this window, and across the overlap tail for
+                // handoff continuity.
                 let aligned_here = alignment
                     .ref_to_target
                     .get(ref_m)
                     .and_then(|v| *v)
                     .is_some();
-                let store = aligned_here;
+                let in_overlap = ref_m >= overlap_start && ref_m < output_end;
+                let store = aligned_here || in_overlap;
 
                 // Information weight in natural log space for one informative allele observation.
                 let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
@@ -4115,7 +4125,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         // Diagnostics: donor set size distribution across haplotypes.
-        if n_target_haps > 0 {
+        if should_log && n_target_haps > 0 {
             let mut min_donors = usize::MAX;
             let mut max_donors = 0usize;
             let mut sum_donors = 0usize;
@@ -4134,28 +4144,6 @@ impl crate::pipelines::ImputationPipeline {
                 "    [debug donors] hap_donor_counts min={} avg={:.2} max={}",
                 min_donors, avg_donors, max_donors
             );
-            if plan.n_ref_haps == 100 && n_target_haps >= 4 {
-                for hap_idx in 0..4usize {
-                    let counts = &sm_donor_counts[hap_idx];
-                    let mut low = 0u32;
-                    let mut high = 0u32;
-                    for (hap, c) in counts.iter() {
-                        if hap.as_usize() < 50 {
-                            low = low.saturating_add(*c);
-                        } else {
-                            high = high.saturating_add(*c);
-                        }
-                    }
-                    let total = low.saturating_add(high).max(1);
-                    eprintln!(
-                        "    [debug donors mix] hap={} low={} high={} frac_high={:.4}",
-                        hap_idx,
-                        low,
-                        high,
-                        high as f64 / total as f64
-                    );
-                }
-            }
         }
 
         thread_local! {
@@ -4410,24 +4398,10 @@ impl crate::pipelines::ImputationPipeline {
                             .map(|h| RefHapId::new(h as u32))
                             .collect();
                     }
-                    let full_panel_window = per_window_cap_local >= plan.n_ref_haps;
-                    // Only use exact full-state LS when the planner explicitly selected
-                    // a full-panel window and no per-haplotype pruning is expected.
-                    if full_panel_window {
-                        return (0..plan.n_ref_haps)
-                            .map(|h| RefHapId::new(h as u32))
-                            .collect();
-                    } else if let Some(full) = full_states.as_ref() {
+                    if let Some(full) = full_states.as_ref() {
                         return full.clone();
                     }
-                    let k = if plan.n_ref_haps <= 512 {
-                        // For small/medium panels, avoid over-pruning states:
-                        // preserve at least 80% of panel states (bounded by panel size).
-                        let floor = (plan.n_ref_haps * 8 + 9) / 10;
-                        per_window_cap_local.max(floor).min(plan.n_ref_haps).max(1)
-                    } else {
-                        per_window_cap_local.max(1)
-                    };
+                    let k = per_window_cap_local.max(1).min(plan.n_ref_haps.max(1));
                     let mut out: Vec<RefHapId> = Vec::with_capacity(k);
                     let mut seen: std::collections::HashSet<RefHapId> =
                         std::collections::HashSet::with_capacity(k * 2);
@@ -4554,9 +4528,17 @@ impl crate::pipelines::ImputationPipeline {
                         // Deterministically complete the state set from the
                         // reference panel. This prevents silent under-filled
                         // state spaces when mixed sources do not cover `k`.
+                        let abyss = plan
+                            .abyss_mask
+                            .get(hap_idx.as_usize())
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
                         for h in 0..plan.n_ref_haps {
                             if out.len() >= k {
                                 break;
+                            }
+                            if abyss.get(h).copied().unwrap_or(false) {
+                                continue;
                             }
                             let hap = RefHapId::new(h as u32);
                             if seen.insert(hap) {
@@ -4908,17 +4890,19 @@ impl crate::pipelines::ImputationPipeline {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        eprintln!(
-            "    [debug hmm] use_hmm={} no_hmm={} has_priors={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
-            dbg_use_hmm.load(Ordering::Relaxed),
-            dbg_no_hmm.load(Ordering::Relaxed),
-            dbg_has_priors.load(Ordering::Relaxed),
-            dbg_no_info.load(Ordering::Relaxed),
-            dbg_insufficient.load(Ordering::Relaxed),
-            dbg_low_conf.load(Ordering::Relaxed),
-            dbg_few_donors.load(Ordering::Relaxed),
-            dbg_fallback_ref_freq.load(Ordering::Relaxed)
-        );
+        if should_log {
+            eprintln!(
+                "    [debug hmm] use_hmm={} no_hmm={} has_priors={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
+                dbg_use_hmm.load(Ordering::Relaxed),
+                dbg_no_hmm.load(Ordering::Relaxed),
+                dbg_has_priors.load(Ordering::Relaxed),
+                dbg_no_info.load(Ordering::Relaxed),
+                dbg_insufficient.load(Ordering::Relaxed),
+                dbg_low_conf.load(Ordering::Relaxed),
+                dbg_few_donors.load(Ordering::Relaxed),
+                dbg_fallback_ref_freq.load(Ordering::Relaxed)
+            );
+        }
 
         let output_markers = output_end.saturating_sub(output_start);
         let mut sm_alt_probs_by_hap: Vec<Option<Vec<f32>>> = vec![None; n_target_haps];

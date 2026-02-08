@@ -1410,9 +1410,16 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                                     // TargetAlleleProbs) as the smoothing prior instead
                                     // of subset AF, so that abyss haplotypes' allele
                                     // distribution is properly represented.
+                                    // Scale to count magnitude (sum ≈ active_states) so
+                                    // the Bayesian smoothing strength is preserved.
+                                    let prior_counts = &mut ws.subset_counts[..n_alleles];
+                                    for idx in 0..n_alleles {
+                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
+                                            * active_states as f32;
+                                    }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        probs,
+                                        prior_counts,
                                         ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
                                         total,
                                         sq_sum,
@@ -1702,9 +1709,14 @@ fn run_impute_hmm_seqcoded(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
+                                    let prior_counts = &mut ws.subset_counts[..n_alleles];
+                                    for idx in 0..n_alleles {
+                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
+                                            * active_states as f32;
+                                    }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        probs,
+                                        prior_counts,
                                         ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
                                         total,
                                         sq_sum,
@@ -1992,9 +2004,20 @@ fn run_impute_hmm_dict(
                                     && recomb_rate > 0.0
                                     && subset_total > 0.0
                                 {
+                                    // Use full-panel allele frequency (stored in
+                                    // TargetAlleleProbs) as the smoothing prior instead
+                                    // of subset AF, so that abyss haplotypes' allele
+                                    // distribution is properly represented.
+                                    // Scale to count magnitude (sum ≈ active_states) so
+                                    // the Bayesian smoothing strength is preserved.
+                                    let prior_counts = &mut ws.subset_counts[..n_alleles];
+                                    for idx in 0..n_alleles {
+                                        prior_counts[idx] = probs.get(idx).copied().unwrap_or(0.0)
+                                            * active_states as f32;
+                                    }
                                     smooth_allele_posteriors_subset(
                                         &mut ws.allele_probs,
-                                        probs,
+                                        prior_counts,
                                         ws.nearest_obs_lambda.get(m_rev).copied().unwrap_or(0.0),
                                         total,
                                         sq_sum,
