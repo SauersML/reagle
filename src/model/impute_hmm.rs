@@ -153,6 +153,11 @@ impl TargetAlleleProbs {
     }
 
     #[inline]
+    fn probs_for_marker_normalized(&self, marker_idx: usize) -> NormalizedAlleleProbs<'_> {
+        NormalizedAlleleProbs::from_trusted(self.probs_for_marker(marker_idx))
+    }
+
+    #[inline]
     pub fn n_markers(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
@@ -267,6 +272,26 @@ impl<'a> NormalizedAlleleProbs<'a> {
     #[inline]
     fn as_slice(self) -> &'a [f32] {
         self.probs
+    }
+
+    #[inline]
+    fn len(self) -> usize {
+        self.probs.len()
+    }
+
+    #[inline]
+    fn get(self, idx: usize) -> Option<f32> {
+        self.probs.get(idx).copied()
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.probs.is_empty()
+    }
+
+    #[inline]
+    fn from_trusted(slice: &'a [f32]) -> Self {
+        Self { probs: slice }
     }
 }
 
@@ -611,7 +636,7 @@ fn refresh_dict_patterns<'a>(
 #[inline]
 fn fill_emissions(
     ref_alleles: &RefAlleles<'_>,
-    target_probs: &[f32],
+    target_probs: NormalizedAlleleProbs<'_>,
     error_rate: f32,
     emission_by_allele: &mut Vec<f32>,
     emissions: &mut [f32],
@@ -633,7 +658,7 @@ fn fill_emissions(
         emission_by_allele.resize(n_alleles, 1.0);
     }
     for i in 0..n_alleles {
-        let p_match = target_probs[i];
+        let p_match = target_probs.get(i).unwrap_or(0.0);
         emission_by_allele[i] = mismatch_prob + (match_prob - mismatch_prob) * p_match;
     }
 
@@ -656,7 +681,7 @@ fn fill_emissions(
 #[inline]
 fn fill_pattern_emissions(
     pattern_alleles: &[u8],
-    target_probs: &[f32],
+    target_probs: NormalizedAlleleProbs<'_>,
     error_rate: f32,
     emission_by_allele: &mut Vec<f32>,
     pattern_emissions: &mut Vec<f32>,
@@ -677,7 +702,7 @@ fn fill_pattern_emissions(
         emission_by_allele.resize(n_alleles, 1.0);
     }
     for i in 0..n_alleles {
-        let p_match = target_probs[i];
+        let p_match = target_probs.get(i).unwrap_or(0.0);
         emission_by_allele[i] = mismatch_prob + (match_prob - mismatch_prob) * p_match;
     }
     if pattern_emissions.len() < pattern_alleles.len() {
@@ -870,7 +895,7 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
 #[inline]
 fn normalized_allele_prior<'a>(
     out: &'a mut Vec<f32>,
-    target_probs: &[f32],
+    target_probs: NormalizedAlleleProbs<'_>,
 ) -> NormalizedAlleleProbs<'a> {
     let n = target_probs.len();
     if out.len() < n {
@@ -879,7 +904,7 @@ fn normalized_allele_prior<'a>(
     let prior = &mut out[..n];
     let mut sum = 0.0f32;
     for i in 0..n {
-        let mut v = target_probs[i];
+        let mut v = target_probs.get(i).unwrap_or(0.0);
         if !v.is_finite() || v < 0.0 {
             v = 0.0;
         }
@@ -993,7 +1018,7 @@ fn forward_update_impl<C: RefColumnLike>(
     active_states: usize,
     transition_haps: usize,
 ) -> f32 {
-    let probs = target_probs.probs_for_marker(m);
+    let probs = target_probs.probs_for_marker_normalized(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
 
@@ -1074,7 +1099,7 @@ fn forward_update_seqcoded(
     transition_haps: usize,
     last_hap_ptr: &mut *const u16,
 ) -> f32 {
-    let probs = target_probs.probs_for_marker(m);
+    let probs = target_probs.probs_for_marker_normalized(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
 
@@ -1156,7 +1181,7 @@ fn forward_update_dict(
     transition_haps: usize,
     last_dict_ptr: &mut *const DictionaryColumn,
 ) -> f32 {
-    let probs = target_probs.probs_for_marker(m);
+    let probs = target_probs.probs_for_marker_normalized(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
 
@@ -1353,7 +1378,7 @@ fn run_impute_hmm_impl<C: RefColumnLike>(
                 }
 
                 for m_rev in (block_start..block_end).rev() {
-                    let probs = target_probs.probs_for_marker(m_rev);
+                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let uniform = target_probs.is_uniform_marker(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
@@ -1660,7 +1685,7 @@ fn run_impute_hmm_seqcoded(
                 }
 
                 for m_rev in (block_start..block_end).rev() {
-                    let probs = target_probs.probs_for_marker(m_rev);
+                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let uniform = target_probs.is_uniform_marker(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
@@ -1959,7 +1984,7 @@ fn run_impute_hmm_dict(
                 }
 
                 for m_rev in (block_start..block_end).rev() {
-                    let probs = target_probs.probs_for_marker(m_rev);
+                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let uniform = target_probs.is_uniform_marker(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
