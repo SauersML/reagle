@@ -136,6 +136,19 @@ struct SampleCohortStats {
     phase_uncertainty_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MismatchProb(f32);
+
+impl MismatchProb {
+    fn new_clamped(p: f32) -> Self {
+        Self(p.clamp(1e-6, 0.25))
+    }
+
+    fn get(self) -> f32 {
+        self.0
+    }
+}
+
 impl SampleCohortStats {
     fn mean_uncertainty(self) -> f64 {
         if self.phase_uncertainty_count == 0 {
@@ -230,10 +243,14 @@ fn fit_cohort_calibration(
     let (m2, s2) = robust_center_scale(&dims[2]);
 
     let mut scaled = Vec::with_capacity(raw_features.len() * 3);
+    const FEATURE_CLAMP: f32 = 6.0;
     for f in &raw_features {
-        scaled.push(((f[0] - m0) / s0) as f32);
-        scaled.push(((f[1] - m1) / s1) as f32);
-        scaled.push(((f[2] - m2) / s2) as f32);
+        let x0 = ((f[0] - m0) / s0) as f32;
+        let x1 = ((f[1] - m1) / s1) as f32;
+        let x2 = ((f[2] - m2) / s2) as f32;
+        scaled.push(x0.clamp(-FEATURE_CLAMP, FEATURE_CLAMP));
+        scaled.push(x1.clamp(-FEATURE_CLAMP, FEATURE_CLAMP));
+        scaled.push(x2.clamp(-FEATURE_CLAMP, FEATURE_CLAMP));
     }
     let data = Array2::from_shape_vec((raw_features.len(), 3), scaled).ok()?;
     let dataset = DatasetBase::from(data);
@@ -280,13 +297,14 @@ fn fit_cohort_calibration(
         sum_emit[label] += s.emission_mass;
     }
 
-    let global = global_p_mismatch.clamp(1e-6, 0.25);
-    let mut cohort_p_mismatch = vec![global; n_clusters];
+    let global = MismatchProb::new_clamped(global_p_mismatch);
+    let global_p = global.get();
+    let mut cohort_p_mismatch = vec![global_p; n_clusters];
     for c in 0..n_clusters {
         if sum_emit[c] > 0.0 {
             let raw = (sum_mismatch[c] / sum_emit[c]) as f32;
-            let lo = (global * 0.25).max(1e-6);
-            let hi = (global * 4.0).min(0.25);
+            let lo = (global_p * 0.25).max(1e-6);
+            let hi = (global_p * 4.0).min(0.25);
             cohort_p_mismatch[c] = raw.clamp(lo, hi);
         }
     }
@@ -307,17 +325,17 @@ fn fit_cohort_calibration(
     }
     let rel_spread = max_cohort / min_cohort.max(1e-6);
     let abs_spread = max_cohort - min_cohort;
-    if rel_spread < MIN_REL_SPREAD || abs_spread < global * MIN_ABS_SPREAD_FACTOR {
+    if rel_spread < MIN_REL_SPREAD || abs_spread < global_p * MIN_ABS_SPREAD_FACTOR {
         return None;
     }
 
-    let mut sample_p_mismatch = vec![global; stats.len()];
+    let mut sample_p_mismatch = vec![global_p; stats.len()];
     for (row, &label) in labels.iter().enumerate() {
         let sample_idx = active_indices[row];
         let s = stats[sample_idx];
         let weight = (s.emission_mass / (s.emission_mass + 500.0)).clamp(0.0, 1.0) as f32;
         let cohort_p = cohort_p_mismatch[label];
-        sample_p_mismatch[sample_idx] = ((1.0 - weight) * global + weight * cohort_p)
+        sample_p_mismatch[sample_idx] = ((1.0 - weight) * global_p + weight * cohort_p)
             .clamp(1e-6, 0.25);
     }
 
@@ -5095,11 +5113,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let seq2 = ref_geno.haplotype(hap2);
                         // Use pre-computed confidence instead of recomputing
                         let sample_conf = &confidence_by_sample[s];
-                        let sample_p_err = sample_p_mismatch
-                            .and_then(|v| v.get(s))
-                            .copied()
-                            .unwrap_or(self.params.p_mismatch)
-                            .clamp(1e-6, 0.25);
+                        let sample_p_err = MismatchProb::new_clamped(
+                            sample_p_mismatch
+                                .and_then(|v| v.get(s))
+                                .copied()
+                                .unwrap_or(self.params.p_mismatch),
+                        )
+                        .get();
                         let sample_p_no_err = 1.0 - sample_p_err;
 
                         // 3. Run HMM with per-heterozygote swap probabilities
