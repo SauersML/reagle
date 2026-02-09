@@ -90,6 +90,7 @@ const STATE_BUDGET_SAFETY: f64 = 0.6;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
+const PBWT_MAX_ORIENTATION_ERROR_FOR_HARD_QUERY: f32 = 0.25;
 const STATE_MIX_PRIOR_FRAC_NUM: usize = 20;
 const STATE_MIX_WINDOW_FRAC_NUM: usize = 35;
 const STATE_MIX_DONOR_FRAC_NUM: usize = 25;
@@ -4152,24 +4153,67 @@ impl crate::pipelines::ImputationPipeline {
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
-                            let h = HapIdx::new((sample_idx * 2 + local) as u32);
-                            let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
+                            let hap1 = sample_idx * 2;
+                            let hap2 = hap1 + 1;
+                            let h1 = HapIdx::new(hap1 as u32);
+                            let h2 = HapIdx::new(hap2 as u32);
+                            let mut a1 = target_win.allele(MarkerIdx::new(target_idx as u32), h1);
+                            let mut a2 = target_win.allele(MarkerIdx::new(target_idx as u32), h2);
                             if let Some(missing) = target_missing {
-                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                    a = 255;
+                                if missing.allele(MarkerIdx::new(target_idx as u32), h1) == 255 {
+                                    a1 = 255;
+                                }
+                                if missing.allele(MarkerIdx::new(target_idx as u32), h2) == 255 {
+                                    a2 = 255;
                                 }
                             }
-                            let a = if a == 255 {
-                                255
-                            } else if let Some(mapping) = mapping {
-                                if (a as usize) < mapping.targ_to_ref.len() {
-                                    let r = mapping.targ_to_ref[a as usize];
-                                    if r >= 0 { r as u8 } else { 255 }
-                                } else {
-                                    255
+                            let map_to_ref = |a: u8| -> u8 {
+                                if a == 255 {
+                                    return 255;
                                 }
+                                if let Some(mapping) = mapping {
+                                    if (a as usize) < mapping.targ_to_ref.len() {
+                                        let r = mapping.targ_to_ref[a as usize];
+                                        if r >= 0 {
+                                            return r as u8;
+                                        }
+                                    }
+                                    255
+                                } else {
+                                    a
+                                }
+                            };
+                            let mapped1 = map_to_ref(a1);
+                            let mapped2 = map_to_ref(a2);
+                            let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
+                            let input_phased = target_win
+                                .phase_mask()
+                                .and_then(|mask| mask.get(target_idx, sample_idx))
+                                .map(|v| v != 0)
+                                .unwrap_or(true);
+                            let a = if is_het && !input_phased {
+                                255
+                            } else if is_het && input_phased {
+                                let phase_conf = target_win
+                                    .sample_phase_confidence_f32(
+                                        MarkerIdx::new(target_idx as u32),
+                                        sample_idx,
+                                    )
+                                    .clamp(0.0, 1.0);
+                                let best_orient_err = phase_conf.min(1.0 - phase_conf);
+                                if best_orient_err > PBWT_MAX_ORIENTATION_ERROR_FOR_HARD_QUERY {
+                                    255
+                                } else if phase_conf < 0.5 {
+                                    if local == 0 { mapped2 } else { mapped1 }
+                                } else if local == 0 {
+                                    mapped1
+                                } else {
+                                    mapped2
+                                }
+                            } else if local == 0 {
+                                mapped1
                             } else {
-                                a
+                                mapped2
                             };
                             query_alleles[i] = PbwtQueryAllele::allele(a)
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
@@ -5150,24 +5194,67 @@ impl crate::pipelines::ImputationPipeline {
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
-                            let h = HapIdx::new((sample_idx * 2 + local) as u32);
-                            let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
+                            let hap1 = sample_idx * 2;
+                            let hap2 = hap1 + 1;
+                            let h1 = HapIdx::new(hap1 as u32);
+                            let h2 = HapIdx::new(hap2 as u32);
+                            let mut a1 = target_win.allele(MarkerIdx::new(target_idx as u32), h1);
+                            let mut a2 = target_win.allele(MarkerIdx::new(target_idx as u32), h2);
                             if let Some(missing) = target_missing {
-                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                    a = 255;
+                                if missing.allele(MarkerIdx::new(target_idx as u32), h1) == 255 {
+                                    a1 = 255;
+                                }
+                                if missing.allele(MarkerIdx::new(target_idx as u32), h2) == 255 {
+                                    a2 = 255;
                                 }
                             }
-                            let a = if a == 255 {
-                                255
-                            } else if let Some(mapping) = mapping {
-                                if (a as usize) < mapping.targ_to_ref.len() {
-                                    let r = mapping.targ_to_ref[a as usize];
-                                    if r >= 0 { r as u8 } else { 255 }
-                                } else {
-                                    255
+                            let map_to_ref = |a: u8| -> u8 {
+                                if a == 255 {
+                                    return 255;
                                 }
+                                if let Some(mapping) = mapping {
+                                    if (a as usize) < mapping.targ_to_ref.len() {
+                                        let r = mapping.targ_to_ref[a as usize];
+                                        if r >= 0 {
+                                            return r as u8;
+                                        }
+                                    }
+                                    255
+                                } else {
+                                    a
+                                }
+                            };
+                            let mapped1 = map_to_ref(a1);
+                            let mapped2 = map_to_ref(a2);
+                            let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
+                            let input_phased = target_win
+                                .phase_mask()
+                                .and_then(|mask| mask.get(target_idx, sample_idx))
+                                .map(|v| v != 0)
+                                .unwrap_or(true);
+                            let a = if is_het && !input_phased {
+                                255
+                            } else if is_het && input_phased {
+                                let phase_conf = target_win
+                                    .sample_phase_confidence_f32(
+                                        MarkerIdx::new(target_idx as u32),
+                                        sample_idx,
+                                    )
+                                    .clamp(0.0, 1.0);
+                                let best_orient_err = phase_conf.min(1.0 - phase_conf);
+                                if best_orient_err > PBWT_MAX_ORIENTATION_ERROR_FOR_HARD_QUERY {
+                                    255
+                                } else if phase_conf < 0.5 {
+                                    if local == 0 { mapped2 } else { mapped1 }
+                                } else if local == 0 {
+                                    mapped1
+                                } else {
+                                    mapped2
+                                }
+                            } else if local == 0 {
+                                mapped1
                             } else {
-                                a
+                                mapped2
                             };
                             query_alleles[i] = PbwtQueryAllele::allele(a)
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);

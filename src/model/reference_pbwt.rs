@@ -82,6 +82,7 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     counts: Vec<u32>,
     offsets: Vec<u32>,
     intervals_buf: Vec<(usize, usize)>,
+    donor_candidate_pos: Vec<usize>,
     step_scratch: Vec<(u32, u32, u32)>,
     wanted_map: HashMap<u32, usize>,
     found_pos_start: Vec<(usize, i32)>,
@@ -205,6 +206,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             counts: Vec::new(),
             offsets: Vec::new(),
             intervals_buf: Vec::new(),
+            donor_candidate_pos: Vec::new(),
             step_scratch: Vec::new(),
             wanted_map: HashMap::new(),
             found_pos_start: Vec::new(),
@@ -247,30 +249,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             return;
         }
 
-        // For very wide beams, keep the old O(k) behavior to avoid turning
-        // donor selection into a bandwidth bottleneck.
-        const EXACT_DIV_SCAN_FACTOR: usize = 64;
-        if total_len > k.saturating_mul(EXACT_DIV_SCAN_FACTOR) {
-            let mut current_interval_idx = 0usize;
-            let mut current_interval_start_offset = 0usize;
-            out.reserve(k);
-            for i in 0..k {
-                let target = (2 * i + 1) * total_len / (2 * k);
-                while current_interval_idx < self.intervals_buf.len() {
-                    let (l, r) = self.intervals_buf[current_interval_idx];
-                    let len = r - l;
-                    if target < current_interval_start_offset + len {
-                        let offset_in_interval = target - current_interval_start_offset;
-                        out.push(self.ppa[l + offset_in_interval].to_u32());
-                        break;
-                    }
-                    current_interval_start_offset += len;
-                    current_interval_idx += 1;
-                }
-            }
-            return;
-        }
-
         #[derive(Clone, Copy, Eq, PartialEq)]
         struct DonorChoice {
             div: i32,
@@ -291,12 +269,133 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             }
         }
 
+        // For very wide beams, avoid full scans but still prioritize low-divergence
+        // donors rather than uniform positional samples.
+        const EXACT_DIV_SCAN_FACTOR: usize = 64;
+        if total_len > k.saturating_mul(EXACT_DIV_SCAN_FACTOR) {
+            const APPROX_SCAN_FACTOR: usize = 24;
+            const MIN_APPROX_SCAN_POINTS: usize = 128;
+            const LOCAL_REFINE_RADIUS: usize = 2;
+
+            let n_scan_targets = total_len.min(
+                k.saturating_mul(APPROX_SCAN_FACTOR)
+                    .max(MIN_APPROX_SCAN_POINTS),
+            );
+            self.donor_candidate_pos.clear();
+            self.donor_candidate_pos.reserve(
+                n_scan_targets
+                    .saturating_mul(2 * LOCAL_REFINE_RADIUS + 1)
+                    .saturating_add(self.intervals_buf.len() * 3),
+            );
+
+            let mut current_interval_idx = 0usize;
+            let mut current_interval_start_offset = 0usize;
+            for i in 0..n_scan_targets {
+                let target = (2 * i + 1) * total_len / (2 * n_scan_targets);
+                while current_interval_idx < self.intervals_buf.len() {
+                    let (l, r) = self.intervals_buf[current_interval_idx];
+                    let len = r - l;
+                    if target < current_interval_start_offset + len {
+                        let offset_in_interval = target - current_interval_start_offset;
+                        let center = l + offset_in_interval;
+                        let start = center.saturating_sub(LOCAL_REFINE_RADIUS).max(l);
+                        let end = (center + LOCAL_REFINE_RADIUS + 1).min(r);
+                        for pos in start..end {
+                            self.donor_candidate_pos.push(pos);
+                        }
+                        break;
+                    }
+                    current_interval_start_offset += len;
+                    current_interval_idx += 1;
+                }
+            }
+
+            // Ensure interval edges and centers are represented.
+            for &(l, r) in &self.intervals_buf {
+                if l < r {
+                    self.donor_candidate_pos.push(l);
+                    self.donor_candidate_pos.push(r - 1);
+                    self.donor_candidate_pos.push(l + (r - l) / 2);
+                }
+            }
+
+            // If candidate generation was too sparse, add deterministic spread points.
+            if self.donor_candidate_pos.len() < k {
+                let mut spread_interval_idx = 0usize;
+                let mut spread_interval_start_offset = 0usize;
+                for i in 0..k {
+                    let target = (2 * i + 1) * total_len / (2 * k);
+                    while spread_interval_idx < self.intervals_buf.len() {
+                        let (l, r) = self.intervals_buf[spread_interval_idx];
+                        let len = r - l;
+                        if target < spread_interval_start_offset + len {
+                            let offset_in_interval = target - spread_interval_start_offset;
+                            self.donor_candidate_pos.push(l + offset_in_interval);
+                            break;
+                        }
+                        spread_interval_start_offset += len;
+                        spread_interval_idx += 1;
+                    }
+                }
+            }
+
+            self.donor_candidate_pos.sort_unstable();
+            self.donor_candidate_pos.dedup();
+
+            let mut best: std::collections::BinaryHeap<DonorChoice> =
+                std::collections::BinaryHeap::with_capacity(k + 1);
+            for &pos in &self.donor_candidate_pos {
+                let choice = DonorChoice {
+                    div: self.div[pos],
+                    pos,
+                };
+                if best.len() < k {
+                    best.push(choice);
+                } else if let Some(top) = best.peek().copied() {
+                    if choice.div < top.div || (choice.div == top.div && choice.pos < top.pos) {
+                        best.pop();
+                        best.push(choice);
+                    }
+                }
+            }
+
+            // Safety net: if approximation produced too few unique candidates, backfill exactly.
+            if best.len() < k {
+                for &(l, r) in &self.intervals_buf {
+                    for pos in l..r {
+                        let choice = DonorChoice {
+                            div: self.div[pos],
+                            pos,
+                        };
+                        if best.len() < k {
+                            best.push(choice);
+                        } else if let Some(top) = best.peek().copied() {
+                            if choice.div < top.div
+                                || (choice.div == top.div && choice.pos < top.pos)
+                            {
+                                best.pop();
+                                best.push(choice);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut choices: Vec<DonorChoice> = best.into_vec();
+            choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
+            out.reserve(choices.len());
+            for c in choices {
+                out.push(self.ppa[c.pos].to_u32());
+            }
+            return;
+        }
+
         let mut best: std::collections::BinaryHeap<DonorChoice> =
             std::collections::BinaryHeap::with_capacity(k + 1);
         for &(l, r) in &self.intervals_buf {
             for pos in l..r {
                 let choice = DonorChoice {
-                    div: self.div.get(pos).copied().unwrap_or(i32::MAX),
+                    div: self.div[pos],
                     pos,
                 };
                 if best.len() < k {

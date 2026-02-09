@@ -41,6 +41,7 @@ pub struct ThreadWorkspace {
     pub seq1: Vec<u8>,
     pub seq2: Vec<u8>,
     pub sample_conf: Vec<f32>,
+    pub sample_phase_conf: Vec<f32>,
     pub het_positions: Vec<usize>,
     /// Forward block buffer for checkpoint recompute
     pub fwd_block: Vec<f32>,
@@ -98,6 +99,7 @@ impl ThreadWorkspace {
             seq1: Vec::new(),
             seq2: Vec::new(),
             sample_conf: Vec::new(),
+            sample_phase_conf: Vec::new(),
             het_positions: Vec::new(),
             fwd_block: Vec::new(),
             ffbs_fwd_curr: Vec::new(),
