@@ -83,7 +83,6 @@ jobs:
       PYTHONUNBUFFERED: "1"
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - person: "Kat"
@@ -101,6 +100,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
 
       - name: Resolve convert_genome release commit
         id: cg-release
@@ -157,6 +167,12 @@ jobs:
         with:
           path: .cache/reference/chr22.fa.gz
           key: chr22-fasta-${{ runner.os }}-v1
+
+      - name: Cache Beagle jar
+        uses: actions/cache@v4
+        with:
+          path: beagle.jar
+          key: beagle-jar-${{ runner.os }}-27Feb25-75f
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -275,6 +291,21 @@ jobs:
             beagle_out.vcf.gz
             beagle_out.vcf.gz.csi
             beagle_out.vcf.gz.tbi
+
+      - name: Cleanup large intermediates
+        if: always()
+        run: |
+          set +e
+          rm -rf convert_genome_array_out convert_genome_truth_out
+          rm -rf tests/data
+          rm -f ref.vcf.gz ref.vcf.gz.csi ref.vcf.gz.tbi
+          rm -f reagle_ref.vcf.gz reagle_ref.vcf.gz.csi reagle_ref.vcf.gz.tbi
+          rm -f ref_beagle.vcf.gz ref_beagle.vcf.gz.csi ref_beagle.vcf.gz.tbi
+          rm -f target.vcf.gz target.vcf.gz.csi target.vcf.gz.tbi
+          rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi
+          rm -f reagle_out.vcf.gz reagle_out.vcf.gz.csi reagle_out.vcf.gz.tbi
+          rm -f beagle_out.vcf.gz beagle_out.vcf.gz.csi beagle_out.vcf.gz.tbi
+          df -h
 
   generate-report:
     needs: impute-and-measure
