@@ -83,6 +83,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - person: "Kat"
@@ -157,121 +158,24 @@ jobs:
           path: .cache/reference/chr22.fa.gz
           key: chr22-fasta-${{ runner.os }}-v1
 
-      - name: Cache prep artifacts
-        id: cache-prep
-        uses: actions/cache@v4
-        with:
-          path: |
-            ref.vcf.gz
-            ref.vcf.gz.csi
-            convert_genome_array_out/panel.vcf
-            convert_genome_array_out/panel.vcf.gz
-            convert_genome_array_out/genotypes.vcf
-            convert_genome_array_out/genotypes.vcf.gz
-            convert_genome_truth_out/panel.vcf
-            convert_genome_truth_out/panel.vcf.gz
-            convert_genome_truth_out/genotypes.vcf
-            convert_genome_truth_out/genotypes.vcf.gz
-            reagle_ref.vcf.gz
-            reagle_ref.vcf.gz.csi
-            reagle_ref.vcf.gz.tbi
-            ref_beagle.vcf.gz
-            ref_beagle.vcf.gz.csi
-            ref_beagle.vcf.gz.tbi
-            beagle.jar
-            target.vcf.gz
-            target.vcf.gz.csi
-            target.vcf.gz.tbi
-            truth.vcf.gz
-            truth.vcf.gz.csi
-            truth.vcf.gz.tbi
-          key: prep-${{ runner.os }}-${{ matrix.person }}-${{ steps.cg-release.outputs.tag }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py', '.github/workflows/imputation_quality_report.yml') }}
-
-      - name: Cache imputation results
-        id: cache-results
-        uses: actions/cache@v4
-        with:
-          path: |
-            tests/data/reagle_metrics.json
-            tests/data/beagle_metrics.json
-            tests/data/reagle_metrics.txt
-            tests/data/reagle_imputed.vcf.gz
-            tests/data/reagle_imputed.vcf.gz.csi
-            tests/data/reagle_imputed.vcf.gz.tbi
-            tests/data/beagle_imputed.vcf.gz
-            tests/data/beagle_imputed.vcf.gz.csi
-            tests/data/beagle_imputed.vcf.gz.tbi
-            tests/data/truth.vcf.gz
-            tests/data/truth.vcf.gz.csi
-            tests/data/truth.vcf.gz.tbi
-            reagle_out.vcf.gz
-            reagle_out.vcf.gz.csi
-            reagle_out.vcf.gz.tbi
-            beagle_out.vcf.gz
-            beagle_out.vcf.gz.csi
-            beagle_out.vcf.gz.tbi
-          key: results-${{ runner.os }}-${{ matrix.person }}-${{ steps.cg-release.outputs.tag }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/quality_assessment.py', 'scripts/prepare_data.py', 'tests/integration_test.py', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', '.github/workflows/imputation_quality_report.yml') }}
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Python
-        if: steps.cache-results.outputs.cache-hit != 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
       - name: Install Java
-        if: steps.cache-results.outputs.cache-hit != 'true'
         uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Install System Tools
-        if: steps.cache-results.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl
 
-      - name: Validate Cached Prep Artifacts
-        if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit == 'true'
-        run: |
-          set -euo pipefail
-          if [ ! -f ref.vcf.gz ]; then
-            echo "ref.vcf.gz missing; skipping cache validation."
-            exit 0
-          fi
-
-          ref_sites=$(bcftools index -n ref.vcf.gz 2>/dev/null || echo 0)
-          panel_path=""
-          panel_sites=0
-
-          if [ -f convert_genome_array_out/panel.vcf.gz ]; then
-            panel_path="convert_genome_array_out/panel.vcf.gz"
-            panel_sites=$(bcftools index -n "$panel_path" 2>/dev/null || echo 0)
-          elif [ -f convert_genome_array_out/panel.vcf ]; then
-            panel_path="convert_genome_array_out/panel.vcf"
-            panel_sites=$(bcftools view -H "$panel_path" 2>/dev/null | wc -l | tr -d ' ')
-          fi
-
-          if [ -z "$panel_path" ]; then
-            echo "No cached panel artifact found; skipping purge."
-            exit 0
-          fi
-
-          min_expected=$(( ref_sites / 2 ))
-          echo "Cached panel check: panel=${panel_sites}, ref=${ref_sites}, min_expected=${min_expected}"
-          if [ "$ref_sites" -gt 0 ] && [ "$panel_sites" -lt "$min_expected" ]; then
-            echo "Cached prep artifacts appear broken; purging prep outputs for regeneration."
-            rm -rf convert_genome_array_out convert_genome_truth_out
-            rm -f target.vcf.gz target.vcf.gz.csi target.vcf.gz.tbi
-            rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi
-            rm -f reagle_ref.vcf.gz reagle_ref.vcf.gz.csi reagle_ref.vcf.gz.tbi
-            rm -f ref_beagle.vcf.gz ref_beagle.vcf.gz.csi ref_beagle.vcf.gz.tbi
-            rm -f beagle.jar
-          fi
-
       - name: Download reference panel
-        if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           name: reference-panel
@@ -282,11 +186,9 @@ jobs:
         run: cargo build --release
 
       - name: Run Quality Assessment
-        if: steps.cache-results.outputs.cache-hit != 'true'
         run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}"
 
-      - name: Validate prep artifacts before cache save
-        if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'
+      - name: Validate prep artifacts
         run: |
           set -euo pipefail
           check_vcf () {
