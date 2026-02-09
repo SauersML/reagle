@@ -5429,8 +5429,12 @@ impl crate::pipelines::ImputationPipeline {
                                 (alt_sum as f32 / donor_candidates.len() as f32)
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
-                                let allele = col.get(HapIdx::new(donor));
-                                let hard = if allele == 1 { 1.0 } else { 0.0 };
+                                let hard = if donor_candidates.is_empty() {
+                                    if target_allele == 1 { 1.0 } else { 0.0 }
+                                } else {
+                                    let allele = col.get(HapIdx::new(donor));
+                                    if allele == 1 { 1.0 } else { 0.0 }
+                                };
                                 let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
                                 (orient_weight * hard + (1.0 - orient_weight) * 0.5)
                                     .clamp(1e-6, 1.0 - 1e-6)
