@@ -901,13 +901,13 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                         &beams_fwd[i],
                         n_ref_haps,
-                        PbwtQueryAllele::wildcard(),
+                        qa1,
                     );
                     if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
                         let peer_uncertainty = pbwt_beam_uncertainty(
                             &beams_fwd[i + 1],
                             n_ref_haps,
-                            PbwtQueryAllele::wildcard(),
+                            qa2,
                         );
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
@@ -1156,13 +1156,13 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                         &beams_bwd[i],
                         n_ref_haps,
-                        PbwtQueryAllele::wildcard(),
+                        qa1,
                     );
                     if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
                         let peer_uncertainty = pbwt_beam_uncertainty(
                             &beams_bwd[i + 1],
                             n_ref_haps,
-                            PbwtQueryAllele::wildcard(),
+                            qa2,
                         );
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }

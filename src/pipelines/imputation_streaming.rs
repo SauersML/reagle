@@ -4275,16 +4275,20 @@ impl crate::pipelines::ImputationPipeline {
                                 if is_het && !input_phased {
                                     cached_query_pair = [255, 255];
                                 } else if is_het && input_phased {
+                                    let qa1 = PbwtQueryAllele::allele(mapped1)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let qa2 = PbwtQueryAllele::allele(mapped2)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
                                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                                         &beams[i],
                                         plan.n_ref_haps,
-                                        PbwtQueryAllele::wildcard(),
+                                        qa1,
                                     );
                                     if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx {
                                         let peer_uncertainty = pbwt_beam_uncertainty(
                                             &beams[i + 1],
                                             plan.n_ref_haps,
-                                            PbwtQueryAllele::wildcard(),
+                                            qa2,
                                         );
                                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
@@ -5358,16 +5362,20 @@ impl crate::pipelines::ImputationPipeline {
                                     cached_query_pair = [255, 255];
                                     cached_allele_weight = 0.0;
                                 } else if is_het && input_phased {
+                                    let qa1 = PbwtQueryAllele::allele(mapped1)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let qa2 = PbwtQueryAllele::allele(mapped2)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
                                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                                         &beams[i],
                                         plan.n_ref_haps,
-                                        PbwtQueryAllele::wildcard(),
+                                        qa1,
                                     );
                                     if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx {
                                         let peer_uncertainty = pbwt_beam_uncertainty(
                                             &beams[i + 1],
                                             plan.n_ref_haps,
-                                            PbwtQueryAllele::wildcard(),
+                                            qa2,
                                         );
                                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
