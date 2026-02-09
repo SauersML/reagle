@@ -172,24 +172,31 @@ jobs:
           path: beagle.jar
           key: beagle-jar-${{ runner.os }}-27Feb25-75f
 
-      - name: Cache prepared benchmark inputs
-        id: cache-prep-inputs
+      - name: Cache input-specific prep files
+        id: cache-prep-input
         uses: actions/cache@v4
         with:
           path: |
             target.vcf.gz
             target.vcf.gz.csi
             target.vcf.gz.tbi
-            truth.vcf.gz
-            truth.vcf.gz.csi
-            truth.vcf.gz.tbi
             reagle_ref.vcf.gz
             reagle_ref.vcf.gz.csi
             reagle_ref.vcf.gz.tbi
+          key: prep-input-v1-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}-${{ steps.cg-release.outputs.tag }}
+
+      - name: Cache person-specific prep files
+        id: cache-prep-person
+        uses: actions/cache@v4
+        with:
+          path: |
+            truth.vcf.gz
+            truth.vcf.gz.csi
+            truth.vcf.gz.tbi
             ref_beagle.vcf.gz
             ref_beagle.vcf.gz.csi
             ref_beagle.vcf.gz.tbi
-          key: prep-inputs-v2-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}-${{ steps.cg-release.outputs.tag }}
+          key: prep-person-v1-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -215,8 +222,8 @@ jobs:
           path: .
           merge-multiple: true
 
-      - name: Validate cached prepared inputs
-        if: steps.cache-prep-inputs.outputs.cache-hit == 'true'
+      - name: Validate cached input-specific prep files
+        if: steps.cache-prep-input.outputs.cache-hit == 'true'
         run: |
           set -euo pipefail
           check_vcf () {
@@ -227,19 +234,38 @@ jobs:
           }
 
           check_vcf target.vcf.gz
-          check_vcf truth.vcf.gz
           check_vcf reagle_ref.vcf.gz
-          check_vcf ref_beagle.vcf.gz
 
           reagle_sites=$(bcftools index -n reagle_ref.vcf.gz)
           ref_sites=$(bcftools index -n ref.vcf.gz)
           min_expected=$(( ref_sites / 2 ))
           echo "Cached reagle_ref sites=${reagle_sites}, ref sites=${ref_sites}, min expected=${min_expected}"
           if [ "$ref_sites" -gt 0 ] && [ "$reagle_sites" -lt "$min_expected" ]; then
-            echo "Cached prep inputs look inconsistent; purging for regeneration."
+            echo "Cached input prep files look inconsistent; purging for regeneration."
             rm -f target.vcf.gz target.vcf.gz.csi target.vcf.gz.tbi
-            rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi
             rm -f reagle_ref.vcf.gz reagle_ref.vcf.gz.csi reagle_ref.vcf.gz.tbi
+          fi
+
+      - name: Validate cached person-specific prep files
+        if: steps.cache-prep-person.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          check_vcf () {
+            local vcf="$1"
+            [ -s "$vcf" ]
+            [ -s "$vcf.csi" ] || [ -s "$vcf.tbi" ]
+            bcftools index -n "$vcf" >/dev/null
+          }
+
+          check_vcf truth.vcf.gz
+          check_vcf ref_beagle.vcf.gz
+
+          truth_sites=$(bcftools index -n truth.vcf.gz)
+          beagle_ref_sites=$(bcftools index -n ref_beagle.vcf.gz)
+          echo "Cached truth sites=${truth_sites}, cached beagle-ref sites=${beagle_ref_sites}"
+          if [ "$truth_sites" -le 0 ] || [ "$beagle_ref_sites" -le 0 ]; then
+            echo "Cached truth/ref_beagle look inconsistent; purging for regeneration."
+            rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi
             rm -f ref_beagle.vcf.gz ref_beagle.vcf.gz.csi ref_beagle.vcf.gz.tbi
           fi
 
