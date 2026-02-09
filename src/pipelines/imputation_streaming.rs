@@ -4297,11 +4297,20 @@ impl crate::pipelines::ImputationPipeline {
                                         plan.n_ref_haps,
                                         qa1,
                                     );
-                                    if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx {
+                                    let peer_idx = if i > 0 && (haps[i - 1] / 2) == sample_idx {
+                                        Some(i - 1)
+                                    } else if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx
+                                    {
+                                        Some(i + 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(peer_i) = peer_idx {
+                                        let peer_query = if (haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
                                         let peer_uncertainty = pbwt_beam_uncertainty(
-                                            &beams[i + 1],
+                                            &beams[peer_i],
                                             plan.n_ref_haps,
-                                            qa2,
+                                            peer_query,
                                         );
                                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
@@ -5383,11 +5392,20 @@ impl crate::pipelines::ImputationPipeline {
                                         plan.n_ref_haps,
                                         qa1,
                                     );
-                                    if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx {
+                                    let peer_idx = if i > 0 && (haps[i - 1] / 2) == sample_idx {
+                                        Some(i - 1)
+                                    } else if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx
+                                    {
+                                        Some(i + 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(peer_i) = peer_idx {
+                                        let peer_query = if (haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
                                         let peer_uncertainty = pbwt_beam_uncertainty(
-                                            &beams[i + 1],
+                                            &beams[peer_i],
                                             plan.n_ref_haps,
-                                            qa2,
+                                            peer_query,
                                         );
                                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                                     }

@@ -909,11 +909,19 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         n_ref_haps,
                         qa1,
                     );
-                    if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                    let peer_idx = if i > 0 && (batch_haps[i - 1] / 2) == sample_idx {
+                        Some(i - 1)
+                    } else if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                        Some(i + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(peer_i) = peer_idx {
+                        let peer_query = if (batch_haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
                         let peer_uncertainty = pbwt_beam_uncertainty(
-                            &beams_fwd[i + 1],
+                            &beams_fwd[peer_i],
                             n_ref_haps,
-                            qa2,
+                            peer_query,
                         );
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
@@ -1164,11 +1172,19 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         n_ref_haps,
                         qa1,
                     );
-                    if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                    let peer_idx = if i > 0 && (batch_haps[i - 1] / 2) == sample_idx {
+                        Some(i - 1)
+                    } else if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                        Some(i + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(peer_i) = peer_idx {
+                        let peer_query = if (batch_haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
                         let peer_uncertainty = pbwt_beam_uncertainty(
-                            &beams_bwd[i + 1],
+                            &beams_bwd[peer_i],
                             n_ref_haps,
-                            qa2,
+                            peer_query,
                         );
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
