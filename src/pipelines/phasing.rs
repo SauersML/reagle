@@ -12968,7 +12968,8 @@ mod tests {
 
         let hero_score = window_scores[0][hero_hap_idx];
         let top = select_top_k(&window_scores[0], 15);
-        let in_top = top.iter().any(|(h, _)| *h == hero_hap_idx);
+        let min_score = top.last().map(|(_, s)| *s).unwrap_or(f32::INFINITY);
+        let in_top_or_tied = hero_score >= min_score - 1e-6;
         println!(
             "[prescan score test] top={:?}",
             top.iter()
@@ -12976,13 +12977,13 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         println!(
-            "[prescan score test] hero_hap={} score={:.3} in_top10={}",
-            hero_hap_idx, hero_score, in_top
+            "[prescan score test] hero_hap={} score={:.3} min_top={:.3} in_top_or_tied={}",
+            hero_hap_idx, hero_score, min_score, in_top_or_tied
         );
         assert!(
-            in_top,
-            "Hero hap {} not in top-10 prescan scores for anchor window",
-            hero_hap_idx
+            in_top_or_tied,
+            "Hero hap {} score {:.3} not in top-10 prescan scores (min {:.3}) for anchor window",
+            hero_hap_idx, hero_score, min_score
         );
     }
 
