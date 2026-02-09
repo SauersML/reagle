@@ -5341,7 +5341,6 @@ impl crate::pipelines::ImputationPipeline {
                             if sample_idx != cached_sample_idx {
                                 cached_sample_idx = sample_idx;
                                 cached_wildcard_weight = 0.0;
-                                cached_allele_weight = 1.0;
                                 let hap1 = sample_idx * 2;
                                 let hap2 = hap1 + 1;
                                 let h1 = HapIdx::new(hap1 as u32);
