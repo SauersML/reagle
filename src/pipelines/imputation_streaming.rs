@@ -37,6 +37,11 @@ use crate::model::impute_hmm::{
     state_posteriors_to_priors,
 };
 use crate::model::parameters::ModelParams;
+use crate::model::phase_query::{
+    build_peer_indices, pbwt_beam_uncertainty, phase_best_orientation_error,
+    phase_orientation_weight, phase_query_orientation_error_limit,
+    uncertain_orientation_wildcard_info_weight,
+};
 use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
@@ -190,60 +195,6 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     posterior.clamp(1e-6, 0.5)
-}
-
-#[inline]
-fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32) -> f32 {
-    let base = 0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0);
-    let scale = 0.55 + 0.9 * beam_uncertainty.clamp(0.0, 1.0);
-    (base * scale).clamp(0.04, 0.30)
-}
-
-#[inline]
-fn phase_best_orientation_error(phase_conf: f32) -> f32 {
-    let p = phase_conf.clamp(0.0, 1.0);
-    p.min(1.0 - p)
-}
-
-#[inline]
-fn phase_orientation_weight(phase_conf: f32, err_limit: f32) -> f32 {
-    let best_orient_err = phase_best_orientation_error(phase_conf);
-    let limit = err_limit.max(1e-6);
-    (limit / best_orient_err.max(limit)).clamp(0.0, 1.0)
-}
-
-#[inline]
-fn pbwt_beam_uncertainty(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> f32 {
-    if n_ref_haps == 0 {
-        return 0.0;
-    }
-    let mut total = 0.0f32;
-    let mut sq_sum = 0.0f32;
-    let mut n_intervals = 0usize;
-    for &(l, r) in beam.intervals() {
-        if r <= l {
-            continue;
-        }
-        let len = (r - l) as f32;
-        total += len;
-        sq_sum += len * len;
-        n_intervals += 1;
-    }
-    if total <= 0.0 {
-        return 0.0;
-    }
-    let coverage = (total / n_ref_haps as f32).clamp(0.0, 1.0);
-    let spread = if n_intervals > 1 && sq_sum > 0.0 {
-        let neff = (total * total / sq_sum).clamp(1.0, n_intervals as f32);
-        (neff - 1.0) / (n_intervals as f32 - 1.0)
-    } else {
-        0.0
-    };
-    let mut uncertainty = (0.7 * coverage + 0.3 * spread).clamp(0.0, 1.0);
-    if query.is_wildcard() {
-        uncertainty = uncertainty.max(0.85);
-    }
-    uncertainty
 }
 
 #[inline]
@@ -691,7 +642,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     }
 
     let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
-    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+    let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![255u8; batch_haps.len()];
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
@@ -801,7 +752,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     let mut query_alleles = vec![PbwtStrictAllele::missing(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
-    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+    let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
     for m in 0..n_markers {
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -4186,6 +4137,7 @@ impl crate::pipelines::ImputationPipeline {
                 Vec<PbwtQueryAllele>,
                 Vec<f32>,
                 Vec<u32>,
+                Vec<Option<usize>>,
                 Vec<(u32, u32, u64)>,
             )> = Vec::new();
             let mut start = 0usize;
@@ -4196,6 +4148,7 @@ impl crate::pipelines::ImputationPipeline {
                 let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
                 let query_info_weight = vec![0.0f32; haps.len()];
                 let current_donor = vec![0u32; haps.len()];
+                let peer_idx_by_hap = build_peer_indices(&haps);
                 let scratch = Vec::new();
                 batches.push((
                     haps,
@@ -4203,6 +4156,7 @@ impl crate::pipelines::ImputationPipeline {
                     query_alleles,
                     query_info_weight,
                     current_donor,
+                    peer_idx_by_hap,
                     scratch,
                 ));
                 start = end;
@@ -4226,7 +4180,7 @@ impl crate::pipelines::ImputationPipeline {
                 let target_m_opt = alignment.ref_to_target.get(ref_m).and_then(|v| *v);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, query_info_weight, _, scratch) in
+                for (haps, beams, query_alleles, query_info_weight, _, peer_idx_by_hap, scratch) in
                     batches.iter_mut()
                 {
                     if let Some(target_m) = target_m_opt {
@@ -4292,21 +4246,24 @@ impl crate::pipelines::ImputationPipeline {
                                         .unwrap_or_else(PbwtQueryAllele::missing);
                                     let qa2 = PbwtQueryAllele::allele(mapped2)
                                         .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let phase_conf = target_win
+                                        .sample_phase_confidence_f32(target_marker, sample_idx)
+                                        .clamp(0.0, 1.0);
+                                    let oriented_pair = if phase_conf < 0.5 {
+                                        [qa2, qa1]
+                                    } else {
+                                        [qa1, qa2]
+                                    };
+                                    let self_query = oriented_pair[local];
                                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                                         &beams[i],
                                         plan.n_ref_haps,
-                                        qa1,
+                                        self_query,
                                     );
-                                    let peer_idx = if i > 0 && (haps[i - 1] / 2) == sample_idx {
-                                        Some(i - 1)
-                                    } else if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx
-                                    {
-                                        Some(i + 1)
-                                    } else {
-                                        None
-                                    };
+                                    let peer_idx = peer_idx_by_hap[i];
                                     if let Some(peer_i) = peer_idx {
-                                        let peer_query = if (haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                                        let peer_local = haps[peer_i] % 2;
+                                        let peer_query = oriented_pair[peer_local];
                                         let peer_uncertainty = pbwt_beam_uncertainty(
                                             &beams[peer_i],
                                             plan.n_ref_haps,
@@ -4314,9 +4271,6 @@ impl crate::pipelines::ImputationPipeline {
                                         );
                                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
-                                    let phase_conf = target_win
-                                        .sample_phase_confidence_f32(target_marker, sample_idx)
-                                        .clamp(0.0, 1.0);
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
@@ -4331,7 +4285,8 @@ impl crate::pipelines::ImputationPipeline {
                                     cached_allele_weight = orientation_weight;
                                     if phase_best_orientation_error(phase_conf) > err_limit {
                                         cached_query_pair = [255, 255];
-                                        cached_wildcard_weight = info_llr * orientation_weight;
+                                        cached_wildcard_weight =
+                                            uncertain_orientation_wildcard_info_weight();
                                     } else if phase_conf < 0.5 {
                                         cached_query_pair = [mapped2, mapped1];
                                     } else {
@@ -4381,7 +4336,7 @@ impl crate::pipelines::ImputationPipeline {
                 let store = aligned_here || in_overlap;
 
                 if store {
-                    for (haps, beams, query_alleles, query_info_weight, current_donor, _) in
+                    for (haps, beams, query_alleles, query_info_weight, current_donor, _, _) in
                         batches.iter_mut()
                     {
                         let mut donor_candidates: Vec<u32> =
@@ -5292,6 +5247,7 @@ impl crate::pipelines::ImputationPipeline {
                 Vec<PbwtQueryAllele>,
                 Vec<f32>,
                 Vec<u32>,
+                Vec<Option<usize>>,
                 Vec<(u32, u32, u64)>,
             )> = Vec::new();
             let mut start = 0usize;
@@ -5302,6 +5258,7 @@ impl crate::pipelines::ImputationPipeline {
                 let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
                 let query_allele_weight = vec![1.0f32; haps.len()];
                 let current_donor = vec![0u32; haps.len()];
+                let peer_idx_by_hap = build_peer_indices(&haps);
                 let scratch = Vec::new();
                 for &hap in &haps {
                     sm_alt_probs_by_hap[hap] = Some(Vec::with_capacity(output_markers));
@@ -5312,6 +5269,7 @@ impl crate::pipelines::ImputationPipeline {
                     query_alleles,
                     query_allele_weight,
                     current_donor,
+                    peer_idx_by_hap,
                     scratch,
                 ));
                 start = end;
@@ -5326,7 +5284,7 @@ impl crate::pipelines::ImputationPipeline {
                     .max(1);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, query_allele_weight, _, scratch) in
+                for (haps, beams, query_alleles, query_allele_weight, _, peer_idx_by_hap, scratch) in
                     batches.iter_mut()
                 {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
@@ -5392,21 +5350,24 @@ impl crate::pipelines::ImputationPipeline {
                                         .unwrap_or_else(PbwtQueryAllele::missing);
                                     let qa2 = PbwtQueryAllele::allele(mapped2)
                                         .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let phase_conf = target_win
+                                        .sample_phase_confidence_f32(target_marker, sample_idx)
+                                        .clamp(0.0, 1.0);
+                                    let oriented_pair = if phase_conf < 0.5 {
+                                        [qa2, qa1]
+                                    } else {
+                                        [qa1, qa2]
+                                    };
+                                    let self_query = oriented_pair[local];
                                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                                         &beams[i],
                                         plan.n_ref_haps,
-                                        qa1,
+                                        self_query,
                                     );
-                                    let peer_idx = if i > 0 && (haps[i - 1] / 2) == sample_idx {
-                                        Some(i - 1)
-                                    } else if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx
-                                    {
-                                        Some(i + 1)
-                                    } else {
-                                        None
-                                    };
+                                    let peer_idx = peer_idx_by_hap[i];
                                     if let Some(peer_i) = peer_idx {
-                                        let peer_query = if (haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                                        let peer_local = haps[peer_i] % 2;
+                                        let peer_query = oriented_pair[peer_local];
                                         let peer_uncertainty = pbwt_beam_uncertainty(
                                             &beams[peer_i],
                                             plan.n_ref_haps,
@@ -5414,9 +5375,6 @@ impl crate::pipelines::ImputationPipeline {
                                         );
                                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
-                                    let phase_conf = target_win
-                                        .sample_phase_confidence_f32(target_marker, sample_idx)
-                                        .clamp(0.0, 1.0);
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
@@ -5430,7 +5388,8 @@ impl crate::pipelines::ImputationPipeline {
                                         phase_orientation_weight(phase_conf, err_limit);
                                     if phase_best_orientation_error(phase_conf) > err_limit {
                                         cached_query_pair = [255, 255];
-                                        cached_wildcard_weight = cached_allele_weight;
+                                        cached_wildcard_weight =
+                                            uncertain_orientation_wildcard_info_weight();
                                     } else if phase_conf < 0.5 {
                                         cached_query_pair = [mapped2, mapped1];
                                     } else {
@@ -5470,7 +5429,7 @@ impl crate::pipelines::ImputationPipeline {
                 if ref_m < output_start || ref_m >= output_end {
                     continue;
                 }
-                for (haps, beams, query_alleles, query_allele_weight, current_donor, _) in
+                for (haps, beams, query_alleles, query_allele_weight, current_donor, _, _) in
                     batches.iter_mut()
                 {
                     let mut donor_candidates: Vec<u32> =
@@ -5498,14 +5457,11 @@ impl crate::pipelines::ImputationPipeline {
                             .get(i)
                             .and_then(|qa| qa.as_allele())
                             .unwrap_or(255);
-                        let p_alt = if n_alleles <= 2 {
-                            if target_allele == 255 {
-                                if donor_candidates.is_empty() {
-                                    panic!(
-                                        "SM-match donor set empty at ref_m={} for hap_idx={} (cannot impute missing site)",
-                                        ref_m, hap_idx
-                                    );
-                                }
+                        let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
+                        let p_alt = if target_allele == 255 {
+                            let donor_alt = if donor_candidates.is_empty() {
+                                0.5
+                            } else {
                                 let mut alt_sum = 0u32;
                                 for &cand in &donor_candidates {
                                     let allele = col.get(HapIdx::new(cand));
@@ -5513,24 +5469,19 @@ impl crate::pipelines::ImputationPipeline {
                                         alt_sum += 1;
                                     }
                                 }
-                                let donor_alt =
-                                    (alt_sum as f32 / donor_candidates.len() as f32).clamp(0.0, 1.0);
-                                let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
-                                (orient_weight * donor_alt + (1.0 - orient_weight) * 0.5)
-                                    .clamp(1e-6, 1.0 - 1e-6)
-                            } else {
-                                let hard = if donor_candidates.is_empty() {
-                                    if target_allele == 1 { 1.0 } else { 0.0 }
-                                } else {
-                                    let allele = col.get(HapIdx::new(donor));
-                                    if allele == 1 { 1.0 } else { 0.0 }
-                                };
-                                let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
-                                (orient_weight * hard + (1.0 - orient_weight) * 0.5)
-                                    .clamp(1e-6, 1.0 - 1e-6)
-                            }
+                                (alt_sum as f32 / donor_candidates.len() as f32).clamp(0.0, 1.0)
+                            };
+                            (orient_weight * donor_alt + (1.0 - orient_weight) * 0.5)
+                                .clamp(1e-6, 1.0 - 1e-6)
                         } else {
-                            0.0
+                            let hard = if donor_candidates.is_empty() {
+                                if target_allele == 1 { 1.0 } else { 0.0 }
+                            } else {
+                                let allele = col.get(HapIdx::new(donor));
+                                if allele == 1 { 1.0 } else { 0.0 }
+                            };
+                            (orient_weight * hard + (1.0 - orient_weight) * 0.5)
+                                .clamp(1e-6, 1.0 - 1e-6)
                         };
                         if let Some(buf) = sm_alt_probs_by_hap[hap_idx].as_mut() {
                             buf.push(p_alt);

@@ -5,6 +5,7 @@ import glob
 import shutil
 import shlex
 import gzip
+import tempfile
 from pathlib import Path
 
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
@@ -55,8 +56,18 @@ def _ensure_chr22_reference_fasta(local_gz: str = ".cache/reference/chr22.fa.gz"
         _download_file(CHR22_FASTA_GZ_URL, gz_path)
 
     print(f"Decompressing chr22 FASTA to {fa_path}...")
-    with gzip.open(gz_path, "rb") as src, open(fa_path, "wb") as dst:
-        shutil.copyfileobj(src, dst)
+    fa_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=str(fa_path.parent),
+        prefix=f".{fa_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+        with gzip.open(gz_path, "rb") as src:
+            shutil.copyfileobj(src, tmp)
+    os.replace(tmp_path, fa_path)
     return str(fa_path)
 
 

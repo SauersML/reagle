@@ -367,9 +367,12 @@ fn active_to_intervals(active: &[bool]) -> Vec<WindowSpan> {
 ///   where w_i is a positive donor weight in a window.
 /// - Scores are in log-space, so we use exp(score - max_score_window) for
 ///   numerically stable relative weights (scale cancels in ESS).
-fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows: usize) -> Vec<f32> {
+fn window_effective_pool_stats(
+    scores_by_hap: &[Vec<(usize, f32)>],
+    num_windows: usize,
+) -> (Vec<f32>, Vec<f32>) {
     if num_windows == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut max_score_by_window = vec![NEG_INF; num_windows];
     let mut support_by_window = vec![0usize; num_windows];
@@ -402,7 +405,7 @@ fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows:
         }
     }
 
-    let mut out = vec![1.0f32; num_windows];
+    let mut neff_by_window = vec![1.0f32; num_windows];
     let mut win = 0usize;
     while win < num_windows {
         let s = sum_w[win];
@@ -413,7 +416,7 @@ fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows:
             // score evidence is sparse to avoid overreacting to a few donors.
             let support = support_by_window[win] as f32;
             let lambda = support / (support + 8.0);
-            out[win] = (lambda * neff + (1.0 - lambda) * support.max(1.0)).max(1.0);
+            neff_by_window[win] = (lambda * neff + (1.0 - lambda) * support.max(1.0)).max(1.0);
         }
         win += 1;
     }
@@ -422,15 +425,21 @@ fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows:
     // score support. This keeps transition penalties stable while preserving
     // broad LD-driven variation in effective donor diversity.
     if num_windows >= 3 {
-        let mut smoothed = out.clone();
+        let mut smoothed = neff_by_window.clone();
         let mut i = 1usize;
         while i + 1 < num_windows {
-            smoothed[i] = (0.25 * out[i - 1] + 0.5 * out[i] + 0.25 * out[i + 1]).max(1.0);
+            smoothed[i] = (0.25 * neff_by_window[i - 1]
+                + 0.5 * neff_by_window[i]
+                + 0.25 * neff_by_window[i + 1])
+                .max(1.0);
             i += 1;
         }
-        out = smoothed;
+        neff_by_window = smoothed;
     }
-    out
+    (
+        neff_by_window,
+        support_by_window.into_iter().map(|s| s as f32).collect(),
+    )
 }
 
 /// Build boundary-specific donor-pool sizes for continuity terms.
@@ -447,7 +456,7 @@ fn boundary_pool_sizes_from_scores(
     if num_windows < 2 {
         return out;
     }
-    let neff_by_window = window_effective_pool_sizes(scores_by_hap, num_windows);
+    let (neff_by_window, support_by_window) = window_effective_pool_stats(scores_by_hap, num_windows);
     let panel_pool = DonorPoolSize::new(n_pool);
 
     let mut b = 0usize;
@@ -460,8 +469,10 @@ fn boundary_pool_sizes_from_scores(
         let right = neff_by_window[b + 1].max(1.0);
         let boundary_neff = (left * right).sqrt();
         // Final shrinkage toward cap-based pool size for safety in sparse/noisy windows.
+        // Reliability comes from score support, not from N_eff magnitude itself.
+        let boundary_support = support_by_window[b].min(support_by_window[b + 1]).max(0.0);
         let cap_f = cap_pool.as_f32();
-        let lambda = (boundary_neff / (boundary_neff + 8.0)).clamp(0.0, 1.0);
+        let lambda = (boundary_support / (boundary_support + 8.0)).clamp(0.0, 1.0);
         let blended = lambda * boundary_neff + (1.0 - lambda) * cap_f;
         let local_pool = DonorPoolSize::new(blended.round().max(2.0) as usize);
         out.push(local_pool.min(cap_pool));
@@ -491,37 +502,60 @@ struct AllocationState {
     len: usize,
 }
 
-fn recompute_counts_logz_used(
+fn recompute_counts_logz_used_into(
     selected_states: &[Option<AllocationState>],
     scores_by_hap: &[Vec<(usize, f32)>],
-    num_windows: usize,
     per_window_caps: &[usize],
-) -> (Vec<usize>, Vec<f32>, usize) {
-    let mut counts = vec![0usize; num_windows];
-    let mut z_w = vec![0.0f32; num_windows];
-    let mut used = 0usize;
+    counts: &mut [usize],
+    z_w: &mut [f32],
+    accepted_marks: &mut Vec<u32>,
+) {
+    counts.fill(0);
+    z_w.fill(0.0);
+    if accepted_marks.len() != counts.len() {
+        accepted_marks.resize(counts.len(), 0);
+    } else {
+        accepted_marks.fill(0);
+    }
+    let mut mark_tick: u32 = 1;
 
     let mut idx = 0usize;
     while idx < selected_states.len() {
         if let Some(state) = selected_states[idx].as_ref() {
-            used += state.len;
+            if mark_tick == u32::MAX {
+                accepted_marks.fill(0);
+                mark_tick = 1;
+            }
+            let tick = mark_tick;
+            mark_tick += 1;
             let mut win = 0usize;
-            while win < num_windows {
+            while win < counts.len() {
                 if state.active[win] && counts[win] < per_window_caps[win] {
                     counts[win] += 1;
+                    accepted_marks[win] = tick;
                 }
                 win += 1;
             }
             for &(win, score) in &scores_by_hap[idx] {
-                if win < num_windows && state.active[win] && score.is_finite() {
+                if win < counts.len() && accepted_marks[win] == tick && score.is_finite() {
                     z_w[win] = logaddexp(z_w[win], score);
                 }
             }
         }
         idx += 1;
     }
+}
 
-    (counts, z_w, used)
+#[inline]
+fn refresh_blocked_flags(counts: &[usize], per_window_caps: &[usize], blocked: &mut Vec<bool>) {
+    if blocked.len() != counts.len() {
+        blocked.resize(counts.len(), false);
+    }
+    let mut w_i = 0usize;
+    while w_i < counts.len() {
+        blocked[w_i] = counts[w_i] >= per_window_caps[w_i];
+        w_i += 1;
+    }
 }
 
 fn fill_residual_capacity(
@@ -535,6 +569,7 @@ fn fill_residual_capacity(
     z_w: &mut [f32],
     remaining: &mut usize,
     dp_scratch: &mut DpScratch,
+    blocked_scratch: &mut Vec<bool>,
 ) {
     // Greedy fill under the true (unpenalized) surrogate objective using mu=0.
     // This is a deterministic post-pass that maximizes additional gain per slot
@@ -542,15 +577,12 @@ fn fill_residual_capacity(
     let n = scores_by_hap.len();
     let w = per_window_caps.len();
     while *remaining > 0 {
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
+        refresh_blocked_flags(counts, per_window_caps, blocked_scratch);
         let mut best_idx: Option<usize> = None;
         let mut best_gain = NEG_INF;
         let mut best_gain_per_slot = NEG_INF;
         let mut best_len = 0usize;
+        let mut best_active: Option<Vec<bool>> = None;
 
         let mut h = 0usize;
         while h < n {
@@ -562,7 +594,7 @@ fn fill_residual_capacity(
                 &scores_by_hap[h],
                 z_w,
                 0.0,
-                &blocked,
+                blocked_scratch,
                 t11,
                 t10,
                 t01,
@@ -578,6 +610,7 @@ fn fill_residual_capacity(
                     best_gain = gain;
                     best_gain_per_slot = gain_per_slot;
                     best_len = len;
+                    best_active = Some(dp_scratch.active[..w].to_vec());
                 }
             }
             h += 1;
@@ -586,44 +619,34 @@ fn fill_residual_capacity(
         let Some(chosen_idx) = best_idx else {
             break;
         };
-
-        let blocked_verify: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
-        let (gain_chk, len_chk) = dp_intervals_sparse_scratch(
-            &scores_by_hap[chosen_idx],
-            z_w,
-            0.0,
-            &blocked_verify,
-            t11,
-            t10,
-            t01,
-            dp_scratch,
-        );
-        if gain_chk <= 0.0 || len_chk == 0 || len_chk > *remaining {
+        let Some(chosen_active) = best_active else {
+            break;
+        };
+        if best_gain <= 0.0 || best_len == 0 || best_len > *remaining {
             break;
         }
-        let chosen_active = dp_scratch.active[..w].to_vec();
 
         selected_states[chosen_idx] = Some(AllocationState {
-            active: chosen_active.clone(),
-            len: len_chk,
+            active: chosen_active,
+            len: best_len,
         });
+        let active = &selected_states[chosen_idx]
+            .as_ref()
+            .expect("just inserted allocation state")
+            .active;
         let mut win = 0usize;
         while win < w {
-            if chosen_active[win] && counts[win] < per_window_caps[win] {
+            if active[win] && counts[win] < per_window_caps[win] {
                 counts[win] += 1;
             }
             win += 1;
         }
         for &(win_idx, score) in &scores_by_hap[chosen_idx] {
-            if win_idx < w && chosen_active[win_idx] && score.is_finite() {
+            if win_idx < w && active[win_idx] && score.is_finite() {
                 z_w[win_idx] = logaddexp(z_w[win_idx], score);
             }
         }
-        *remaining = remaining.saturating_sub(len_chk);
+        *remaining = remaining.saturating_sub(best_len);
     }
 }
 
@@ -801,8 +824,6 @@ pub fn allocate_lms_sparse(
     struct HeapEntry {
         gain: f32,
         idx: usize,
-        active: Vec<bool>,
-        len: usize,
     }
 
     impl Eq for HeapEntry {}
@@ -829,12 +850,10 @@ pub fn allocate_lms_sparse(
 
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut dp_scratch = DpScratch::default();
+    let mut blocked_scratch: Vec<bool> = vec![false; w];
+    let mut recompute_marks: Vec<u32> = vec![0u32; w];
     {
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
+        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
         let mut h = 0usize;
         while h < n {
             let scores = &scores_by_hap[h];
@@ -842,19 +861,14 @@ pub fn allocate_lms_sparse(
                 scores,
                 &z_w,
                 mu,
-                &blocked,
+                &blocked_scratch,
                 &t11,
                 &t10,
                 &t01,
                 &mut dp_scratch,
             );
             if gain > 0.0 && len > 0 && len <= remaining {
-                heap.push(HeapEntry {
-                    gain,
-                    idx: h,
-                    active: dp_scratch.active[..w].to_vec(),
-                    len,
-                });
+                heap.push(HeapEntry { gain, idx: h });
             }
             h += 1;
         }
@@ -867,16 +881,12 @@ pub fn allocate_lms_sparse(
         if selected_states[entry.idx].is_some() {
             continue;
         }
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
+        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
         let (gain, len) = dp_intervals_sparse_scratch(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
-            &blocked,
+            &blocked_scratch,
             &t11,
             &t10,
             &t01,
@@ -907,8 +917,6 @@ pub fn allocate_lms_sparse(
             remaining = remaining.saturating_sub(len);
         } else {
             entry.gain = gain;
-            entry.active = active;
-            entry.len = len;
             heap.push(entry);
         }
     }
@@ -925,6 +933,7 @@ pub fn allocate_lms_sparse(
         &mut z_w,
         &mut remaining,
         &mut dp_scratch,
+        &mut blocked_scratch,
     );
 
     // One coordinate-ascent polish sweep over selected donors.
@@ -935,22 +944,23 @@ pub fn allocate_lms_sparse(
             continue;
         };
 
-        let (re_counts, re_logz, used_without_current) =
-            recompute_counts_logz_used(&selected_states, scores_by_hap, w, per_window_caps);
-        counts = re_counts;
-        z_w = re_logz;
+        recompute_counts_logz_used_into(
+            &selected_states,
+            scores_by_hap,
+            per_window_caps,
+            &mut counts,
+            &mut z_w,
+            &mut recompute_marks,
+        );
+        let used_without_current: usize = counts.iter().copied().sum();
         remaining = total_budget.saturating_sub(used_without_current);
 
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
+        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
         let (gain, len) = dp_intervals_sparse_scratch(
             &scores_by_hap[polish_idx],
             &z_w,
             mu,
-            &blocked,
+            &blocked_scratch,
             &t11,
             &t10,
             &t01,
@@ -960,9 +970,13 @@ pub fn allocate_lms_sparse(
         if gain > 0.0 && len > 0 && len <= remaining {
             let active = dp_scratch.active[..w].to_vec();
             selected_states[polish_idx] = Some(AllocationState {
-                active: active.clone(),
+                active,
                 len,
             });
+            let active = &selected_states[polish_idx]
+                .as_ref()
+                .expect("just inserted allocation state")
+                .active;
             let mut win = 0usize;
             while win < w {
                 if active[win] && counts[win] < per_window_caps[win] {
@@ -1011,6 +1025,7 @@ pub fn allocate_lms_sparse(
         &mut z_w,
         &mut remaining,
         &mut dp_scratch,
+        &mut blocked_scratch,
     );
 
     let mut intervals_by_hap: Vec<(usize, Vec<WindowSpan>)> = Vec::new();
@@ -1054,8 +1069,6 @@ fn simulate_allocation(
     struct HeapEntry {
         gain: f32,
         idx: usize,
-        active: Vec<bool>,
-        len: usize,
     }
 
     impl Eq for HeapEntry {}
@@ -1082,32 +1095,23 @@ fn simulate_allocation(
 
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut dp_scratch = DpScratch::default();
+    let mut blocked_scratch: Vec<bool> = vec![false; w];
     {
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
+        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
         for h in 0..n {
             let scores = &scores_by_hap[h];
             let (gain, len) = dp_intervals_sparse_scratch(
                 scores,
                 &z_w,
                 mu,
-                &blocked,
+                &blocked_scratch,
                 t11,
                 t10,
                 t01,
                 &mut dp_scratch,
             );
-            let active = dp_scratch.active[..w].to_vec();
             if gain > 0.0 && len > 0 {
-                heap.push(HeapEntry {
-                    gain,
-                    idx: h,
-                    active,
-                    len,
-                });
+                heap.push(HeapEntry { gain, idx: h });
             }
         }
     }
@@ -1117,16 +1121,12 @@ fn simulate_allocation(
         if selected[entry.idx] {
             continue;
         }
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
+        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
         let (gain, len) = dp_intervals_sparse_scratch(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
-            &blocked,
+            &blocked_scratch,
             t11,
             t10,
             t01,
@@ -1153,11 +1153,47 @@ fn simulate_allocation(
             }
         } else {
             entry.gain = gain;
-            entry.active = active;
-            entry.len = len;
             heap.push(entry);
         }
     }
 
     (used, total_gain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_pool_keeps_small_neff_when_support_is_strong() {
+        let n_haps = 1024usize;
+        let mut scores_by_hap: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_haps];
+        for (h, scores) in scores_by_hap.iter_mut().enumerate() {
+            let score = if h < 2 { 0.0 } else { -20.0 };
+            scores.push((0, score));
+            scores.push((1, score));
+        }
+
+        let pools = boundary_pool_sizes_from_scores(&scores_by_hap, 2, &[256, 256], 256);
+        assert_eq!(pools.len(), 1);
+        assert!(
+            pools[0].as_f32() < 32.0,
+            "expected strong-support low-ESS boundary pool to stay small, got {}",
+            pools[0].as_f32()
+        );
+    }
+
+    #[test]
+    fn boundary_pool_shrinks_to_cap_when_support_is_sparse() {
+        // Single strong donor per window -> low reliability, so we should
+        // revert toward cap for safety.
+        let scores_by_hap = vec![vec![(0usize, 0.0f32), (1usize, 0.0f32)]];
+        let pools = boundary_pool_sizes_from_scores(&scores_by_hap, 2, &[256, 256], 256);
+        assert_eq!(pools.len(), 1);
+        assert!(
+            pools[0].as_f32() > 180.0,
+            "expected sparse-support boundary pool to stay near cap, got {}",
+            pools[0].as_f32()
+        );
+    }
 }

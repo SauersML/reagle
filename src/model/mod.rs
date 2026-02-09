@@ -48,6 +48,7 @@ pub mod ibs2;
 pub mod impute_hmm;
 pub mod parameters;
 pub mod pbwt;
+pub mod phase_query;
 pub mod phase_ibs;
 pub mod pl_emission;
 pub mod reference_pbwt;

@@ -1,4 +1,4 @@
-use crate::model::pbwt::{PbwtAllele, PbwtAlphabet, PbwtDivUpdater, PbwtIndex};
+use crate::model::pbwt::{PbwtAllele, PbwtAlphabet, PbwtBiallelicBin, PbwtDivUpdater, PbwtIndex};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -241,10 +241,10 @@ impl PbwtBiallelicQueryProb {
     }
 
     #[inline]
-    fn prob_for_bin(self, b: usize) -> f32 {
-        if b == 0 {
+    fn prob_for_bin(self, b: PbwtBiallelicBin) -> f32 {
+        if b == PbwtBiallelicBin::Ref {
             self.p0
-        } else if b == 2 {
+        } else if b == PbwtBiallelicBin::Alt {
             self.p1
         } else {
             0.0
@@ -508,6 +508,9 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             let mut best: std::collections::BinaryHeap<DonorChoice> =
                 std::collections::BinaryHeap::with_capacity(k + 1);
             for &pos in &self.donor_candidate_pos {
+                if pos >= self.div.len() {
+                    continue;
+                }
                 let choice = DonorChoice {
                     div: self.div[pos],
                     pos,
@@ -527,6 +530,9 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                             continue;
                         }
                         self.donor_seen_marks[pos] = chosen_tick;
+                        if pos >= self.div.len() {
+                            continue;
+                        }
                         let choice = DonorChoice {
                             div: self.div[pos],
                             pos,
@@ -544,6 +550,9 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             std::collections::BinaryHeap::with_capacity(k + 1);
         for &(l, r) in &self.intervals_buf {
             for pos in l..r {
+                if pos >= self.div.len() {
+                    continue;
+                }
                 let choice = DonorChoice {
                     div: self.div[pos],
                     pos,
@@ -837,27 +846,39 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             if qa.is_wildcard() {
                 scratch.clear();
                 for &(l, r) in old.intervals() {
-                    for b in 0..n_bins {
-                        if b == 1 {
-                            continue;
-                        }
-                        let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
-                        let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
-                        if nl < nr {
-                            let len = nr - nl;
-                            let score = if n_alleles == 2 {
+                    if n_alleles == 2 {
+                        for bb in PbwtBiallelicBin::NON_MISSING {
+                            let b = bb.as_usize();
+                            let nl =
+                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                            if nl < nr {
+                                let len = nr - nl;
                                 let p = query_bin_probs
                                     .and_then(|probs| probs.get(q_idx))
-                                    .map(|prob| prob.prob_for_bin(b))
+                                    .map(|prob| prob.prob_for_bin(bb))
                                     .unwrap_or(0.5);
-                                Self::scaled_score(len, p)
-                            } else {
-                                len as u64
-                            };
-                            if score == 0 {
+                                let score = Self::scaled_score(len, p);
+                                if score == 0 {
+                                    continue;
+                                }
+                                scratch.push((nl, nr, score));
+                            }
+                        }
+                    } else {
+                        for b in 0..n_bins {
+                            if b == 1 {
                                 continue;
                             }
-                            scratch.push((nl, nr, score));
+                            let nl =
+                                self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
+                            if nl < nr {
+                                let score = (nr - nl) as u64;
+                                scratch.push((nl, nr, score));
+                            }
                         }
                     }
                 }
@@ -885,13 +906,20 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     let (p0, p1) = query_bin_probs
                         .and_then(|probs| probs.get(q_idx))
                         .map(|prob| (prob.prob_for_allele(0), prob.prob_for_allele(1)))
-                        .unwrap_or_else(|| if b == 0 { (1.0, 0.0) } else { (0.0, 1.0) });
+                        .unwrap_or_else(|| {
+                            match PbwtAllele::from_raw(queried_allele, alphabet).biallelic_bin() {
+                                PbwtBiallelicBin::Ref => (1.0, 0.0),
+                                PbwtBiallelicBin::Alt => (0.0, 1.0),
+                                PbwtBiallelicBin::Missing => (0.5, 0.5),
+                            }
+                        });
                     for &(l, r) in old.intervals() {
-                        for (bb, p) in [(0usize, p0), (2usize, p1)] {
-                            let nl =
-                                self.offset_for(bb, n_alleles) + self.rank(bb, l, n_ref, n_alleles);
-                            let nr =
-                                self.offset_for(bb, n_alleles) + self.rank(bb, r, n_ref, n_alleles);
+                        for (bb, p) in [(PbwtBiallelicBin::Ref, p0), (PbwtBiallelicBin::Alt, p1)] {
+                            let b_idx = bb.as_usize();
+                            let nl = self.offset_for(b_idx, n_alleles)
+                                + self.rank(b_idx, l, n_ref, n_alleles);
+                            let nr = self.offset_for(b_idx, n_alleles)
+                                + self.rank(b_idx, r, n_ref, n_alleles);
                             if nl < nr {
                                 let score = Self::scaled_score(nr - nl, p);
                                 if score == 0 {

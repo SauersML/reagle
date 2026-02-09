@@ -71,6 +71,23 @@ pub enum PbwtAllele {
     Missing,
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PbwtBiallelicBin {
+    Ref = 0,
+    Missing = 1,
+    Alt = 2,
+}
+
+impl PbwtBiallelicBin {
+    pub const NON_MISSING: [Self; 2] = [Self::Ref, Self::Alt];
+
+    #[inline(always)]
+    pub const fn as_usize(self) -> usize {
+        self as usize
+    }
+}
+
 impl PbwtAllele {
     #[inline(always)]
     pub fn from_raw(allele: u8, alphabet: PbwtAlphabet) -> Self {
@@ -86,17 +103,22 @@ impl PbwtAllele {
     #[inline(always)]
     pub fn bin(self, alphabet: PbwtAlphabet) -> usize {
         if alphabet.n_alleles() == 2 {
-            match self {
-                Self::Ref => 0,
-                Self::Alt(1) => 2,
-                Self::Alt(_) | Self::Missing => 1,
-            }
+            self.biallelic_bin().as_usize()
         } else {
             match self {
                 Self::Ref => 0,
                 Self::Missing => 1,
                 Self::Alt(a) => (a as usize) + 1,
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn biallelic_bin(self) -> PbwtBiallelicBin {
+        match self {
+            Self::Ref => PbwtBiallelicBin::Ref,
+            Self::Alt(1) => PbwtBiallelicBin::Alt,
+            Self::Alt(_) | Self::Missing => PbwtBiallelicBin::Missing,
         }
     }
 }

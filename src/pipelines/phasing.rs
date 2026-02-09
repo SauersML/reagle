@@ -70,6 +70,9 @@ use crate::data::ref_packed::PackedRefView;
 use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, PbwtInjector};
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
+use crate::model::phase_query::{
+    build_peer_indices, phase_best_orientation_error, phase_query_orientation_error_limit,
+};
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{
     PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
@@ -817,24 +820,6 @@ fn adaptive_pbwt_donor_k(
 }
 
 #[inline]
-fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32) -> f32 {
-    // Decision-theoretic proxy:
-    // - High genotype confidence allows larger tolerated orientation error.
-    // - High beam uncertainty means committing to one orientation is less risky,
-    //   so tolerate larger orientation error before wildcarding.
-    // - Low beam uncertainty means sharp/fragile PBWT path, so wildcard sooner.
-    let base = 0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0);
-    let scale = 0.55 + 0.9 * beam_uncertainty.clamp(0.0, 1.0);
-    (base * scale).clamp(0.04, 0.30)
-}
-
-#[inline]
-fn phase_best_orientation_error(phase_conf: f32) -> f32 {
-    let p = phase_conf.clamp(0.0, 1.0);
-    p.min(1.0 - p)
-}
-
-#[inline]
 fn biallelic_haplotype_probs(
     a1: u8,
     a2: u8,
@@ -899,12 +884,13 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     let mut beams_fwd: Vec<RankBeam> = (0..batch_haps.len())
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
+    let peer_idx_by_hap = build_peer_indices(batch_haps);
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![PbwtQueryAllele::missing(); batch_haps.len()];
     let mut query_allele_probs = vec![PbwtBiallelicQueryProb::uniform(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
-    let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+    let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
@@ -941,20 +927,24 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
+                    let phase_conf = target_gt
+                        .sample_phase_confidence_f32(marker_idx, sample_idx)
+                        .clamp(0.0, 1.0);
+                    let oriented_pair = if phase_conf < 0.5 {
+                        [qa2, qa1]
+                    } else {
+                        [qa1, qa2]
+                    };
+                    let self_query = oriented_pair[local];
                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                         &beams_fwd[i],
                         n_ref_haps,
-                        qa1,
+                        self_query,
                     );
-                    let peer_idx = if i > 0 && (batch_haps[i - 1] / 2) == sample_idx {
-                        Some(i - 1)
-                    } else if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
-                        Some(i + 1)
-                    } else {
-                        None
-                    };
+                    let peer_idx = peer_idx_by_hap[i];
                     if let Some(peer_i) = peer_idx {
-                        let peer_query = if (batch_haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                        let peer_local = batch_haps[peer_i] % 2;
+                        let peer_query = oriented_pair[peer_local];
                         let peer_uncertainty = pbwt_beam_uncertainty(
                             &beams_fwd[peer_i],
                             n_ref_haps,
@@ -962,9 +952,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         );
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
-                    let phase_conf = target_gt
-                        .sample_phase_confidence_f32(marker_idx, sample_idx)
-                        .clamp(0.0, 1.0);
                     cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
                     let geno_conf = target_gt
                         .sample_confidence_f32(marker_idx, sample_idx)
@@ -1094,6 +1081,16 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_fwd[i], query_alleles[i]);
                 pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
                 let allele_probs = query_allele_probs[i];
+                let p0 = allele_probs.prob_for_allele(0).clamp(0.0, 1.0);
+                let p1 = allele_probs.prob_for_allele(1).clamp(0.0, 1.0);
+                let query_allele = query_alleles[i].as_allele();
+                let allele_certainty = match query_allele {
+                    Some(a) if a > 1 => 1.0,
+                    _ => (p0 - p1).abs(),
+                };
+                if allele_certainty <= f32::EPSILON {
+                    continue;
+                }
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -1103,10 +1100,17 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         continue;
                     }
                     let ref_allele = ref_alleles[idx];
-                    if ref_allele == 255 || ref_allele > 1 {
+                    if ref_allele == 255 {
                         continue;
                     }
-                    let p_match = allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0);
+                    let p_match = if ref_allele <= 1 {
+                        allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
+                    } else {
+                        match query_allele {
+                            Some(a) if a == ref_allele => 1.0,
+                            _ => 0.0,
+                        }
+                    };
                     if p_match <= 0.0 {
                         continue;
                     }
@@ -1118,7 +1122,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if freq <= 0.0 {
                         continue;
                     }
-                    let weight = p_match * -(freq.max(min_freq)).ln();
+                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
@@ -1170,20 +1174,24 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
+                    let phase_conf = target_gt
+                        .sample_phase_confidence_f32(marker_idx, sample_idx)
+                        .clamp(0.0, 1.0);
+                    let oriented_pair = if phase_conf < 0.5 {
+                        [qa2, qa1]
+                    } else {
+                        [qa1, qa2]
+                    };
+                    let self_query = oriented_pair[local];
                     let mut beam_uncertainty = pbwt_beam_uncertainty(
                         &beams_bwd[i],
                         n_ref_haps,
-                        qa1,
+                        self_query,
                     );
-                    let peer_idx = if i > 0 && (batch_haps[i - 1] / 2) == sample_idx {
-                        Some(i - 1)
-                    } else if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
-                        Some(i + 1)
-                    } else {
-                        None
-                    };
+                    let peer_idx = peer_idx_by_hap[i];
                     if let Some(peer_i) = peer_idx {
-                        let peer_query = if (batch_haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                        let peer_local = batch_haps[peer_i] % 2;
+                        let peer_query = oriented_pair[peer_local];
                         let peer_uncertainty = pbwt_beam_uncertainty(
                             &beams_bwd[peer_i],
                             n_ref_haps,
@@ -1191,9 +1199,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         );
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
-                    let phase_conf = target_gt
-                        .sample_phase_confidence_f32(marker_idx, sample_idx)
-                        .clamp(0.0, 1.0);
                     cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
                     let geno_conf = target_gt
                         .sample_confidence_f32(marker_idx, sample_idx)
@@ -1323,6 +1328,16 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_bwd[i], query_alleles[i]);
                 pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
                 let allele_probs = query_allele_probs[i];
+                let p0 = allele_probs.prob_for_allele(0).clamp(0.0, 1.0);
+                let p1 = allele_probs.prob_for_allele(1).clamp(0.0, 1.0);
+                let query_allele = query_alleles[i].as_allele();
+                let allele_certainty = match query_allele {
+                    Some(a) if a > 1 => 1.0,
+                    _ => (p0 - p1).abs(),
+                };
+                if allele_certainty <= f32::EPSILON {
+                    continue;
+                }
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -1332,10 +1347,17 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         continue;
                     }
                     let ref_allele = ref_alleles[idx];
-                    if ref_allele == 255 || ref_allele > 1 {
+                    if ref_allele == 255 {
                         continue;
                     }
-                    let p_match = allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0);
+                    let p_match = if ref_allele <= 1 {
+                        allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
+                    } else {
+                        match query_allele {
+                            Some(a) if a == ref_allele => 1.0,
+                            _ => 0.0,
+                        }
+                    };
                     if p_match <= 0.0 {
                         continue;
                     }
@@ -1347,7 +1369,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if freq <= 0.0 {
                         continue;
                     }
-                    let weight = p_match * -(freq.max(min_freq)).ln();
+                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
