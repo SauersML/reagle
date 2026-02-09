@@ -102,6 +102,26 @@ pub enum PbwtStrictAllele {
     Missing,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DonorChoice {
+    div: i32,
+    pos: usize,
+}
+
+impl Ord for DonorChoice {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.div
+            .cmp(&other.div)
+            .then_with(|| self.pos.cmp(&other.pos))
+    }
+}
+
+impl PartialOrd for DonorChoice {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl PbwtQueryAllele {
     pub const WILDCARD_VALUE: u8 = 128;
 
@@ -169,6 +189,34 @@ impl PbwtStrictAllele {
 }
 
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
+    #[inline]
+    fn push_top_k_choice(
+        best: &mut std::collections::BinaryHeap<DonorChoice>,
+        choice: DonorChoice,
+        k: usize,
+    ) {
+        if best.len() < k {
+            best.push(choice);
+            return;
+        }
+        if let Some(top) = best.peek().copied() {
+            if choice.div < top.div || (choice.div == top.div && choice.pos < top.pos) {
+                best.pop();
+                best.push(choice);
+            }
+        }
+    }
+
+    #[inline]
+    fn flush_top_k_choices(&self, best: std::collections::BinaryHeap<DonorChoice>, out: &mut Vec<u32>) {
+        let mut choices: Vec<DonorChoice> = best.into_vec();
+        choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
+        out.reserve(choices.len());
+        for c in choices {
+            out.push(self.ppa[c.pos].to_u32());
+        }
+    }
+
     #[inline]
     fn load_top_intervals(
         scratch: &mut Vec<(u32, u32, u32)>,
@@ -247,26 +295,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 }
             }
             return;
-        }
-
-        #[derive(Clone, Copy, Eq, PartialEq)]
-        struct DonorChoice {
-            div: i32,
-            pos: usize,
-        }
-
-        impl Ord for DonorChoice {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.div
-                    .cmp(&other.div)
-                    .then_with(|| self.pos.cmp(&other.pos))
-            }
-        }
-
-        impl PartialOrd for DonorChoice {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
         }
 
         // For very wide beams, avoid full scans but still prioritize low-divergence
@@ -349,14 +377,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     div: self.div[pos],
                     pos,
                 };
-                if best.len() < k {
-                    best.push(choice);
-                } else if let Some(top) = best.peek().copied() {
-                    if choice.div < top.div || (choice.div == top.div && choice.pos < top.pos) {
-                        best.pop();
-                        best.push(choice);
-                    }
-                }
+                Self::push_top_k_choice(&mut best, choice, k);
             }
 
             // Safety net: if approximation produced too few unique candidates, backfill exactly.
@@ -367,26 +388,12 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                             div: self.div[pos],
                             pos,
                         };
-                        if best.len() < k {
-                            best.push(choice);
-                        } else if let Some(top) = best.peek().copied() {
-                            if choice.div < top.div
-                                || (choice.div == top.div && choice.pos < top.pos)
-                            {
-                                best.pop();
-                                best.push(choice);
-                            }
-                        }
+                        Self::push_top_k_choice(&mut best, choice, k);
                     }
                 }
             }
 
-            let mut choices: Vec<DonorChoice> = best.into_vec();
-            choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
-            out.reserve(choices.len());
-            for c in choices {
-                out.push(self.ppa[c.pos].to_u32());
-            }
+            self.flush_top_k_choices(best, out);
             return;
         }
 
@@ -398,22 +405,10 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     div: self.div[pos],
                     pos,
                 };
-                if best.len() < k {
-                    best.push(choice);
-                } else if let Some(top) = best.peek().copied() {
-                    if choice.div < top.div || (choice.div == top.div && choice.pos < top.pos) {
-                        best.pop();
-                        best.push(choice);
-                    }
-                }
+                Self::push_top_k_choice(&mut best, choice, k);
             }
         }
-        let mut choices: Vec<DonorChoice> = best.into_vec();
-        choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
-        out.reserve(choices.len());
-        for c in choices {
-            out.push(self.ppa[c.pos].to_u32());
-        }
+        self.flush_top_k_choices(best, out);
     }
 
     fn bin_for_allele(a: u8, alphabet: PbwtAlphabet) -> usize {
