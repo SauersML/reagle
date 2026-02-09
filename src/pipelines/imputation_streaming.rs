@@ -5240,6 +5240,7 @@ impl crate::pipelines::ImputationPipeline {
                 Vec<usize>,
                 Vec<RankBeam>,
                 Vec<PbwtQueryAllele>,
+                Vec<f32>,
                 Vec<u32>,
                 Vec<(u32, u32, u32)>,
             )> = Vec::new();
@@ -5249,12 +5250,20 @@ impl crate::pipelines::ImputationPipeline {
                 let haps: Vec<usize> = sm_haps[start..end].to_vec();
                 let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
                 let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+                let query_allele_weight = vec![1.0f32; haps.len()];
                 let current_donor = vec![0u32; haps.len()];
                 let scratch = Vec::new();
                 for &hap in &haps {
                     sm_alt_probs_by_hap[hap] = Some(Vec::with_capacity(output_markers));
                 }
-                batches.push((haps, beams, query_alleles, current_donor, scratch));
+                batches.push((
+                    haps,
+                    beams,
+                    query_alleles,
+                    query_allele_weight,
+                    current_donor,
+                    scratch,
+                ));
                 start = end;
             }
 
@@ -5267,7 +5276,9 @@ impl crate::pipelines::ImputationPipeline {
                     .max(1);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
+                for (haps, beams, query_alleles, query_allele_weight, _, scratch) in
+                    batches.iter_mut()
+                {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
                         let target_marker = MarkerIdx::new(target_idx as u32);
@@ -5278,11 +5289,13 @@ impl crate::pipelines::ImputationPipeline {
 
                         let mut cached_sample_idx = usize::MAX;
                         let mut cached_query_pair = [255u8; 2];
+                        let mut cached_allele_weight = 1.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
                             if sample_idx != cached_sample_idx {
                                 cached_sample_idx = sample_idx;
+                                cached_allele_weight = 1.0;
                                 let hap1 = sample_idx * 2;
                                 let hap2 = hap1 + 1;
                                 let h1 = HapIdx::new(hap1 as u32);
@@ -5322,6 +5335,7 @@ impl crate::pipelines::ImputationPipeline {
                                     .unwrap_or(true);
                                 if is_het && !input_phased {
                                     cached_query_pair = [255, 255];
+                                    cached_allele_weight = 0.0;
                                 } else if is_het && input_phased {
                                     let phase_conf = target_win
                                         .sample_phase_confidence_f32(target_marker, sample_idx)
@@ -5330,8 +5344,11 @@ impl crate::pipelines::ImputationPipeline {
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
                                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                                    if best_orient_err > phase_query_orientation_error_limit(geno_conf)
-                                    {
+                                    let err_limit =
+                                        phase_query_orientation_error_limit(geno_conf).max(1e-6);
+                                    cached_allele_weight =
+                                        (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
+                                    if best_orient_err > err_limit {
                                         cached_query_pair = [255, 255];
                                     } else if phase_conf < 0.5 {
                                         cached_query_pair = [mapped2, mapped1];
@@ -5340,14 +5357,22 @@ impl crate::pipelines::ImputationPipeline {
                                     }
                                 } else {
                                     cached_query_pair = [mapped1, mapped2];
+                                    cached_allele_weight = 1.0;
                                 }
                             }
                             query_alleles[i] = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
+                            query_allele_weight[i] = if query_alleles[i].is_wildcard() {
+                                0.0
+                            } else {
+                                cached_allele_weight
+                            };
                         }
                     } else {
-                        for qa in query_alleles.iter_mut() {
+                        for (qa, qw) in query_alleles.iter_mut().zip(query_allele_weight.iter_mut())
+                        {
                             *qa = PbwtQueryAllele::wildcard();
+                            *qw = 0.0;
                         }
                     }
 
@@ -5358,7 +5383,9 @@ impl crate::pipelines::ImputationPipeline {
                 if ref_m < output_start || ref_m >= output_end {
                     continue;
                 }
-                for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
+                for (haps, beams, query_alleles, query_allele_weight, current_donor, _) in
+                    batches.iter_mut()
+                {
                     let mut donor_candidates: Vec<u32> =
                         Vec::with_capacity(SM_MATCH_DONORS.saturating_mul(2));
                     for (i, &hap_idx) in haps.iter().enumerate() {
@@ -5402,7 +5429,10 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
                                 let allele = col.get(HapIdx::new(donor));
-                                if allele == 1 { 1.0 } else { 0.0 }
+                                let hard = if allele == 1 { 1.0 } else { 0.0 };
+                                let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
+                                (orient_weight * hard + (1.0 - orient_weight) * 0.5)
+                                    .clamp(1e-6, 1.0 - 1e-6)
                             }
                         } else {
                             0.0
