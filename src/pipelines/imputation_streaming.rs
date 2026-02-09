@@ -4163,6 +4163,7 @@ impl crate::pipelines::ImputationPipeline {
         {
             let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
             let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+            let phase_mask = target_win.phase_mask();
             let batch_size = 4096usize;
             let mut batches: Vec<(
                 Vec<usize>,
@@ -4201,7 +4202,6 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
                         let target_marker = MarkerIdx::new(target_idx as u32);
-                        let phase_mask = target_win.phase_mask();
                         let mapping = alignment
                             .allele_mappings
                             .get(target_idx)
@@ -5212,6 +5212,7 @@ impl crate::pipelines::ImputationPipeline {
         if !sm_haps.is_empty() && output_markers > 0 {
             let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
             let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+            let phase_mask = target_win.phase_mask();
             let batch_size = 4096usize;
             let mut batches: Vec<(
                 Vec<usize>,
@@ -5248,7 +5249,6 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
                         let target_marker = MarkerIdx::new(target_idx as u32);
-                        let phase_mask = target_win.phase_mask();
                         let mapping = alignment
                             .allele_mappings
                             .get(target_idx)
