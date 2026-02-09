@@ -205,6 +205,9 @@ fn continuity_terms(
     let mut t10 = Vec::with_capacity(boundary_cm.len());
     let mut t01 = Vec::with_capacity(boundary_cm.len());
     for (i, &dist_cm) in boundary_cm.iter().enumerate() {
+        // `n_pool_f` is boundary-local effective donor diversity.
+        // When LD collapses donor uncertainty, N_eff decreases and the
+        // ON/OFF transition odds become less switch-averse for equivalent evidence.
         let n_pool_f = n_pool_by_boundary
             .get(i)
             .copied()
@@ -354,6 +357,130 @@ fn active_to_intervals(active: &[bool]) -> Vec<WindowSpan> {
     out
 }
 
+/// Estimate per-window effective donor pool size from sparse donor scores.
+///
+/// Coalescent/Li-Stephens motivation:
+/// - The ON/OFF transition collapse uses a donor-pool denominator `N`.
+/// - In practice, donor evidence is highly concentrated in strong-LD regions.
+/// - We estimate a local effective `N` via ESS:
+///     N_eff = (sum w_i)^2 / sum(w_i^2),
+///   where w_i is a positive donor weight in a window.
+/// - Scores are in log-space, so we use exp(score - max_score_window) for
+///   numerically stable relative weights (scale cancels in ESS).
+fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows: usize) -> Vec<f32> {
+    if num_windows == 0 {
+        return Vec::new();
+    }
+    let mut max_score_by_window = vec![NEG_INF; num_windows];
+    for scores in scores_by_hap {
+        for &(win, score) in scores {
+            if win < num_windows && score.is_finite() && score > max_score_by_window[win] {
+                max_score_by_window[win] = score;
+            }
+        }
+    }
+
+    let mut sum_w = vec![0.0f64; num_windows];
+    let mut sum_w2 = vec![0.0f64; num_windows];
+    for scores in scores_by_hap {
+        for &(win, score) in scores {
+            if win >= num_windows || !score.is_finite() {
+                continue;
+            }
+            let max_s = max_score_by_window[win];
+            if !max_s.is_finite() {
+                continue;
+            }
+            let centered = (score - max_s).clamp(-80.0, 0.0) as f64;
+            let w_i = centered.exp();
+            sum_w[win] += w_i;
+            sum_w2[win] += w_i * w_i;
+        }
+    }
+
+    let mut out = vec![1.0f32; num_windows];
+    let mut win = 0usize;
+    while win < num_windows {
+        let s = sum_w[win];
+        let s2 = sum_w2[win];
+        if s > 0.0 && s2 > 0.0 {
+            out[win] = ((s * s) / s2) as f32;
+        }
+        win += 1;
+    }
+    out
+}
+
+/// Build boundary-specific donor-pool sizes for continuity terms.
+///
+/// We map per-window N_eff values to boundaries using the geometric mean
+/// between adjacent windows, then clamp by hard resource limits.
+fn boundary_pool_sizes_from_scores(
+    scores_by_hap: &[Vec<(usize, f32)>],
+    num_windows: usize,
+    per_window_caps: &[usize],
+    n_pool: usize,
+) -> Vec<DonorPoolSize> {
+    let mut out = Vec::with_capacity(num_windows.saturating_sub(1));
+    if num_windows < 2 {
+        return out;
+    }
+    let neff_by_window = window_effective_pool_sizes(scores_by_hap, num_windows);
+    let panel_pool = DonorPoolSize::new(n_pool);
+
+    let mut b = 0usize;
+    while b + 1 < num_windows {
+        let left = neff_by_window[b].max(1.0);
+        let right = neff_by_window[b + 1].max(1.0);
+        let boundary_neff = (left * right).sqrt();
+        let local_pool = DonorPoolSize::new(boundary_neff.round().max(2.0) as usize);
+        let c0 = DonorPoolSize::new(per_window_caps.get(b).copied().unwrap_or(n_pool));
+        let c1 = DonorPoolSize::new(per_window_caps.get(b + 1).copied().unwrap_or(n_pool));
+        out.push(local_pool.min(c0).min(c1).min(panel_pool));
+        b += 1;
+    }
+    out
+}
+
+#[derive(Clone)]
+struct AllocationState {
+    active: Vec<bool>,
+    len: usize,
+}
+
+fn recompute_counts_logz_used(
+    selected_states: &[Option<AllocationState>],
+    scores_by_hap: &[Vec<(usize, f32)>],
+    num_windows: usize,
+    per_window_caps: &[usize],
+) -> (Vec<usize>, Vec<f32>, usize) {
+    let mut counts = vec![0usize; num_windows];
+    let mut z_w = vec![0.0f32; num_windows];
+    let mut used = 0usize;
+
+    let mut idx = 0usize;
+    while idx < selected_states.len() {
+        if let Some(state) = selected_states[idx].as_ref() {
+            used += state.len;
+            let mut win = 0usize;
+            while win < num_windows {
+                if state.active[win] && counts[win] < per_window_caps[win] {
+                    counts[win] += 1;
+                }
+                win += 1;
+            }
+            for &(win, score) in &scores_by_hap[idx] {
+                if win < num_windows && state.active[win] && score.is_finite() {
+                    z_w[win] = logaddexp(z_w[win], score);
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    (counts, z_w, used)
+}
+
 /// Allocate active haplotypes per window for a single target haplotype.
 ///
 /// Inputs:
@@ -402,58 +529,103 @@ pub fn allocate_lms_sparse(
             .collect();
         return WindowAllocation { intervals_by_hap };
     }
-    let mut intervals_by_hap: Vec<(usize, Vec<WindowSpan>)> = Vec::new();
     let mut counts = vec![0usize; w];
     let mut z_w = vec![0.0f32; w]; // log(1)
-    let mut selected = vec![false; n];
+    let mut selected_states: Vec<Option<AllocationState>> = vec![None; n];
     let mut remaining = total_budget;
 
-    let panel_pool = DonorPoolSize::new(n_pool);
-    let mut n_pool_by_boundary: Vec<DonorPoolSize> = Vec::with_capacity(w.saturating_sub(1));
-    for i in 0..w.saturating_sub(1) {
-        let c0 = DonorPoolSize::new(per_window_caps.get(i).copied().unwrap_or(n_pool));
-        let c1 = DonorPoolSize::new(per_window_caps.get(i + 1).copied().unwrap_or(n_pool));
-        let n_eff = c0.min(c1).min(panel_pool);
-        n_pool_by_boundary.push(n_eff);
-    }
+    let n_pool_by_boundary = boundary_pool_sizes_from_scores(scores_by_hap, w, per_window_caps, n_pool);
     let (t11, t10, t01) = continuity_terms(boundary_cm, params, &n_pool_by_boundary);
 
-    // Determine mu by binary search to approximately meet budget.
-    // We tune mu on the fly: larger mu -> fewer activations.
+    // Determine mu by bracket + coarse search + local refinement.
+    // Larger mu reduces activations under the same surrogate objective.
     let mut mu_low = -10.0f32;
     let mut mu_high = 10.0f32;
 
     // Ensure bounds bracket a feasible range.
-    for _ in 0..5 {
+    let mut low_iter = 0usize;
+    while low_iter < 5 {
         let (used, _) =
             simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu_low, per_window_caps);
         if used >= total_budget {
             break;
         }
         mu_low -= 5.0;
+        low_iter += 1;
     }
-    for _ in 0..5 {
+    let mut high_iter = 0usize;
+    while high_iter < 5 {
         let (used, _) =
             simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu_high, per_window_caps);
         if used <= total_budget {
             break;
         }
         mu_high += 5.0;
+        high_iter += 1;
     }
 
-    // Coarse grid search over mu to avoid non-monotone behavior in greedy outer loop.
+    // Coarse grid search over mu to avoid non-monotone behavior in the greedy outer loop.
     let mut mu_best = mu_high;
     let mut best_used = 0usize;
     let mut best_gain = NEG_INF;
-    for k in 0..17 {
+    let mut best_k = 0usize;
+    let mut found_feasible = false;
+    let mut coarse_samples: Vec<(f32, usize, f32)> = Vec::with_capacity(17);
+    let mut k = 0usize;
+    while k < 17 {
         let t = k as f32 / 16.0;
         let mu = mu_low + t * (mu_high - mu_low);
         let (used, gain) =
             simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
-        if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used)) {
+        coarse_samples.push((mu, used, gain));
+        if used <= total_budget
+            && (!found_feasible
+                || gain > best_gain
+                || (gain == best_gain && used > best_used))
+        {
+            found_feasible = true;
             mu_best = mu;
             best_used = used;
             best_gain = gain;
+            best_k = k;
+        }
+        k += 1;
+    }
+
+    if found_feasible {
+        // Refine around the best coarse sample.
+        let mut left = if best_k > 0 {
+            coarse_samples[best_k - 1].0
+        } else {
+            mu_low
+        };
+        let mut right = if best_k + 1 < coarse_samples.len() {
+            coarse_samples[best_k + 1].0
+        } else {
+            mu_high
+        };
+        let mut refine_iter = 0usize;
+        while refine_iter < 3 {
+            let span = right - left;
+            if span <= 1e-3 {
+                break;
+            }
+            let step = span / 8.0;
+            let mut j = 0usize;
+            while j < 9 {
+                let mu = left + step * j as f32;
+                let (used, gain) =
+                    simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
+                if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used)) {
+                    mu_best = mu;
+                    best_used = used;
+                    best_gain = gain;
+                }
+                j += 1;
+            }
+            left = (mu_best - step).max(mu_low);
+            right = (mu_best + step).min(mu_high);
+            refine_iter += 1;
         }
     }
     let mu = mu_best;
@@ -523,7 +695,7 @@ pub fn allocate_lms_sparse(
 
     while remaining > 0 {
         let Some(mut entry) = heap.pop() else { break };
-        if selected[entry.idx] {
+        if selected_states[entry.idx].is_some() {
             continue;
         }
         let blocked: Vec<bool> = counts
@@ -547,7 +719,10 @@ pub fn allocate_lms_sparse(
         }
         let next_gain = heap.peek().map(|e| e.gain).unwrap_or(NEG_INF);
         if gain >= next_gain {
-            selected[entry.idx] = true;
+            selected_states[entry.idx] = Some(AllocationState {
+                active: active.clone(),
+                len,
+            });
             for win in 0..w {
                 if active[win] && counts[win] < per_window_caps[win] {
                     counts[win] += 1;
@@ -558,10 +733,6 @@ pub fn allocate_lms_sparse(
                     z_w[win] = logaddexp(z_w[win], score);
                 }
             }
-            let intervals = active_to_intervals(&active);
-            if !intervals.is_empty() {
-                intervals_by_hap.push((candidate_haps[entry.idx], intervals));
-            }
             remaining = remaining.saturating_sub(len);
         } else {
             entry.gain = gain;
@@ -569,6 +740,145 @@ pub fn allocate_lms_sparse(
             entry.len = len;
             heap.push(entry);
         }
+    }
+
+    // Residual-capacity pass: once Lagrangian filtering stops, continue to fill
+    // positive-gain states under hard caps/budget using mu=0 (true objective).
+    while remaining > 0 {
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let mut best_idx: Option<usize> = None;
+        let mut best_gain = NEG_INF;
+        let mut best_len = 0usize;
+        let mut best_active: Vec<bool> = Vec::new();
+
+        let mut h = 0usize;
+        while h < n {
+            if selected_states[h].is_some() {
+                h += 1;
+                continue;
+            }
+            let (gain, len) = dp_intervals_sparse_scratch(
+                &scores_by_hap[h],
+                &z_w,
+                0.0,
+                &blocked,
+                &t11,
+                &t10,
+                &t01,
+                &mut dp_scratch,
+            );
+            if gain > 0.0 && len > 0 && len <= remaining && (gain > best_gain || (gain == best_gain && len > best_len)) {
+                best_idx = Some(h);
+                best_gain = gain;
+                best_len = len;
+                best_active = dp_scratch.active[..w].to_vec();
+            }
+            h += 1;
+        }
+
+        let Some(chosen_idx) = best_idx else {
+            break;
+        };
+
+        selected_states[chosen_idx] = Some(AllocationState {
+            active: best_active.clone(),
+            len: best_len,
+        });
+        for win in 0..w {
+            if best_active[win] && counts[win] < per_window_caps[win] {
+                counts[win] += 1;
+            }
+        }
+        for &(win, score) in &scores_by_hap[chosen_idx] {
+            if win < w && best_active[win] && score.is_finite() {
+                z_w[win] = logaddexp(z_w[win], score);
+            }
+        }
+        remaining = remaining.saturating_sub(best_len);
+    }
+
+    // One coordinate-ascent polish sweep over selected donors.
+    let mut polish_idx = 0usize;
+    while polish_idx < n {
+        let Some(old_state) = selected_states[polish_idx].take() else {
+            polish_idx += 1;
+            continue;
+        };
+
+        let (re_counts, re_logz, used_without_current) =
+            recompute_counts_logz_used(&selected_states, scores_by_hap, w, per_window_caps);
+        counts = re_counts;
+        z_w = re_logz;
+        remaining = total_budget.saturating_sub(used_without_current);
+
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let (gain, len) = dp_intervals_sparse_scratch(
+            &scores_by_hap[polish_idx],
+            &z_w,
+            mu,
+            &blocked,
+            &t11,
+            &t10,
+            &t01,
+            &mut dp_scratch,
+        );
+
+        if gain > 0.0 && len > 0 && len <= remaining {
+            let active = dp_scratch.active[..w].to_vec();
+            selected_states[polish_idx] = Some(AllocationState {
+                active: active.clone(),
+                len,
+            });
+            for win in 0..w {
+                if active[win] && counts[win] < per_window_caps[win] {
+                    counts[win] += 1;
+                }
+            }
+            for &(win, score) in &scores_by_hap[polish_idx] {
+                if win < w && active[win] && score.is_finite() {
+                    z_w[win] = logaddexp(z_w[win], score);
+                }
+            }
+            remaining = remaining.saturating_sub(len);
+        } else {
+            selected_states[polish_idx] = Some(old_state);
+            let restored = selected_states[polish_idx]
+                .as_ref()
+                .expect("just restored allocation state");
+            for win in 0..w {
+                if restored.active[win] && counts[win] < per_window_caps[win] {
+                    counts[win] += 1;
+                }
+            }
+            for &(win, score) in &scores_by_hap[polish_idx] {
+                if win < w && restored.active[win] && score.is_finite() {
+                    z_w[win] = logaddexp(z_w[win], score);
+                }
+            }
+            remaining = remaining.saturating_sub(restored.len);
+        }
+
+        polish_idx += 1;
+    }
+
+    let mut intervals_by_hap: Vec<(usize, Vec<WindowSpan>)> = Vec::new();
+    let mut idx = 0usize;
+    while idx < n {
+        if let Some(state) = selected_states[idx].as_ref() {
+            let intervals = active_to_intervals(&state.active);
+            if !intervals.is_empty() {
+                intervals_by_hap.push((candidate_haps[idx], intervals));
+            }
+        }
+        idx += 1;
     }
 
     WindowAllocation { intervals_by_hap }
