@@ -804,50 +804,54 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
+        let mut cached_sample_idx = usize::MAX;
+        let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
-            let hap1 = sample_idx * 2;
-            let hap2 = hap1 + 1;
-            let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-            let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-            let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
-            let phased = phase_mask
-                .and_then(|mask| mask.get(orig_m, sample_idx))
-                .unwrap_or(0);
-            let wildcard_unphased_het = phased == 0
-                && mask_unphased_hets
-                    .and_then(|flags| flags.get(sample_idx))
-                    .copied()
-                    .unwrap_or(false)
-                && is_het;
-            if wildcard_unphased_het {
-                query_alleles[i] = PbwtQueryAllele::wildcard();
-            } else if phased == 0 && a1 != 255 && a1 == a2 {
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
-            } else if phased != 0 && is_het {
-                let phase_conf = target_gt
-                    .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                let geno_conf = target_gt
-                    .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
-                } else if phase_conf < 0.5 {
-                    let flipped = if hap_idx == hap1 { a2 } else { a1 };
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(flipped).unwrap_or_else(PbwtQueryAllele::missing);
+            let local = hap_idx % 2;
+            if sample_idx != cached_sample_idx {
+                cached_sample_idx = sample_idx;
+                let hap1 = sample_idx * 2;
+                let hap2 = hap1 + 1;
+                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let qa1 = PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
+                let qa2 = PbwtQueryAllele::allele(a2).unwrap_or_else(PbwtQueryAllele::missing);
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(orig_m, sample_idx))
+                    .unwrap_or(0);
+                let wildcard_unphased_het = phased == 0
+                    && mask_unphased_hets
+                        .and_then(|flags| flags.get(sample_idx))
+                        .copied()
+                        .unwrap_or(false)
+                    && is_het;
+                if wildcard_unphased_het {
+                    cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                } else if phased == 0 && a1 != 255 && a1 == a2 {
+                    cached_query_pair = [qa1, qa2];
+                } else if phased != 0 && is_het {
+                    let phase_conf = target_gt
+                        .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .clamp(0.0, 1.0);
+                    let geno_conf = target_gt
+                        .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .clamp(0.0, 1.0);
+                    let best_orient_err = phase_conf.min(1.0 - phase_conf);
+                    if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
+                        cached_query_pair =
+                            [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    } else if phase_conf < 0.5 {
+                        cached_query_pair = [qa2, qa1];
+                    } else {
+                        cached_query_pair = [qa1, qa2];
+                    }
                 } else {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
+                    cached_query_pair = [qa1, qa2];
                 }
-            } else {
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
             }
+            query_alleles[i] = cached_query_pair[local];
         }
 
         if let Some(alignment) = alignment {
@@ -1025,50 +1029,54 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     for (rev_step, m) in (start..end).rev().enumerate() {
         let local_idx = end - start - 1 - rev_step;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
+        let mut cached_sample_idx = usize::MAX;
+        let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
-            let hap1 = sample_idx * 2;
-            let hap2 = hap1 + 1;
-            let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-            let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-            let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
-            let phased = phase_mask
-                .and_then(|mask| mask.get(orig_m, sample_idx))
-                .unwrap_or(0);
-            let wildcard_unphased_het = phased == 0
-                && mask_unphased_hets
-                    .and_then(|flags| flags.get(sample_idx))
-                    .copied()
-                    .unwrap_or(false)
-                && is_het;
-            if wildcard_unphased_het {
-                query_alleles[i] = PbwtQueryAllele::wildcard();
-            } else if phased == 0 && a1 != 255 && a1 == a2 {
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
-            } else if phased != 0 && is_het {
-                let phase_conf = target_gt
-                    .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                let geno_conf = target_gt
-                    .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
-                    .clamp(0.0, 1.0);
-                let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
-                } else if phase_conf < 0.5 {
-                    let flipped = if hap_idx == hap1 { a2 } else { a1 };
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(flipped).unwrap_or_else(PbwtQueryAllele::missing);
+            let local = hap_idx % 2;
+            if sample_idx != cached_sample_idx {
+                cached_sample_idx = sample_idx;
+                let hap1 = sample_idx * 2;
+                let hap2 = hap1 + 1;
+                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let qa1 = PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
+                let qa2 = PbwtQueryAllele::allele(a2).unwrap_or_else(PbwtQueryAllele::missing);
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(orig_m, sample_idx))
+                    .unwrap_or(0);
+                let wildcard_unphased_het = phased == 0
+                    && mask_unphased_hets
+                        .and_then(|flags| flags.get(sample_idx))
+                        .copied()
+                        .unwrap_or(false)
+                    && is_het;
+                if wildcard_unphased_het {
+                    cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                } else if phased == 0 && a1 != 255 && a1 == a2 {
+                    cached_query_pair = [qa1, qa2];
+                } else if phased != 0 && is_het {
+                    let phase_conf = target_gt
+                        .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .clamp(0.0, 1.0);
+                    let geno_conf = target_gt
+                        .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .clamp(0.0, 1.0);
+                    let best_orient_err = phase_conf.min(1.0 - phase_conf);
+                    if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
+                        cached_query_pair =
+                            [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    } else if phase_conf < 0.5 {
+                        cached_query_pair = [qa2, qa1];
+                    } else {
+                        cached_query_pair = [qa1, qa2];
+                    }
                 } else {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
+                    cached_query_pair = [qa1, qa2];
                 }
-            } else {
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
             }
+            query_alleles[i] = cached_query_pair[local];
         }
 
         if let Some(alignment) = alignment {
