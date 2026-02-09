@@ -197,6 +197,57 @@ fn phase_query_orientation_error_limit(genotype_conf: f32) -> f32 {
     (0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0)).clamp(0.08, 0.25)
 }
 
+#[inline]
+fn pbwt_beam_uncertainty(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> f32 {
+    if n_ref_haps == 0 {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    let mut sq_sum = 0.0f32;
+    let mut n_intervals = 0usize;
+    for &(l, r) in beam.intervals() {
+        if r <= l {
+            continue;
+        }
+        let len = (r - l) as f32;
+        total += len;
+        sq_sum += len * len;
+        n_intervals += 1;
+    }
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let coverage = (total / n_ref_haps as f32).clamp(0.0, 1.0);
+    let spread = if n_intervals > 1 && sq_sum > 0.0 {
+        let neff = (total * total / sq_sum).clamp(1.0, n_intervals as f32);
+        (neff - 1.0) / (n_intervals as f32 - 1.0)
+    } else {
+        0.0
+    };
+    let mut uncertainty = (0.7 * coverage + 0.3 * spread).clamp(0.0, 1.0);
+    if query.is_wildcard() {
+        uncertainty = uncertainty.max(0.85);
+    }
+    uncertainty
+}
+
+#[inline]
+fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> usize {
+    if n_ref_haps == 0 {
+        return 1;
+    }
+    let min_k = SM_MATCH_MIN_DONORS.max(1);
+    let max_k = SM_MATCH_DONORS.saturating_mul(2).max(min_k).min(n_ref_haps);
+    if max_k <= min_k {
+        return min_k.min(n_ref_haps).max(1);
+    }
+    let u = pbwt_beam_uncertainty(beam, n_ref_haps, query);
+    let span = (max_k - min_k) as f32;
+    (min_k as f32 + span * u)
+        .round()
+        .clamp(min_k as f32, max_k as f32) as usize
+}
+
 #[derive(Clone, Debug)]
 struct ImputationPlan {
     n_ref_haps: usize,
@@ -4254,8 +4305,10 @@ impl crate::pipelines::ImputationPipeline {
                         let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let beam = &beams[i];
+                            let donor_k =
+                                adaptive_sm_donor_k(beam, plan.n_ref_haps, query_alleles[i]);
                             donor_candidates.clear();
-                            pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                            pbwt.select_donors_into(beam, donor_k, &mut donor_candidates);
                             let donor = donor_candidates
                                 .first()
                                 .copied()
@@ -5284,7 +5337,8 @@ impl crate::pipelines::ImputationPipeline {
                     let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
                     for (i, &hap_idx) in haps.iter().enumerate() {
                         let beam = &beams[i];
-                        pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                        let donor_k = adaptive_sm_donor_k(beam, plan.n_ref_haps, query_alleles[i]);
+                        pbwt.select_donors_into(beam, donor_k, &mut donor_candidates);
                         let mut donor = current_donor[i];
                         let mut found = false;
                         for &cand in &donor_candidates {
