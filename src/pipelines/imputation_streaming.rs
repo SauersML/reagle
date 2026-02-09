@@ -4303,7 +4303,8 @@ impl crate::pipelines::ImputationPipeline {
 
                 if store {
                     for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
-                        let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                        let mut donor_candidates: Vec<u32> =
+                            Vec::with_capacity(SM_MATCH_DONORS.saturating_mul(2));
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let beam = &beams[i];
                             let donor_k =
@@ -5336,7 +5337,8 @@ impl crate::pipelines::ImputationPipeline {
                     continue;
                 }
                 for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
-                    let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                    let mut donor_candidates: Vec<u32> =
+                        Vec::with_capacity(SM_MATCH_DONORS.saturating_mul(2));
                     for (i, &hap_idx) in haps.iter().enumerate() {
                         let beam = &beams[i];
                         let donor_k = adaptive_sm_donor_k(beam, plan.n_ref_haps, query_alleles[i]);
