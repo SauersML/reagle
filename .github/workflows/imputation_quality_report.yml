@@ -54,7 +54,7 @@ jobs:
 
       - name: Install System Tools
         if: steps.cache-reference.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl git
+        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl
 
       - name: Prepare reference panel
         if: steps.cache-reference.outputs.cache-hit != 'true'
@@ -172,7 +172,7 @@ jobs:
 
       - name: Install System Tools
         if: steps.cache-results.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl git
+        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl
 
       - name: Download reference panel
         if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'

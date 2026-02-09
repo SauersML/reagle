@@ -3,16 +3,11 @@ import sys
 import subprocess
 import argparse
 import shutil
-import tempfile
 import urllib.request
 from urllib.error import URLError, HTTPError
 
 BEAGLE_JAR = "beagle.jar"
-BEAGLE_URLS = [
-    "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar",
-    "https://faculty.washington.edu/browning/beagle/beagle.29Oct24.c8e.jar",
-    "https://faculty.washington.edu/browning/beagle/beagle.22Jul22.46e.jar",
-]
+BEAGLE_URL = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar"
 
 
 def run_cmd(cmd, shell=False):
@@ -28,46 +23,46 @@ def ensure_beagle():
     if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
         return BEAGLE_JAR
     download_errors = []
-    for url in BEAGLE_URLS:
-        print(f"Downloading Beagle from {url}...")
+    print(f"Downloading Beagle from {BEAGLE_URL}...")
+    for attempt in range(3):
         try:
             if shutil.which("wget"):
-                run_cmd(["wget", "-q", "--tries=3", "--timeout=30", url, "-O", BEAGLE_JAR])
+                run_cmd(
+                    [
+                        "wget",
+                        "-q",
+                        "--tries=1",
+                        "--timeout=30",
+                        BEAGLE_URL,
+                        "-O",
+                        BEAGLE_JAR,
+                    ]
+                )
             elif shutil.which("curl"):
-                run_cmd(["curl", "-fsSL", "--retry", "3", "--connect-timeout", "30", url, "-o", BEAGLE_JAR])
+                run_cmd(
+                    [
+                        "curl",
+                        "-fsSL",
+                        "--retry",
+                        "0",
+                        "--connect-timeout",
+                        "30",
+                        BEAGLE_URL,
+                        "-o",
+                        BEAGLE_JAR,
+                    ]
+                )
             else:
-                with urllib.request.urlopen(url, timeout=30) as resp, open(BEAGLE_JAR, "wb") as out:
+                with urllib.request.urlopen(BEAGLE_URL, timeout=30) as resp, open(
+                    BEAGLE_JAR, "wb"
+                ) as out:
                     out.write(resp.read())
             if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
                 return BEAGLE_JAR
-            download_errors.append(f"{url}: downloaded empty file")
+            download_errors.append(f"attempt {attempt + 1}: downloaded empty file")
         except (subprocess.CalledProcessError, URLError, HTTPError, TimeoutError) as e:
-            download_errors.append(f"{url}: {e}")
-
-    # Last resort: build Beagle jar from source to avoid brittle external URL failures.
-    print("Beagle binary download failed from all known URLs. Building Beagle from source...")
-    if not shutil.which("javac"):
-        raise RuntimeError(
-            "Failed to download Beagle jar and javac is unavailable for source build fallback. "
-            + " | ".join(download_errors)
-        )
-    with tempfile.TemporaryDirectory(prefix="beagle-src-") as td:
-        src_dir = os.path.join(td, "beagle-java")
-        build_dir = os.path.join(td, "build-java")
-        run_cmd(["git", "clone", "--depth", "1", "https://github.com/SauersML/Beagle", src_dir])
-        os.makedirs(build_dir, exist_ok=True)
-        java_files = []
-        for root, _, files in os.walk(src_dir):
-            for file in files:
-                if file.endswith(".java"):
-                    java_files.append(os.path.join(root, file))
-        if not java_files:
-            raise RuntimeError("Beagle source build fallback found no Java sources")
-        run_cmd(["javac", "-d", build_dir, *java_files])
-        run_cmd(["jar", "cfe", BEAGLE_JAR, "main.Main", "-C", build_dir, "."])
-    if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
-        return BEAGLE_JAR
-    raise RuntimeError("Failed to obtain Beagle jar: " + " | ".join(download_errors))
+            download_errors.append(f"attempt {attempt + 1}: {e}")
+    raise RuntimeError("Failed to download Beagle jar from official URL: " + " | ".join(download_errors))
 
 
 def print_tool_versions():
