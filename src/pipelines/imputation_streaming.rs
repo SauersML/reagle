@@ -90,8 +90,8 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
 const ABYSS_RANK_BASE: usize = 60;
-const IMPUTE_RAM_FRACTION: f64 = 0.25;
-const STATE_BUDGET_SAFETY: f64 = 0.6;
+const IMPUTE_RAM_FRACTION: f64 = 0.4;
+const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
@@ -3668,11 +3668,11 @@ impl crate::pipelines::ImputationPipeline {
         let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.3f32 * scale
+            0.4f32 * scale
         } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.15f32 * scale
+            0.2f32 * scale
         } else {
             0.0f32
         };
