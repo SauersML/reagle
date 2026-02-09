@@ -190,7 +190,12 @@ fn fit_cohort_calibration(
     stats: &[SampleCohortStats],
     global_p_mismatch: f32,
 ) -> Option<CohortCalibration> {
-    if stats.len() < 50 {
+    const MIN_SAMPLES_FOR_CALIBRATION: usize = 50;
+    const MIN_COHORT_SIZE: usize = 12;
+    const MIN_REL_SPREAD: f32 = 1.15;
+    const MIN_ABS_SPREAD_FACTOR: f32 = 0.15;
+
+    if stats.len() < MIN_SAMPLES_FOR_CALIBRATION {
         return None;
     }
     let mut active_indices: Vec<usize> = Vec::new();
@@ -207,7 +212,7 @@ fn fit_cohort_calibration(
             raw_features.push([log_e, log_s, u]);
         }
     }
-    if active_indices.len() < 50 {
+    if active_indices.len() < MIN_SAMPLES_FOR_CALIBRATION {
         return None;
     }
 
@@ -284,6 +289,26 @@ fn fit_cohort_calibration(
             let hi = (global * 4.0).min(0.25);
             cohort_p_mismatch[c] = raw.clamp(lo, hi);
         }
+    }
+
+    for &size in &cohort_sizes {
+        if size < MIN_COHORT_SIZE {
+            return None;
+        }
+    }
+    let mut min_cohort = f32::INFINITY;
+    let mut max_cohort = f32::NEG_INFINITY;
+    for &p in &cohort_p_mismatch {
+        min_cohort = min_cohort.min(p);
+        max_cohort = max_cohort.max(p);
+    }
+    if !min_cohort.is_finite() || !max_cohort.is_finite() {
+        return None;
+    }
+    let rel_spread = max_cohort / min_cohort.max(1e-6);
+    let abs_spread = max_cohort - min_cohort;
+    if rel_spread < MIN_REL_SPREAD || abs_spread < global * MIN_ABS_SPREAD_FACTOR {
+        return None;
     }
 
     let mut sample_p_mismatch = vec![global; stats.len()];
@@ -9201,16 +9226,12 @@ fn sample_dynamic_mcmc(
     }
 
     let mut candidates_buf: Vec<u32> = Vec::new();
-    let mut rejected_buf: Vec<u32> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut rejected_seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut collect_dynamic_neighbors =
         |path_ref: &[u32], query_hap: &[u8], target_states: usize, out: &mut Vec<u32>| {
             seen_buf.clear();
             candidates_buf.clear();
-            rejected_seen_buf.clear();
-            rejected_buf.clear();
 
             for &m in &anchors_static {
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
@@ -9230,9 +9251,6 @@ fn sample_dynamic_mcmc(
                             continue;
                         }
                         if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
-                            if rejected_seen_buf.insert(h) {
-                                rejected_buf.push(h);
-                            }
                             continue;
                         }
                         if seen_buf.insert(h) {
@@ -9243,27 +9261,8 @@ fn sample_dynamic_mcmc(
             }
 
             if candidates_buf.is_empty() {
-                if rejected_buf.is_empty() {
-                    out.clear();
-                    return;
-                }
-                rejected_buf.sort_unstable_by(|a, b| {
-                    let a_score = sample_phase_stability
-                        .get((a / 2) as usize)
-                        .copied()
-                        .unwrap_or(0.5);
-                    let b_score = sample_phase_stability
-                        .get((b / 2) as usize)
-                        .copied()
-                        .unwrap_or(0.5);
-                    b_score
-                        .partial_cmp(&a_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let take = target_states.min(rejected_buf.len()).max(1);
-                for &h in rejected_buf.iter().take(take) {
-                    candidates_buf.push(h);
-                }
+                out.clear();
+                return;
             }
 
             // Phase-conditioned scoring:
