@@ -193,8 +193,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
 }
 
 #[inline]
-fn phase_query_orientation_error_limit(genotype_conf: f32) -> f32 {
-    (0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0)).clamp(0.08, 0.25)
+fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32) -> f32 {
+    let base = 0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0);
+    let scale = 0.55 + 0.9 * beam_uncertainty.clamp(0.0, 1.0);
+    (base * scale).clamp(0.04, 0.30)
 }
 
 #[inline]
@@ -4273,6 +4275,19 @@ impl crate::pipelines::ImputationPipeline {
                                 if is_het && !input_phased {
                                     cached_query_pair = [255, 255];
                                 } else if is_het && input_phased {
+                                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                                        &beams[i],
+                                        plan.n_ref_haps,
+                                        PbwtQueryAllele::wildcard(),
+                                    );
+                                    if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx {
+                                        let peer_uncertainty = pbwt_beam_uncertainty(
+                                            &beams[i + 1],
+                                            plan.n_ref_haps,
+                                            PbwtQueryAllele::wildcard(),
+                                        );
+                                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                                    }
                                     let phase_conf = target_win
                                         .sample_phase_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
@@ -4281,7 +4296,11 @@ impl crate::pipelines::ImputationPipeline {
                                         .clamp(0.0, 1.0);
                                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
                                     let err_limit =
-                                        phase_query_orientation_error_limit(geno_conf).max(1e-6);
+                                        phase_query_orientation_error_limit(
+                                            geno_conf,
+                                            beam_uncertainty,
+                                        )
+                                        .max(1e-6);
                                     let orientation_weight =
                                         (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
                                     cached_allele_weight = orientation_weight;
@@ -5339,6 +5358,19 @@ impl crate::pipelines::ImputationPipeline {
                                     cached_query_pair = [255, 255];
                                     cached_allele_weight = 0.0;
                                 } else if is_het && input_phased {
+                                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                                        &beams[i],
+                                        plan.n_ref_haps,
+                                        PbwtQueryAllele::wildcard(),
+                                    );
+                                    if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx {
+                                        let peer_uncertainty = pbwt_beam_uncertainty(
+                                            &beams[i + 1],
+                                            plan.n_ref_haps,
+                                            PbwtQueryAllele::wildcard(),
+                                        );
+                                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                                    }
                                     let phase_conf = target_win
                                         .sample_phase_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
@@ -5347,7 +5379,11 @@ impl crate::pipelines::ImputationPipeline {
                                         .clamp(0.0, 1.0);
                                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
                                     let err_limit =
-                                        phase_query_orientation_error_limit(geno_conf).max(1e-6);
+                                        phase_query_orientation_error_limit(
+                                            geno_conf,
+                                            beam_uncertainty,
+                                        )
+                                        .max(1e-6);
                                     cached_allele_weight =
                                         (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
                                     if best_orient_err > err_limit {

@@ -815,10 +815,15 @@ fn adaptive_pbwt_donor_k(
 }
 
 #[inline]
-fn phase_query_orientation_error_limit(genotype_conf: f32) -> f32 {
-    // Low genotype confidence should trigger wildcarding sooner to avoid
-    // forcing PBWT down noisy allele orientations.
-    (0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0)).clamp(0.08, 0.25)
+fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32) -> f32 {
+    // Decision-theoretic proxy:
+    // - High genotype confidence allows larger tolerated orientation error.
+    // - High beam uncertainty means committing to one orientation is less risky,
+    //   so tolerate larger orientation error before wildcarding.
+    // - Low beam uncertainty means sharp/fragile PBWT path, so wildcard sooner.
+    let base = 0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0);
+    let scale = 0.55 + 0.9 * beam_uncertainty.clamp(0.0, 1.0);
+    (base * scale).clamp(0.04, 0.30)
 }
 
 fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
@@ -893,6 +898,19 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
+                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                        &beams_fwd[i],
+                        n_ref_haps,
+                        PbwtQueryAllele::wildcard(),
+                    );
+                    if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                        let peer_uncertainty = pbwt_beam_uncertainty(
+                            &beams_fwd[i + 1],
+                            n_ref_haps,
+                            PbwtQueryAllele::wildcard(),
+                        );
+                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                    }
                     let phase_conf = target_gt
                         .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
@@ -900,7 +918,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                    if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
+                    if best_orient_err
+                        > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
+                    {
                         cached_query_pair =
                             [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
                         let p_keep = phase_conf;
@@ -1133,6 +1153,19 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
+                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                        &beams_bwd[i],
+                        n_ref_haps,
+                        PbwtQueryAllele::wildcard(),
+                    );
+                    if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                        let peer_uncertainty = pbwt_beam_uncertainty(
+                            &beams_bwd[i + 1],
+                            n_ref_haps,
+                            PbwtQueryAllele::wildcard(),
+                        );
+                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                    }
                     let phase_conf = target_gt
                         .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
@@ -1140,7 +1173,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                    if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
+                    if best_orient_err
+                        > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
+                    {
                         cached_query_pair =
                             [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
                         let p_keep = phase_conf;
@@ -7964,6 +7999,24 @@ fn emit_haploid_constrained(
     conf * raw_emit + (1.0 - conf) * 0.5
 }
 
+#[inline]
+fn constrained_emission_confidence(
+    geno_a1: u8,
+    geno_a2: u8,
+    fixed_allele: u8,
+    geno_conf: f32,
+    phase_conf: f32,
+) -> f32 {
+    let g = geno_conf.clamp(0.0, 1.0);
+    if geno_a1 != geno_a2 && fixed_allele != 255 {
+        // At constrained heterozygotes, partner orientation uncertainty must
+        // soften the emission even when genotype confidence is high.
+        (g * phase_conf.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    } else {
+        g
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HapEmissionInputs<'a> {
     /// Allele this haplotype is constrained to emit (non-PL emission path).
@@ -8593,6 +8646,7 @@ fn ffbs_haploid_constrained(
     geno_a1: &[u8],
     geno_a2: &[u8],
     conf: &[f32],
+    phase_conf: &[f32],
     fixed_allele: &[u8], // Allele assigned to OTHER haplotype (255 = no constraint)
     neighbors: &[u32],   // Selected neighbor haplotype indices
     phase_ibs: &BidirectionalPhaseIbs,
@@ -8603,7 +8657,15 @@ fn ffbs_haploid_constrained(
 ) {
     use wide::f32x8;
 
-    if n_markers == 0 || n_states == 0 || neighbors.is_empty() {
+    if n_markers == 0
+        || n_states == 0
+        || neighbors.is_empty()
+        || conf.len() < n_markers
+        || phase_conf.len() < n_markers
+        || geno_a1.len() < n_markers
+        || geno_a2.len() < n_markers
+        || fixed_allele.len() < n_markers
+    {
         return;
     }
 
@@ -8619,6 +8681,13 @@ fn ffbs_haploid_constrained(
 
     // Initialize at marker 0
     let init = 1.0f32 / actual_n_states as f32;
+    let conf0 = constrained_emission_confidence(
+        geno_a1[0],
+        geno_a2[0],
+        fixed_allele[0],
+        conf[0],
+        phase_conf[0],
+    );
     for k in 0..actual_n_states {
         let ref_al = phase_ibs.allele(0, neighbors[k]);
         let emit = emit_haploid_constrained(
@@ -8626,7 +8695,7 @@ fn ffbs_haploid_constrained(
             geno_a1[0],
             geno_a2[0],
             fixed_allele[0],
-            conf[0],
+            conf0,
             p_no_err,
             p_err,
         );
@@ -8646,6 +8715,13 @@ fn ffbs_haploid_constrained(
         let stay_gap = params.0;
         let shift = params.1;
         let scale = stay_gap / fwd_sum;
+        let conf_m = constrained_emission_confidence(
+            geno_a1[m],
+            geno_a2[m],
+            fixed_allele[m],
+            conf[m],
+            phase_conf[m],
+        );
 
         // SIMD-optimized transition + emission
         let shift_vec = f32x8::splat(shift);
@@ -8665,7 +8741,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8674,7 +8750,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8683,7 +8759,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8692,7 +8768,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8701,7 +8777,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8710,7 +8786,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8719,7 +8795,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8728,7 +8804,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -8751,7 +8827,7 @@ fn ffbs_haploid_constrained(
                 geno_a1[m],
                 geno_a2[m],
                 fixed_allele[m],
-                conf[m],
+                conf_m,
                 p_no_err,
                 p_err,
             );
@@ -9549,6 +9625,7 @@ fn sample_dynamic_mcmc(
             seq1,
             seq2,
             conf,
+            phase_conf,
             &fixed_allele,
             &neighbors,
             phase_ibs,
@@ -9659,6 +9736,7 @@ fn sample_dynamic_mcmc(
             seq1,
             seq2,
             conf,
+            phase_conf,
             &fixed_allele,
             &neighbors,
             phase_ibs,
