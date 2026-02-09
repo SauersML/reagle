@@ -479,6 +479,7 @@ fn compute_ref_freqs<TargetSpace, RefSpace>(
 
 fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     batch_haps: &[usize],
+    target_gt: &GenotypeMatrix<TargetSpace>,
     geno: &MutableGenotypes,
     ref_columns: &[GenotypeColumn],
     phase_mask: Option<&crate::data::storage::matrix::BitMatrix>,
@@ -511,31 +512,40 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
+    // Treat low-confidence phased heterozygotes as uncertain PBWT queries.
+    // This prevents one weak orientation call from breaking long donor matches.
+    const LOW_PHASE_CONF_WILDCARD_THRESHOLD: f32 = 0.90;
 
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
+            let hap1 = sample_idx * 2;
+            let hap2 = hap1 + 1;
+            let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+            let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
             let phased = phase_mask
                 .and_then(|mask| mask.get(orig_m, sample_idx))
                 .unwrap_or(0);
-            if phased == 0
+            let wildcard_unphased_het = phased == 0
                 && mask_unphased_hets
                     .and_then(|flags| flags.get(sample_idx))
                     .copied()
                     .unwrap_or(false)
-            {
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                if a1 != 255 && a1 == a2 {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
-                } else {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
-                }
+                && is_het;
+            let wildcard_low_conf = phased != 0
+                && is_het
+                && target_gt.sample_phase_confidence_f32(
+                    MarkerIdx::new(orig_m as u32),
+                    sample_idx,
+                ) < LOW_PHASE_CONF_WILDCARD_THRESHOLD;
+            if wildcard_unphased_het || wildcard_low_conf {
+                query_alleles[i] = PbwtQueryAllele::wildcard();
+            } else if phased == 0 && a1 != 255 && a1 == a2 {
+                query_alleles[i] =
+                    PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
             } else {
                 let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
                 query_alleles[i] =
@@ -718,25 +728,31 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
+            let hap1 = sample_idx * 2;
+            let hap2 = hap1 + 1;
+            let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+            let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
             let phased = phase_mask
                 .and_then(|mask| mask.get(orig_m, sample_idx))
                 .unwrap_or(0);
-            if phased == 0
+            let wildcard_unphased_het = phased == 0
                 && mask_unphased_hets
                     .and_then(|flags| flags.get(sample_idx))
                     .copied()
                     .unwrap_or(false)
-            {
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                if a1 != 255 && a1 == a2 {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
-                } else {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
-                }
+                && is_het;
+            let wildcard_low_conf = phased != 0
+                && is_het
+                && target_gt.sample_phase_confidence_f32(
+                    MarkerIdx::new(orig_m as u32),
+                    sample_idx,
+                ) < LOW_PHASE_CONF_WILDCARD_THRESHOLD;
+            if wildcard_unphased_het || wildcard_low_conf {
+                query_alleles[i] = PbwtQueryAllele::wildcard();
+            } else if phased == 0 && a1 != 255 && a1 == a2 {
+                query_alleles[i] =
+                    PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
             } else {
                 let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
                 query_alleles[i] =
@@ -4053,6 +4069,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                 score_window_batch_pbwt_segment(
                     &batch_haps_buf,
+                    target_gt,
                     target_geno,
                     &ref_columns,
                     phase_mask,
@@ -11459,6 +11476,7 @@ mod tests {
         let mut window_scores = vec![vec![f32::NEG_INFINITY; ref_gt.n_haplotypes()]; 2];
         score_window_batch_pbwt_segment(
             &[0, 1],
+            &target_gt,
             &target_geno,
             &ref_columns,
             target_gt.phase_mask(),
@@ -11562,6 +11580,7 @@ mod tests {
             let mut window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; 2];
             score_window_batch_pbwt_segment(
                 &[0, 1],
+                &target_gt,
                 &target_geno,
                 &ref_columns,
                 phase_mask,
