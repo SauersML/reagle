@@ -9314,14 +9314,20 @@ fn sample_dynamic_mcmc(
                 scored_buf.select_nth_unstable_by(keep - 1, |a, b| {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
-            }
-            scored_buf[..keep].sort_unstable_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            out.clear();
-            out.reserve(keep.saturating_sub(out.capacity()));
-            for (h, _) in scored_buf.iter().take(keep) {
-                out.push(*h);
+                scored_buf[..keep].sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                out.clear();
+                out.reserve(keep.saturating_sub(out.capacity()));
+                for (h, _) in scored_buf.iter().take(keep) {
+                    out.push(*h);
+                }
+            } else {
+                out.clear();
+                out.reserve(scored_buf.len().saturating_sub(out.capacity()));
+                for (h, _) in &scored_buf {
+                    out.push(*h);
+                }
             }
         };
 
