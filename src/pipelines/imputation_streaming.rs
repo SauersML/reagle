@@ -200,6 +200,13 @@ fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32
 }
 
 #[inline]
+fn phase_orientation_weight(phase_conf: f32, err_limit: f32) -> f32 {
+    let best_orient_err = phase_conf.clamp(0.0, 1.0).min(1.0 - phase_conf.clamp(0.0, 1.0));
+    let limit = err_limit.max(1e-6);
+    (limit / best_orient_err.max(limit)).clamp(0.0, 1.0)
+}
+
+#[inline]
 fn pbwt_beam_uncertainty(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> f32 {
     if n_ref_haps == 0 {
         return 0.0;
@@ -4298,7 +4305,6 @@ impl crate::pipelines::ImputationPipeline {
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
-                                    let best_orient_err = phase_conf.min(1.0 - phase_conf);
                                     let err_limit =
                                         phase_query_orientation_error_limit(
                                             geno_conf,
@@ -4306,9 +4312,9 @@ impl crate::pipelines::ImputationPipeline {
                                         )
                                         .max(1e-6);
                                     let orientation_weight =
-                                        (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
+                                        phase_orientation_weight(phase_conf, err_limit);
                                     cached_allele_weight = orientation_weight;
-                                    if best_orient_err > err_limit {
+                                    if phase_conf.min(1.0 - phase_conf) > err_limit {
                                         cached_query_pair = [255, 255];
                                         cached_wildcard_weight = info_llr * orientation_weight;
                                     } else if phase_conf < 0.5 {
@@ -5385,7 +5391,6 @@ impl crate::pipelines::ImputationPipeline {
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
-                                    let best_orient_err = phase_conf.min(1.0 - phase_conf);
                                     let err_limit =
                                         phase_query_orientation_error_limit(
                                             geno_conf,
@@ -5393,8 +5398,8 @@ impl crate::pipelines::ImputationPipeline {
                                         )
                                         .max(1e-6);
                                     cached_allele_weight =
-                                        (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
-                                    if best_orient_err > err_limit {
+                                        phase_orientation_weight(phase_conf, err_limit);
+                                    if phase_conf.min(1.0 - phase_conf) > err_limit {
                                         cached_query_pair = [255, 255];
                                         cached_wildcard_weight = cached_allele_weight;
                                     } else if phase_conf < 0.5 {

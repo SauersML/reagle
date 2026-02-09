@@ -826,6 +826,12 @@ fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32
     (base * scale).clamp(0.04, 0.30)
 }
 
+#[inline]
+fn phase_best_orientation_error(phase_conf: f32) -> f32 {
+    let p = phase_conf.clamp(0.0, 1.0);
+    p.min(1.0 - p)
+}
+
 fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     batch_haps: &[usize],
     target_gt: &GenotypeMatrix<TargetState, TargetSpace>,
@@ -917,7 +923,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let geno_conf = target_gt
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
-                    let best_orient_err = phase_conf.min(1.0 - phase_conf);
+                    let best_orient_err = phase_best_orientation_error(phase_conf);
                     if best_orient_err
                         > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
                     {
@@ -1172,7 +1178,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let geno_conf = target_gt
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
-                    let best_orient_err = phase_conf.min(1.0 - phase_conf);
+                    let best_orient_err = phase_best_orientation_error(phase_conf);
                     if best_orient_err
                         > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
                     {
