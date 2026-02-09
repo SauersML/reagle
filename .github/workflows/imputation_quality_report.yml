@@ -37,18 +37,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache reference panel
+        id: cache-reference
+        uses: actions/cache@v4
+        with:
+          path: |
+            ref.vcf.gz
+            ref.vcf.gz.csi
+          key: reference-panel-${{ runner.os }}-${{ hashFiles('scripts/prepare_data.py') }}
+
       - name: Install Python
+        if: steps.cache-reference.outputs.cache-hit != 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
       - name: Install System Tools
+        if: steps.cache-reference.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget
 
-      - name: Install convert_genome
-        run: python3 -c "import scripts.prepare_data as p; p.install_convert_genome()"
-
       - name: Prepare reference panel
+        if: steps.cache-reference.outputs.cache-hit != 'true'
         run: python3 scripts/prepare_data.py reference ref.vcf.gz
 
       - name: Upload reference panel
@@ -70,34 +79,102 @@ jobs:
         include:
           - person: "Kat"
             file_path: "data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt"
+            truth_glob: "data/kat_suricata/**"
           - person: "Kat"
             file_path: "data/kat_suricata/ancestrydna.txt"
+            truth_glob: "data/kat_suricata/**"
           - person: "Christopher"
             file_path: "data/christopher_smith/dna-data-2023-09-26.zip"
+            truth_glob: "data/christopher_smith/**"
           - person: "Christopher"
             file_path: "data/christopher_smith/genome_Christopher_Smith_v5_Full_20230926164611.zip"
+            truth_glob: "data/christopher_smith/**"
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache chr22 FASTA
+        uses: actions/cache@v4
+        with:
+          path: .cache/reference/chr22.fa.gz
+          key: chr22-fasta-${{ runner.os }}-v1
+
+      - name: Cache prep artifacts
+        id: cache-prep
+        uses: actions/cache@v4
+        with:
+          path: |
+            ref.vcf.gz
+            ref.vcf.gz.csi
+            convert_genome_array_out/panel.vcf
+            convert_genome_array_out/panel.vcf.gz
+            convert_genome_array_out/genotypes.vcf
+            convert_genome_array_out/genotypes.vcf.gz
+            convert_genome_truth_out/panel.vcf
+            convert_genome_truth_out/panel.vcf.gz
+            convert_genome_truth_out/genotypes.vcf
+            convert_genome_truth_out/genotypes.vcf.gz
+            reagle_ref.vcf.gz
+            reagle_ref.vcf.gz.csi
+            reagle_ref.vcf.gz.tbi
+            ref_beagle.vcf.gz
+            ref_beagle.vcf.gz.csi
+            ref_beagle.vcf.gz.tbi
+            target.vcf.gz
+            target.vcf.gz.csi
+            target.vcf.gz.tbi
+            truth.vcf.gz
+            truth.vcf.gz.csi
+            truth.vcf.gz.tbi
+          key: prep-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}
+
+      - name: Cache imputation results
+        id: cache-results
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/data/reagle_metrics.json
+            tests/data/beagle_metrics.json
+            tests/data/reagle_metrics.txt
+            tests/data/reagle_imputed.vcf.gz
+            tests/data/reagle_imputed.vcf.gz.csi
+            tests/data/reagle_imputed.vcf.gz.tbi
+            tests/data/beagle_imputed.vcf.gz
+            tests/data/beagle_imputed.vcf.gz.csi
+            tests/data/beagle_imputed.vcf.gz.tbi
+            tests/data/truth.vcf.gz
+            tests/data/truth.vcf.gz.csi
+            tests/data/truth.vcf.gz.tbi
+            reagle_out.vcf.gz
+            reagle_out.vcf.gz.csi
+            reagle_out.vcf.gz.tbi
+            beagle_out.vcf.gz
+            beagle_out.vcf.gz.csi
+            beagle_out.vcf.gz.tbi
+          key: results-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/quality_assessment.py', 'scripts/prepare_data.py', 'tests/integration_test.py', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**') }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Python
+        if: steps.cache-results.outputs.cache-hit != 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
       - name: Install Java
+        if: steps.cache-results.outputs.cache-hit != 'true'
         uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Install System Tools
+        if: steps.cache-results.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y bcftools tabix
 
       - name: Download reference panel
+        if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           name: reference-panel
@@ -108,6 +185,7 @@ jobs:
         run: cargo build --release
 
       - name: Run Quality Assessment
+        if: steps.cache-results.outputs.cache-hit != 'true'
         run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}"
 
       - name: Diagnostics (post-run)

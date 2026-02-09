@@ -7,6 +7,7 @@ import shlex
 from pathlib import Path
 
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
+CHR22_FASTA_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
 
 
 def _bump_nofile_limit(min_soft: int = 4096):
@@ -36,6 +37,17 @@ def _download_file(url, dest):
         subprocess.check_call(["curl", "-fsSL", url, "-o", str(dest)])
         return
     raise RuntimeError("Neither wget nor curl found; cannot download reference panel.")
+
+
+def _ensure_chr22_reference(local_path: str = ".cache/reference/chr22.fa.gz") -> str:
+    path = Path(local_path)
+    if path.exists() and path.stat().st_size > 0:
+        print(f"Reusing cached chr22 reference FASTA: {path}")
+        return str(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading chr22 reference FASTA to {path}...")
+    _download_file(CHR22_FASTA_URL, path)
+    return str(path)
 
 
 def _has_vcf_index(vcf_path: Path):
@@ -86,8 +98,21 @@ def _clear_convert_genome_cache():
 
 def install_convert_genome():
     """Installs convert_genome using the official install script (pre-compiled binary)."""
-    print("Installing convert_genome (fresh install)...")
-    _clear_convert_genome_cache()
+    existing = shutil.which("convert_genome")
+    if existing:
+        try:
+            subprocess.check_call(
+                ["convert_genome", "--help"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"convert_genome already available: {existing}")
+            return
+        except Exception:
+            print("Existing convert_genome is not usable; reinstalling...")
+            _clear_convert_genome_cache()
+    else:
+        print("convert_genome not found; installing...")
 
     install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh"
     subprocess.check_call(["bash", "-c", f"curl -fsSL {install_script_url} | bash"])
@@ -224,7 +249,7 @@ def prepare_truth(source, output_vcf, panel_path):
     install_convert_genome()
     _bump_nofile_limit()
 
-    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    ref_hg38_fasta = _ensure_chr22_reference()
     truth_output_dir = "convert_genome_truth_out"
     _clean_output_dir(truth_output_dir)
     truth_hg38_vcf = "truth_hg38.vcf.gz"
@@ -232,7 +257,7 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         source_vcf,
-        ref_hg38_url,
+        ref_hg38_fasta,
         "--output-dir", truth_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -293,19 +318,23 @@ def prepare_truth(source, output_vcf, panel_path):
 
 def run_conversion(input_path, output_vcf, panel_path):
     """Runs convert_genome to convert input to hg38 VCF."""
+    output_path = Path(output_vcf)
+    if output_path.exists() and _has_vcf_index(output_path) and output_path.stat().st_size > 0:
+        print(f"Array conversion already exists: {output_vcf}")
+        return
 
     raw_file = prepare_input_file(input_path)
 
     print(f"Converting {raw_file} to GRCh38 VCF...")
 
-    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    ref_hg38_fasta = _ensure_chr22_reference()
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
 
     cmd = [
         "convert_genome",
         raw_file,
-        ref_hg38_url,
+        ref_hg38_fasta,
         "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
