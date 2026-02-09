@@ -12,6 +12,7 @@ use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
 use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImputeHmmContext {
@@ -116,10 +117,18 @@ pub struct TargetAlleleProbs {
     probs: Vec<f32>,
     uniform: Vec<bool>,
     observed: Vec<bool>,
+    panel_priors: Option<Arc<Vec<AllelePosteriors>>>,
+    min_untyped_prior_mix: f32,
 }
 
 impl TargetAlleleProbs {
-    pub fn new(offsets: Vec<usize>, probs: Vec<f32>, observed: Vec<bool>) -> Self {
+    pub fn new(
+        offsets: Vec<usize>,
+        probs: Vec<f32>,
+        observed: Vec<bool>,
+        panel_priors: Option<Arc<Vec<AllelePosteriors>>>,
+        min_untyped_prior_mix: f32,
+    ) -> Self {
         let mut uniform = Vec::new();
         if offsets.len() >= 2 {
             uniform.reserve(offsets.len() - 1);
@@ -142,6 +151,8 @@ impl TargetAlleleProbs {
             probs,
             uniform,
             observed,
+            panel_priors,
+            min_untyped_prior_mix: min_untyped_prior_mix.clamp(0.0, 0.9),
         }
     }
 
@@ -180,6 +191,21 @@ impl TargetAlleleProbs {
     #[inline]
     pub fn has_untyped_markers(&self) -> bool {
         self.observed.iter().any(|&obs| !obs)
+    }
+
+    #[inline]
+    pub fn panel_priors(&self) -> Option<&[AllelePosteriors]> {
+        self.panel_priors.as_deref().map(|v| v.as_slice())
+    }
+
+    #[inline]
+    pub fn set_panel_priors(&mut self, priors: Arc<Vec<AllelePosteriors>>) {
+        self.panel_priors = Some(priors);
+    }
+
+    #[inline]
+    pub fn min_untyped_prior_mix(&self) -> f32 {
+        self.min_untyped_prior_mix
     }
 }
 
@@ -817,16 +843,20 @@ fn compute_nearest_observed_lambda(
     }
 
     let cluster_scale = (smoothing_cluster_cm.max(1e-6) / BASE_CLUSTER_CM).max(0.0);
+    const MIN_SAME_POS_LAMBDA: f32 = 0.05;
     for m in 0..n {
         let left = ws.nearest_obs_fwd[m];
         let right = ws.nearest_obs_bwd[m];
-        let raw_lambda = if left.is_finite() && right.is_finite() {
+        let mut raw_lambda = if left.is_finite() && right.is_finite() {
             // In an untyped interval bracketed by typed anchors, uncertainty is
             // governed by the full bracket span rather than the nearest side.
             left + right
         } else {
             left.min(right)
         };
+        if raw_lambda == 0.0 && !target_probs.is_observed_marker(m) {
+            raw_lambda = MIN_SAME_POS_LAMBDA;
+        }
         ws.nearest_obs_lambda[m] = raw_lambda * cluster_scale;
         // When no typed marker is reachable in either direction, lambda stays
         // Infinity. smooth_allele_posteriors_subset handles this correctly:
@@ -843,7 +873,6 @@ fn smooth_allele_posteriors_subset(
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
-    const SMOOTHING_GAIN: f32 = 10.0;
     if allele_probs.is_empty() {
         return;
     }
@@ -872,7 +901,9 @@ fn smooth_allele_posteriors_subset(
     let max_effective = allele_probs.len().max(1) as f32;
     let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
-    let prior_mass = (SMOOTHING_GAIN * effective_alleles * (1.0 - retain) / retain).max(0.0);
+    // Pseudo-count mass should track information decay only. Extra gain
+    // over-regularizes sparse arrays and can collapse rare-allele posteriors.
+    let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
@@ -882,6 +913,119 @@ fn smooth_allele_posteriors_subset(
         *p = (*p + prior_mass * local_prior) / denom;
     }
     normalize_probs(allele_probs);
+}
+
+#[inline]
+fn apply_marker_prior_smoothing(
+    allele_probs: &mut [f32],
+    panel_priors: Option<&[AllelePosteriors]>,
+    marker_idx: usize,
+    smoothing_prior_counts: &mut [f32],
+    smoothing_prior_total: f32,
+    allele_prior_scratch: &mut Vec<f32>,
+    probs: &[f32],
+    nearest_obs_lambda: f32,
+    untyped_uniform_marker: bool,
+    active_states: usize,
+    panel_haps: usize,
+    min_prior_mix: f32,
+    warned_af_fallback: &mut bool,
+    context: ImputeHmmContext,
+) {
+    if !untyped_uniform_marker {
+        return;
+    }
+
+    let missing_mass = if panel_haps > 0 && active_states < panel_haps {
+        ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+        match panel {
+            AllelePosteriors::Biallelic(p_alt) => {
+                if allele_probs.len() == 2 {
+                    let p_alt = p_alt.clamp(0.0, 1.0);
+                    let panel_probs = [1.0 - p_alt, p_alt];
+                    if min_prior_mix > 0.0 {
+                        let mix = min_prior_mix.clamp(0.0, 0.9);
+                        let keep = 1.0 - mix;
+                        allele_probs[0] = keep * allele_probs[0] + mix * panel_probs[0];
+                        allele_probs[1] = keep * allele_probs[1] + mix * panel_probs[1];
+                        normalize_probs(allele_probs);
+                    }
+                    if missing_mass > 0.0 {
+                        let keep = 1.0 - missing_mass;
+                        allele_probs[0] = keep * allele_probs[0] + missing_mass * panel_probs[0];
+                        allele_probs[1] = keep * allele_probs[1] + missing_mass * panel_probs[1];
+                        normalize_probs(allele_probs);
+                    }
+                    smooth_allele_posteriors_subset(
+                        allele_probs,
+                        NormalizedAlleleProbs::from_trusted(&panel_probs),
+                        nearest_obs_lambda,
+                        true,
+                    );
+                    return;
+                }
+            }
+            AllelePosteriors::Multiallelic(p) => {
+                if p.len() == allele_probs.len() {
+                    if min_prior_mix > 0.0 {
+                        let mix = min_prior_mix.clamp(0.0, 0.9);
+                        let keep = 1.0 - mix;
+                        for (i, prob) in allele_probs.iter_mut().enumerate() {
+                            let prior = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            *prob = keep * *prob + mix * prior;
+                        }
+                        normalize_probs(allele_probs);
+                    }
+                    if missing_mass > 0.0 {
+                        let keep = 1.0 - missing_mass;
+                        for (i, prob) in allele_probs.iter_mut().enumerate() {
+                            let prior = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            *prob = keep * *prob + missing_mass * prior;
+                        }
+                        normalize_probs(allele_probs);
+                    }
+                    smooth_allele_posteriors_subset(
+                        allele_probs,
+                        NormalizedAlleleProbs::from_trusted(p),
+                        nearest_obs_lambda,
+                        true,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    let prior_probs = if smoothing_prior_total > 0.0 {
+        let inv = 1.0 / smoothing_prior_total;
+        for v in smoothing_prior_counts.iter_mut() {
+            *v *= inv;
+        }
+        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
+    } else {
+        if !*warned_af_fallback {
+            eprintln!(
+                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
+                context.window_idx, context.sample_idx, context.hap_idx, marker_idx
+            );
+            *warned_af_fallback = true;
+        }
+        normalized_allele_prior(
+            allele_prior_scratch,
+            NormalizedAlleleProbs::from_trusted(probs),
+        )
+    };
+    smooth_allele_posteriors_subset(
+        allele_probs,
+        prior_probs,
+        nearest_obs_lambda,
+        true,
+    );
 }
 
 #[inline]
@@ -1496,37 +1640,25 @@ fn run_impute_hmm_impl(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if use_prior_smoothing
-                                    && target_probs.is_untyped_uniform_marker(m_rev)
-                                    && recomb_rate > 0.0
-                                {
-                                    // Smoothing prior must be independent of the
-                                    // marker posterior; otherwise smoothing is a no-op.
-                                    // Use the active state-set allele composition.
-                                    let prior_probs = if smoothing_prior_total > 0.0 {
-                                        let inv = 1.0 / smoothing_prior_total;
-                                        for v in smoothing_prior_counts.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
-                                    } else {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
-                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
-                                    };
-                                    smooth_allele_posteriors_subset(
+                                if use_prior_smoothing {
+                                    apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
-                                        prior_probs,
+                                        target_probs.panel_priors(),
+                                        m_rev,
+                                        smoothing_prior_counts,
+                                        smoothing_prior_total,
+                                        &mut ws.allele_prior_scratch,
+                                        probs.as_slice(),
                                         ws.nearest_obs_lambda
                                             .get(m_rev)
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
+                                        target_probs.min_untyped_prior_mix(),
+                                        &mut warned_af_fallback,
+                                        context,
                                     );
                                 }
                             } else {
@@ -1840,34 +1972,25 @@ fn run_impute_hmm_seqcoded(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if use_prior_smoothing
-                                    && target_probs.is_untyped_uniform_marker(m_rev)
-                                    && recomb_rate > 0.0
-                                {
-                                    let prior_probs = if smoothing_prior_total > 0.0 {
-                                        let inv = 1.0 / smoothing_prior_total;
-                                        for v in smoothing_prior_counts.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
-                                    } else {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
-                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
-                                    };
-                                    smooth_allele_posteriors_subset(
+                                if use_prior_smoothing {
+                                    apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
-                                        prior_probs,
+                                        target_probs.panel_priors(),
+                                        m_rev,
+                                        smoothing_prior_counts,
+                                        smoothing_prior_total,
+                                        &mut ws.allele_prior_scratch,
+                                        probs.as_slice(),
                                         ws.nearest_obs_lambda
                                             .get(m_rev)
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
+                                        target_probs.min_untyped_prior_mix(),
+                                        &mut warned_af_fallback,
+                                        context,
                                     );
                                 }
                             } else {
@@ -2179,34 +2302,25 @@ fn run_impute_hmm_dict(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if use_prior_smoothing
-                                    && target_probs.is_untyped_uniform_marker(m_rev)
-                                    && recomb_rate > 0.0
-                                {
-                                    let prior_probs = if smoothing_prior_total > 0.0 {
-                                        let inv = 1.0 / smoothing_prior_total;
-                                        for v in smoothing_prior_counts.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
-                                    } else {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
-                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
-                                    };
-                                    smooth_allele_posteriors_subset(
+                                if use_prior_smoothing {
+                                    apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
-                                        prior_probs,
+                                        target_probs.panel_priors(),
+                                        m_rev,
+                                        smoothing_prior_counts,
+                                        smoothing_prior_total,
+                                        &mut ws.allele_prior_scratch,
+                                        probs.as_slice(),
                                         ws.nearest_obs_lambda
                                             .get(m_rev)
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
+                                        target_probs.min_untyped_prior_mix(),
+                                        &mut warned_af_fallback,
+                                        context,
                                     );
                                 }
                             } else {

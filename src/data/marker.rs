@@ -322,9 +322,10 @@ impl AlleleMapping {
 
     /// Check if all target alleles can be mapped
     pub fn is_valid(&self) -> bool {
-        // Only require that the target REF allele maps.
-        // Target-only ALT alleles are permitted (left as -1), and will be treated as missing.
-        self.targ_to_ref.first().copied().unwrap_or(-1) >= 0
+        // Require all target alleles to map. If any target ALT allele is absent
+        // in the reference marker, this is a different variant and should not
+        // be aligned for phasing/imputation.
+        self.targ_to_ref.iter().all(|&v| v >= 0)
     }
 }
 

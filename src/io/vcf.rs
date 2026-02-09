@@ -113,6 +113,23 @@ impl MarkerImputationStats {
         self.sum_p_sq[1] += p_sq_sum;
     }
 
+    /// Add a multiallelic sample's data.
+    /// p1/p2 are per-allele haplotype probabilities (length = n_alleles).
+    #[inline]
+    pub fn add_sample_multiallelic(&mut self, p1: &[f32], p2: &[f32]) {
+        assert!(
+            self.sum_p.len() == p1.len() && p1.len() == p2.len(),
+            "add_sample_multiallelic requires matching allele counts"
+        );
+        self.n_haps += 2;
+        for a in 0..self.sum_p.len() {
+            let v1 = p1[a].max(0.0);
+            let v2 = p2[a].max(0.0);
+            self.sum_p[a] += v1 + v2;
+            self.sum_p_sq[a] += v1 * v1 + v2 * v2;
+        }
+    }
+
     /// Calculate DR2 (dosage R-squared) matching Java Beagle's implementation.
     /// Formula: (Σp² - (Σp)²/N) / (Σp - (Σp)²/N)
     pub fn dr2(&self, allele: usize) -> f32 {
