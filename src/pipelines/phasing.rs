@@ -6016,23 +6016,52 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 n_total_haps
             };
             let mut carrier_haps: Vec<Vec<u32>> = vec![Vec::new(); n_markers];
+            let mut carrier_context_markers: Vec<Vec<usize>> = vec![Vec::new(); n_markers];
+            let mut total_conditioned_rare = 0usize;
+            let mut rare_with_carriers = 0usize;
+            let mut rare_with_carrier_context = 0usize;
             for &m in &rare_markers {
+                if !(maf[m] < rare_threshold && maf[m] > 0.0) {
+                    continue;
+                }
+                total_conditioned_rare += 1;
                 let mut carriers = Vec::new();
-                let hap_iter: Box<dyn Iterator<Item = usize>> = if n_ref_haps > 0 {
+                if n_ref_haps > 0 {
                     // Reference-guided Stage 2: only reference carriers should
                     // define injected rare-donor support.
-                    Box::new(n_haps..n_total_haps)
+                    for h in n_haps..n_total_haps {
+                        let allele = get_allele_global(m, h);
+                        if allele > 0 && allele != 255 {
+                            carriers.push(h as u32);
+                        }
+                    }
                 } else {
-                    Box::new(0..n_total_haps)
-                };
-                for h in hap_iter {
-                    let allele = get_allele_global(m, h);
-                    if allele > 0 && allele != 255 {
-                        carriers.push(h as u32);
+                    for h in 0..n_total_haps {
+                        let allele = get_allele_global(m, h);
+                        if allele > 0 && allele != 255 {
+                            carriers.push(h as u32);
+                        }
                     }
                 }
+                carriers.sort_unstable();
+                if carriers.is_empty() {
+                    carrier_haps[m] = carriers;
+                    continue;
+                }
+                rare_with_carriers += 1;
+                let context = stage2_phaser.carrier_context_markers(m);
+                if !context.is_empty() {
+                    rare_with_carrier_context += 1;
+                }
+                carrier_context_markers[m] = context;
                 carrier_haps[m] = carriers;
             }
+            eprintln!(
+                "Stage 2: rare-carrier conditioning markers with carriers={} with_context={} total_rare={}",
+                rare_with_carriers,
+                rare_with_carrier_context,
+                total_conditioned_rare
+            );
 
             // Process samples in parallel - collect results: Stage2Decision
             // Note: This is called after all iterations, so we use iteration=0 for deterministic state selection
@@ -6343,6 +6372,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let marker_maf = maf[m];
                         let is_rare_marker = marker_maf < rare_threshold;
                         let carriers = &carrier_haps[m];
+                        let context_markers = &carrier_context_markers[m];
+                        let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
                         let bridge_probs1 = if is_rare_marker && !carriers.is_empty() {
                             stage2_phaser.carrier_injected_bridge_hap_probs(
                                 m,
@@ -6350,7 +6381,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 state_haps_for_interp_a,
                                 state_haps_for_interp_b,
                                 carriers,
+                                context_markers,
                                 carrier_panel_haps.max(1),
+                                s * 2,
+                                obs_conf,
+                                self.params.p_mismatch,
+                                &get_allele,
                             )
                         } else {
                             stage2_phaser.bridge_hap_probs(
@@ -6367,7 +6403,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 state_haps_for_interp_a,
                                 state_haps_for_interp_b,
                                 carriers,
+                                context_markers,
                                 carrier_panel_haps.max(1),
+                                s * 2 + 1,
+                                obs_conf,
+                                self.params.p_mismatch,
+                                &get_allele,
                             )
                         } else {
                             stage2_phaser.bridge_hap_probs(
@@ -6380,7 +6421,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         // Handle missing genotypes by imputation
                         if sp.is_missing(m) || a1 == 255 || a2 == 255 {
-                            let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
                             let imp_a1 = if let Some((h, top, second)) =
                                 top_bridge_haplotype(&bridge_probs1)
                             {
@@ -6435,7 +6475,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             continue;
                         }
 
-                        let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
                         let mut log_same = 0.0f32;
                         let mut log_swap = 0.0f32;
 
@@ -10315,6 +10354,9 @@ struct Stage2Phaser {
 }
 
 impl Stage2Phaser {
+    const MAX_CARRIER_CONTEXT_MARKERS: usize = 24;
+    const CARRIER_CONTEXT_RADIUS_CM: f64 = 0.75;
+
     /// Create a new Stage2Phaser
     ///
     /// # Arguments
@@ -10508,70 +10550,41 @@ impl Stage2Phaser {
         hap_probs
     }
 
-    fn carrier_injected_bridge_hap_probs(
-        &self,
-        marker: usize,
-        state_probs: &[Vec<f32>],
-        haps_at_mkr_a: &[CombinedHapId],
-        haps_at_mkr_b: &[CombinedHapId],
+    fn blend_base_with_carriers(
+        mut base: std::collections::HashMap<u32, f32>,
         carriers: &[u32],
         panel_haps: usize,
+        obs_conf: f32,
     ) -> std::collections::HashMap<u32, f32> {
-        let mut base = self.bridge_hap_probs(marker, state_probs, haps_at_mkr_a, haps_at_mkr_b);
         if carriers.is_empty() || panel_haps == 0 {
             return base;
         }
 
-        let mkr_a = self.prev_stage1_marker[marker];
-        let mkr_b = (mkr_a + 1).min(self.n_stage1.saturating_sub(1));
-        if mkr_a == mkr_b || self.stage1_markers.is_empty() {
-            return base;
-        }
+        let carrier_frac = (carriers.len() as f32 / panel_haps as f32).clamp(0.0, 1.0);
+        let rarity_boost = (1.0 - carrier_frac.sqrt()).clamp(0.0, 1.0);
+        let lambda = (0.12 + 0.38 * rarity_boost + 0.10 * obs_conf).clamp(0.10, 0.60);
+        let keep = 1.0 - lambda;
 
-        let pos_a_idx = self.stage1_markers[mkr_a];
-        let pos_b_idx = self.stage1_markers[mkr_b];
-        let pos_a = *self.gen_positions.get(pos_a_idx).unwrap_or(&0.0);
-        let pos_b = *self.gen_positions.get(pos_b_idx).unwrap_or(&pos_a);
-        let pos_m = *self.gen_positions.get(marker).unwrap_or(&pos_a);
-
-        if !(pos_b > pos_a && pos_m > pos_a && pos_m < pos_b) {
-            return base;
-        }
-
-        let d1 = (pos_m - pos_a).max(0.0);
-        let d2 = (pos_b - pos_m).max(0.0);
-        let r1 = self.p_recomb(d1);
-        let r2 = self.p_recomb(d2);
-
-        // Inject carrier mass using two transition opportunities around the
-        // rare marker (A->M and M->B). This preserves map-distance behavior.
-        let panel = panel_haps as f32;
-        let carrier_frac = (carriers.len() as f32 / panel).clamp(0.0, 1.0);
-        let switch_opportunity = (1.0 - (1.0 - r1) * (1.0 - r2)).clamp(0.0, 1.0);
-        let switch_mass = (switch_opportunity * carrier_frac).clamp(0.0, 1.0);
-        if switch_mass <= 0.0 {
-            return base;
-        }
-
-        let keep = (1.0 - switch_mass).max(0.0);
         for p in base.values_mut() {
             *p *= keep;
         }
 
-        // Allocate injected mass to carriers proportionally to the current
-        // bridge mass when available; otherwise fall back to uniform.
-        let carrier_mass: f32 = carriers
-            .iter()
-            .map(|h| base.get(h).copied().unwrap_or(0.0))
-            .sum();
-        if carrier_mass > 0.0 {
-            let inv = 1.0 / carrier_mass;
+        let mut carrier_prior_sum = 0.0f32;
+        for &hap in carriers {
+            carrier_prior_sum += base.get(&hap).copied().unwrap_or(0.0);
+        }
+
+        if carrier_prior_sum > 0.0 {
+            let inv = 1.0 / carrier_prior_sum;
             for &hap in carriers {
-                let w = base.get(&hap).copied().unwrap_or(0.0) * inv;
-                *base.entry(hap).or_insert(0.0) += switch_mass * w;
+                let prior = base.get(&hap).copied().unwrap_or(0.0);
+                let add = lambda * prior * inv;
+                if add > 0.0 {
+                    *base.entry(hap).or_insert(0.0) += add;
+                }
             }
         } else {
-            let add = switch_mass / carriers.len() as f32;
+            let add = lambda / carriers.len() as f32;
             for &hap in carriers {
                 *base.entry(hap).or_insert(0.0) += add;
             }
@@ -10585,6 +10598,199 @@ impl Stage2Phaser {
             }
         }
         base
+    }
+
+    fn carrier_injected_bridge_hap_probs<F>(
+        &self,
+        marker: usize,
+        state_probs: &[Vec<f32>],
+        haps_at_mkr_a: &[CombinedHapId],
+        haps_at_mkr_b: &[CombinedHapId],
+        carriers: &[u32],
+        context_markers: &[usize],
+        panel_haps: usize,
+        target_hap: usize,
+        obs_conf: f32,
+        p_mismatch: f32,
+        get_allele: &F,
+    ) -> std::collections::HashMap<u32, f32>
+    where
+        F: Fn(usize, usize) -> u8,
+    {
+        let mut base = self.bridge_hap_probs(marker, state_probs, haps_at_mkr_a, haps_at_mkr_b);
+        if carriers.is_empty() || panel_haps == 0 {
+            return base;
+        }
+        if context_markers.is_empty() {
+            return Self::blend_base_with_carriers(base, carriers, panel_haps, obs_conf);
+        }
+
+        let mkr_a = self.prev_stage1_marker[marker];
+        let mkr_b = (mkr_a + 1).min(self.n_stage1.saturating_sub(1));
+        if mkr_a == mkr_b || self.stage1_markers.is_empty() {
+            return base;
+        }
+
+        let pos_a_idx = self.stage1_markers[mkr_a];
+        let pos_b_idx = self.stage1_markers[mkr_b];
+        let pos_a = *self.gen_positions.get(pos_a_idx).unwrap_or(&0.0);
+        let pos_b = *self.gen_positions.get(pos_b_idx).unwrap_or(&pos_a);
+        let pos_m = *self.gen_positions.get(marker).unwrap_or(&pos_a);
+        if !(pos_b > pos_a && pos_m >= pos_a && pos_m <= pos_b) {
+            return base;
+        }
+
+        let err = p_mismatch.clamp(1e-4, 0.25);
+        let ln_match = (1.0 - err).ln();
+        let ln_mismatch = err.ln();
+        let prior_floor = (1.0 / panel_haps as f32).max(1e-9);
+        const MIN_CONTEXT_INFO_MARKERS: usize = 3;
+
+        let mut max_log_weight = f32::NEG_INFINITY;
+        let mut carrier_log_weights: Vec<(u32, f32)> = Vec::with_capacity(carriers.len());
+        for &hap in carriers {
+            let mut n_info = 0usize;
+            let mut ll = 0.0f32;
+            for &ctx_m in context_markers {
+                let ta = get_allele(ctx_m, target_hap);
+                let ha = get_allele(ctx_m, hap as usize);
+                if ta == 255 || ha == 255 {
+                    continue;
+                }
+                n_info += 1;
+                if ta == ha {
+                    ll += ln_match;
+                } else {
+                    ll += ln_mismatch;
+                }
+            }
+            if n_info < MIN_CONTEXT_INFO_MARKERS {
+                continue;
+            }
+            let prior = base.get(&hap).copied().unwrap_or(0.0).max(prior_floor);
+            let log_weight = prior.ln() + ll;
+            if log_weight > max_log_weight {
+                max_log_weight = log_weight;
+            }
+            carrier_log_weights.push((hap, log_weight));
+        }
+        if carrier_log_weights.is_empty() {
+            return Self::blend_base_with_carriers(base, carriers, panel_haps, obs_conf);
+        }
+
+        let mut carrier_post_sum = 0.0f32;
+        for i in 0..carrier_log_weights.len() {
+            let log_weight = carrier_log_weights[i].1;
+            let w = (log_weight - max_log_weight).exp();
+            carrier_post_sum += w;
+        }
+        if carrier_post_sum <= 0.0 {
+            return base;
+        }
+        let inv_post = 1.0 / carrier_post_sum;
+
+        // Adaptive carrier-conditioning strength:
+        // - stronger for very rare carrier sets and confident observations
+        // - weaker when many carriers dilute informativeness.
+        let carrier_frac = (carriers.len() as f32 / panel_haps as f32).clamp(0.0, 1.0);
+        let rarity_boost = (1.0 - carrier_frac.sqrt()).clamp(0.0, 1.0);
+        let context_strength =
+            (carrier_log_weights.len() as f32 / context_markers.len() as f32).clamp(0.0, 1.0);
+        let lambda = (0.25 + 0.50 * rarity_boost + 0.15 * context_strength + 0.10 * obs_conf)
+            .clamp(0.20, 0.90);
+        let keep = 1.0 - lambda;
+
+        for p in base.values_mut() {
+            *p *= keep;
+        }
+        for (hap, log_weight) in carrier_log_weights {
+            let p_carrier = (log_weight - max_log_weight).exp() * inv_post;
+            let add = lambda * p_carrier;
+            if add > 0.0 {
+                *base.entry(hap).or_insert(0.0) += add;
+            }
+        }
+
+        let sum: f32 = base.values().copied().sum();
+        if sum > 0.0 {
+            let inv = 1.0 / sum;
+            for p in base.values_mut() {
+                *p *= inv;
+            }
+        }
+        base
+    }
+
+    fn carrier_context_markers(&self, marker: usize) -> Vec<usize> {
+        if self.n_stage1 == 0
+            || self.stage1_markers.is_empty()
+            || marker >= self.gen_positions.len()
+        {
+            return Vec::new();
+        }
+
+        let mkr_a = self.prev_stage1_marker[marker];
+        let mkr_b = (mkr_a + 1).min(self.n_stage1.saturating_sub(1));
+        let pos_m = *self.gen_positions.get(marker).unwrap_or(&0.0);
+        let mut out: Vec<usize> = Vec::with_capacity(Self::MAX_CARRIER_CONTEXT_MARKERS + 2);
+        let mut left_idx = mkr_a as isize;
+        let mut right_idx = mkr_b as isize;
+
+        while out.len() < Self::MAX_CARRIER_CONTEXT_MARKERS
+            && (left_idx >= 0 || right_idx < self.n_stage1 as isize)
+        {
+            let left_candidate = if left_idx >= 0 {
+                let idx = left_idx as usize;
+                let marker_idx = self.stage1_markers[idx];
+                let d = (pos_m - *self.gen_positions.get(marker_idx).unwrap_or(&pos_m)).abs();
+                if d <= Self::CARRIER_CONTEXT_RADIUS_CM {
+                    Some((marker_idx, d))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let right_candidate = if right_idx < self.n_stage1 as isize {
+                let idx = right_idx as usize;
+                let marker_idx = self.stage1_markers[idx];
+                let d = (*self.gen_positions.get(marker_idx).unwrap_or(&pos_m) - pos_m).abs();
+                if d <= Self::CARRIER_CONTEXT_RADIUS_CM {
+                    Some((marker_idx, d))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            match (left_candidate, right_candidate) {
+                (Some((lm, dl)), Some((rm, dr))) => {
+                    if dl <= dr {
+                        out.push(lm);
+                        left_idx -= 1;
+                    } else {
+                        out.push(rm);
+                        right_idx += 1;
+                    }
+                }
+                (Some((lm, _)), None) => {
+                    out.push(lm);
+                    left_idx -= 1;
+                }
+                (None, Some((rm, _))) => {
+                    out.push(rm);
+                    right_idx += 1;
+                }
+                (None, None) => break,
+            }
+        }
+
+        if out.len() > 1 {
+            out.sort_unstable();
+            out.dedup();
+        }
+        out
     }
 }
 
