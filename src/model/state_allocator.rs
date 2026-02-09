@@ -408,6 +408,19 @@ fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows:
         }
         win += 1;
     }
+
+    // Smooth local ESS to avoid boundary-to-boundary jitter from sparse/noisy
+    // score support. This keeps transition penalties stable while preserving
+    // broad LD-driven variation in effective donor diversity.
+    if num_windows >= 3 {
+        let mut smoothed = out.clone();
+        let mut i = 1usize;
+        while i + 1 < num_windows {
+            smoothed[i] = (0.25 * out[i - 1] + 0.5 * out[i] + 0.25 * out[i + 1]).max(1.0);
+            i += 1;
+        }
+        out = smoothed;
+    }
     out
 }
 
@@ -752,6 +765,7 @@ pub fn allocate_lms_sparse(
             .collect();
         let mut best_idx: Option<usize> = None;
         let mut best_gain = NEG_INF;
+        let mut best_gain_per_slot = NEG_INF;
         let mut best_len = 0usize;
         let mut best_active: Vec<bool> = Vec::new();
 
@@ -771,11 +785,18 @@ pub fn allocate_lms_sparse(
                 &t01,
                 &mut dp_scratch,
             );
-            if gain > 0.0 && len > 0 && len <= remaining && (gain > best_gain || (gain == best_gain && len > best_len)) {
-                best_idx = Some(h);
-                best_gain = gain;
-                best_len = len;
-                best_active = dp_scratch.active[..w].to_vec();
+            if gain > 0.0 && len > 0 && len <= remaining {
+                let gain_per_slot = gain / len as f32;
+                if gain_per_slot > best_gain_per_slot
+                    || (gain_per_slot == best_gain_per_slot
+                        && (gain > best_gain || (gain == best_gain && len > best_len)))
+                {
+                    best_idx = Some(h);
+                    best_gain = gain;
+                    best_gain_per_slot = gain_per_slot;
+                    best_len = len;
+                    best_active = dp_scratch.active[..w].to_vec();
+                }
             }
             h += 1;
         }
