@@ -757,6 +757,13 @@ fn adaptive_pbwt_donor_k(
     NonZeroUsize::new(k.max(1)).expect("k.max(1) must be non-zero")
 }
 
+#[inline]
+fn phase_query_orientation_error_limit(genotype_conf: f32) -> f32 {
+    // Low genotype confidence should trigger wildcarding sooner to avoid
+    // forcing PBWT down noisy allele orientations.
+    (0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0)).clamp(0.08, 0.25)
+}
+
 fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     batch_haps: &[usize],
     target_gt: &GenotypeMatrix<TargetState, TargetSpace>,
@@ -794,11 +801,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
-    // Confidence-aware heterozygote query policy:
-    // - choose the most likely orientation (keep vs flip) when confidence is decisive,
-    // - otherwise wildcard to avoid forcing fragile PBWT matches.
-    const MAX_ORIENTATION_ERROR_FOR_HARD_QUERY: f32 = 0.25;
-
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
@@ -828,8 +830,11 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let phase_conf = target_gt
                     .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
+                let geno_conf = target_gt
+                    .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                    .clamp(0.0, 1.0);
                 let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                if best_orient_err > MAX_ORIENTATION_ERROR_FOR_HARD_QUERY {
+                if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
                     query_alleles[i] = PbwtQueryAllele::wildcard();
                 } else if phase_conf < 0.5 {
                     let flipped = if hap_idx == hap1 { a2 } else { a1 };
@@ -1046,8 +1051,11 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let phase_conf = target_gt
                     .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
                     .clamp(0.0, 1.0);
+                let geno_conf = target_gt
+                    .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                    .clamp(0.0, 1.0);
                 let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                if best_orient_err > MAX_ORIENTATION_ERROR_FOR_HARD_QUERY {
+                if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
                     query_alleles[i] = PbwtQueryAllele::wildcard();
                 } else if phase_conf < 0.5 {
                     let flipped = if hap_idx == hap1 { a2 } else { a1 };
@@ -5708,7 +5716,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let t_mcmc_start = Instant::now();
                         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
                             let dyn_k_max = self.config.dynamic_k.max(1).min(n_states.max(1));
-                            let dyn_k_min = dyn_k_max.min(16).max(1);
+                            let dyn_k_min = dyn_k_max.min(PBWT_ADAPTIVE_K_FLOOR).max(1);
                             let sample_uncertainty =
                                 1.0f32 - sample_phase_stability[s].clamp(0.0, 1.0);
                             let dyn_k = if dyn_k_max > dyn_k_min {
@@ -6058,6 +6066,41 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             });
                         }
 
+                        let cohort_stats = if collect_cohort_stats {
+                            let (mismatch_mass, emission_mass, expected_switches, genetic_dist_cm) =
+                                if let Some(est) = local_estimates.as_ref() {
+                                    (
+                                        est.mismatch_mass(),
+                                        est.emission_mass(),
+                                        est.expected_switches(),
+                                        est.genetic_distance_cm(),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0)
+                                };
+                            let mut uncertainty_sum = 0.0f64;
+                            let mut uncertainty_count = 0usize;
+                            for i in 0..n_hi_freq {
+                                let a1 = seq1[i];
+                                let a2 = seq2[i];
+                                if a1 != 255 && a2 != 255 && a1 != a2 {
+                                    uncertainty_sum +=
+                                        (1.0 - sample_phase_conf[i].clamp(0.0, 1.0)) as f64;
+                                    uncertainty_count += 1;
+                                }
+                            }
+                            Some(SampleCohortStats {
+                                mismatch_mass,
+                                emission_mass,
+                                expected_switches,
+                                genetic_dist_morgans: genetic_dist_cm / 100.0,
+                                phase_uncertainty_sum: uncertainty_sum,
+                                phase_uncertainty_count: uncertainty_count,
+                            })
+                        } else {
+                            None
+                        };
+
                         let het_count = het_positions.len() as u64;
                         ws.seq1 = seq1;
                         ws.seq2 = seq2;
@@ -6112,41 +6155,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         if let Some(bb) = telemetry.as_ref() {
                             bb.add_samples(1);
                         }
-
-                        let cohort_stats = if collect_cohort_stats {
-                            let (mismatch_mass, emission_mass, expected_switches, genetic_dist_cm) =
-                                if let Some(est) = local_estimates.as_ref() {
-                                    (
-                                        est.mismatch_mass(),
-                                        est.emission_mass(),
-                                        est.expected_switches(),
-                                        est.genetic_distance_cm(),
-                                    )
-                                } else {
-                                    (0.0, 0.0, 0.0, 0.0)
-                                };
-                            let mut uncertainty_sum = 0.0f64;
-                            let mut uncertainty_count = 0usize;
-                            for i in 0..n_hi_freq {
-                                let a1 = seq1[i];
-                                let a2 = seq2[i];
-                                if a1 != 255 && a2 != 255 && a1 != a2 {
-                                    uncertainty_sum +=
-                                        (1.0 - sample_phase_conf[i].clamp(0.0, 1.0)) as f64;
-                                    uncertainty_count += 1;
-                                }
-                            }
-                            Some(SampleCohortStats {
-                                mismatch_mass,
-                                emission_mass,
-                                expected_switches,
-                                genetic_dist_morgans: genetic_dist_cm / 100.0,
-                                phase_uncertainty_sum: uncertainty_sum,
-                                phase_uncertainty_count: uncertainty_count,
-                            })
-                        } else {
-                            None
-                        };
 
                         Stage1PhaseDecision {
                             orientation,
@@ -8982,6 +8990,7 @@ fn sample_dynamic_mcmc(
         n_states: usize,
         n_haps: u32,
         hap1_idx: u32,
+        sample_uncertainty: f32,
         rng: &mut impl rand::Rng,
     ) {
         if n_haps == 0 {
@@ -9025,7 +9034,13 @@ fn sample_dynamic_mcmc(
             return;
         }
 
-        let mix_count = (target / 10).max(4).min(target);
+        let mix_count = if sample_uncertainty >= 0.66 {
+            (target / 5).max(6).min(target)
+        } else if sample_uncertainty >= 0.33 {
+            (target / 8).max(4).min(target)
+        } else {
+            (target / 16).max(2).min(target)
+        };
         for _ in 0..mix_count {
             let h = rng.random_range(0..n_haps);
             if h == hap1_idx || h == hap1_idx + 1 {
@@ -9047,6 +9062,7 @@ fn sample_dynamic_mcmc(
         n_haps: u32,
         hap1_idx: u32,
         marker_idx: LocalMarkerIdx,
+        sample_uncertainty: f32,
         rng: &mut impl rand::Rng,
         allow_donor_at_marker: &impl Fn(u32, LocalMarkerIdx) -> bool,
     ) {
@@ -9067,7 +9083,13 @@ fn sample_dynamic_mcmc(
             return;
         }
 
-        let max_attempts = target.saturating_mul(32).max(64);
+        let max_attempts = if sample_uncertainty >= 0.66 {
+            target.saturating_mul(32).max(64)
+        } else if sample_uncertainty >= 0.33 {
+            target.saturating_mul(24).max(48)
+        } else {
+            target.saturating_mul(16).max(32)
+        };
         let mut attempts = 0usize;
         while neighbors.len() < target && attempts < max_attempts {
             attempts += 1;
@@ -9092,7 +9114,9 @@ fn sample_dynamic_mcmc(
 
     record_neighbors(&neighbors);
 
-    let stride = (n_markers / 8).max(1);
+    let sample_uncertainty = 1.0f32 - recipient_stability;
+    let anchor_bins = (6.0 + 10.0 * sample_uncertainty).round() as usize;
+    let stride = (n_markers / anchor_bins.max(1)).max(1);
     let mut anchors_static: Vec<usize> = Vec::new();
     // Prefer anchors with highest expected information under current emissions.
     let mut start = 0usize;
@@ -9124,20 +9148,38 @@ fn sample_dynamic_mcmc(
     anchors_static.sort_unstable();
     anchors_static.dedup();
 
-    let radius = (n_markers / 32).clamp(16, 256);
+    let base_radius = (n_markers / 40).clamp(12, 192);
+    let radius = ((base_radius as f32) * (1.0 + 1.5 * sample_uncertainty)).round() as usize;
+    let radius = radius.clamp(12, 320);
+    let score_step = if sample_uncertainty >= 0.66 {
+        1usize
+    } else if sample_uncertainty >= 0.33 {
+        2usize
+    } else {
+        3usize
+    };
     let mut score_markers_static: Vec<usize> = Vec::new();
     for &anchor in &anchors_static {
         let start = anchor.saturating_sub(radius);
         let end = (anchor + radius + 1).min(n_markers);
         for m in start..end {
             // Light subsampling in dense windows for speed; always keep anchor.
-            if m == anchor || ((m - start) % 2 == 0) {
+            if m == anchor || ((m - start) % score_step == 0) {
                 score_markers_static.push(m);
             }
         }
     }
     score_markers_static.sort_unstable();
     score_markers_static.dedup();
+    let mut score_markers_sparse: Vec<usize> = Vec::with_capacity(score_markers_static.len() / 2 + 1);
+    for (i, &m) in score_markers_static.iter().enumerate() {
+        if i % 2 == 0 {
+            score_markers_sparse.push(m);
+        }
+    }
+    if score_markers_sparse.is_empty() && !score_markers_static.is_empty() {
+        score_markers_sparse.push(score_markers_static[0]);
+    }
 
     // Cache per-marker log emissions so donor scoring avoids repeated floating-point transforms.
     let mut ll_match: Vec<f32> = vec![0.0; n_markers];
@@ -9165,8 +9207,15 @@ fn sample_dynamic_mcmc(
             for &m in &anchors_static {
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
                 if (ref_hap as usize) < phase_ibs.n_haps() {
+                    let search_states = if recipient_stability < 0.95 {
+                        target_states
+                            .saturating_add((target_states / 2).max(1))
+                            .min(phase_ibs.n_haps().saturating_sub(2).max(1))
+                    } else {
+                        target_states
+                    };
                     let mut local =
-                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, target_states);
+                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, search_states);
                     local.push(ref_hap);
                     for h in local {
                         if h == hap1_idx || h == hap1_idx + 1 {
@@ -9214,9 +9263,14 @@ fn sample_dynamic_mcmc(
             // haplotype sequence (query_hap), using cached confidence-weighted mismatch terms.
             scored_buf.clear();
             scored_buf.reserve(candidates_buf.len().saturating_sub(scored_buf.len()));
+            let score_markers = if recipient_stability >= 0.95 && target_states <= n_states / 2 {
+                &score_markers_sparse
+            } else {
+                &score_markers_static
+            };
             for &h in &candidates_buf {
                 let mut ll = 0.0f32;
-                for &m in &score_markers_static {
+                for &m in score_markers {
                     let obs = query_hap[m];
                     if obs == 255 {
                         continue;
@@ -9279,7 +9333,14 @@ fn sample_dynamic_mcmc(
         if neighbors.is_empty() {
             continue;
         }
-        mix_neighbors(&mut neighbors, state_target, n_haps, hap1_idx, &mut rng);
+        mix_neighbors(
+            &mut neighbors,
+            state_target,
+            n_haps,
+            hap1_idx,
+            sample_uncertainty,
+            &mut rng,
+        );
         neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
         if neighbors.is_empty() {
             refill_neighbors_for_marker(
@@ -9288,6 +9349,7 @@ fn sample_dynamic_mcmc(
                 n_haps,
                 hap1_idx,
                 LocalMarkerIdx(center_marker),
+                sample_uncertainty,
                 &mut rng,
                 &allow_donor_at_marker,
             );
@@ -9381,7 +9443,14 @@ fn sample_dynamic_mcmc(
         if neighbors.is_empty() {
             continue;
         }
-        mix_neighbors(&mut neighbors, state_target, n_haps, hap1_idx, &mut rng);
+        mix_neighbors(
+            &mut neighbors,
+            state_target,
+            n_haps,
+            hap1_idx,
+            sample_uncertainty,
+            &mut rng,
+        );
         neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
         if neighbors.is_empty() {
             refill_neighbors_for_marker(
@@ -9390,6 +9459,7 @@ fn sample_dynamic_mcmc(
                 n_haps,
                 hap1_idx,
                 LocalMarkerIdx(center_marker),
+                sample_uncertainty,
                 &mut rng,
                 &allow_donor_at_marker,
             );
@@ -13121,5 +13191,53 @@ mod tests {
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
         );
+    }
+
+    #[test]
+    fn test_fit_cohort_calibration_small_n_skips() {
+        let stats = vec![SampleCohortStats::default(); 10];
+        let out = fit_cohort_calibration(&stats, 0.001);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_fit_cohort_calibration_produces_per_sample_rates() {
+        let mut stats = Vec::new();
+        for _ in 0..70 {
+            stats.push(SampleCohortStats {
+                mismatch_mass: 5.0,
+                emission_mass: 5000.0,
+                expected_switches: 15.0,
+                genetic_dist_morgans: 1.2,
+                phase_uncertainty_sum: 80.0,
+                phase_uncertainty_count: 200,
+            });
+        }
+        for _ in 0..70 {
+            stats.push(SampleCohortStats {
+                mismatch_mass: 200.0,
+                emission_mass: 5000.0,
+                expected_switches: 60.0,
+                genetic_dist_morgans: 1.2,
+                phase_uncertainty_sum: 120.0,
+                phase_uncertainty_count: 200,
+            });
+        }
+
+        let out = fit_cohort_calibration(&stats, 0.001).expect("expected calibration model");
+        assert_eq!(out.sample_p_mismatch.len(), stats.len());
+        assert!(!out.cohort_p_mismatch.is_empty());
+        let min_p = out
+            .sample_p_mismatch
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let max_p = out
+            .sample_p_mismatch
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(min_p.is_finite() && max_p.is_finite());
+        assert!(max_p > min_p);
     }
 }

@@ -90,7 +90,6 @@ const STATE_BUDGET_SAFETY: f64 = 0.6;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
-const PBWT_MAX_ORIENTATION_ERROR_FOR_HARD_QUERY: f32 = 0.25;
 const STATE_MIX_PRIOR_FRAC_NUM: usize = 20;
 const STATE_MIX_WINDOW_FRAC_NUM: usize = 35;
 const STATE_MIX_DONOR_FRAC_NUM: usize = 25;
@@ -191,6 +190,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     posterior.clamp(1e-6, 0.5)
+}
+
+#[inline]
+fn phase_query_orientation_error_limit(genotype_conf: f32) -> f32 {
+    (0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0)).clamp(0.08, 0.25)
 }
 
 #[derive(Clone, Debug)]
@@ -4145,6 +4149,8 @@ impl crate::pipelines::ImputationPipeline {
                 for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
+                        let target_marker = MarkerIdx::new(target_idx as u32);
+                        let phase_mask = target_win.phase_mask();
                         let mapping = alignment
                             .allele_mappings
                             .get(target_idx)
@@ -4186,8 +4192,7 @@ impl crate::pipelines::ImputationPipeline {
                             let mapped1 = map_to_ref(a1);
                             let mapped2 = map_to_ref(a2);
                             let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
-                            let input_phased = target_win
-                                .phase_mask()
+                            let input_phased = phase_mask
                                 .and_then(|mask| mask.get(target_idx, sample_idx))
                                 .map(|v| v != 0)
                                 .unwrap_or(true);
@@ -4195,13 +4200,14 @@ impl crate::pipelines::ImputationPipeline {
                                 255
                             } else if is_het && input_phased {
                                 let phase_conf = target_win
-                                    .sample_phase_confidence_f32(
-                                        MarkerIdx::new(target_idx as u32),
-                                        sample_idx,
-                                    )
+                                    .sample_phase_confidence_f32(target_marker, sample_idx)
+                                    .clamp(0.0, 1.0);
+                                let geno_conf = target_win
+                                    .sample_confidence_f32(target_marker, sample_idx)
                                     .clamp(0.0, 1.0);
                                 let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                                if best_orient_err > PBWT_MAX_ORIENTATION_ERROR_FOR_HARD_QUERY {
+                                if best_orient_err > phase_query_orientation_error_limit(geno_conf)
+                                {
                                     255
                                 } else if phase_conf < 0.5 {
                                     if local == 0 { mapped2 } else { mapped1 }
@@ -5186,6 +5192,8 @@ impl crate::pipelines::ImputationPipeline {
                 for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
+                        let target_marker = MarkerIdx::new(target_idx as u32);
+                        let phase_mask = target_win.phase_mask();
                         let mapping = alignment
                             .allele_mappings
                             .get(target_idx)
@@ -5227,8 +5235,7 @@ impl crate::pipelines::ImputationPipeline {
                             let mapped1 = map_to_ref(a1);
                             let mapped2 = map_to_ref(a2);
                             let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
-                            let input_phased = target_win
-                                .phase_mask()
+                            let input_phased = phase_mask
                                 .and_then(|mask| mask.get(target_idx, sample_idx))
                                 .map(|v| v != 0)
                                 .unwrap_or(true);
@@ -5236,13 +5243,14 @@ impl crate::pipelines::ImputationPipeline {
                                 255
                             } else if is_het && input_phased {
                                 let phase_conf = target_win
-                                    .sample_phase_confidence_f32(
-                                        MarkerIdx::new(target_idx as u32),
-                                        sample_idx,
-                                    )
+                                    .sample_phase_confidence_f32(target_marker, sample_idx)
+                                    .clamp(0.0, 1.0);
+                                let geno_conf = target_win
+                                    .sample_confidence_f32(target_marker, sample_idx)
                                     .clamp(0.0, 1.0);
                                 let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                                if best_orient_err > PBWT_MAX_ORIENTATION_ERROR_FOR_HARD_QUERY {
+                                if best_orient_err > phase_query_orientation_error_limit(geno_conf)
+                                {
                                     255
                                 } else if phase_conf < 0.5 {
                                     if local == 0 { mapped2 } else { mapped1 }
