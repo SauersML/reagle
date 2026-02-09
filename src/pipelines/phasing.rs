@@ -5321,6 +5321,37 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         assert!(swap_probs_mask_sum.is_finite());
                         assert!(swap_lr.len() <= n_markers);
                         assert!(het_phase_out.len() <= het_positions.len());
+                        if collect_cohort_stats {
+                            let (mismatch_mass, emission_mass, expected_switches, genetic_dist_cm) =
+                                if let Some(est) = local_estimates.as_ref() {
+                                    (
+                                        est.mismatch_mass(),
+                                        est.emission_mass(),
+                                        est.expected_switches(),
+                                        est.genetic_distance_cm(),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0)
+                                };
+                            let mut uncertainty_sum = 0.0f64;
+                            let mut uncertainty_count = 0usize;
+                            for &m in &het_positions {
+                                uncertainty_sum +=
+                                    (1.0 - sample_phase_view[s].phase_confidence(m).clamp(0.0, 1.0))
+                                        as f64;
+                                uncertainty_count += 1;
+                            }
+                            *cohort_stats_out_one = Some(SampleCohortStats {
+                                mismatch_mass,
+                                emission_mass,
+                                expected_switches,
+                                genetic_dist_morgans: genetic_dist_cm / 100.0,
+                                phase_uncertainty_sum: uncertainty_sum,
+                                phase_uncertainty_count: uncertainty_count,
+                            });
+                        } else {
+                            *cohort_stats_out_one = None;
+                        }
                         let mut swapped = false;
                         let mut swap_idx = 0usize;
                         for m in 0..n_markers {
@@ -5343,9 +5374,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // After computing swap masks for all samples, apply them sequentially.
         // This is done sequentially because swap_haplotypes requires mutable access.
         info_span!("apply_swaps").in_scope(|| {
-            for (s, (mask, het_lr_values, het_phase_values, paths)) in
+            let mut cohort_stats_out = cohort_stats_out;
+            for (s, (mask, het_lr_values, het_phase_values, paths, cohort_stats_one)) in
                 swap_results.into_iter().enumerate()
             {
+                if let Some(out) = cohort_stats_out.as_deref_mut() {
+                    if s < out.len() {
+                        out[s] = cohort_stats_one.unwrap_or_default();
+                    }
+                }
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
                 let hap2 = sample_idx.hap2();
