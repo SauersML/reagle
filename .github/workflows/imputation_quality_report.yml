@@ -101,6 +101,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve convert_genome release commit
+        id: cg-release
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+
+          key = "unknown"
+          try:
+              with urllib.request.urlopen(
+                  "https://api.github.com/repos/SauersML/convert_genome/releases/latest",
+                  timeout=20,
+              ) as resp:
+                  data = json.load(resp)
+              tag = data.get("tag_name")
+              if not tag:
+                  key = str(data.get("id") or "unknown")
+              else:
+                  # Resolve tag -> commit SHA so cache keys track the actual binary source commit.
+                  # Use ^{} first to dereference annotated tags; fall back to direct tag ref.
+                  refs = [
+                      f"refs/tags/{tag}^{{}}",
+                      f"refs/tags/{tag}",
+                  ]
+                  sha = None
+                  for ref in refs:
+                      p = subprocess.run(
+                          ["git", "ls-remote", "https://github.com/SauersML/convert_genome.git", ref],
+                          check=False,
+                          capture_output=True,
+                          text=True,
+                      )
+                      line = (p.stdout or "").strip()
+                      if line:
+                          sha = line.split()[0]
+                          break
+                  if sha:
+                      key = f"{tag}-{sha}"
+                  else:
+                      key = tag
+          except Exception:
+              key = "lookup-failed"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"tag={key}\n")
+          print(f"convert_genome release cache key: {key}")
+          PY
+
       - name: Cache chr22 FASTA
         uses: actions/cache@v4
         with:
@@ -135,7 +185,7 @@ jobs:
             truth.vcf.gz
             truth.vcf.gz.csi
             truth.vcf.gz.tbi
-          key: prep-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}
+          key: prep-${{ runner.os }}-${{ matrix.person }}-${{ steps.cg-release.outputs.tag }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py', '.github/workflows/imputation_quality_report.yml') }}
 
       - name: Cache imputation results
         id: cache-results
@@ -160,7 +210,7 @@ jobs:
             beagle_out.vcf.gz
             beagle_out.vcf.gz.csi
             beagle_out.vcf.gz.tbi
-          key: results-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/quality_assessment.py', 'scripts/prepare_data.py', 'tests/integration_test.py', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**') }}
+          key: results-${{ runner.os }}-${{ matrix.person }}-${{ steps.cg-release.outputs.tag }}-${{ hashFiles(matrix.file_path, matrix.truth_glob, 'scripts/quality_assessment.py', 'scripts/prepare_data.py', 'tests/integration_test.py', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', '.github/workflows/imputation_quality_report.yml') }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -181,6 +231,44 @@ jobs:
       - name: Install System Tools
         if: steps.cache-results.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl
+
+      - name: Validate Cached Prep Artifacts
+        if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f ref.vcf.gz ]; then
+            echo "ref.vcf.gz missing; skipping cache validation."
+            exit 0
+          fi
+
+          ref_sites=$(bcftools index -n ref.vcf.gz 2>/dev/null || echo 0)
+          panel_path=""
+          panel_sites=0
+
+          if [ -f convert_genome_array_out/panel.vcf.gz ]; then
+            panel_path="convert_genome_array_out/panel.vcf.gz"
+            panel_sites=$(bcftools index -n "$panel_path" 2>/dev/null || echo 0)
+          elif [ -f convert_genome_array_out/panel.vcf ]; then
+            panel_path="convert_genome_array_out/panel.vcf"
+            panel_sites=$(bcftools view -H "$panel_path" 2>/dev/null | wc -l | tr -d ' ')
+          fi
+
+          if [ -z "$panel_path" ]; then
+            echo "No cached panel artifact found; skipping purge."
+            exit 0
+          fi
+
+          min_expected=$(( ref_sites / 2 ))
+          echo "Cached panel check: panel=${panel_sites}, ref=${ref_sites}, min_expected=${min_expected}"
+          if [ "$ref_sites" -gt 0 ] && [ "$panel_sites" -lt "$min_expected" ]; then
+            echo "Cached prep artifacts appear broken; purging prep outputs for regeneration."
+            rm -rf convert_genome_array_out convert_genome_truth_out
+            rm -f target.vcf.gz target.vcf.gz.csi target.vcf.gz.tbi
+            rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi
+            rm -f reagle_ref.vcf.gz reagle_ref.vcf.gz.csi reagle_ref.vcf.gz.tbi
+            rm -f ref_beagle.vcf.gz ref_beagle.vcf.gz.csi ref_beagle.vcf.gz.tbi
+            rm -f beagle.jar
+          fi
 
       - name: Download reference panel
         if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'

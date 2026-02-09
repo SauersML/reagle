@@ -57,6 +57,53 @@ def _atomic_bgzip_copy(src_vcf, out_vcf):
                 os.remove(p)
 
 
+def _atomic_indexed_copy(src_vcf, out_vcf):
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=".",
+        prefix=f".{os.path.basename(out_vcf)}.",
+        suffix=".tmp.vcf.gz",
+    ) as tmp:
+        tmp_vcf = tmp.name
+    try:
+        shutil.copy2(src_vcf, tmp_vcf)
+        if os.path.exists(src_vcf + ".csi"):
+            shutil.copy2(src_vcf + ".csi", tmp_vcf + ".csi")
+        elif os.path.exists(src_vcf + ".tbi"):
+            shutil.copy2(src_vcf + ".tbi", tmp_vcf + ".tbi")
+        else:
+            run_cmd(["bcftools", "index", "-f", tmp_vcf])
+        _replace_vcf_and_index(tmp_vcf, out_vcf)
+    finally:
+        for suffix in ("", ".csi", ".tbi"):
+            p = tmp_vcf + suffix
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def _vcf_record_count(vcf_path):
+    if vcf_path.endswith(".vcf") and not vcf_path.endswith(".vcf.gz"):
+        result = subprocess.run(
+            f"bcftools view -H {vcf_path} | wc -l",
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        count = (result.stdout or "").strip()
+        return int(count) if count else 0
+
+    result = subprocess.run(
+        ["bcftools", "index", "-n", vcf_path],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    count = (result.stdout or "").strip()
+    return int(count) if count else 0
+
+
 def ensure_beagle():
     """Download Beagle JAR if not present."""
     if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
@@ -185,15 +232,15 @@ def print_vcf_diagnostics(vcf_path, label):
 
 def prepare_reagle_reference_from_convert_genome(output_vcf="reagle_ref.vcf.gz"):
     """
-    Materialize the convert_genome-produced panel as a bgzipped/indexed VCF.
+    Materialize the Reagle reference panel as a bgzipped/indexed VCF.
 
     Context:
     - `scripts/prepare_data.py array ...` runs convert_genome and writes
       `convert_genome_array_out/panel.vcf(.gz)`.
-    - That panel is intended to be a FULL rewritten panel artifact from
-      convert_genome (not a QA-only mini-reference by design).
-    - This function does not create a custom reduced panel; it only normalizes
-      whichever convert_genome panel artifact currently exists into `output_vcf`.
+    - Some convert_genome runs can emit an incomplete panel output that does
+      not contain the full reference panel loci.
+    - A severely undersized panel breaks imputation support; this function
+      validates size and fails fast if the panel output is clearly broken.
 
     Operational note:
     - If `output_vcf` already exists, we reuse it (cache behavior).
@@ -216,8 +263,33 @@ def prepare_reagle_reference_from_convert_genome(output_vcf="reagle_ref.vcf.gz")
             "convert_genome panel output not found in convert_genome_array_out/"
         )
 
-    print(f"Using convert_genome panel for Reagle reference: {panel_src}")
-    _atomic_bgzip_copy(panel_src, output_vcf)
+    ref_src = "ref.vcf.gz"
+    if not os.path.exists(ref_src):
+        raise RuntimeError("Missing ref.vcf.gz required for panel sanity check")
+
+    panel_records = _vcf_record_count(panel_src)
+    ref_records = _vcf_record_count(ref_src)
+
+    if panel_records <= 0:
+        raise RuntimeError(f"convert_genome panel is empty: {panel_src}")
+
+    min_expected = int(ref_records * 0.5) if ref_records > 0 else 1
+    if ref_records > 0 and panel_records < min_expected:
+        raise RuntimeError(
+            "convert_genome panel output appears incomplete/broken "
+            f"({panel_records} records vs ref {ref_records}); "
+            "refusing to run Reagle with this panel. "
+            "Rebuild/update convert_genome and regenerate convert_genome_array_out/panel.vcf(.gz)."
+        )
+
+    print(
+        f"Using convert_genome panel for Reagle reference: {panel_src} "
+        f"({panel_records} records; ref={ref_records})"
+    )
+    if panel_src.endswith(".vcf.gz"):
+        _atomic_indexed_copy(panel_src, output_vcf)
+    else:
+        _atomic_bgzip_copy(panel_src, output_vcf)
     return output_vcf
 
 
