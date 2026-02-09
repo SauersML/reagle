@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -135,6 +136,7 @@ const PBWT_ADAPTIVE_K_MIN_DIVISOR: usize = 3;
 const PBWT_ADAPTIVE_K_FLOOR: usize = 16;
 const PBWT_ADAPTIVE_K_MAX_MULT: usize = 2;
 const PBWT_WILDCARD_MIN_UNCERTAINTY: f32 = 0.85;
+const PBWT_MIN_ENTROPY_EPS: f32 = 1e-12;
 const PBWT_FORCE_TOP_HAPS: usize = 32;
 const PBWT_ANCHOR_TOP_HAPS: usize = 512;
 const FAST_BEAM_WIDTH: usize = 16;
@@ -502,13 +504,21 @@ fn pbwt_beam_uncertainty(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAll
         return 0.0;
     }
     let coverage = (total / n_ref_haps as f32).clamp(0.0, 1.0);
-    let spread = if n_intervals > 1 && sq_sum > 0.0 {
-        let neff = (total * total / sq_sum).clamp(1.0, n_intervals as f32);
-        (neff - 1.0) / (n_intervals as f32 - 1.0)
+    let entropy_norm = if n_intervals > 1 && sq_sum > 0.0 {
+        let mut entropy = 0.0f32;
+        for &(l, r) in beam.intervals() {
+            if r <= l {
+                continue;
+            }
+            let p = ((r - l) as f32 / total).clamp(PBWT_MIN_ENTROPY_EPS, 1.0);
+            entropy -= p * p.ln();
+        }
+        let max_entropy = (n_intervals as f32).ln().max(PBWT_MIN_ENTROPY_EPS);
+        (entropy / max_entropy).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let mut uncertainty = (0.7 * coverage + 0.3 * spread).clamp(0.0, 1.0);
+    let mut uncertainty = (0.7 * coverage + 0.3 * entropy_norm).clamp(0.0, 1.0);
     if query.is_wildcard() {
         uncertainty = uncertainty.max(PBWT_WILDCARD_MIN_UNCERTAINTY);
     }
@@ -521,9 +531,9 @@ fn adaptive_pbwt_donor_k(
     n_ref_haps: usize,
     beam: &RankBeam,
     query: PbwtQueryAllele,
-) -> usize {
+) -> NonZeroUsize {
     if n_ref_haps == 0 {
-        return 0;
+        return NonZeroUsize::new(1).expect("1 must be non-zero");
     }
     let base = base_k.max(1).min(n_ref_haps);
     let k_min = (base / PBWT_ADAPTIVE_K_MIN_DIVISOR)
@@ -534,13 +544,14 @@ fn adaptive_pbwt_donor_k(
         .max(base)
         .min(n_ref_haps);
     if k_max <= k_min {
-        return k_min.max(1);
+        return NonZeroUsize::new(k_min.max(1)).expect("k_min.max(1) must be non-zero");
     }
     let uncertainty = pbwt_beam_uncertainty(beam, n_ref_haps, query);
     let span = (k_max - k_min) as f32;
-    (k_min as f32 + span * uncertainty)
+    let k = (k_min as f32 + span * uncertainty)
         .round()
-        .clamp(k_min as f32, k_max as f32) as usize
+        .clamp(k_min as f32, k_max as f32) as usize;
+    NonZeroUsize::new(k.max(1)).expect("k.max(1) must be non-zero")
 }
 
 fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
@@ -727,7 +738,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 let donor_k =
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_fwd[i], query_alleles[i]);
                 if query_alleles[i].is_wildcard() {
-                    pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k, &mut donors_buf);
+                    pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
                     for &d in donors_buf.iter() {
                         let idx = d as usize;
                         if idx >= n_ref_haps {
@@ -773,7 +784,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = -(freq.max(min_freq)).ln();
-                pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k, &mut donors_buf);
+                pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -945,7 +956,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 let donor_k =
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_bwd[i], query_alleles[i]);
                 if query_alleles[i].is_wildcard() {
-                    pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k, &mut donors_buf);
+                    pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
                     for &d in donors_buf.iter() {
                         let idx = d as usize;
                         if idx >= n_ref_haps {
@@ -991,7 +1002,7 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = -(freq.max(min_freq)).ln();
-                pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k, &mut donors_buf);
+                pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -8291,75 +8302,77 @@ fn sample_dynamic_mcmc(
     let mut seeded_from_heuristic = false;
     if initial_paths.is_none() && n_markers <= 2000 && !neighbors.is_empty() {
         let limit = neighbors.len().min(16);
-        let mut scores = vec![0.0f32; limit * limit];
-        let mut informative = 0usize;
-        for m in 0..n_markers {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 == 255 && a2 == 255 {
-                continue;
-            }
-            informative += 1;
-            let conf_m = conf[m].clamp(0.0, 1.0);
-            let is_het = a1 != a2 && a1 != 255 && a2 != 255;
-            for i in 0..limit {
-                let h1 = neighbors[i];
-                let r1 = phase_ibs.allele(m, h1);
-                for j in 0..i {
-                    let h2 = neighbors[j];
-                    let r2 = phase_ibs.allele(m, h2);
-                    let prob = if is_het {
-                        let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
-                            * emit_prob(r2, a2, conf_m, p_no_err, p_err);
-                        let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
-                            * emit_prob(r2, a1, conf_m, p_no_err, p_err);
-                        0.5 * (keep + swap)
-                    } else {
-                        let obs = if a1 != 255 { a1 } else { a2 };
-                        emit_prob(r1, obs, conf_m, p_no_err, p_err)
-                            * emit_prob(r2, obs, conf_m, p_no_err, p_err)
-                    };
-                    scores[i * limit + j] += prob.max(1e-30).ln();
+        if limit >= 2 {
+            let mut scores = vec![0.0f32; limit * limit];
+            let mut informative = 0usize;
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 && a2 == 255 {
+                    continue;
                 }
-            }
-        }
-
-        if informative > 0 {
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_pair = (0, 1);
-            for i in 0..limit {
-                for j in 0..i {
-                    let s = scores[i * limit + j];
-                    if s > best_score {
-                        best_score = s;
-                        best_pair = (i, j);
+                informative += 1;
+                let conf_m = conf[m].clamp(0.0, 1.0);
+                let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                for i in 0..limit {
+                    let h1 = neighbors[i];
+                    let r1 = phase_ibs.allele(m, h1);
+                    for j in 0..i {
+                        let h2 = neighbors[j];
+                        let r2 = phase_ibs.allele(m, h2);
+                        let prob = if is_het {
+                            let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
+                                * emit_prob(r2, a2, conf_m, p_no_err, p_err);
+                            let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
+                                * emit_prob(r2, a1, conf_m, p_no_err, p_err);
+                            0.5 * (keep + swap)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            emit_prob(r1, obs, conf_m, p_no_err, p_err)
+                                * emit_prob(r2, obs, conf_m, p_no_err, p_err)
+                        };
+                        scores[i * limit + j] += prob.max(1e-30).ln();
                     }
                 }
             }
 
-            let h1_best = neighbors[best_pair.0];
-            let h2_best = neighbors[best_pair.1];
-            path1_ref.fill(h1_best);
-            path2_ref.fill(h2_best);
-            for m in 0..n_markers {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    continue;
+            if informative > 0 {
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_pair = (0usize, 1usize);
+                for i in 0..limit {
+                    for j in 0..i {
+                        let s = scores[i * limit + j];
+                        if s > best_score {
+                            best_score = s;
+                            best_pair = (i, j);
+                        }
+                    }
                 }
-                let r1 = phase_ibs.allele(m, h1_best);
-                let r2 = phase_ibs.allele(m, h2_best);
-                let m1 = r1 == a1 && r2 == a2;
-                let m2 = r1 == a2 && r2 == a1;
-                if m1 && !m2 {
-                    h1_alleles[m] = a1;
-                    h2_alleles[m] = a2;
-                } else if m2 && !m1 {
-                    h1_alleles[m] = a2;
-                    h2_alleles[m] = a1;
+
+                let h1_best = neighbors[best_pair.0];
+                let h2_best = neighbors[best_pair.1];
+                path1_ref.fill(h1_best);
+                path2_ref.fill(h2_best);
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                        continue;
+                    }
+                    let r1 = phase_ibs.allele(m, h1_best);
+                    let r2 = phase_ibs.allele(m, h2_best);
+                    let m1 = r1 == a1 && r2 == a2;
+                    let m2 = r1 == a2 && r2 == a1;
+                    if m1 && !m2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if m2 && !m1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
                 }
+                seeded_from_heuristic = true;
             }
-            seeded_from_heuristic = true;
         }
     }
 
@@ -8436,6 +8449,49 @@ fn sample_dynamic_mcmc(
             let old = neighbors[replace_idx];
             seen.remove(&old);
             neighbors[replace_idx] = h;
+        }
+    }
+
+    fn refill_neighbors_for_marker(
+        neighbors: &mut Vec<u32>,
+        n_states: usize,
+        n_haps: u32,
+        hap1_idx: u32,
+        marker_idx: usize,
+        rng: &mut impl rand::Rng,
+        allow_donor_at_marker: &impl Fn(u32, usize) -> bool,
+    ) {
+        if n_haps <= 2 {
+            return;
+        }
+        let target = n_states.min((n_haps.saturating_sub(2)) as usize).max(1);
+        let mut seen: HashSet<u32> = HashSet::with_capacity(target.saturating_mul(2).max(8));
+        neighbors.retain(|&h| {
+            h != hap1_idx
+                && h != hap1_idx + 1
+                && (h as usize) < n_haps as usize
+                && allow_donor_at_marker(h, marker_idx)
+                && seen.insert(h)
+        });
+        if neighbors.len() >= target {
+            neighbors.truncate(target);
+            return;
+        }
+
+        let max_attempts = target.saturating_mul(32).max(64);
+        let mut attempts = 0usize;
+        while neighbors.len() < target && attempts < max_attempts {
+            attempts += 1;
+            let h = rng.random_range(0..n_haps);
+            if h == hap1_idx || h == hap1_idx + 1 {
+                continue;
+            }
+            if !allow_donor_at_marker(h, marker_idx) {
+                continue;
+            }
+            if seen.insert(h) {
+                neighbors.push(h);
+            }
         }
     }
 
@@ -8617,7 +8673,18 @@ fn sample_dynamic_mcmc(
         mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
         neighbors.retain(|&h| allow_donor_at_marker(h, center_marker));
         if neighbors.is_empty() {
-            continue;
+            refill_neighbors_for_marker(
+                &mut neighbors,
+                n_states,
+                n_haps,
+                hap1_idx,
+                center_marker,
+                &mut rng,
+                &allow_donor_at_marker,
+            );
+            if neighbors.is_empty() {
+                continue;
+            }
         }
         record_neighbors(&neighbors);
 
@@ -8708,7 +8775,18 @@ fn sample_dynamic_mcmc(
         mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
         neighbors.retain(|&h| allow_donor_at_marker(h, center_marker));
         if neighbors.is_empty() {
-            continue;
+            refill_neighbors_for_marker(
+                &mut neighbors,
+                n_states,
+                n_haps,
+                hap1_idx,
+                center_marker,
+                &mut rng,
+                &allow_donor_at_marker,
+            );
+            if neighbors.is_empty() {
+                continue;
+            }
         }
         record_neighbors(&neighbors);
 
