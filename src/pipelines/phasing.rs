@@ -573,8 +573,22 @@ fn adaptive_prescan_top_m(scores: &[f32], base_top: usize, n_ref_haps: usize) ->
     if min_top >= base {
         return base;
     }
-    let finite_count = scores.iter().filter(|&&s| s.is_finite() && s > 0.0).count();
-    let uncertainty = (finite_count as f32 / n_ref_haps as f32).clamp(0.0, 1.0);
+    const SCORE_DENSITY_SAMPLES: usize = 2048;
+    let n = scores.len().min(n_ref_haps);
+    if n == 0 {
+        return min_top;
+    }
+    let samples = n.min(SCORE_DENSITY_SAMPLES).max(1);
+    let mut finite_hits = 0usize;
+    for i in 0..samples {
+        let idx = ((i as u128 * n as u128) / samples as u128) as usize;
+        let clamped = idx.min(n.saturating_sub(1));
+        let s = scores[clamped];
+        if s.is_finite() && s > 0.0 {
+            finite_hits += 1;
+        }
+    }
+    let uncertainty = (finite_hits as f32 / samples as f32).clamp(0.0, 1.0);
     let span = (base - min_top) as f32;
     (min_top as f32 + span * uncertainty)
         .round()
