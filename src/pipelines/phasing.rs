@@ -844,6 +844,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
+        let marker_idx = MarkerIdx::new(orig_m as u32);
         let mut cached_sample_idx = usize::MAX;
         let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
         let mut cached_query_probs = [[0.5f32, 0.5f32]; 2];
@@ -875,10 +876,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
                     let phase_conf = target_gt
-                        .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let geno_conf = target_gt
-                        .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
                     if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
@@ -1083,6 +1084,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     for (rev_step, m) in (start..end).rev().enumerate() {
         let local_idx = end - start - 1 - rev_step;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
+        let marker_idx = MarkerIdx::new(orig_m as u32);
         let mut cached_sample_idx = usize::MAX;
         let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
         let mut cached_query_probs = [[0.5f32, 0.5f32]; 2];
@@ -1114,10 +1116,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
                     let phase_conf = target_gt
-                        .sample_phase_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let geno_conf = target_gt
-                        .sample_confidence_f32(MarkerIdx::new(orig_m as u32), sample_idx)
+                        .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
                     if best_orient_err > phase_query_orientation_error_limit(geno_conf) {
@@ -3659,6 +3661,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .collect();
 
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            let mut cohort_calibration: Option<CohortCalibration> = None;
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
                 self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -3680,6 +3683,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 } else {
                     None
                 };
+                let mut cohort_stats = if is_burnin && it == 0 {
+                    Some(vec![SampleCohortStats::default(); n_samples])
+                } else {
+                    None
+                };
 
                 self.run_phase_baum_iteration(
                     target_gt,
@@ -3688,6 +3696,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     &gen_dists,
                     &mut sample_phases,
                     &mut mcmc_paths,
+                    cohort_calibration
+                        .as_ref()
+                        .map(|cal| cal.sample_p_mismatch.as_slice()),
+                    cohort_stats.as_deref_mut(),
                     atomic_estimates.as_ref(),
                     &confidence_by_sample,
                 )?;
@@ -3711,6 +3723,25 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         p_recomb = std::iter::once(0.0f32)
                             .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
                             .collect();
+                    }
+                }
+
+                if let Some(stats) = cohort_stats {
+                    if let Some(model) = fit_cohort_calibration(&stats, self.params.p_mismatch) {
+                        let preview: Vec<String> = model
+                            .cohort_p_mismatch
+                            .iter()
+                            .zip(model.cohort_sizes.iter())
+                            .map(|(&p, &n)| format!("{:.6} (n={})", p, n))
+                            .collect();
+                        eprintln!(
+                            "Cohort calibration enabled: {} cohorts, p_mismatch={}",
+                            model.cohort_p_mismatch.len(),
+                            preview.join(", ")
+                        );
+                        cohort_calibration = Some(model);
+                    } else {
+                        eprintln!("Cohort calibration skipped: insufficient structure in burn-in");
                     }
                 }
             }
@@ -4950,6 +4981,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         gen_dists: &[f64],
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
+        sample_p_mismatch: Option<&[f32]>,
+        cohort_stats_out: Option<&mut [SampleCohortStats]>,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
     ) -> Result<()> {
@@ -4998,6 +5031,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Vec<(usize, f32)>,
             Vec<(usize, f32)>,
             Option<GlobalMosaicPaths>,
+            Option<SampleCohortStats>,
         )> = info_span!("build_composite_view").in_scope(|| {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
@@ -5016,24 +5050,27 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
             let prior_paths = &mcmc_paths[..];
             let sample_phase_view: &[SamplePhase] = &*sample_phases;
+            let collect_cohort_stats = cohort_stats_out.is_some();
             let mut swap_results: Vec<(
                 BitVec<u8, Lsb0>,
                 Vec<(usize, f32)>,
                 Vec<(usize, f32)>,
                 Option<GlobalMosaicPaths>,
+                Option<SampleCohortStats>,
             )> = vec![
                 (
                     BitVec::repeat(false, n_markers),
                     Vec::new(),
                     Vec::new(),
-                    None
+                    None,
+                    None,
                 );
                 n_samples
             ];
 
             tracing::info_span!("hmm_samples").in_scope(|| {
                 swap_results.par_iter_mut().enumerate().for_each(
-                    |(s, (mask, het_lr_out, het_phase_out, paths_out))| {
+                    |(s, (mask, het_lr_out, het_phase_out, paths_out, cohort_stats_out_one))| {
                         let sample_idx = SampleIdx::new(s as u32);
                         let hap1 = sample_idx.hap1();
                         let hap2 = sample_idx.hap2();
@@ -5058,6 +5095,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let seq2 = ref_geno.haplotype(hap2);
                         // Use pre-computed confidence instead of recomputing
                         let sample_conf = &confidence_by_sample[s];
+                        let sample_p_err = sample_p_mismatch
+                            .and_then(|v| v.get(s))
+                            .copied()
+                            .unwrap_or(self.params.p_mismatch)
+                            .clamp(1e-6, 0.25);
+                        let sample_p_no_err = 1.0 - sample_p_err;
 
                         // 3. Run HMM with per-heterozygote swap probabilities
                         // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
@@ -5072,8 +5115,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         // Collect EM statistics if requested (using original sequences)
                         // Only create HMM when needed to avoid unnecessary p_recomb.clone()
                         if n_states_full > final_states {
+                            let mut local_params = self.params.clone();
+                            local_params.p_mismatch = sample_p_err;
                             let hmm_full =
-                                MosaicHmm::new(ref_view, &self.params, n_states_full, p_recomb);
+                                MosaicHmm::new(ref_view, &local_params, n_states_full, p_recomb);
                             let mut fwd1 = Vec::new();
                             let mut bwd1 = Vec::new();
                             let mut fwd2 = Vec::new();
@@ -5162,13 +5207,21 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             selection_applied = true;
                         }
 
-                        if let Some(atomic) = atomic_estimates {
-                            let hmm = MosaicHmm::new(ref_view, &self.params, n_states, p_recomb);
+                        let local_estimates: Option<crate::model::parameters::ParamEstimates> =
+                            if atomic_estimates.is_some() || collect_cohort_stats {
+                            let mut local_params = self.params.clone();
+                            local_params.p_mismatch = sample_p_err;
+                            let hmm = MosaicHmm::new(ref_view, &local_params, n_states, p_recomb);
                             let mut local_est = crate::model::parameters::ParamEstimates::new();
                             hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
                             hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
-                            atomic.add_estimation_data(&local_est);
-                        }
+                            if let Some(atomic) = atomic_estimates {
+                                atomic.add_estimation_data(&local_est);
+                            }
+                            Some(local_est)
+                        } else {
+                            None
+                        };
 
                         // 3-Track HMM with Prior-First Approach
                         //
@@ -5190,9 +5243,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     && sample_phase_view[s].is_unphased(m)
                             })
                             .collect();
-
-                        let p_err = self.params.p_mismatch;
-                        let p_no_err = 1.0 - p_err;
 
                         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) =
                             THREAD_WORKSPACE.with(|ws| {
@@ -5240,8 +5290,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     sample_seed,
                                     self.config.mcmc_burnin,
                                     self.config.mcmc_lr_samples,
-                                    p_no_err,
-                                    p_err,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     ws,
                                 );
                                 result
