@@ -4169,6 +4169,7 @@ impl crate::pipelines::ImputationPipeline {
                 Vec<usize>,
                 Vec<RankBeam>,
                 Vec<PbwtQueryAllele>,
+                Vec<f32>,
                 Vec<u32>,
                 Vec<(u32, u32, u32)>,
             )> = Vec::new();
@@ -4178,9 +4179,17 @@ impl crate::pipelines::ImputationPipeline {
                 let haps: Vec<usize> = (start..end).collect();
                 let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
                 let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+                let query_info_weight = vec![0.0f32; haps.len()];
                 let current_donor = vec![0u32; haps.len()];
                 let scratch = Vec::new();
-                batches.push((haps, beams, query_alleles, current_donor, scratch));
+                batches.push((
+                    haps,
+                    beams,
+                    query_alleles,
+                    query_info_weight,
+                    current_donor,
+                    scratch,
+                ));
                 start = end;
             }
 
@@ -4188,6 +4197,9 @@ impl crate::pipelines::ImputationPipeline {
                 let entry = counts.entry(hap).or_insert(0);
                 *entry = entry.saturating_add(1);
             };
+            // Information weight in natural log space for one informative allele observation.
+            let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
+            let info_llr = ((1.0 - theta) / theta).ln();
 
             for ref_m in 0..n_ref_markers {
                 let col = &ref_columns[ref_m];
@@ -4198,7 +4210,9 @@ impl crate::pipelines::ImputationPipeline {
                     .max(1);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
+                for (haps, beams, query_alleles, query_info_weight, _, scratch) in
+                    batches.iter_mut()
+                {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
                         let target_marker = MarkerIdx::new(target_idx as u32);
@@ -4209,11 +4223,15 @@ impl crate::pipelines::ImputationPipeline {
 
                         let mut cached_sample_idx = usize::MAX;
                         let mut cached_query_pair = [255u8; 2];
+                        let mut cached_wildcard_weight = 0.0f32;
+                        let mut cached_allele_weight = 0.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
                             if sample_idx != cached_sample_idx {
                                 cached_sample_idx = sample_idx;
+                                cached_wildcard_weight = 0.0;
+                                cached_allele_weight = 0.0;
                                 let hap1 = sample_idx * 2;
                                 let hap2 = hap1 + 1;
                                 let h1 = HapIdx::new(hap1 as u32);
@@ -4261,9 +4279,14 @@ impl crate::pipelines::ImputationPipeline {
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
                                     let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                                    if best_orient_err > phase_query_orientation_error_limit(geno_conf)
-                                    {
+                                    let err_limit =
+                                        phase_query_orientation_error_limit(geno_conf).max(1e-6);
+                                    let orientation_weight =
+                                        (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
+                                    cached_allele_weight = orientation_weight;
+                                    if best_orient_err > err_limit {
                                         cached_query_pair = [255, 255];
+                                        cached_wildcard_weight = info_llr * orientation_weight;
                                     } else if phase_conf < 0.5 {
                                         cached_query_pair = [mapped2, mapped1];
                                     } else {
@@ -4271,14 +4294,27 @@ impl crate::pipelines::ImputationPipeline {
                                     }
                                 } else {
                                     cached_query_pair = [mapped1, mapped2];
+                                    cached_allele_weight = 1.0;
                                 }
                             }
-                            query_alleles[i] = PbwtQueryAllele::allele(cached_query_pair[local])
+                            let query = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
+                            let target_allele = query.as_allele().unwrap_or(255);
+                            query_info_weight[i] = if target_allele != 255
+                                && (target_allele as usize) < n_alleles
+                            {
+                                info_llr * cached_allele_weight
+                            } else if query.is_wildcard() {
+                                cached_wildcard_weight
+                            } else {
+                                0.0
+                            };
+                            query_alleles[i] = query;
                         }
                     } else {
-                        for qa in query_alleles.iter_mut() {
+                        for (qa, iw) in query_alleles.iter_mut().zip(query_info_weight.iter_mut()) {
                             *qa = PbwtQueryAllele::wildcard();
+                            *iw = 0.0;
                         }
                     }
 
@@ -4289,21 +4325,18 @@ impl crate::pipelines::ImputationPipeline {
                 // Donor/confusion evidence should be collected where the target
                 // is informative in this window, and across the overlap tail for
                 // handoff continuity.
-                let aligned_target_idx = alignment
+                let aligned_here = alignment
                     .ref_to_target
                     .get(ref_m)
                     .and_then(|v| *v)
-                    .map(|m| m.as_usize());
-                let aligned_here = aligned_target_idx.is_some();
+                    .is_some();
                 let in_overlap = ref_m >= overlap_start && ref_m < output_end;
                 let store = aligned_here || in_overlap;
 
-                // Information weight in natural log space for one informative allele observation.
-                let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
-                let info_llr = ((1.0 - theta) / theta).ln();
-
                 if store {
-                    for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
+                    for (haps, beams, query_alleles, query_info_weight, current_donor, _) in
+                        batches.iter_mut()
+                    {
                         let mut donor_candidates: Vec<u32> =
                             Vec::with_capacity(SM_MATCH_DONORS.saturating_mul(2));
                         for (i, &hap_idx) in haps.iter().enumerate() {
@@ -4318,55 +4351,7 @@ impl crate::pipelines::ImputationPipeline {
                                 .unwrap_or(current_donor[i]);
                             current_donor[i] = donor;
 
-                            let target_allele = query_alleles
-                                .get(i)
-                                .and_then(|qa| qa.as_allele())
-                                .unwrap_or(255);
-                            let info_weight = if target_allele != 255
-                                && (target_allele as usize) < n_alleles
-                            {
-                                info_llr
-                            } else if query_alleles[i].is_wildcard() {
-                                let mut certainty = 0.0f32;
-                                if let Some(target_idx) = aligned_target_idx {
-                                    let target_marker = MarkerIdx::new(target_idx as u32);
-                                    let sample_idx = hap_idx / 2;
-                                    let input_phased = phase_mask
-                                        .and_then(|mask| mask.get(target_idx, sample_idx))
-                                        .map(|v| v != 0)
-                                        .unwrap_or(true);
-                                    if input_phased {
-                                        let hap1 = HapIdx::new((sample_idx * 2) as u32);
-                                        let hap2 = HapIdx::new((sample_idx * 2 + 1) as u32);
-                                        let mut a1 = target_win.allele(target_marker, hap1);
-                                        let mut a2 = target_win.allele(target_marker, hap2);
-                                        if let Some(missing) = target_missing {
-                                            if missing.allele(target_marker, hap1) == 255 {
-                                                a1 = 255;
-                                            }
-                                            if missing.allele(target_marker, hap2) == 255 {
-                                                a2 = 255;
-                                            }
-                                        }
-                                        if a1 != 255 && a2 != 255 && a1 != a2 {
-                                            let phase_conf = target_win
-                                                .sample_phase_confidence_f32(target_marker, sample_idx)
-                                                .clamp(0.0, 1.0);
-                                            let geno_conf = target_win
-                                                .sample_confidence_f32(target_marker, sample_idx)
-                                                .clamp(0.0, 1.0);
-                                            let best_orient_err = phase_conf.min(1.0 - phase_conf);
-                                            let err_limit = phase_query_orientation_error_limit(geno_conf)
-                                                .max(1e-6);
-                                            certainty = (1.0 - best_orient_err / err_limit)
-                                                .clamp(0.0, 1.0);
-                                        }
-                                    }
-                                }
-                                info_llr * certainty
-                            } else {
-                                0.0
-                            };
+                            let info_weight = query_info_weight[i];
                             if info_weight > 0.0 {
                                 sm_total_info[hap_idx] += info_weight;
                             }
