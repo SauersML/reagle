@@ -4208,7 +4208,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .max(per_window_cap)
                     .min(n_ref_haps.max(1));
                 for (i, &hap_idx) in batch_haps_buf.iter().enumerate() {
-                    let top_m = adaptive_prescan_top_m(&window_scores_buf[i], base_top_m, n_ref_haps);
+                    let top_m =
+                        adaptive_prescan_top_m(&window_scores_buf[i], base_top_m, n_ref_haps);
                     let top = select_top_k(&window_scores_buf[i], top_m);
                     scores_by_window_by_hap[hap_idx].push(top);
                 }
@@ -8581,7 +8582,7 @@ fn sample_dynamic_mcmc(
                         if h == hap1_idx || h == hap1_idx + 1 {
                             continue;
                         }
-                        if !allow_donor_at_marker(h, m) {
+                        if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
                             if rejected_seen_buf.insert(h) {
                                 rejected_buf.push(h);
                             }
