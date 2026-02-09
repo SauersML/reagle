@@ -4577,8 +4577,8 @@ impl crate::pipelines::ImputationPipeline {
                     true
                 } else if has_priors_h1 {
                     true
-                } else if no_info_h1 || insufficient_info_h1 {
-                    false
+                } else if no_info_h1 {
+                    true
                 } else {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
@@ -4587,8 +4587,8 @@ impl crate::pipelines::ImputationPipeline {
                     true
                 } else if has_priors_h2 {
                     true
-                } else if no_info_h2 || insufficient_info_h2 {
-                    false
+                } else if no_info_h2 {
+                    true
                 } else {
                     conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
