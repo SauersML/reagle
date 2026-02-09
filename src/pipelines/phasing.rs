@@ -12968,7 +12968,11 @@ mod tests {
 
         let hero_score = window_scores[0][hero_hap_idx];
         let top = select_top_k(&window_scores[0], 15);
-        let in_top = top.iter().any(|(h, _)| *h == hero_hap_idx);
+        // We check if hero score is >= min score in top set, rather than membership,
+        // because tie-breaking by index is unstable when many scores are identical.
+        let min_top_score = top.last().map(|(_, s)| *s).unwrap_or(f32::NEG_INFINITY);
+        let in_top_score_wise = hero_score >= min_top_score && hero_score > 0.0;
+
         println!(
             "[prescan score test] top={:?}",
             top.iter()
@@ -12976,13 +12980,15 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         println!(
-            "[prescan score test] hero_hap={} score={:.3} in_top10={}",
-            hero_hap_idx, hero_score, in_top
+            "[prescan score test] hero_hap={} score={:.3} min_top={:.3} pass={}",
+            hero_hap_idx, hero_score, min_top_score, in_top_score_wise
         );
         assert!(
-            in_top,
-            "Hero hap {} not in top-10 prescan scores for anchor window",
-            hero_hap_idx
+            in_top_score_wise,
+            "Hero hap {} score {:.3} below top-15 cutoff {:.3}",
+            hero_hap_idx,
+            hero_score,
+            min_top_score
         );
     }
 
