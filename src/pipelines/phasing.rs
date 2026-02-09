@@ -353,6 +353,24 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     ranked
 }
 
+#[inline]
+fn adaptive_prescan_top_m(scores: &[f32], base_top: usize, n_ref_haps: usize) -> usize {
+    if base_top == 0 || n_ref_haps == 0 {
+        return 0;
+    }
+    let base = base_top.min(n_ref_haps).max(1);
+    let min_top = (base / 2).max(PBWT_ADAPTIVE_K_FLOOR).min(base);
+    if min_top >= base {
+        return base;
+    }
+    let finite_count = scores.iter().filter(|&&s| s.is_finite() && s > 0.0).count();
+    let uncertainty = (finite_count as f32 / n_ref_haps as f32).clamp(0.0, 1.0);
+    let span = (base - min_top) as f32;
+    (min_top as f32 + span * uncertainty)
+        .round()
+        .clamp(min_top as f32, base as f32) as usize
+}
+
 fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(fwd.len());
     for i in 0..fwd.len() {
@@ -4185,11 +4203,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     ref_index_map.as_deref(),
                 );
 
-                let top_m = per_window_cap
+                let base_top_m = per_window_cap
                     .saturating_mul(PBWT_PER_WINDOW_MULT)
                     .max(per_window_cap)
                     .min(n_ref_haps.max(1));
                 for (i, &hap_idx) in batch_haps_buf.iter().enumerate() {
+                    let top_m = adaptive_prescan_top_m(&window_scores_buf[i], base_top_m, n_ref_haps);
                     let top = select_top_k(&window_scores_buf[i], top_m);
                     scores_by_window_by_hap[hap_idx].push(top);
                 }
@@ -8080,6 +8099,9 @@ fn sample_dynamic_mcmc(
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
+    #[derive(Clone, Copy)]
+    struct LocalMarkerIdx(usize);
+
     if het_positions.is_empty()
         || n_markers == 0
         || n_states == 0
@@ -8131,15 +8153,15 @@ fn sample_dynamic_mcmc(
     const IBD2_DIRECTION_MARGIN: f32 = 0.05;
     const IBD2_HIGH_CONF: f32 = 0.985;
 
-    let allow_donor_at_marker = |donor_hap: u32, marker_idx: usize| -> bool {
-        if marker_idx >= n_markers {
+    let allow_donor_at_marker = |donor_hap: u32, marker_idx: LocalMarkerIdx| -> bool {
+        if marker_idx.0 >= n_markers {
             return false;
         }
         let donor_sample = donor_hap / 2;
         if donor_sample == sample_idx {
             return false;
         }
-        let Some(global_m) = hi_freq_to_orig.get(marker_idx).copied() else {
+        let Some(global_m) = hi_freq_to_orig.get(marker_idx.0).copied() else {
             return false;
         };
         let Some(segments) = ibs2_by_other.get(&donor_sample) else {
@@ -8160,7 +8182,7 @@ fn sample_dynamic_mcmc(
             .copied()
             .unwrap_or(0.5)
             .clamp(0.0, 1.0);
-        let local_recipient = phase_conf[marker_idx].clamp(0.0, 1.0);
+        let local_recipient = phase_conf[marker_idx.0].clamp(0.0, 1.0);
         if donor_stability >= IBD2_HIGH_CONF && local_recipient >= IBD2_HIGH_CONF {
             return true;
         }
@@ -8244,7 +8266,7 @@ fn sample_dynamic_mcmc(
     if !initial_neighbors.is_empty() {
         let mut filtered = Vec::with_capacity(initial_neighbors.len());
         for &h in &initial_neighbors {
-            if allow_donor_at_marker(h, center_init) {
+            if allow_donor_at_marker(h, LocalMarkerIdx(center_init)) {
                 filtered.push(h);
             }
         }
@@ -8457,9 +8479,9 @@ fn sample_dynamic_mcmc(
         n_states: usize,
         n_haps: u32,
         hap1_idx: u32,
-        marker_idx: usize,
+        marker_idx: LocalMarkerIdx,
         rng: &mut impl rand::Rng,
-        allow_donor_at_marker: &impl Fn(u32, usize) -> bool,
+        allow_donor_at_marker: &impl Fn(u32, LocalMarkerIdx) -> bool,
     ) {
         if n_haps <= 2 {
             return;
@@ -8662,7 +8684,7 @@ fn sample_dynamic_mcmc(
         collect_dynamic_neighbors(&path1_ref, &h1_alleles, &mut neighbors);
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
-            && allow_donor_at_marker(ref_hap, center_marker)
+            && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
             && !neighbors.contains(&ref_hap)
         {
             neighbors.push(ref_hap);
@@ -8671,14 +8693,14 @@ fn sample_dynamic_mcmc(
             continue;
         }
         mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
-        neighbors.retain(|&h| allow_donor_at_marker(h, center_marker));
+        neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
         if neighbors.is_empty() {
             refill_neighbors_for_marker(
                 &mut neighbors,
                 n_states,
                 n_haps,
                 hap1_idx,
-                center_marker,
+                LocalMarkerIdx(center_marker),
                 &mut rng,
                 &allow_donor_at_marker,
             );
@@ -8764,7 +8786,7 @@ fn sample_dynamic_mcmc(
         collect_dynamic_neighbors(&path2_ref, &h2_alleles, &mut neighbors);
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
-            && allow_donor_at_marker(ref_hap, center_marker)
+            && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
             && !neighbors.contains(&ref_hap)
         {
             neighbors.push(ref_hap);
@@ -8773,14 +8795,14 @@ fn sample_dynamic_mcmc(
             continue;
         }
         mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
-        neighbors.retain(|&h| allow_donor_at_marker(h, center_marker));
+        neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
         if neighbors.is_empty() {
             refill_neighbors_for_marker(
                 &mut neighbors,
                 n_states,
                 n_haps,
                 hap1_idx,
-                center_marker,
+                LocalMarkerIdx(center_marker),
                 &mut rng,
                 &allow_donor_at_marker,
             );
