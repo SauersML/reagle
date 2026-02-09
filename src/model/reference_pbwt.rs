@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 const MAX_RANK_INTERVALS: usize = 8;
+const PBWT_SCORE_SCALE: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RankBeam {
@@ -85,7 +86,7 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     donor_candidate_pos: Vec<usize>,
     donor_seen_marks: Vec<u32>,
     donor_seen_tick: u32,
-    step_scratch: Vec<(u32, u32, u32)>,
+    step_scratch: Vec<(u32, u32, u64)>,
     wanted_map: HashMap<u32, usize>,
     found_pos_start: Vec<(usize, i32)>,
     found_mask: Vec<bool>,
@@ -102,6 +103,12 @@ pub enum PbwtQueryAllele {
 pub enum PbwtStrictAllele {
     Allele(u8),
     Missing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PbwtBiallelicQueryProb {
+    p0: f32,
+    p1: f32,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -190,6 +197,61 @@ impl PbwtStrictAllele {
     }
 }
 
+impl PbwtBiallelicQueryProb {
+    #[inline]
+    pub fn new(p0: f32, p1: f32) -> Self {
+        let a = p0.clamp(0.0, 1.0);
+        let b = p1.clamp(0.0, 1.0);
+        let s = a + b;
+        if s <= f32::EPSILON {
+            Self { p0: 0.5, p1: 0.5 }
+        } else {
+            Self {
+                p0: a / s,
+                p1: b / s,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn uniform() -> Self {
+        Self { p0: 0.5, p1: 0.5 }
+    }
+
+    #[inline]
+    pub fn deterministic(allele: u8) -> Self {
+        if allele == 0 {
+            Self { p0: 1.0, p1: 0.0 }
+        } else if allele == 1 {
+            Self { p0: 0.0, p1: 1.0 }
+        } else {
+            Self::uniform()
+        }
+    }
+
+    #[inline]
+    pub fn prob_for_allele(self, allele: u8) -> f32 {
+        if allele == 0 {
+            self.p0
+        } else if allele == 1 {
+            self.p1
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    fn prob_for_bin(self, b: usize) -> f32 {
+        if b == 0 {
+            self.p0
+        } else if b == 2 {
+            self.p1
+        } else {
+            0.0
+        }
+    }
+}
+
 impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     #[inline]
     fn push_top_k_choice(
@@ -239,7 +301,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
 
     #[inline]
     fn load_top_intervals(
-        scratch: &mut Vec<(u32, u32, u32)>,
+        scratch: &mut Vec<(u32, u32, u64)>,
         next: &mut RankBeam,
         keep_cap: usize,
     ) {
@@ -256,6 +318,19 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             next.intervals[i] = (scratch[i].0, scratch[i].1);
         }
         next.len = keep;
+    }
+
+    #[inline]
+    fn scaled_score(len: u32, prob: f32) -> u64 {
+        let p = prob.clamp(0.0, 1.0) as f64;
+        let weighted = (len as f64) * p * (PBWT_SCORE_SCALE as f64);
+        if weighted <= 0.0 {
+            0
+        } else if weighted >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            weighted.round() as u64
+        }
     }
 
     pub fn new(n_ref_haps: usize) -> Self {
@@ -562,12 +637,13 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         self.prefix_counts[Self::prefix_idx(bin, p, n_ref)]
     }
 
-    pub fn advance_with_beams_query(
+    pub fn advance_with_beams_query_probs(
         &mut self,
         ref_alleles: &[u8],
         n_alleles: usize,
         marker: usize,
         query_alleles: &[PbwtQueryAllele],
+        query_bin_probs: Option<&[PbwtBiallelicQueryProb]>,
         beams: &mut [RankBeam],
     ) {
         let mut scratch = std::mem::take(&mut self.step_scratch);
@@ -576,6 +652,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             n_alleles,
             marker,
             query_alleles,
+            query_bin_probs,
             beams,
             &mut scratch,
         );
@@ -608,11 +685,18 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         n_alleles: usize,
         marker: usize,
         query_alleles: &[PbwtQueryAllele],
+        query_bin_probs: Option<&[PbwtBiallelicQueryProb]>,
         beams: &mut [RankBeam],
-        scratch: &mut Vec<(u32, u32, u32)>,
+        scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         self.prepare_step(ref_alleles, n_alleles);
-        self.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch);
+        self.update_beams_with_scratch_query(
+            beams,
+            query_alleles,
+            query_bin_probs,
+            n_alleles,
+            scratch,
+        );
         self.finalize_step(ref_alleles, n_alleles, marker);
     }
 
@@ -623,7 +707,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         marker: usize,
         query_alleles: &[PbwtStrictAllele],
         beams: &mut [RankBeam],
-        scratch: &mut Vec<(u32, u32, u32)>,
+        scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         self.prepare_step(ref_alleles, n_alleles);
         self.update_beams_with_scratch_strict(beams, query_alleles, n_alleles, scratch);
@@ -727,8 +811,9 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         &self,
         beams: &mut [RankBeam],
         query_alleles: &[PbwtQueryAllele],
+        query_bin_probs: Option<&[PbwtBiallelicQueryProb]>,
         n_alleles: usize,
-        scratch: &mut Vec<(u32, u32, u32)>,
+        scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         let alphabet = PbwtAlphabet::new(n_alleles)
             .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
@@ -759,7 +844,19 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
-                            let score = nr - nl;
+                            let len = nr - nl;
+                            let score = if n_alleles == 2 {
+                                let p = query_bin_probs
+                                    .and_then(|probs| probs.get(q_idx))
+                                    .map(|prob| prob.prob_for_bin(b))
+                                    .unwrap_or(0.5);
+                                Self::scaled_score(len, p)
+                            } else {
+                                len as u64
+                            };
+                            if score == 0 {
+                                continue;
+                            }
                             scratch.push((nl, nr, score));
                         }
                     }
@@ -772,7 +869,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
-                            let score = nr - nl;
+                            let score = (nr - nl) as u64;
                             scratch.push((nl, nr, score));
                         }
                     }
@@ -783,7 +880,29 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     .as_allele()
                     .expect("non-wildcard/non-missing query allele should be concrete");
                 let b = Self::bin_for_allele(queried_allele, alphabet);
-                if b < n_bins {
+                if b < n_bins && n_alleles == 2 && query_bin_probs.is_some() {
+                    scratch.clear();
+                    let (p0, p1) = query_bin_probs
+                        .and_then(|probs| probs.get(q_idx))
+                        .map(|prob| (prob.prob_for_allele(0), prob.prob_for_allele(1)))
+                        .unwrap_or_else(|| if b == 0 { (1.0, 0.0) } else { (0.0, 1.0) });
+                    for &(l, r) in old.intervals() {
+                        for (bb, p) in [(0usize, p0), (2usize, p1)] {
+                            let nl =
+                                self.offset_for(bb, n_alleles) + self.rank(bb, l, n_ref, n_alleles);
+                            let nr =
+                                self.offset_for(bb, n_alleles) + self.rank(bb, r, n_ref, n_alleles);
+                            if nl < nr {
+                                let score = Self::scaled_score(nr - nl, p);
+                                if score == 0 {
+                                    continue;
+                                }
+                                scratch.push((nl, nr, score));
+                            }
+                        }
+                    }
+                    Self::load_top_intervals(scratch, &mut next, MAX_RANK_INTERVALS);
+                } else if b < n_bins {
                     for &(l, r) in old.intervals() {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
@@ -804,7 +923,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                             let nr =
                                 self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                             if nl < nr {
-                                let score = nr - nl;
+                                let score = (nr - nl) as u64;
                                 scratch.push((nl, nr, score));
                             }
                         }
@@ -837,7 +956,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         beams: &mut [RankBeam],
         query_alleles: &[PbwtStrictAllele],
         n_alleles: usize,
-        scratch: &mut Vec<(u32, u32, u32)>,
+        scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         let alphabet = PbwtAlphabet::new(n_alleles)
             .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
@@ -865,7 +984,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let nl = self.offset_for(b, n_alleles) + self.rank(b, l, n_ref, n_alleles);
                         let nr = self.offset_for(b, n_alleles) + self.rank(b, r, n_ref, n_alleles);
                         if nl < nr {
-                            let score = nr - nl;
+                            let score = (nr - nl) as u64;
                             scratch.push((nl, nr, score));
                         }
                     }
@@ -976,21 +1095,32 @@ impl ReferencePbwt {
         }
     }
 
-    pub fn advance_with_beams_query(
+    pub fn advance_with_beams_query_probs(
         &mut self,
         ref_alleles: &[u8],
         n_alleles: usize,
         marker: usize,
         query_alleles: &[PbwtQueryAllele],
+        query_bin_probs: Option<&[PbwtBiallelicQueryProb]>,
         beams: &mut [RankBeam],
     ) {
         match self {
-            Self::U16(inner) => {
-                inner.advance_with_beams_query(ref_alleles, n_alleles, marker, query_alleles, beams)
-            }
-            Self::U32(inner) => {
-                inner.advance_with_beams_query(ref_alleles, n_alleles, marker, query_alleles, beams)
-            }
+            Self::U16(inner) => inner.advance_with_beams_query_probs(
+                ref_alleles,
+                n_alleles,
+                marker,
+                query_alleles,
+                query_bin_probs,
+                beams,
+            ),
+            Self::U32(inner) => inner.advance_with_beams_query_probs(
+                ref_alleles,
+                n_alleles,
+                marker,
+                query_alleles,
+                query_bin_probs,
+                beams,
+            ),
         }
     }
 
@@ -1005,15 +1135,28 @@ impl ReferencePbwt {
         &mut self,
         beams: &mut [RankBeam],
         query_alleles: &[PbwtQueryAllele],
+        query_bin_probs: Option<&[PbwtBiallelicQueryProb]>,
         n_alleles: usize,
-        scratch: &mut Vec<(u32, u32, u32)>,
+        scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         match self {
             Self::U16(inner) => {
-                inner.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch)
+                inner.update_beams_with_scratch_query(
+                    beams,
+                    query_alleles,
+                    query_bin_probs,
+                    n_alleles,
+                    scratch,
+                )
             }
             Self::U32(inner) => {
-                inner.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch)
+                inner.update_beams_with_scratch_query(
+                    beams,
+                    query_alleles,
+                    query_bin_probs,
+                    n_alleles,
+                    scratch,
+                )
             }
         }
     }

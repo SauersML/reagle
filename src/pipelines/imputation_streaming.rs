@@ -4186,7 +4186,7 @@ impl crate::pipelines::ImputationPipeline {
                 Vec<PbwtQueryAllele>,
                 Vec<f32>,
                 Vec<u32>,
-                Vec<(u32, u32, u32)>,
+                Vec<(u32, u32, u64)>,
             )> = Vec::new();
             let mut start = 0usize;
             while start < n_target_haps {
@@ -4363,7 +4363,13 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    pbwt.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch);
+                    pbwt.update_beams_with_scratch_query(
+                        beams,
+                        query_alleles,
+                        None,
+                        n_alleles,
+                        scratch,
+                    );
                 }
                 pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 
@@ -5286,7 +5292,7 @@ impl crate::pipelines::ImputationPipeline {
                 Vec<PbwtQueryAllele>,
                 Vec<f32>,
                 Vec<u32>,
-                Vec<(u32, u32, u32)>,
+                Vec<(u32, u32, u64)>,
             )> = Vec::new();
             let mut start = 0usize;
             while start < sm_haps.len() {
@@ -5451,7 +5457,13 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    pbwt.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch);
+                    pbwt.update_beams_with_scratch_query(
+                        beams,
+                        query_alleles,
+                        None,
+                        n_alleles,
+                        scratch,
+                    );
                 }
                 pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 

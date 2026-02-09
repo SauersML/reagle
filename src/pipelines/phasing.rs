@@ -71,7 +71,9 @@ use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, Pbwt
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
-use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{
+    PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
+};
 use crate::model::state_allocator::allocate_lms_sparse;
 use crate::model::states::ThreadedHaps;
 use crate::model::types::{CombinedHapId, CombinedHapSpace, RefHapId, combined_from_ref};
@@ -832,6 +834,39 @@ fn phase_best_orientation_error(phase_conf: f32) -> f32 {
     p.min(1.0 - p)
 }
 
+#[inline]
+fn biallelic_haplotype_probs(
+    a1: u8,
+    a2: u8,
+    phase_conf: f32,
+) -> [PbwtBiallelicQueryProb; 2] {
+    if a1 == 0 && a2 == 1 {
+        let p = phase_conf.clamp(0.0, 1.0);
+        [
+            PbwtBiallelicQueryProb::new(p, 1.0 - p),
+            PbwtBiallelicQueryProb::new(1.0 - p, p),
+        ]
+    } else if a1 == 1 && a2 == 0 {
+        let p = phase_conf.clamp(0.0, 1.0);
+        [
+            PbwtBiallelicQueryProb::new(1.0 - p, p),
+            PbwtBiallelicQueryProb::new(p, 1.0 - p),
+        ]
+    } else if a1 == 0 && a2 == 0 {
+        [
+            PbwtBiallelicQueryProb::deterministic(0),
+            PbwtBiallelicQueryProb::deterministic(0),
+        ]
+    } else if a1 == 1 && a2 == 1 {
+        [
+            PbwtBiallelicQueryProb::deterministic(1),
+            PbwtBiallelicQueryProb::deterministic(1),
+        ]
+    } else {
+        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()]
+    }
+}
+
 fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     batch_haps: &[usize],
     target_gt: &GenotypeMatrix<TargetState, TargetSpace>,
@@ -866,7 +901,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![PbwtQueryAllele::missing(); batch_haps.len()];
-    let mut query_wildcard_probs = vec![[0.5f32, 0.5f32]; batch_haps.len()];
+    let mut query_allele_probs = vec![PbwtBiallelicQueryProb::uniform(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
@@ -876,7 +911,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
         let marker_idx = MarkerIdx::new(orig_m as u32);
         let mut cached_sample_idx = usize::MAX;
         let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
-        let mut cached_query_probs = [[0.5f32, 0.5f32]; 2];
+        let mut cached_query_probs = [PbwtBiallelicQueryProb::uniform(); 2];
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
             let local = hap_idx % 2;
@@ -898,9 +933,11 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         .copied()
                         .unwrap_or(false)
                     && is_het;
-                cached_query_probs = [[0.5, 0.5], [0.5, 0.5]];
+                cached_query_probs = biallelic_haplotype_probs(a1, a2, 1.0);
                 if wildcard_unphased_het {
                     cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    cached_query_probs =
+                        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()];
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
@@ -928,6 +965,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let phase_conf = target_gt
                         .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
+                    cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
                     let geno_conf = target_gt
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
@@ -937,12 +975,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     {
                         cached_query_pair =
                             [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
-                        let p_keep = phase_conf;
-                        if a1 == 0 && a2 == 1 {
-                            cached_query_probs = [[p_keep, 1.0 - p_keep], [1.0 - p_keep, p_keep]];
-                        } else if a1 == 1 && a2 == 0 {
-                            cached_query_probs = [[1.0 - p_keep, p_keep], [p_keep, 1.0 - p_keep]];
-                        }
                     } else if phase_conf < 0.5 {
                         cached_query_pair = [qa2, qa1];
                     } else {
@@ -950,10 +982,16 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     }
                 } else {
                     cached_query_pair = [qa1, qa2];
+                    if phased == 0 && is_het {
+                        cached_query_probs = [
+                            PbwtBiallelicQueryProb::uniform(),
+                            PbwtBiallelicQueryProb::uniform(),
+                        ];
+                    }
                 }
             }
             query_alleles[i] = cached_query_pair[local];
-            query_wildcard_probs[i] = cached_query_probs[local];
+            query_allele_probs[i] = cached_query_probs[local];
         }
 
         if let Some(alignment) = alignment {
@@ -1038,11 +1076,12 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
             (max_allele as usize).saturating_add(1).max(2)
         };
 
-        pbwt_fwd.advance_with_beams_query(
+        pbwt_fwd.advance_with_beams_query_probs(
             &ref_alleles,
             n_alleles,
             local_idx,
             &query_alleles,
+            Some(&query_allele_probs),
             &mut beams_fwd,
         );
 
@@ -1053,59 +1092,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 }
                 let donor_k =
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_fwd[i], query_alleles[i]);
-                if query_alleles[i].is_wildcard() {
-                    pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
-                    let wildcard_probs = query_wildcard_probs[i];
-                    for &d in donors_buf.iter() {
-                        let idx = d as usize;
-                        if idx >= n_ref_haps {
-                            continue;
-                        }
-                        if exclude_self && idx / 2 == hap_idx / 2 {
-                            continue;
-                        }
-                        let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
-                            continue;
-                        }
-                        if ref_allele != 0 && ref_allele != 1 {
-                            continue;
-                        }
-                        let freq = freqs
-                            .get(m)
-                            .and_then(|f| f.get(ref_allele as usize))
-                            .copied()
-                            .unwrap_or(0.0);
-                        if freq <= 0.0 {
-                            continue;
-                        }
-                        let p_match = wildcard_probs[ref_allele as usize].clamp(0.0, 1.0);
-                        if p_match <= 0.0 {
-                            continue;
-                        }
-                        let weight = p_match * -(freq.max(min_freq)).ln();
-                        let w = &mut window_scores[i][idx];
-                        if w.is_finite() {
-                            *w += weight;
-                        } else {
-                            *w = weight;
-                        }
-                    }
-                    continue;
-                }
-                let targ = query_alleles[i]
-                    .as_allele()
-                    .expect("non-missing/non-wildcard query allele should be concrete");
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
                 pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
+                let allele_probs = query_allele_probs[i];
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -1114,10 +1102,23 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if exclude_self && idx / 2 == hap_idx / 2 {
                         continue;
                     }
-                    let ref_a = ref_alleles[idx];
-                    if ref_a == 255 || ref_a != targ {
+                    let ref_allele = ref_alleles[idx];
+                    if ref_allele == 255 || ref_allele > 1 {
                         continue;
                     }
+                    let p_match = allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0);
+                    if p_match <= 0.0 {
+                        continue;
+                    }
+                    let freq = freqs
+                        .get(m)
+                        .and_then(|f| f.get(ref_allele as usize))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
@@ -1139,7 +1140,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
         let marker_idx = MarkerIdx::new(orig_m as u32);
         let mut cached_sample_idx = usize::MAX;
         let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
-        let mut cached_query_probs = [[0.5f32, 0.5f32]; 2];
+        let mut cached_query_probs = [PbwtBiallelicQueryProb::uniform(); 2];
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
             let local = hap_idx % 2;
@@ -1161,9 +1162,11 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         .copied()
                         .unwrap_or(false)
                     && is_het;
-                cached_query_probs = [[0.5, 0.5], [0.5, 0.5]];
+                cached_query_probs = biallelic_haplotype_probs(a1, a2, 1.0);
                 if wildcard_unphased_het {
                     cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    cached_query_probs =
+                        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()];
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
@@ -1191,6 +1194,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let phase_conf = target_gt
                         .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
+                    cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
                     let geno_conf = target_gt
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
@@ -1200,12 +1204,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     {
                         cached_query_pair =
                             [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
-                        let p_keep = phase_conf;
-                        if a1 == 0 && a2 == 1 {
-                            cached_query_probs = [[p_keep, 1.0 - p_keep], [1.0 - p_keep, p_keep]];
-                        } else if a1 == 1 && a2 == 0 {
-                            cached_query_probs = [[1.0 - p_keep, p_keep], [p_keep, 1.0 - p_keep]];
-                        }
                     } else if phase_conf < 0.5 {
                         cached_query_pair = [qa2, qa1];
                     } else {
@@ -1213,10 +1211,16 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     }
                 } else {
                     cached_query_pair = [qa1, qa2];
+                    if phased == 0 && is_het {
+                        cached_query_probs = [
+                            PbwtBiallelicQueryProb::uniform(),
+                            PbwtBiallelicQueryProb::uniform(),
+                        ];
+                    }
                 }
             }
             query_alleles[i] = cached_query_pair[local];
-            query_wildcard_probs[i] = cached_query_probs[local];
+            query_allele_probs[i] = cached_query_probs[local];
         }
 
         if let Some(alignment) = alignment {
@@ -1301,11 +1305,12 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
             (max_allele as usize).saturating_add(1).max(2)
         };
 
-        pbwt_bwd.advance_with_beams_query(
+        pbwt_bwd.advance_with_beams_query_probs(
             &ref_alleles,
             n_alleles,
             rev_step,
             &query_alleles,
+            Some(&query_allele_probs),
             &mut beams_bwd,
         );
 
@@ -1316,59 +1321,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 }
                 let donor_k =
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_bwd[i], query_alleles[i]);
-                if query_alleles[i].is_wildcard() {
-                    pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
-                    let wildcard_probs = query_wildcard_probs[i];
-                    for &d in donors_buf.iter() {
-                        let idx = d as usize;
-                        if idx >= n_ref_haps {
-                            continue;
-                        }
-                        if exclude_self && idx / 2 == hap_idx / 2 {
-                            continue;
-                        }
-                        let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
-                            continue;
-                        }
-                        if ref_allele != 0 && ref_allele != 1 {
-                            continue;
-                        }
-                        let freq = freqs
-                            .get(m)
-                            .and_then(|f| f.get(ref_allele as usize))
-                            .copied()
-                            .unwrap_or(0.0);
-                        if freq <= 0.0 {
-                            continue;
-                        }
-                        let p_match = wildcard_probs[ref_allele as usize].clamp(0.0, 1.0);
-                        if p_match <= 0.0 {
-                            continue;
-                        }
-                        let weight = p_match * -(freq.max(min_freq)).ln();
-                        let w = &mut window_scores[i][idx];
-                        if w.is_finite() {
-                            *w += weight;
-                        } else {
-                            *w = weight;
-                        }
-                    }
-                    continue;
-                }
-                let targ = query_alleles[i]
-                    .as_allele()
-                    .expect("non-missing/non-wildcard query allele should be concrete");
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
                 pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
+                let allele_probs = query_allele_probs[i];
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -1377,10 +1331,23 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if exclude_self && idx / 2 == hap_idx / 2 {
                         continue;
                     }
-                    let ref_a = ref_alleles[idx];
-                    if ref_a == 255 || ref_a != targ {
+                    let ref_allele = ref_alleles[idx];
+                    if ref_allele == 255 || ref_allele > 1 {
                         continue;
                     }
+                    let p_match = allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0);
+                    if p_match <= 0.0 {
+                        continue;
+                    }
+                    let freq = freqs
+                        .get(m)
+                        .and_then(|f| f.get(ref_allele as usize))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
