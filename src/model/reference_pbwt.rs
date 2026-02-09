@@ -1,6 +1,6 @@
 use crate::model::pbwt::{PbwtAllele, PbwtAlphabet, PbwtDivUpdater, PbwtIndex};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -382,8 +382,15 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
 
             // Safety net: if approximation produced too few unique candidates, backfill exactly.
             if best.len() < k {
+                let mut seen_pos: HashSet<usize> = HashSet::with_capacity(best.len() * 2 + 1);
+                for c in best.iter() {
+                    seen_pos.insert(c.pos);
+                }
                 for &(l, r) in &self.intervals_buf {
                     for pos in l..r {
+                        if !seen_pos.insert(pos) {
+                            continue;
+                        }
                         let choice = DonorChoice {
                             div: self.div[pos],
                             pos,
