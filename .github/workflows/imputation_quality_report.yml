@@ -101,13 +101,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space (best effort)
+        run: |
+          set +e
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/dotnet
+          docker system prune -af >/dev/null 2>&1 || true
+          df -h
+
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
           key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Resolve convert_genome release commit
@@ -174,7 +182,7 @@ jobs:
 
       - name: Cache input-specific prep files
         id: cache-prep-input
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             target.vcf.gz
@@ -187,7 +195,7 @@ jobs:
 
       - name: Cache person-specific prep files
         id: cache-prep-person
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             truth.vcf.gz
@@ -338,7 +346,7 @@ jobs:
             tests/data/reagle_metrics.txt
 
       - name: Upload Run Outputs
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: outputs-${{ matrix.person }}-${{ hashFiles(matrix.file_path) }}

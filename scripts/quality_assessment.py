@@ -230,6 +230,21 @@ def print_vcf_diagnostics(vcf_path, label):
         print(f"Range: Error - {e}")
 
 
+def print_disk_diagnostics(label):
+    print(f"\n=== Disk Diagnostics: {label} ===")
+    for cmd in [
+        "df -h .",
+        "du -sh .cache convert_genome_array_out convert_genome_truth_out tests/data 2>/dev/null || true",
+    ]:
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            output = (result.stdout or "").strip()
+            if output:
+                print(output)
+        except Exception as e:
+            print(f"{cmd}: Error - {e}")
+
+
 def prepare_reagle_reference_from_convert_genome(output_vcf="reagle_ref.vcf.gz"):
     """
     Materialize the Reagle reference panel as a bgzipped/indexed VCF.
@@ -330,13 +345,20 @@ def run_benchmark(person, file_path):
     print_tool_versions()
     # 1. Prepare Data
     print(f"=== Preparing data for {person} ({file_path}) ===")
-    run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
+    if os.path.exists("ref.vcf.gz") and (
+        os.path.exists("ref.vcf.gz.csi") or os.path.exists("ref.vcf.gz.tbi")
+    ):
+        print("Reusing reference panel from existing artifact: ref.vcf.gz")
+    else:
+        run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
     # convert_genome array conversion writes:
     #   - target.vcf.gz (final target used by benchmark)
     #   - convert_genome_array_out/genotypes.vcf(.gz)
     #   - convert_genome_array_out/panel.vcf(.gz) [full rewritten panel artifact]
     # We keep these artifacts for diagnostics and compatibility checks.
+    print_disk_diagnostics("before array conversion")
     run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz", "ref.vcf.gz"])
+    print_disk_diagnostics("after array conversion")
 
     truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"
     run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz", "ref.vcf.gz"])
