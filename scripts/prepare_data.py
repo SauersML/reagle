@@ -4,9 +4,11 @@ import subprocess
 import glob
 import shutil
 import shlex
+import gzip
 from pathlib import Path
 
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
+CHR22_FASTA_GZ_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
 
 
 def _bump_nofile_limit(min_soft: int = 4096):
@@ -36,6 +38,26 @@ def _download_file(url, dest):
         subprocess.check_call(["curl", "-fsSL", url, "-o", str(dest)])
         return
     raise RuntimeError("Neither wget nor curl found; cannot download reference panel.")
+
+
+def _ensure_chr22_reference_fasta(local_gz: str = ".cache/reference/chr22.fa.gz",
+                                  local_fa: str = ".cache/reference/chr22.fa") -> str:
+    gz_path = Path(local_gz)
+    fa_path = Path(local_fa)
+
+    if fa_path.exists() and fa_path.stat().st_size > 0:
+        print(f"Reusing cached chr22 FASTA: {fa_path}")
+        return str(fa_path)
+
+    if not gz_path.exists() or gz_path.stat().st_size == 0:
+        gz_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading chr22 reference FASTA to {gz_path}...")
+        _download_file(CHR22_FASTA_GZ_URL, gz_path)
+
+    print(f"Decompressing chr22 FASTA to {fa_path}...")
+    with gzip.open(gz_path, "rb") as src, open(fa_path, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    return str(fa_path)
 
 
 def _has_vcf_index(vcf_path: Path):
@@ -224,7 +246,7 @@ def prepare_truth(source, output_vcf, panel_path):
     install_convert_genome()
     _bump_nofile_limit()
 
-    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    ref_hg38_fasta = _ensure_chr22_reference_fasta()
     truth_output_dir = "convert_genome_truth_out"
     _clean_output_dir(truth_output_dir)
     truth_hg38_vcf = "truth_hg38.vcf.gz"
@@ -232,7 +254,7 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         source_vcf,
-        ref_hg38_url,
+        ref_hg38_fasta,
         "--output-dir", truth_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -298,14 +320,14 @@ def run_conversion(input_path, output_vcf, panel_path):
 
     print(f"Converting {raw_file} to GRCh38 VCF...")
 
-    ref_hg38_url = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz"
+    ref_hg38_fasta = _ensure_chr22_reference_fasta()
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
 
     cmd = [
         "convert_genome",
         raw_file,
-        ref_hg38_url,
+        ref_hg38_fasta,
         "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",
