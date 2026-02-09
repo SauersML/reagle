@@ -5674,11 +5674,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add(s as u64)
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
-                        let sample_p_err = sample_p_mismatch
-                            .and_then(|v| v.get(s))
-                            .copied()
-                            .unwrap_or(self.params.p_mismatch)
-                            .clamp(1e-6, 0.25);
+                        let sample_p_err = MismatchProb::new_clamped(
+                            sample_p_mismatch
+                                .and_then(|v| v.get(s))
+                                .copied()
+                                .unwrap_or(self.params.p_mismatch),
+                        )
+                        .get();
                         let sample_p_no_err = 1.0 - sample_p_err;
 
                         // Identify unresolved heterozygotes in hi-freq space.
