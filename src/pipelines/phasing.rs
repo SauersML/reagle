@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bitvec::prelude::*;
+use linfa::DatasetBase;
+use linfa::traits::{Fit, Predict};
+use linfa_clustering::KMeans;
+use ndarray::{Array1, Array2};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use tracing::{info_span, instrument};
@@ -121,6 +125,183 @@ impl Stage1Timing {
     }
 }
 use mini_mcmc::core::{MarkovChain, Trace};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SampleCohortStats {
+    mismatch_mass: f64,
+    emission_mass: f64,
+    expected_switches: f64,
+    genetic_dist_morgans: f64,
+    phase_uncertainty_sum: f64,
+    phase_uncertainty_count: usize,
+}
+
+impl SampleCohortStats {
+    fn mean_uncertainty(self) -> f64 {
+        if self.phase_uncertainty_count == 0 {
+            0.5
+        } else {
+            (self.phase_uncertainty_sum / self.phase_uncertainty_count as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    fn has_signal(self) -> bool {
+        self.emission_mass > 0.0 && self.genetic_dist_morgans > 0.0
+    }
+}
+
+#[derive(Debug)]
+struct CohortCalibration {
+    sample_p_mismatch: Vec<f32>,
+    cohort_p_mismatch: Vec<f32>,
+    cohort_sizes: Vec<usize>,
+}
+
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let q = q.clamp(0.0, 1.0);
+    let pos = q * (sorted.len().saturating_sub(1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let w = pos - lo as f64;
+        sorted[lo] * (1.0 - w) + sorted[hi] * w
+    }
+}
+
+fn robust_center_scale(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 1.0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = percentile(&sorted, 0.5);
+    let q1 = percentile(&sorted, 0.25);
+    let q3 = percentile(&sorted, 0.75);
+    let iqr = (q3 - q1).abs().max(1e-6);
+    (median, iqr)
+}
+
+fn fit_cohort_calibration(
+    stats: &[SampleCohortStats],
+    global_p_mismatch: f32,
+) -> Option<CohortCalibration> {
+    if stats.len() < 50 {
+        return None;
+    }
+    let mut active_indices: Vec<usize> = Vec::new();
+    let mut raw_features: Vec<[f64; 3]> = Vec::new();
+    for (idx, s) in stats.iter().copied().enumerate() {
+        if !s.has_signal() {
+            continue;
+        }
+        let log_e = ((s.mismatch_mass + 1.0) / (s.emission_mass + 2.0)).ln();
+        let log_s = ((s.expected_switches + 1.0) / (s.genetic_dist_morgans + 1e-3)).ln();
+        let u = s.mean_uncertainty();
+        if log_e.is_finite() && log_s.is_finite() && u.is_finite() {
+            active_indices.push(idx);
+            raw_features.push([log_e, log_s, u]);
+        }
+    }
+    if active_indices.len() < 50 {
+        return None;
+    }
+
+    let mut dims: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    dims[0].reserve(raw_features.len());
+    dims[1].reserve(raw_features.len());
+    dims[2].reserve(raw_features.len());
+    for f in &raw_features {
+        dims[0].push(f[0]);
+        dims[1].push(f[1]);
+        dims[2].push(f[2]);
+    }
+    let (m0, s0) = robust_center_scale(&dims[0]);
+    let (m1, s1) = robust_center_scale(&dims[1]);
+    let (m2, s2) = robust_center_scale(&dims[2]);
+
+    let mut scaled = Vec::with_capacity(raw_features.len() * 3);
+    for f in &raw_features {
+        scaled.push(((f[0] - m0) / s0) as f32);
+        scaled.push(((f[1] - m1) / s1) as f32);
+        scaled.push(((f[2] - m2) / s2) as f32);
+    }
+    let data = Array2::from_shape_vec((raw_features.len(), 3), scaled).ok()?;
+    let dataset = DatasetBase::from(data);
+    let n = raw_features.len();
+    let max_k = 5usize.min(n.saturating_sub(1));
+    if max_k < 2 {
+        return None;
+    }
+
+    let mut best_model = None;
+    let mut best_score = f32::INFINITY;
+    for k in 2..=max_k {
+        let model = match KMeans::params(k)
+            .max_n_iterations(100)
+            .tolerance(1e-4)
+            .fit(&dataset)
+        {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let inertia = model.inertia().max(1e-12);
+        let penalty = ((k * 3) as f32) * (n as f32).ln().max(1.0);
+        let score = (n as f32) * inertia.ln() + penalty;
+        if score < best_score {
+            best_score = score;
+            best_model = Some(model);
+        }
+    }
+    let model = best_model?;
+    let labels: Array1<usize> = model.predict(dataset.records());
+    let n_clusters = labels.iter().copied().max().unwrap_or(0) + 1;
+    if n_clusters == 0 {
+        return None;
+    }
+
+    let mut cohort_sizes = vec![0usize; n_clusters];
+    let mut sum_mismatch = vec![0.0f64; n_clusters];
+    let mut sum_emit = vec![0.0f64; n_clusters];
+    for (row, &label) in labels.iter().enumerate() {
+        let sample_idx = active_indices[row];
+        let s = stats[sample_idx];
+        cohort_sizes[label] += 1;
+        sum_mismatch[label] += s.mismatch_mass;
+        sum_emit[label] += s.emission_mass;
+    }
+
+    let global = global_p_mismatch.clamp(1e-6, 0.25);
+    let mut cohort_p_mismatch = vec![global; n_clusters];
+    for c in 0..n_clusters {
+        if sum_emit[c] > 0.0 {
+            let raw = (sum_mismatch[c] / sum_emit[c]) as f32;
+            let lo = (global * 0.25).max(1e-6);
+            let hi = (global * 4.0).min(0.25);
+            cohort_p_mismatch[c] = raw.clamp(lo, hi);
+        }
+    }
+
+    let mut sample_p_mismatch = vec![global; stats.len()];
+    for (row, &label) in labels.iter().enumerate() {
+        let sample_idx = active_indices[row];
+        let s = stats[sample_idx];
+        let weight = (s.emission_mass / (s.emission_mass + 500.0)).clamp(0.0, 1.0) as f32;
+        let cohort_p = cohort_p_mismatch[label];
+        sample_p_mismatch[sample_idx] = ((1.0 - weight) * global + weight * cohort_p)
+            .clamp(1e-6, 0.25);
+    }
+
+    Some(CohortCalibration {
+        sample_p_mismatch,
+        cohort_p_mismatch,
+        cohort_sizes,
+    })
+}
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
@@ -2123,6 +2304,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
             let mut frozen_streaks = vec![0usize; n_samples];
+            let mut cohort_calibration: Option<CohortCalibration> = None;
 
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
@@ -2148,6 +2330,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     None
                 };
 
+                let mut cohort_stats = if is_burnin && it == 0 {
+                    Some(vec![SampleCohortStats::default(); n_samples])
+                } else {
+                    None
+                };
                 let (total_switches, total_phased, sample_changed) = self
                     .run_phase_baum_iteration_stage1(
                         &target_gt,
@@ -2165,6 +2352,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         } else {
                             Some(&frozen_samples)
                         },
+                        cohort_calibration
+                            .as_ref()
+                            .map(|cal| cal.sample_p_mismatch.as_slice()),
+                        cohort_stats.as_deref_mut(),
                         atomic_estimates.as_ref(),
                         it,
                     )?;
@@ -2188,6 +2379,26 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         stage1_p_recomb = std::iter::once(0.0f32)
                             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
                             .collect();
+                    }
+                }
+
+                if let Some(stats) = cohort_stats {
+                    if let Some(model) = fit_cohort_calibration(&stats, self.params.p_mismatch) {
+                        let n_cohorts = model.cohort_p_mismatch.len();
+                        let preview: Vec<String> = model
+                            .cohort_p_mismatch
+                            .iter()
+                            .zip(model.cohort_sizes.iter())
+                            .map(|(&p, &n)| format!("{:.6} (n={})", p, n))
+                            .collect();
+                        eprintln!(
+                            "Cohort calibration enabled: {} cohorts, p_mismatch={}",
+                            n_cohorts,
+                            preview.join(", ")
+                        );
+                        cohort_calibration = Some(model);
+                    } else {
+                        eprintln!("Cohort calibration skipped: insufficient structure in burn-in");
                     }
                 }
 
@@ -2657,6 +2868,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
             let mut frozen_streaks = vec![0usize; n_samples];
+            let mut cohort_calibration: Option<CohortCalibration> = None;
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
                 let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -2675,6 +2887,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 }
 
                 self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+                let mut cohort_stats = if is_burnin && it == 0 {
+                    Some(vec![SampleCohortStats::default(); n_samples])
+                } else {
+                    None
+                };
                 let (total_switches, total_phased, sample_changed) = self
                     .run_phase_baum_iteration_stage1(
                         &target_gt,
@@ -2692,6 +2909,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         } else {
                             Some(&frozen_samples)
                         },
+                        cohort_calibration
+                            .as_ref()
+                            .map(|cal| cal.sample_p_mismatch.as_slice()),
+                        cohort_stats.as_deref_mut(),
                         None,
                         it,
                     )?;
@@ -2742,6 +2963,25 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         stable_main_iters = 0;
                     }
                     prev_remaining_hets = Some(remaining_hets);
+                }
+
+                if let Some(stats) = cohort_stats {
+                    if let Some(model) = fit_cohort_calibration(&stats, self.params.p_mismatch) {
+                        let preview: Vec<String> = model
+                            .cohort_p_mismatch
+                            .iter()
+                            .zip(model.cohort_sizes.iter())
+                            .map(|(&p, &n)| format!("{:.6} (n={})", p, n))
+                            .collect();
+                        eprintln!(
+                            "Cohort calibration enabled: {} cohorts, p_mismatch={}",
+                            model.cohort_p_mismatch.len(),
+                            preview.join(", ")
+                        );
+                        cohort_calibration = Some(model);
+                    } else {
+                        eprintln!("Cohort calibration skipped: insufficient structure in burn-in");
+                    }
                 }
             }
 
@@ -3609,6 +3849,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &ibs2,
                 &mut sample_phases,
                 &mut mcmc_paths,
+                None,
+                None,
                 None,
                 None,
                 0,
@@ -5018,6 +5260,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
         frozen_samples: Option<&[bool]>,
+        sample_p_mismatch: Option<&[f32]>,
+        cohort_stats_out: Option<&mut [SampleCohortStats]>,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
     ) -> Result<(usize, usize, Vec<bool>)> {
@@ -5069,6 +5313,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             orientation: Stage1OrientationUpdate,
             het_updates: Vec<Stage1HetUpdate>,
             paths: Option<GlobalMosaicPaths>,
+            cohort_stats: Option<SampleCohortStats>,
         }
         let phase_decisions: Vec<Stage1PhaseDecision> = {
             // Immutable borrow of geno for the entire read phase
@@ -5158,6 +5403,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     min_scale
                 );
             }
+            let collect_cohort_stats = cohort_stats_out.is_some();
             let sample_iter = || {
                 sample_phases.par_iter().enumerate().map(|(s, sp)| {
                     if frozen_samples
@@ -5169,6 +5415,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             orientation: Stage1OrientationUpdate::NoChange,
                             het_updates: Vec::new(),
                             paths: None,
+                            cohort_stats: None,
                         };
                     }
                     THREAD_WORKSPACE.with(|ws| {
@@ -5202,6 +5449,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 orientation: Stage1OrientationUpdate::NoChange,
                                 het_updates: Vec::new(),
                                 paths: None,
+                                cohort_stats: None,
                             };
                         }
 
@@ -5233,6 +5481,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add(s as u64)
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
+                        let sample_p_err = sample_p_mismatch
+                            .and_then(|v| v.get(s))
+                            .copied()
+                            .unwrap_or(self.params.p_mismatch)
+                            .clamp(1e-6, 0.25);
+                        let sample_p_no_err = 1.0 - sample_p_err;
 
                         // Identify unresolved heterozygotes in hi-freq space.
                         let mut het_positions: Vec<usize> = Vec::new();
@@ -5259,11 +5513,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 orientation: Stage1OrientationUpdate::NoChange,
                                 het_updates: Vec::new(),
                                 paths: None,
+                                cohort_stats: None,
                             };
                         }
-
-                        let p_err = self.params.p_mismatch;
-                        let p_no_err = 1.0 - p_err;
 
                         let has_phase_anchors = sp.has_input_phase_anchor();
 
@@ -5298,10 +5550,22 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     for &(i, a1, a2) in &anchors {
                                         let ref_al = subset_view.allele(MarkerIdx::new(i as u32), hap_idx);
                                         let conf_m = sample_conf[i].clamp(0.0, 1.0);
-                                        score1 += emit_prob(ref_al, a1, conf_m, p_no_err, p_err)
+                                        score1 += emit_prob(
+                                            ref_al,
+                                            a1,
+                                            conf_m,
+                                            sample_p_no_err,
+                                            sample_p_err,
+                                        )
                                             .max(1e-30)
                                             .ln();
-                                        score2 += emit_prob(ref_al, a2, conf_m, p_no_err, p_err)
+                                        score2 += emit_prob(
+                                            ref_al,
+                                            a2,
+                                            conf_m,
+                                            sample_p_no_err,
+                                            sample_p_err,
+                                        )
                                             .max(1e-30)
                                             .ln();
                                     }
@@ -5342,10 +5606,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             let ref_al =
                                                 subset_view.allele(MarkerIdx::new(i as u32), hap_idx);
                                             let emit = if a1 == a2 {
-                                                emit_prob(ref_al, a1, conf_m, p_no_err, p_err)
+                                                emit_prob(
+                                                    ref_al,
+                                                    a1,
+                                                    conf_m,
+                                                    sample_p_no_err,
+                                                    sample_p_err,
+                                                )
                                             } else {
-                                                let keep = emit_prob(ref_al, a1, conf_m, p_no_err, p_err);
-                                                let swap = emit_prob(ref_al, a2, conf_m, p_no_err, p_err);
+                                                let keep = emit_prob(
+                                                    ref_al,
+                                                    a1,
+                                                    conf_m,
+                                                    sample_p_no_err,
+                                                    sample_p_err,
+                                                );
+                                                let swap = emit_prob(
+                                                    ref_al,
+                                                    a2,
+                                                    conf_m,
+                                                    sample_p_no_err,
+                                                    sample_p_err,
+                                                );
                                                 0.5 * (keep + swap)
                                             };
                                             score += emit.max(1e-30).ln();
@@ -5390,10 +5672,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
 
                         // Collect EM statistics if requested
-                        if let Some(atomic) = atomic_estimates {
+                        let local_estimates: Option<crate::model::parameters::ParamEstimates> =
+                            if atomic_estimates.is_some() || collect_cohort_stats {
+                            let mut local_params = self.params.clone();
+                            local_params.p_mismatch = sample_p_err;
                             let hmm = MosaicHmm::new(
                                 subset_view,
-                                &self.params,
+                                &local_params,
                                 n_states,
                                 stage1_p_recomb,
                             );
@@ -5410,12 +5695,40 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 stage1_gen_dists,
                                 &mut local_est,
                             );
-                            atomic.add_estimation_data(&local_est);
-                        }
+                            if let Some(atomic) = atomic_estimates {
+                                atomic.add_estimation_data(&local_est);
+                            }
+                            Some(local_est)
+                        } else {
+                            None
+                        };
 
                         let t_mcmc_start = Instant::now();
                         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
-                            let dyn_k = self.config.dynamic_k.max(1).min(n_states.max(1));
+                            let dyn_k_max = self.config.dynamic_k.max(1).min(n_states.max(1));
+                            let dyn_k_min = dyn_k_max.min(16).max(1);
+                            let sample_uncertainty =
+                                1.0f32 - sample_phase_stability[s].clamp(0.0, 1.0);
+                            let dyn_k = if dyn_k_max > dyn_k_min {
+                                let span = (dyn_k_max - dyn_k_min) as f32;
+                                dyn_k_min
+                                    + (sample_uncertainty * span).round() as usize
+                            } else {
+                                dyn_k_max
+                            };
+                            let dyn_steps_max = self.config.mcmc_steps.max(1);
+                            let dyn_steps_min = if sample_phase_stability[s] >= 0.995 {
+                                1
+                            } else {
+                                dyn_steps_max.min(2).max(1)
+                            };
+                            let dyn_steps = if dyn_steps_max > dyn_steps_min {
+                                let step_span = (dyn_steps_max - dyn_steps_min) as f32;
+                                dyn_steps_min
+                                    + (sample_uncertainty * step_span).round() as usize
+                            } else {
+                                dyn_steps_max
+                            };
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
@@ -5429,8 +5742,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &seq1,
                                     &seq2,
                                     &sample_conf,
-                                    p_no_err,
-                                    p_err,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     &mut rp,
                                     &mut ws.scores,
                                     None,
@@ -5502,9 +5815,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         &sample_phase_stability,
                                         &het_positions,
                                         sample_seed,
-                                        self.config.mcmc_steps,
-                                        p_no_err,
-                                        p_err,
+                                        dyn_steps,
+                                        sample_p_no_err,
+                                        sample_p_err,
                                         prior_local.as_ref(),
                                         None,
                                         None,
@@ -5528,9 +5841,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &sample_phase_stability,
                                     &het_positions,
                                     sample_seed,
-                                    self.config.mcmc_steps,
-                                    p_no_err,
-                                    p_err,
+                                    dyn_steps,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     prior_local.as_ref(),
                                     None,
                                     None,
@@ -5597,8 +5910,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         sample_seed,
                                         self.config.mcmc_burnin,
                                         self.config.mcmc_lr_samples,
-                                        p_no_err,
-                                        p_err,
+                                        sample_p_no_err,
+                                        sample_p_err,
                                         ws,
                                     )
                                 })
@@ -5624,8 +5937,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     sample_seed,
                                     self.config.mcmc_burnin,
                                     self.config.mcmc_lr_samples,
-                                    p_no_err,
-                                    p_err,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     ws,
                                 )
                             };
@@ -5798,10 +6111,46 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             bb.add_samples(1);
                         }
 
+                        let cohort_stats = if collect_cohort_stats {
+                            let (mismatch_mass, emission_mass, expected_switches, genetic_dist_cm) =
+                                if let Some(est) = local_estimates.as_ref() {
+                                    (
+                                        est.mismatch_mass(),
+                                        est.emission_mass(),
+                                        est.expected_switches(),
+                                        est.genetic_distance_cm(),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0)
+                                };
+                            let mut uncertainty_sum = 0.0f64;
+                            let mut uncertainty_count = 0usize;
+                            for i in 0..n_hi_freq {
+                                let a1 = seq1[i];
+                                let a2 = seq2[i];
+                                if a1 != 255 && a2 != 255 && a1 != a2 {
+                                    uncertainty_sum +=
+                                        (1.0 - sample_phase_conf[i].clamp(0.0, 1.0)) as f64;
+                                    uncertainty_count += 1;
+                                }
+                            }
+                            Some(SampleCohortStats {
+                                mismatch_mass,
+                                emission_mass,
+                                expected_switches,
+                                genetic_dist_morgans: genetic_dist_cm / 100.0,
+                                phase_uncertainty_sum: uncertainty_sum,
+                                phase_uncertainty_count: uncertainty_count,
+                            })
+                        } else {
+                            None
+                        };
+
                         Stage1PhaseDecision {
                             orientation,
                             het_updates,
                             paths: new_paths,
+                            cohort_stats,
                         }
                     })
                 })
@@ -5823,8 +6172,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Determine if we're in burn-in (don't mark as phased during burn-in)
         let is_burnin = iteration < self.config.burnin;
         let lr_threshold = self.params.lr_threshold;
+        let mut cohort_stats_out = cohort_stats_out;
 
         for (s, decision) in phase_decisions.into_iter().enumerate() {
+            if let Some(out) = cohort_stats_out.as_deref_mut() {
+                if s < out.len() {
+                    out[s] = decision.cohort_stats.unwrap_or_default();
+                }
+            }
             let sp = &mut sample_phases[s];
 
             match decision.orientation {
@@ -8281,6 +8636,30 @@ fn sample_dynamic_mcmc(
     #[derive(Clone, Copy)]
     struct LocalMarkerIdx(usize);
 
+    #[inline]
+    fn adaptive_dynamic_state_target(
+        max_states: usize,
+        n_haps: u32,
+        local_phase_conf: f32,
+        sample_stability: f32,
+    ) -> usize {
+        if max_states == 0 || n_haps == 0 {
+            return 0;
+        }
+        let cap = max_states.min(n_haps.saturating_sub(2) as usize).max(1);
+        let min_states = (cap / 3).max(PBWT_ADAPTIVE_K_FLOOR).min(cap);
+        if min_states >= cap {
+            return cap;
+        }
+        let local_uncertainty = 1.0 - local_phase_conf.clamp(0.0, 1.0);
+        let sample_uncertainty = 1.0 - sample_stability.clamp(0.0, 1.0);
+        let uncertainty = (0.7 * local_uncertainty + 0.3 * sample_uncertainty).clamp(0.0, 1.0);
+        let span = (cap - min_states) as f32;
+        (min_states as f32 + span * uncertainty)
+            .round()
+            .clamp(min_states as f32, cap as f32) as usize
+    }
+
     if het_positions.is_empty()
         || n_markers == 0
         || n_states == 0
@@ -8441,7 +8820,14 @@ fn sample_dynamic_mcmc(
     // Initialize path with starting states from standard neighbor finding
     // This gives the first iteration something to work with
     let center_init = n_markers / 2;
-    let mut initial_neighbors = phase_ibs.find_neighbors(hap1_idx, center_init, ibs2, n_states);
+    let initial_state_target = adaptive_dynamic_state_target(
+        n_states,
+        phase_ibs.n_haps() as u32,
+        phase_conf[center_init],
+        recipient_stability,
+    );
+    let mut initial_neighbors =
+        phase_ibs.find_neighbors(hap1_idx, center_init, ibs2, initial_state_target);
     if !initial_neighbors.is_empty() {
         let mut filtered = Vec::with_capacity(initial_neighbors.len());
         for &h in &initial_neighbors {
@@ -8463,7 +8849,7 @@ fn sample_dynamic_mcmc(
                     .partial_cmp(&a_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            filtered.extend(initial_neighbors.iter().take(n_states.max(1)).copied());
+            filtered.extend(initial_neighbors.iter().take(initial_state_target.max(1)).copied());
         }
         initial_neighbors = filtered;
     }
@@ -8704,47 +9090,74 @@ fn sample_dynamic_mcmc(
 
     record_neighbors(&neighbors);
 
+    let stride = (n_markers / 8).max(1);
+    let mut anchors_static: Vec<usize> = Vec::new();
+    // Prefer anchors with highest expected information under current emissions.
+    let mut start = 0usize;
+    while start < n_markers {
+        let end = (start + stride).min(n_markers);
+        let mut best_m = start;
+        let mut best_score = f32::NEG_INFINITY;
+        for m in start..end {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 == 255 && a2 == 255 {
+                continue;
+            }
+            let conf_score = conf[m].clamp(0.0, 1.0);
+            let emit_match = (p_no_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
+            let emit_mismatch = (p_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
+            let score = (emit_match / emit_mismatch).ln().abs();
+            if score > best_score {
+                best_score = score;
+                best_m = m;
+            }
+        }
+        anchors_static.push(best_m);
+        start = end;
+    }
+    if anchors_static.last().copied() != Some(n_markers.saturating_sub(1)) {
+        anchors_static.push(n_markers.saturating_sub(1));
+    }
+    anchors_static.sort_unstable();
+    anchors_static.dedup();
+
+    let radius = (n_markers / 32).clamp(16, 256);
+    let mut score_markers_static: Vec<usize> = Vec::new();
+    for &anchor in &anchors_static {
+        let start = anchor.saturating_sub(radius);
+        let end = (anchor + radius + 1).min(n_markers);
+        for m in start..end {
+            // Light subsampling in dense windows for speed; always keep anchor.
+            if m == anchor || ((m - start) % 2 == 0) {
+                score_markers_static.push(m);
+            }
+        }
+    }
+    score_markers_static.sort_unstable();
+    score_markers_static.dedup();
+
+    // Cache per-marker log emissions so donor scoring avoids repeated floating-point transforms.
+    let mut ll_match: Vec<f32> = vec![0.0; n_markers];
+    let mut ll_mismatch: Vec<f32> = vec![0.0; n_markers];
+    for m in 0..n_markers {
+        let conf_m = conf[m].clamp(0.0, 1.0);
+        let emit_match = (p_no_err * conf_m + 0.5 * (1.0 - conf_m)).max(1e-30);
+        let emit_mismatch = (p_err * conf_m + 0.5 * (1.0 - conf_m)).max(1e-30);
+        ll_match[m] = emit_match.ln();
+        ll_mismatch[m] = emit_mismatch.ln();
+    }
+
     let mut anchors_buf: Vec<usize> = Vec::new();
     let mut candidates_buf: Vec<u32> = Vec::new();
     let mut rejected_buf: Vec<u32> = Vec::new();
-    let mut score_markers_buf: Vec<usize> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut rejected_seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut collect_dynamic_neighbors = |path_ref: &[u32], query_hap: &[u8], out: &mut Vec<u32>| {
-            let stride = (n_markers / 8).max(1);
-            // Prefer anchors that maximize expected information under the emission model.
-            let anchor_score = |m: usize| -> f32 {
-                let obs = query_hap[m];
-                if obs == 255 {
-                    return f32::NEG_INFINITY;
-                }
-                let conf_score = conf[m].clamp(0.0, 1.0);
-                let emit_match = (p_no_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
-                let emit_mismatch = (p_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
-                // Information gain proxy: larger match/mismatch odds gives stronger donor discrimination.
-                (emit_match / emit_mismatch).ln().abs()
-            };
-
+    let mut collect_dynamic_neighbors =
+        |path_ref: &[u32], query_hap: &[u8], target_states: usize, out: &mut Vec<u32>| {
             anchors_buf.clear();
-            let mut start = 0usize;
-            while start < n_markers {
-                let end = (start + stride).min(n_markers);
-                let mut best_m = start;
-                let mut best_score = f32::NEG_INFINITY;
-                for m in start..end {
-                    let score = anchor_score(m);
-                    if score > best_score {
-                        best_score = score;
-                        best_m = m;
-                    }
-                }
-                anchors_buf.push(best_m);
-                start = end;
-            }
-            if anchors_buf.last().copied() != Some(n_markers.saturating_sub(1)) {
-                anchors_buf.push(n_markers.saturating_sub(1));
-            }
+            anchors_buf.extend(anchors_static.iter().copied());
             seen_buf.clear();
             candidates_buf.clear();
             rejected_seen_buf.clear();
@@ -8754,7 +9167,7 @@ fn sample_dynamic_mcmc(
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
                 if (ref_hap as usize) < phase_ibs.n_haps() {
                     let mut local =
-                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, n_states);
+                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, target_states);
                     local.push(ref_hap);
                     for h in local {
                         if h == hap1_idx || h == hap1_idx + 1 {
@@ -8791,7 +9204,7 @@ fn sample_dynamic_mcmc(
                         .partial_cmp(&a_score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let take = n_states.min(rejected_buf.len()).max(1);
+                let take = target_states.min(rejected_buf.len()).max(1);
                 for &h in rejected_buf.iter().take(take) {
                     candidates_buf.push(h);
                 }
@@ -8799,27 +9212,12 @@ fn sample_dynamic_mcmc(
 
             // Phase-conditioned scoring:
             // score each donor haplotype by local log-likelihood under current sampled
-            // haplotype sequence (query_hap), using confidence-weighted mismatch model.
-            let radius = (n_markers / 32).clamp(16, 256);
-            score_markers_buf.clear();
-            for &anchor in &anchors_buf {
-                let start = anchor.saturating_sub(radius);
-                let end = (anchor + radius + 1).min(n_markers);
-                for m in start..end {
-                    // Light subsampling in dense windows for speed; always keep anchor.
-                    if m == anchor || ((m - start) % 2 == 0) {
-                        score_markers_buf.push(m);
-                    }
-                }
-            }
-            score_markers_buf.sort_unstable();
-            score_markers_buf.dedup();
-
+            // haplotype sequence (query_hap), using cached confidence-weighted mismatch terms.
             scored_buf.clear();
             scored_buf.reserve(candidates_buf.len().saturating_sub(scored_buf.len()));
             for &h in &candidates_buf {
                 let mut ll = 0.0f32;
-                for &m in &score_markers_buf {
+                for &m in &score_markers_static {
                     let obs = query_hap[m];
                     if obs == 255 {
                         continue;
@@ -8828,19 +9226,24 @@ fn sample_dynamic_mcmc(
                     if ref_al == 255 {
                         continue;
                     }
-                    let conf_m = conf[m].clamp(0.0, 1.0);
-                    let emit = if ref_al == obs {
-                        p_no_err * conf_m + 0.5 * (1.0 - conf_m)
+                    ll += if ref_al == obs {
+                        ll_match[m]
                     } else {
-                        p_err * conf_m + 0.5 * (1.0 - conf_m)
+                        ll_mismatch[m]
                     };
-                    ll += emit.max(1e-30).ln();
                 }
                 scored_buf.push((h, ll));
             }
 
-            scored_buf.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let keep = n_states.min(scored_buf.len()).max(1);
+            let keep = target_states.min(scored_buf.len()).max(1);
+            if scored_buf.len() > keep {
+                scored_buf.select_nth_unstable_by(keep - 1, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            scored_buf[..keep].sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
             out.clear();
             out.reserve(keep.saturating_sub(out.capacity()));
             for (h, _) in scored_buf.iter().take(keep) {
@@ -8860,7 +9263,13 @@ fn sample_dynamic_mcmc(
         } else {
             n_markers / 2
         };
-        collect_dynamic_neighbors(&path1_ref, &h1_alleles, &mut neighbors);
+        let state_target = adaptive_dynamic_state_target(
+            n_states,
+            n_haps,
+            phase_conf[center_marker],
+            recipient_stability,
+        );
+        collect_dynamic_neighbors(&path1_ref, &h1_alleles, state_target, &mut neighbors);
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
             && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
@@ -8871,12 +9280,12 @@ fn sample_dynamic_mcmc(
         if neighbors.is_empty() {
             continue;
         }
-        mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
+        mix_neighbors(&mut neighbors, state_target, n_haps, hap1_idx, &mut rng);
         neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
         if neighbors.is_empty() {
             refill_neighbors_for_marker(
                 &mut neighbors,
-                n_states,
+                state_target,
                 n_haps,
                 hap1_idx,
                 LocalMarkerIdx(center_marker),
@@ -8962,7 +9371,7 @@ fn sample_dynamic_mcmc(
         // === Sample H2 | (G, H1_new) ===
 
         // 1. Select neighbors for H2 with H2-conditioned scoring (not H1's sequence).
-        collect_dynamic_neighbors(&path2_ref, &h2_alleles, &mut neighbors);
+        collect_dynamic_neighbors(&path2_ref, &h2_alleles, state_target, &mut neighbors);
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
             && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
@@ -8973,12 +9382,12 @@ fn sample_dynamic_mcmc(
         if neighbors.is_empty() {
             continue;
         }
-        mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
+        mix_neighbors(&mut neighbors, state_target, n_haps, hap1_idx, &mut rng);
         neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
         if neighbors.is_empty() {
             refill_neighbors_for_marker(
                 &mut neighbors,
-                n_states,
+                state_target,
                 n_haps,
                 hap1_idx,
                 LocalMarkerIdx(center_marker),
