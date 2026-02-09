@@ -1618,12 +1618,17 @@ fn test_ultra_dense_markers() {
         })
         .build();
 
-    // Target with every 10th marker genotyped - ALL haplotypes match ref group 0
+    // Target with every 10th marker genotyped
+    // Sample 0: matches ref group 0 (all 0s)
+    // Sample 1: matches ref group 1 (all 1s)
     let target_file = SyntheticVcfBuilder::new(n_ref_markers, 2)
         .positions(positions)
-        .allele_generator(|m, _| {
+        .allele_generator(|m, h| {
+            // h=0,1 (Sample 0) -> 0
+            // h=2,3 (Sample 1) -> 1
+            let allele = if h < 2 { 0 } else { 1 };
             if m % 10 == 0 {
-                0 // All target haplotypes get allele 0, matching ref haps 0-9
+                allele
             } else {
                 255
             }
@@ -1648,23 +1653,32 @@ fn test_ultra_dense_markers() {
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
 
-    // With perfect LD, imputed dosages should be very close to 0 (match target pattern)
-    let mut sum_dosage = 0.0f32;
+    // With perfect LD, imputed dosages should match the target pattern.
+    // Sample 0 (all 0s) -> dosage 0
+    // Sample 1 (all 1s) -> dosage 2
+    let mut sample0_sum = 0.0f32;
+    let mut sample1_sum = 0.0f32;
     let mut count = 0;
     for marker_dosages in &dosages {
-        for ds in marker_dosages {
-            sum_dosage += ds;
-            count += 1;
-        }
+        sample0_sum += marker_dosages[0];
+        sample1_sum += marker_dosages[1];
+        count += 1;
     }
 
-    let avg_dosage = sum_dosage / count as f32;
-    println!("Average dosage: {}", avg_dosage);
-    // Target matches haplotype group 0, so average dosage should be LOW
+    let avg_dosage0 = sample0_sum / count as f32;
+    let avg_dosage1 = sample1_sum / count as f32;
+    println!("Average dosage sample 0: {}", avg_dosage0);
+    println!("Average dosage sample 1: {}", avg_dosage1);
+
     assert!(
-        avg_dosage < 0.5,
-        "Average dosage should be low for matching haplotype group, got {}",
-        avg_dosage
+        avg_dosage0 < 0.1,
+        "Sample 0 dosage should be low, got {}",
+        avg_dosage0
+    );
+    assert!(
+        avg_dosage1 > 1.9,
+        "Sample 1 dosage should be high, got {}",
+        avg_dosage1
     );
 
     // DR2 validation for ultra-dense markers test
