@@ -3392,7 +3392,6 @@ impl crate::pipelines::ImputationPipeline {
                     == 1
             })
             .collect();
-
         let ref_allele_freqs = RefAlleleFreqs::new(ref_columns);
 
         let gen_positions: Vec<f64> = {
@@ -3643,24 +3642,22 @@ impl crate::pipelines::ImputationPipeline {
             / n_ref_markers.max(1) as f32)
             .clamp(0.0, 1.0);
         let err_floor = if genotyped_fraction < 0.01 {
-            // Sparse arrays have few typed anchors. Even when hard calls are
-            // correct, a too-low mismatch floor over-concentrates the HMM,
-            // collapsing rare-allele posteriors. Use a higher floor to
-            // preserve uncertainty and improve calibration.
-            0.01f32
+            // Keep a modest mismatch floor on sparse arrays to prevent overconfident
+            // emissions without washing out LD-driven signal at nearby untyped sites.
+            0.001f32
         } else if genotyped_fraction < 0.02 {
-            0.005f32
+            0.0005f32
         } else {
             self.params.p_mismatch
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let smoothing_cluster_cm = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.2f32 / frac).min(128.0);
+            let scale = (0.05f32 / frac).min(64.0);
             self.config.cluster.max(1e-6) * scale
         } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.03f32 / frac).min(12.0);
+            let scale = (0.01f32 / frac).min(8.0);
             self.config.cluster.max(1e-6) * scale
         } else {
             self.config.cluster.max(1e-6)
@@ -3668,11 +3665,11 @@ impl crate::pipelines::ImputationPipeline {
         let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.4f32 * scale
+            0.3f32 * scale
         } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.2f32 * scale
+            0.15f32 * scale
         } else {
             0.0f32
         };

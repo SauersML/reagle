@@ -6656,14 +6656,19 @@ fn test_imputed_af_collapse_against_java() {
 
     let (_, java_records) = parse_vcf(&work_dir.path().join("java_out.vcf.gz"));
     let (_, rust_records) = parse_vcf(&work_dir.path().join("rust_out.vcf.gz"));
+    let (_, ref_records) = parse_vcf(&ref_path);
+    let (_, target_records) = parse_vcf(&target_path);
+    let mut target_positions: Vec<u64> = target_records.iter().map(|r| r.pos).collect();
+    target_positions.sort_unstable();
     let rust_idx = build_record_index_multi(&rust_records);
+    let ref_idx = build_record_index_multi(&ref_records);
 
-    let mut collapse: Vec<(u64, f64, f64)> = Vec::new();
+    let mut collapse: Vec<(String, u64, String, Vec<String>, f64, f64, bool)> = Vec::new();
     for j_rec in &java_records {
         if !j_rec.info.contains_key("IMP") {
             continue;
         }
-        let Some((r_rec, _)) = match_record_by_alleles(
+        let Some((r_rec, rust_swap)) = match_record_by_alleles(
             &rust_idx,
             &rust_records,
             &j_rec.chrom,
@@ -6679,14 +6684,25 @@ fn test_imputed_af_collapse_against_java() {
             .and_then(|s| s.split(',').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0);
-        let rust_af: f64 = r_rec
+        let mut rust_af: f64 = r_rec
             .info
             .get("AF")
             .and_then(|s| s.split(',').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0);
+        if rust_swap {
+            rust_af = 1.0 - rust_af;
+        }
         if java_af >= 0.05 && rust_af <= 0.01 {
-            collapse.push((j_rec.pos, java_af, rust_af));
+            collapse.push((
+                j_rec.chrom.clone(),
+                j_rec.pos,
+                j_rec.ref_allele.clone(),
+                j_rec.alt_alleles.clone(),
+                java_af,
+                rust_af,
+                rust_swap,
+            ));
         }
     }
 
@@ -6695,8 +6711,76 @@ fn test_imputed_af_collapse_against_java() {
             "Found {} imputed markers with AF collapse (Java>=0.05, Rust<=0.01)",
             collapse.len()
         );
-        for (pos, j_af, r_af) in collapse.iter().take(10) {
-            println!("  pos={} java_af={:.4} rust_af={:.4}", pos, j_af, r_af);
+        for (chrom, pos, ref_allele, alt_alleles, j_af, r_af, rust_swap) in
+            collapse.iter().take(10)
+        {
+            println!(
+                "  pos={}:{} {}>{} java_af={:.4} rust_af={:.4} swap={}",
+                chrom,
+                pos,
+                ref_allele,
+                alt_alleles.join(","),
+                j_af,
+                r_af,
+                rust_swap
+            );
+        }
+        println!("  Collapse diagnostics (first 10):");
+        for (chrom, pos, ref_allele, alt_alleles, j_af, r_af, rust_swap) in
+            collapse.iter().take(10)
+        {
+            let idx = target_positions.binary_search(pos).unwrap_or_else(|i| i);
+            let mut nearest = None;
+            if idx < target_positions.len() {
+                nearest = Some(target_positions[idx].abs_diff(*pos));
+            }
+            if idx > 0 {
+                let prev = target_positions[idx - 1].abs_diff(*pos);
+                nearest = Some(nearest.map(|n| n.min(prev)).unwrap_or(prev));
+            }
+            let is_multi = alt_alleles.len() > 1;
+            let is_indel = alt_alleles.iter().any(|a| a.len() != ref_allele.len());
+            let ref_match = match_record_by_alleles(
+                &ref_idx,
+                &ref_records,
+                chrom,
+                *pos,
+                ref_allele,
+                alt_alleles,
+            );
+            let mut ref_af = ref_match
+                .map(|(rec, _)| {
+                let mut alt = 0usize;
+                let mut total = 0usize;
+                for g in &rec.genotypes {
+                    let alleles: Vec<&str> = g.gt.split(|c| c == '/' || c == '|').collect();
+                    for a in alleles {
+                        if a == "." {
+                            continue;
+                        }
+                        total += 1;
+                        if a != "0" {
+                            alt += 1;
+                        }
+                    }
+                }
+                if total > 0 {
+                    alt as f64 / total as f64
+                } else {
+                    0.0
+                }
+            })
+                .unwrap_or(0.0);
+            if let Some((_, ref_swap)) = ref_match {
+                if ref_swap {
+                    ref_af = 1.0 - ref_af;
+                }
+            }
+            let dist = nearest.unwrap_or(0);
+            println!(
+                "    pos={} dist_to_typed={}bp multi={} indel={} ref_af={:.4} java_af={:.4} rust_af={:.4} swap={}",
+                pos, dist, is_multi, is_indel, ref_af, j_af, r_af, rust_swap
+            );
         }
     }
 

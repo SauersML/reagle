@@ -943,13 +943,13 @@ fn apply_marker_prior_smoothing(
     };
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+        let mix = min_prior_mix.clamp(0.0, 0.9);
         match panel {
             AllelePosteriors::Biallelic(p_alt) => {
                 if allele_probs.len() == 2 {
                     let p_alt = p_alt.clamp(0.0, 1.0);
                     let panel_probs = [1.0 - p_alt, p_alt];
-                    if min_prior_mix > 0.0 {
-                        let mix = min_prior_mix.clamp(0.0, 0.9);
+                    if mix > 0.0 {
                         let keep = 1.0 - mix;
                         allele_probs[0] = keep * allele_probs[0] + mix * panel_probs[0];
                         allele_probs[1] = keep * allele_probs[1] + mix * panel_probs[1];
@@ -972,8 +972,7 @@ fn apply_marker_prior_smoothing(
             }
             AllelePosteriors::Multiallelic(p) => {
                 if p.len() == allele_probs.len() {
-                    if min_prior_mix > 0.0 {
-                        let mix = min_prior_mix.clamp(0.0, 0.9);
+                    if mix > 0.0 {
                         let keep = 1.0 - mix;
                         for (i, prob) in allele_probs.iter_mut().enumerate() {
                             let prior = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
