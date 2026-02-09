@@ -286,6 +286,27 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             return;
         }
 
+        // Defensive normalization: some callers may provide adjacent/overlapping ranges.
+        // Merging here guarantees unique positional coverage for donor selection.
+        self.intervals_buf.sort_unstable_by_key(|&(l, _)| l);
+        let mut merged_len = 0usize;
+        for i in 0..self.intervals_buf.len() {
+            let (l, r) = self.intervals_buf[i];
+            if merged_len == 0 {
+                self.intervals_buf[merged_len] = (l, r);
+                merged_len = 1;
+                continue;
+            }
+            let (prev_l, prev_r) = self.intervals_buf[merged_len - 1];
+            if l <= prev_r {
+                self.intervals_buf[merged_len - 1] = (prev_l, prev_r.max(r));
+            } else {
+                self.intervals_buf[merged_len] = (l, r);
+                merged_len += 1;
+            }
+        }
+        self.intervals_buf.truncate(merged_len);
+
         let total_len: usize = self.intervals_buf.iter().map(|&(l, r)| r - l).sum();
         if total_len <= k {
             out.reserve(total_len);
