@@ -372,10 +372,14 @@ fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows:
         return Vec::new();
     }
     let mut max_score_by_window = vec![NEG_INF; num_windows];
+    let mut support_by_window = vec![0usize; num_windows];
     for scores in scores_by_hap {
         for &(win, score) in scores {
-            if win < num_windows && score.is_finite() && score > max_score_by_window[win] {
-                max_score_by_window[win] = score;
+            if win < num_windows && score.is_finite() {
+                support_by_window[win] += 1;
+                if score > max_score_by_window[win] {
+                    max_score_by_window[win] = score;
+                }
             }
         }
     }
@@ -404,7 +408,12 @@ fn window_effective_pool_sizes(scores_by_hap: &[Vec<(usize, f32)>], num_windows:
         let s = sum_w[win];
         let s2 = sum_w2[win];
         if s > 0.0 && s2 > 0.0 {
-            out[win] = ((s * s) / s2) as f32;
+            let neff = ((s * s) / s2) as f32;
+            // Empirical-Bayes shrinkage toward observed support count when
+            // score evidence is sparse to avoid overreacting to a few donors.
+            let support = support_by_window[win] as f32;
+            let lambda = support / (support + 8.0);
+            out[win] = (lambda * neff + (1.0 - lambda) * support.max(1.0)).max(1.0);
         }
         win += 1;
     }
@@ -443,13 +452,19 @@ fn boundary_pool_sizes_from_scores(
 
     let mut b = 0usize;
     while b + 1 < num_windows {
+        let c0 = DonorPoolSize::new(per_window_caps.get(b).copied().unwrap_or(n_pool));
+        let c1 = DonorPoolSize::new(per_window_caps.get(b + 1).copied().unwrap_or(n_pool));
+        let cap_pool = c0.min(c1).min(panel_pool);
+
         let left = neff_by_window[b].max(1.0);
         let right = neff_by_window[b + 1].max(1.0);
         let boundary_neff = (left * right).sqrt();
-        let local_pool = DonorPoolSize::new(boundary_neff.round().max(2.0) as usize);
-        let c0 = DonorPoolSize::new(per_window_caps.get(b).copied().unwrap_or(n_pool));
-        let c1 = DonorPoolSize::new(per_window_caps.get(b + 1).copied().unwrap_or(n_pool));
-        out.push(local_pool.min(c0).min(c1).min(panel_pool));
+        // Final shrinkage toward cap-based pool size for safety in sparse/noisy windows.
+        let cap_f = cap_pool.as_f32();
+        let lambda = (boundary_neff / (boundary_neff + 8.0)).clamp(0.0, 1.0);
+        let blended = lambda * boundary_neff + (1.0 - lambda) * cap_f;
+        let local_pool = DonorPoolSize::new(blended.round().max(2.0) as usize);
+        out.push(local_pool.min(cap_pool));
         b += 1;
     }
     out
@@ -767,7 +782,6 @@ pub fn allocate_lms_sparse(
         let mut best_gain = NEG_INF;
         let mut best_gain_per_slot = NEG_INF;
         let mut best_len = 0usize;
-        let mut best_active: Vec<bool> = Vec::new();
 
         let mut h = 0usize;
         while h < n {
@@ -795,7 +809,6 @@ pub fn allocate_lms_sparse(
                     best_gain = gain;
                     best_gain_per_slot = gain_per_slot;
                     best_len = len;
-                    best_active = dp_scratch.active[..w].to_vec();
                 }
             }
             h += 1;
@@ -805,21 +818,41 @@ pub fn allocate_lms_sparse(
             break;
         };
 
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let (gain_chk, len_chk) = dp_intervals_sparse_scratch(
+            &scores_by_hap[chosen_idx],
+            &z_w,
+            0.0,
+            &blocked,
+            &t11,
+            &t10,
+            &t01,
+            &mut dp_scratch,
+        );
+        if gain_chk <= 0.0 || len_chk == 0 || len_chk > remaining {
+            break;
+        }
+        let chosen_active = dp_scratch.active[..w].to_vec();
+
         selected_states[chosen_idx] = Some(AllocationState {
-            active: best_active.clone(),
-            len: best_len,
+            active: chosen_active.clone(),
+            len: len_chk,
         });
         for win in 0..w {
-            if best_active[win] && counts[win] < per_window_caps[win] {
+            if chosen_active[win] && counts[win] < per_window_caps[win] {
                 counts[win] += 1;
             }
         }
         for &(win, score) in &scores_by_hap[chosen_idx] {
-            if win < w && best_active[win] && score.is_finite() {
+            if win < w && chosen_active[win] && score.is_finite() {
                 z_w[win] = logaddexp(z_w[win], score);
             }
         }
-        remaining = remaining.saturating_sub(best_len);
+        remaining = remaining.saturating_sub(len_chk);
     }
 
     // One coordinate-ascent polish sweep over selected donors.
