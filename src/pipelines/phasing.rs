@@ -757,9 +757,9 @@ fn adaptive_pbwt_donor_k(
     NonZeroUsize::new(k.max(1)).expect("k.max(1) must be non-zero")
 }
 
-fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
+fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     batch_haps: &[usize],
-    target_gt: &GenotypeMatrix<TargetSpace>,
+    target_gt: &GenotypeMatrix<TargetState, TargetSpace>,
     geno: &MutableGenotypes,
     ref_columns: &[GenotypeColumn],
     phase_mask: Option<&crate::data::storage::matrix::BitMatrix>,
@@ -773,7 +773,9 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     exclude_self: bool,
     marker_map: Option<&[usize]>,
     ref_index_map: Option<&[usize]>,
-) {
+) where
+    TargetState: crate::data::storage::phase_state::PhaseState,
+{
     let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
     if batch_haps.is_empty() || n_ref_haps == 0 {
         return;
@@ -9148,7 +9150,6 @@ fn sample_dynamic_mcmc(
         ll_mismatch[m] = emit_mismatch.ln();
     }
 
-    let mut anchors_buf: Vec<usize> = Vec::new();
     let mut candidates_buf: Vec<u32> = Vec::new();
     let mut rejected_buf: Vec<u32> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
@@ -9156,14 +9157,12 @@ fn sample_dynamic_mcmc(
     let mut rejected_seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut collect_dynamic_neighbors =
         |path_ref: &[u32], query_hap: &[u8], target_states: usize, out: &mut Vec<u32>| {
-            anchors_buf.clear();
-            anchors_buf.extend(anchors_static.iter().copied());
             seen_buf.clear();
             candidates_buf.clear();
             rejected_seen_buf.clear();
             rejected_buf.clear();
 
-            for &m in &anchors_buf {
+            for &m in &anchors_static {
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
                 if (ref_hap as usize) < phase_ibs.n_haps() {
                     let mut local =
