@@ -536,6 +536,9 @@ fn fill_residual_capacity(
     remaining: &mut usize,
     dp_scratch: &mut DpScratch,
 ) {
+    // Greedy fill under the true (unpenalized) surrogate objective using mu=0.
+    // This is a deterministic post-pass that maximizes additional gain per slot
+    // under hard caps after the Lagrangian phase settles.
     let n = scores_by_hap.len();
     let w = per_window_caps.len();
     while *remaining > 0 {
@@ -773,7 +776,8 @@ pub fn allocate_lms_sparse(
         }
     } else if !coarse_samples.is_empty() {
         // Fallback under non-monotone allocation behavior: minimize overuse first,
-        // then maximize gain.
+        // then maximize gain. This keeps mu selection stable even when
+        // approximate monotonicity in used(mu) is imperfect.
         let mut fallback_mu = coarse_samples[0].0;
         let mut fallback_overuse = coarse_samples[0].1.saturating_sub(total_budget);
         let mut fallback_gain = coarse_samples[0].2;
