@@ -139,6 +139,10 @@ const PBWT_WILDCARD_MIN_UNCERTAINTY: f32 = 0.85;
 const PBWT_MIN_ENTROPY_EPS: f32 = 1e-12;
 const PBWT_FORCE_TOP_HAPS: usize = 32;
 const PBWT_ANCHOR_TOP_HAPS: usize = 512;
+const EMIT_PROFILE_MAX_PROBE_SAMPLES: usize = 128;
+const EMIT_PROFILE_PRIOR_STRENGTH: f32 = 24.0;
+const EMIT_PROFILE_HET_CONFIDENCE_GATE: f32 = 0.98;
+const EMIT_PROFILE_MIN_CONF_SCALE: f32 = 0.35;
 const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
@@ -5133,6 +5137,27 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .iter()
                 .map(|sp| stage1_sample_phase_stability(sp, hi_freq_to_orig))
                 .collect();
+            let emission_conf_scales = Arc::new(build_marker_emission_conf_scales(
+                target_gt,
+                sample_phases,
+                hi_freq_to_orig,
+                self.params.p_mismatch,
+            ));
+            if !emission_conf_scales.is_empty() {
+                let mut sum_scale = 0.0f32;
+                let mut min_scale = 1.0f32;
+                for &scale in emission_conf_scales.iter() {
+                    sum_scale += scale;
+                    min_scale = min_scale.min(scale);
+                }
+                let mean_scale = sum_scale / emission_conf_scales.len() as f32;
+                eprintln!(
+                    "[stage1 emission] markers={} mean_conf_scale={:.4} min_conf_scale={:.4}",
+                    emission_conf_scales.len(),
+                    mean_scale,
+                    min_scale
+                );
+            }
             let sample_iter = || {
                 sample_phases.par_iter().enumerate().map(|(s, sp)| {
                     if frozen_samples
@@ -5190,10 +5215,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ws.seq2.reserve(n_hi_freq);
                         ws.sample_conf.reserve(n_hi_freq);
                         ws.sample_phase_conf.reserve(n_hi_freq);
-                        for &m in hi_freq_to_orig {
+                        for (i, &m) in hi_freq_to_orig.iter().enumerate() {
                             ws.seq1.push(sp.allele1(m));
                             ws.seq2.push(sp.allele2(m));
-                            ws.sample_conf.push(sp.confidence(m));
+                            let conf_scale = emission_conf_scales[i];
+                            ws.sample_conf
+                                .push((sp.confidence(m) * conf_scale).clamp(0.0, 1.0));
                             ws.sample_phase_conf.push(sp.phase_confidence(m));
                         }
                         let seq1 = std::mem::take(&mut ws.seq1);
@@ -6045,6 +6072,27 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         if n_stage1 < 2 {
             return None;
         }
+        let hi_freq_emit_conf_scale = build_marker_emission_conf_scales(
+            target_gt,
+            sample_phases,
+            hi_freq_markers,
+            self.params.p_mismatch,
+        );
+        if !hi_freq_emit_conf_scale.is_empty() {
+            let mut sum_scale = 0.0f32;
+            let mut min_scale = 1.0f32;
+            for &scale in &hi_freq_emit_conf_scale {
+                sum_scale += scale;
+                min_scale = min_scale.min(scale);
+            }
+            let mean_scale = sum_scale / hi_freq_emit_conf_scale.len() as f32;
+            eprintln!(
+                "[stage2 scaffold emission] markers={} mean_conf_scale={:.4} min_conf_scale={:.4}",
+                hi_freq_emit_conf_scale.len(),
+                mean_scale,
+                min_scale
+            );
+        }
 
         // Compute total haplotype count (target + reference)
 
@@ -6126,6 +6174,32 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             let rare_markers: Vec<usize> = (0..n_markers)
                 .filter(|&m| (maf[m] < rare_threshold && maf[m] > 0.0) || has_missing(m))
                 .collect();
+            let mut marker_emit_conf_scale = vec![1.0f32; n_markers];
+            if !rare_markers.is_empty() {
+                let rare_scales = build_marker_emission_conf_scales(
+                    target_gt,
+                    sample_phases,
+                    &rare_markers,
+                    self.params.p_mismatch,
+                );
+                for (idx, &m) in rare_markers.iter().enumerate() {
+                    marker_emit_conf_scale[m] = rare_scales[idx];
+                }
+                let mut sum_scale = 0.0f32;
+                let mut min_scale = 1.0f32;
+                for &m in &rare_markers {
+                    let scale = marker_emit_conf_scale[m];
+                    sum_scale += scale;
+                    min_scale = min_scale.min(scale);
+                }
+                let mean_scale = sum_scale / rare_markers.len() as f32;
+                eprintln!(
+                    "[stage2 emission] rare_markers={} mean_conf_scale={:.4} min_conf_scale={:.4}",
+                    rare_markers.len(),
+                    mean_scale,
+                    min_scale
+                );
+            }
 
             // Use CompositeSubset view when reference panel is available
             let subset_view =
@@ -6199,8 +6273,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     // Extract Stage 1 alleles from SamplePhase
                     let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele1(m)).collect();
                     let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele2(m)).collect();
-                    let seq_conf: Vec<f32> =
-                        hi_freq_markers.iter().map(|&m| sp.confidence(m)).collect();
+                    let seq_conf: Vec<f32> = hi_freq_markers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &m)| (sp.confidence(m) * hi_freq_emit_conf_scale[i]).clamp(0.0, 1.0))
+                        .collect();
                     let hmm = MosaicHmm::new(subset_view, &self.params, n_states, stage1_p_recomb);
                     let plp = PlProvider {
                         gt: target_gt,
@@ -6533,7 +6610,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         // Handle missing genotypes by imputation
                         if sp.is_missing(m) || a1 == 255 || a2 == 255 {
-                            let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
+                            let obs_conf =
+                                (sp.confidence(m) * marker_emit_conf_scale[m]).clamp(0.05, 1.0);
                             let imp_a1 = if let Some((h, top, second)) =
                                 top_bridge_haplotype(&bridge_probs1)
                             {
@@ -6588,7 +6666,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             continue;
                         }
 
-                        let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
+                        let obs_conf =
+                            (sp.confidence(m) * marker_emit_conf_scale[m]).clamp(0.05, 1.0);
                         let mut log_same = 0.0f32;
                         let mut log_swap = 0.0f32;
 
@@ -6995,6 +7074,105 @@ fn build_sample_confidence(target_gt: &GenotypeMatrix) -> Vec<Vec<f32>> {
                 })
                 .collect()
         })
+        .collect()
+}
+
+fn build_marker_emission_conf_scales(
+    target_gt: &GenotypeMatrix,
+    sample_phases: &[SamplePhase],
+    markers: &[usize],
+    base_error_rate: f32,
+) -> Vec<f32> {
+    if markers.is_empty() {
+        return Vec::new();
+    }
+    let n_samples = sample_phases.len();
+    if n_samples == 0 {
+        return vec![1.0; markers.len()];
+    }
+
+    let base_error = base_error_rate.clamp(1e-6, 0.45);
+    let probe_target = n_samples.min(EMIT_PROFILE_MAX_PROBE_SAMPLES).max(1);
+    let stride = n_samples.div_ceil(probe_target).max(1);
+    let mut probe_samples = Vec::with_capacity(probe_target);
+    for s in (0..n_samples).step_by(stride) {
+        probe_samples.push(s);
+        if probe_samples.len() >= probe_target {
+            break;
+        }
+    }
+    if probe_samples.is_empty() {
+        probe_samples.push(0);
+    }
+
+    let mut marker_errors = vec![base_error; markers.len()];
+    for (idx, &m) in markers.iter().enumerate() {
+        let n_alleles = target_gt
+            .markers()
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles()
+            .max(2);
+        let type_scale = if n_alleles > 2 { 1.6 } else { 1.0 };
+        let prior_mean = (base_error * type_scale).clamp(base_error, 0.45);
+        let alpha = (prior_mean * EMIT_PROFILE_PRIOR_STRENGTH).max(1e-6);
+        let beta = ((1.0 - prior_mean) * EMIT_PROFILE_PRIOR_STRENGTH).max(1e-6);
+
+        let mut weighted_residual_sum = 0.0f32;
+        let mut weight_sum = 0.0f32;
+        let mut missing_count = 0usize;
+        for &s in &probe_samples {
+            let sp = &sample_phases[s];
+            let a1 = sp.allele1(m);
+            let a2 = sp.allele2(m);
+            if a1 == 255 || a2 == 255 {
+                missing_count += 1;
+                continue;
+            }
+            let conf = sp.confidence(m).clamp(0.0, 1.0);
+            let heterozygous = a1 != a2;
+            let gate = if !heterozygous {
+                1.0
+            } else {
+                let phase_conf = sp.phase_confidence(m).clamp(0.0, 1.0);
+                if phase_conf.min(1.0 - phase_conf) <= (1.0 - EMIT_PROFILE_HET_CONFIDENCE_GATE) {
+                    0.35
+                } else {
+                    0.0
+                }
+            };
+            if gate <= 0.0 {
+                continue;
+            }
+            let weight = gate * (0.15 + 0.85 * conf);
+            let residual = (1.0 - conf).clamp(0.0, 1.0);
+            weighted_residual_sum += weight * residual;
+            weight_sum += weight;
+        }
+
+        let probe_n = probe_samples.len().max(1) as f32;
+        let missing_rate = missing_count as f32 / probe_n;
+        let missing_weight = missing_rate * 2.0;
+        weighted_residual_sum += missing_weight * 0.25;
+        weight_sum += missing_weight;
+
+        let posterior =
+            (alpha + weighted_residual_sum) / (alpha + beta + weight_sum).max(alpha + beta + 1e-6);
+        marker_errors[idx] = posterior.clamp(base_error, 0.45);
+    }
+
+    if marker_errors.len() >= 3 {
+        let mut smoothed = marker_errors.clone();
+        for i in 1..(marker_errors.len() - 1) {
+            smoothed[i] =
+                0.25 * marker_errors[i - 1] + 0.5 * marker_errors[i] + 0.25 * marker_errors[i + 1];
+        }
+        marker_errors = smoothed;
+    }
+
+    let denom = (0.5 - base_error).max(1e-6);
+    marker_errors
+        .into_iter()
+        .map(|err| ((0.5 - err) / denom).clamp(EMIT_PROFILE_MIN_CONF_SCALE, 1.0))
         .collect()
 }
 
