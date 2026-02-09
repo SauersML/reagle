@@ -14,11 +14,16 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bitvec::prelude::*;
+use linfa::DatasetBase;
+use linfa::traits::{Fit, Predict};
+use linfa_clustering::KMeans;
+use ndarray::{Array1, Array2};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use tracing::{info_span, instrument};
@@ -66,7 +71,9 @@ use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, Pbwt
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
-use crate::model::reference_pbwt::{PbwtQueryAllele, RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{
+    PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
+};
 use crate::model::state_allocator::allocate_lms_sparse;
 use crate::model::states::ThreadedHaps;
 use crate::model::types::{CombinedHapId, CombinedHapSpace, RefHapId, combined_from_ref};
@@ -121,6 +128,226 @@ impl Stage1Timing {
 }
 use mini_mcmc::core::{MarkovChain, Trace};
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SampleCohortStats {
+    mismatch_mass: f64,
+    emission_mass: f64,
+    expected_switches: f64,
+    genetic_dist_morgans: f64,
+    phase_uncertainty_sum: f64,
+    phase_uncertainty_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MismatchProb(f32);
+
+impl MismatchProb {
+    fn new_clamped(p: f32) -> Self {
+        Self(p.clamp(1e-6, 0.25))
+    }
+
+    fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl SampleCohortStats {
+    fn mean_uncertainty(self) -> f64 {
+        if self.phase_uncertainty_count == 0 {
+            0.5
+        } else {
+            (self.phase_uncertainty_sum / self.phase_uncertainty_count as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    fn has_signal(self) -> bool {
+        self.emission_mass > 0.0 && self.genetic_dist_morgans > 0.0
+    }
+}
+
+#[derive(Debug)]
+struct CohortCalibration {
+    sample_p_mismatch: Vec<f32>,
+    cohort_p_mismatch: Vec<f32>,
+    cohort_sizes: Vec<usize>,
+}
+
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let q = q.clamp(0.0, 1.0);
+    let pos = q * (sorted.len().saturating_sub(1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let w = pos - lo as f64;
+        sorted[lo] * (1.0 - w) + sorted[hi] * w
+    }
+}
+
+fn robust_center_scale(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 1.0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = percentile(&sorted, 0.5);
+    let q1 = percentile(&sorted, 0.25);
+    let q3 = percentile(&sorted, 0.75);
+    let iqr = (q3 - q1).abs().max(1e-6);
+    (median, iqr)
+}
+
+fn fit_cohort_calibration(
+    stats: &[SampleCohortStats],
+    global_p_mismatch: f32,
+) -> Option<CohortCalibration> {
+    const MIN_SAMPLES_FOR_CALIBRATION: usize = 50;
+    const MIN_COHORT_SIZE: usize = 12;
+    const MIN_REL_SPREAD: f32 = 1.15;
+    const MIN_ABS_SPREAD_FACTOR: f32 = 0.15;
+
+    if stats.len() < MIN_SAMPLES_FOR_CALIBRATION {
+        return None;
+    }
+    let mut active_indices: Vec<usize> = Vec::new();
+    let mut raw_features: Vec<[f64; 3]> = Vec::new();
+    for (idx, s) in stats.iter().copied().enumerate() {
+        if !s.has_signal() {
+            continue;
+        }
+        let log_e = ((s.mismatch_mass + 1.0) / (s.emission_mass + 2.0)).ln();
+        let log_s = ((s.expected_switches + 1.0) / (s.genetic_dist_morgans + 1e-3)).ln();
+        let u = s.mean_uncertainty();
+        if log_e.is_finite() && log_s.is_finite() && u.is_finite() {
+            active_indices.push(idx);
+            raw_features.push([log_e, log_s, u]);
+        }
+    }
+    if active_indices.len() < MIN_SAMPLES_FOR_CALIBRATION {
+        return None;
+    }
+
+    let mut dims: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    dims[0].reserve(raw_features.len());
+    dims[1].reserve(raw_features.len());
+    dims[2].reserve(raw_features.len());
+    for f in &raw_features {
+        dims[0].push(f[0]);
+        dims[1].push(f[1]);
+        dims[2].push(f[2]);
+    }
+    let (m0, s0) = robust_center_scale(&dims[0]);
+    let (m1, s1) = robust_center_scale(&dims[1]);
+    let (m2, s2) = robust_center_scale(&dims[2]);
+
+    let mut scaled = Vec::with_capacity(raw_features.len() * 3);
+    const FEATURE_CLAMP: f32 = 6.0;
+    for f in &raw_features {
+        let x0 = ((f[0] - m0) / s0) as f32;
+        let x1 = ((f[1] - m1) / s1) as f32;
+        let x2 = ((f[2] - m2) / s2) as f32;
+        scaled.push(x0.clamp(-FEATURE_CLAMP, FEATURE_CLAMP));
+        scaled.push(x1.clamp(-FEATURE_CLAMP, FEATURE_CLAMP));
+        scaled.push(x2.clamp(-FEATURE_CLAMP, FEATURE_CLAMP));
+    }
+    let data = Array2::from_shape_vec((raw_features.len(), 3), scaled).ok()?;
+    let dataset = DatasetBase::from(data);
+    let n = raw_features.len();
+    let max_k = 5usize.min(n.saturating_sub(1));
+    if max_k < 2 {
+        return None;
+    }
+
+    let mut best_model = None;
+    let mut best_score = f32::INFINITY;
+    for k in 2..=max_k {
+        let model = match KMeans::params(k)
+            .max_n_iterations(100)
+            .tolerance(1e-4)
+            .fit(&dataset)
+        {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let inertia = model.inertia().max(1e-12);
+        let penalty = ((k * 3) as f32) * (n as f32).ln().max(1.0);
+        let score = (n as f32) * inertia.ln() + penalty;
+        if score < best_score {
+            best_score = score;
+            best_model = Some(model);
+        }
+    }
+    let model = best_model?;
+    let labels: Array1<usize> = model.predict(dataset.records());
+    let n_clusters = labels.iter().copied().max().unwrap_or(0) + 1;
+    if n_clusters == 0 {
+        return None;
+    }
+
+    let mut cohort_sizes = vec![0usize; n_clusters];
+    let mut sum_mismatch = vec![0.0f64; n_clusters];
+    let mut sum_emit = vec![0.0f64; n_clusters];
+    for (row, &label) in labels.iter().enumerate() {
+        let sample_idx = active_indices[row];
+        let s = stats[sample_idx];
+        cohort_sizes[label] += 1;
+        sum_mismatch[label] += s.mismatch_mass;
+        sum_emit[label] += s.emission_mass;
+    }
+
+    let global = MismatchProb::new_clamped(global_p_mismatch);
+    let global_p = global.get();
+    let mut cohort_p_mismatch = vec![global_p; n_clusters];
+    for c in 0..n_clusters {
+        if sum_emit[c] > 0.0 {
+            let raw = (sum_mismatch[c] / sum_emit[c]) as f32;
+            let lo = (global_p * 0.25).max(1e-6);
+            let hi = (global_p * 4.0).min(0.25);
+            cohort_p_mismatch[c] = raw.clamp(lo, hi);
+        }
+    }
+
+    for &size in &cohort_sizes {
+        if size < MIN_COHORT_SIZE {
+            return None;
+        }
+    }
+    let mut min_cohort = f32::INFINITY;
+    let mut max_cohort = f32::NEG_INFINITY;
+    for &p in &cohort_p_mismatch {
+        min_cohort = min_cohort.min(p);
+        max_cohort = max_cohort.max(p);
+    }
+    if !min_cohort.is_finite() || !max_cohort.is_finite() {
+        return None;
+    }
+    let rel_spread = max_cohort / min_cohort.max(1e-6);
+    let abs_spread = max_cohort - min_cohort;
+    if rel_spread < MIN_REL_SPREAD || abs_spread < global_p * MIN_ABS_SPREAD_FACTOR {
+        return None;
+    }
+
+    let mut sample_p_mismatch = vec![global_p; stats.len()];
+    for (row, &label) in labels.iter().enumerate() {
+        let sample_idx = active_indices[row];
+        let s = stats[sample_idx];
+        let weight = (s.emission_mass / (s.emission_mass + 500.0)).clamp(0.0, 1.0) as f32;
+        let cohort_p = cohort_p_mismatch[label];
+        sample_p_mismatch[sample_idx] = ((1.0 - weight) * global_p + weight * cohort_p)
+            .clamp(1e-6, 0.25);
+    }
+
+    Some(CohortCalibration {
+        sample_p_mismatch,
+        cohort_p_mismatch,
+        cohort_sizes,
+    })
+}
+
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
@@ -131,8 +358,17 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
+const PBWT_ADAPTIVE_K_MIN_DIVISOR: usize = 3;
+const PBWT_ADAPTIVE_K_FLOOR: usize = 16;
+const PBWT_ADAPTIVE_K_MAX_MULT: usize = 2;
+const PBWT_WILDCARD_MIN_UNCERTAINTY: f32 = 0.85;
+const PBWT_MIN_ENTROPY_EPS: f32 = 1e-12;
 const PBWT_FORCE_TOP_HAPS: usize = 32;
 const PBWT_ANCHOR_TOP_HAPS: usize = 512;
+const EMIT_PROFILE_MAX_PROBE_SAMPLES: usize = 128;
+const EMIT_PROFILE_PRIOR_STRENGTH: f32 = 24.0;
+const EMIT_PROFILE_HET_CONFIDENCE_GATE: f32 = 0.98;
+const EMIT_PROFILE_MIN_CONF_SCALE: f32 = 0.35;
 const FAST_BEAM_WIDTH: usize = 16;
 const FAST_BEAM_SWITCH_CANDIDATES: usize = 4;
 const FAST_BEAM_INJECT_K: usize = 8;
@@ -347,6 +583,38 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     ranked
 }
 
+#[inline]
+fn adaptive_prescan_top_m(scores: &[f32], base_top: usize, n_ref_haps: usize) -> usize {
+    if base_top == 0 || n_ref_haps == 0 {
+        return 0;
+    }
+    let base = base_top.min(n_ref_haps).max(1);
+    let min_top = (base / 2).max(PBWT_ADAPTIVE_K_FLOOR).min(base);
+    if min_top >= base {
+        return base;
+    }
+    const SCORE_DENSITY_SAMPLES: usize = 2048;
+    let n = scores.len().min(n_ref_haps);
+    if n == 0 {
+        return min_top;
+    }
+    let samples = n.min(SCORE_DENSITY_SAMPLES).max(1);
+    let mut finite_hits = 0usize;
+    for i in 0..samples {
+        let idx = ((i as u128 * n as u128) / samples as u128) as usize;
+        let clamped = idx.min(n.saturating_sub(1));
+        let s = scores[clamped];
+        if s.is_finite() && s > 0.0 {
+            finite_hits += 1;
+        }
+    }
+    let uncertainty = (finite_hits as f32 / samples as f32).clamp(0.0, 1.0);
+    let span = (base - min_top) as f32;
+    (min_top as f32 + span * uncertainty)
+        .round()
+        .clamp(min_top as f32, base as f32) as usize
+}
+
 fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(fwd.len());
     for i in 0..fwd.len() {
@@ -477,8 +745,131 @@ fn compute_ref_freqs<TargetSpace, RefSpace>(
     freqs
 }
 
-fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
+#[inline]
+fn pbwt_beam_uncertainty(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> f32 {
+    if n_ref_haps == 0 {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    let mut sq_sum = 0.0f32;
+    let mut n_intervals = 0usize;
+    for &(l, r) in beam.intervals() {
+        if r <= l {
+            continue;
+        }
+        let len = (r - l) as f32;
+        total += len;
+        sq_sum += len * len;
+        n_intervals += 1;
+    }
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let coverage = (total / n_ref_haps as f32).clamp(0.0, 1.0);
+    let entropy_norm = if n_intervals > 1 && sq_sum > 0.0 {
+        let mut entropy = 0.0f32;
+        for &(l, r) in beam.intervals() {
+            if r <= l {
+                continue;
+            }
+            let p = ((r - l) as f32 / total).clamp(PBWT_MIN_ENTROPY_EPS, 1.0);
+            entropy -= p * p.ln();
+        }
+        let max_entropy = (n_intervals as f32).ln().max(PBWT_MIN_ENTROPY_EPS);
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut uncertainty = (0.7 * coverage + 0.3 * entropy_norm).clamp(0.0, 1.0);
+    if query.is_wildcard() {
+        uncertainty = uncertainty.max(PBWT_WILDCARD_MIN_UNCERTAINTY);
+    }
+    uncertainty
+}
+
+#[inline]
+fn adaptive_pbwt_donor_k(
+    base_k: usize,
+    n_ref_haps: usize,
+    beam: &RankBeam,
+    query: PbwtQueryAllele,
+) -> NonZeroUsize {
+    if n_ref_haps == 0 {
+        return NonZeroUsize::new(1).expect("1 must be non-zero");
+    }
+    let base = base_k.max(1).min(n_ref_haps);
+    let k_min = (base / PBWT_ADAPTIVE_K_MIN_DIVISOR)
+        .max(PBWT_ADAPTIVE_K_FLOOR)
+        .min(base);
+    let k_max = base
+        .saturating_mul(PBWT_ADAPTIVE_K_MAX_MULT)
+        .max(base)
+        .min(n_ref_haps);
+    if k_max <= k_min {
+        return NonZeroUsize::new(k_min.max(1)).expect("k_min.max(1) must be non-zero");
+    }
+    let uncertainty = pbwt_beam_uncertainty(beam, n_ref_haps, query);
+    let span = (k_max - k_min) as f32;
+    let k = (k_min as f32 + span * uncertainty)
+        .round()
+        .clamp(k_min as f32, k_max as f32) as usize;
+    NonZeroUsize::new(k.max(1)).expect("k.max(1) must be non-zero")
+}
+
+#[inline]
+fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32) -> f32 {
+    // Decision-theoretic proxy:
+    // - High genotype confidence allows larger tolerated orientation error.
+    // - High beam uncertainty means committing to one orientation is less risky,
+    //   so tolerate larger orientation error before wildcarding.
+    // - Low beam uncertainty means sharp/fragile PBWT path, so wildcard sooner.
+    let base = 0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0);
+    let scale = 0.55 + 0.9 * beam_uncertainty.clamp(0.0, 1.0);
+    (base * scale).clamp(0.04, 0.30)
+}
+
+#[inline]
+fn phase_best_orientation_error(phase_conf: f32) -> f32 {
+    let p = phase_conf.clamp(0.0, 1.0);
+    p.min(1.0 - p)
+}
+
+#[inline]
+fn biallelic_haplotype_probs(
+    a1: u8,
+    a2: u8,
+    phase_conf: f32,
+) -> [PbwtBiallelicQueryProb; 2] {
+    if a1 == 0 && a2 == 1 {
+        let p = phase_conf.clamp(0.0, 1.0);
+        [
+            PbwtBiallelicQueryProb::new(p, 1.0 - p),
+            PbwtBiallelicQueryProb::new(1.0 - p, p),
+        ]
+    } else if a1 == 1 && a2 == 0 {
+        let p = phase_conf.clamp(0.0, 1.0);
+        [
+            PbwtBiallelicQueryProb::new(1.0 - p, p),
+            PbwtBiallelicQueryProb::new(p, 1.0 - p),
+        ]
+    } else if a1 == 0 && a2 == 0 {
+        [
+            PbwtBiallelicQueryProb::deterministic(0),
+            PbwtBiallelicQueryProb::deterministic(0),
+        ]
+    } else if a1 == 1 && a2 == 1 {
+        [
+            PbwtBiallelicQueryProb::deterministic(1),
+            PbwtBiallelicQueryProb::deterministic(1),
+        ]
+    } else {
+        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()]
+    }
+}
+
+fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     batch_haps: &[usize],
+    target_gt: &GenotypeMatrix<TargetState, TargetSpace>,
     geno: &MutableGenotypes,
     ref_columns: &[GenotypeColumn],
     phase_mask: Option<&crate::data::storage::matrix::BitMatrix>,
@@ -492,7 +883,9 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     exclude_self: bool,
     marker_map: Option<&[usize]>,
     ref_index_map: Option<&[usize]>,
-) {
+) where
+    TargetState: crate::data::storage::phase_state::PhaseState,
+{
     let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
     if batch_haps.is_empty() || n_ref_haps == 0 {
         return;
@@ -508,39 +901,97 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
         .collect();
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![PbwtQueryAllele::missing(); batch_haps.len()];
+    let mut query_allele_probs = vec![PbwtBiallelicQueryProb::uniform(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (2.0 * n_ref_haps.max(1) as f32);
-
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
+        let marker_idx = MarkerIdx::new(orig_m as u32);
+        let mut cached_sample_idx = usize::MAX;
+        let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
+        let mut cached_query_probs = [PbwtBiallelicQueryProb::uniform(); 2];
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
-            let phased = phase_mask
-                .and_then(|mask| mask.get(orig_m, sample_idx))
-                .unwrap_or(0);
-            if phased == 0
-                && mask_unphased_hets
-                    .and_then(|flags| flags.get(sample_idx))
-                    .copied()
-                    .unwrap_or(false)
-            {
+            let local = hap_idx % 2;
+            if sample_idx != cached_sample_idx {
+                cached_sample_idx = sample_idx;
                 let hap1 = sample_idx * 2;
                 let hap2 = hap1 + 1;
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                if a1 != 255 && a1 == a2 {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
+                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let qa1 = PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
+                let qa2 = PbwtQueryAllele::allele(a2).unwrap_or_else(PbwtQueryAllele::missing);
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(orig_m, sample_idx))
+                    .unwrap_or(0);
+                let wildcard_unphased_het = phased == 0
+                    && mask_unphased_hets
+                        .and_then(|flags| flags.get(sample_idx))
+                        .copied()
+                        .unwrap_or(false)
+                    && is_het;
+                cached_query_probs = biallelic_haplotype_probs(a1, a2, 1.0);
+                if wildcard_unphased_het {
+                    cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    cached_query_probs =
+                        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()];
+                } else if phased == 0 && a1 != 255 && a1 == a2 {
+                    cached_query_pair = [qa1, qa2];
+                } else if phased != 0 && is_het {
+                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                        &beams_fwd[i],
+                        n_ref_haps,
+                        qa1,
+                    );
+                    let peer_idx = if i > 0 && (batch_haps[i - 1] / 2) == sample_idx {
+                        Some(i - 1)
+                    } else if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                        Some(i + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(peer_i) = peer_idx {
+                        let peer_query = if (batch_haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                        let peer_uncertainty = pbwt_beam_uncertainty(
+                            &beams_fwd[peer_i],
+                            n_ref_haps,
+                            peer_query,
+                        );
+                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                    }
+                    let phase_conf = target_gt
+                        .sample_phase_confidence_f32(marker_idx, sample_idx)
+                        .clamp(0.0, 1.0);
+                    cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
+                    let geno_conf = target_gt
+                        .sample_confidence_f32(marker_idx, sample_idx)
+                        .clamp(0.0, 1.0);
+                    let best_orient_err = phase_best_orientation_error(phase_conf);
+                    if best_orient_err
+                        > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
+                    {
+                        cached_query_pair =
+                            [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    } else if phase_conf < 0.5 {
+                        cached_query_pair = [qa2, qa1];
+                    } else {
+                        cached_query_pair = [qa1, qa2];
+                    }
                 } else {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
+                    cached_query_pair = [qa1, qa2];
+                    if phased == 0 && is_het {
+                        cached_query_probs = [
+                            PbwtBiallelicQueryProb::uniform(),
+                            PbwtBiallelicQueryProb::uniform(),
+                        ];
+                    }
                 }
-            } else {
-                let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
             }
+            query_alleles[i] = cached_query_pair[local];
+            query_allele_probs[i] = cached_query_probs[local];
         }
 
         if let Some(alignment) = alignment {
@@ -625,11 +1076,12 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
             (max_allele as usize).saturating_add(1).max(2)
         };
 
-        pbwt_fwd.advance_with_beams_query(
+        pbwt_fwd.advance_with_beams_query_probs(
             &ref_alleles,
             n_alleles,
             local_idx,
             &query_alleles,
+            Some(&query_allele_probs),
             &mut beams_fwd,
         );
 
@@ -638,54 +1090,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 if query_alleles[i].is_missing() {
                     continue;
                 }
-                if query_alleles[i].is_wildcard() {
-                    pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
-                    for &d in donors_buf.iter() {
-                        let idx = d as usize;
-                        if idx >= n_ref_haps {
-                            continue;
-                        }
-                        if exclude_self && idx / 2 == hap_idx / 2 {
-                            continue;
-                        }
-                        let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
-                            continue;
-                        }
-                        if ref_allele != 0 && ref_allele != 1 {
-                            continue;
-                        }
-                        let freq = freqs
-                            .get(m)
-                            .and_then(|f| f.get(ref_allele as usize))
-                            .copied()
-                            .unwrap_or(0.0);
-                        if freq <= 0.0 {
-                            continue;
-                        }
-                        let weight = -(freq.max(min_freq)).ln();
-                        let w = &mut window_scores[i][idx];
-                        if w.is_finite() {
-                            *w += weight;
-                        } else {
-                            *w = weight;
-                        }
-                    }
-                    continue;
-                }
-                let targ = query_alleles[i]
-                    .as_allele()
-                    .expect("non-missing/non-wildcard query allele should be concrete");
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
-                pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
+                let donor_k =
+                    adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_fwd[i], query_alleles[i]);
+                pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
+                let allele_probs = query_allele_probs[i];
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -694,10 +1102,23 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     if exclude_self && idx / 2 == hap_idx / 2 {
                         continue;
                     }
-                    let ref_a = ref_alleles[idx];
-                    if ref_a == 255 || ref_a != targ {
+                    let ref_allele = ref_alleles[idx];
+                    if ref_allele == 255 || ref_allele > 1 {
                         continue;
                     }
+                    let p_match = allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0);
+                    if p_match <= 0.0 {
+                        continue;
+                    }
+                    let freq = freqs
+                        .get(m)
+                        .and_then(|f| f.get(ref_allele as usize))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
@@ -716,32 +1137,90 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
     for (rev_step, m) in (start..end).rev().enumerate() {
         let local_idx = end - start - 1 - rev_step;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
+        let marker_idx = MarkerIdx::new(orig_m as u32);
+        let mut cached_sample_idx = usize::MAX;
+        let mut cached_query_pair = [PbwtQueryAllele::missing(); 2];
+        let mut cached_query_probs = [PbwtBiallelicQueryProb::uniform(); 2];
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
             let sample_idx = hap_idx / 2;
-            let phased = phase_mask
-                .and_then(|mask| mask.get(orig_m, sample_idx))
-                .unwrap_or(0);
-            if phased == 0
-                && mask_unphased_hets
-                    .and_then(|flags| flags.get(sample_idx))
-                    .copied()
-                    .unwrap_or(false)
-            {
+            let local = hap_idx % 2;
+            if sample_idx != cached_sample_idx {
+                cached_sample_idx = sample_idx;
                 let hap1 = sample_idx * 2;
                 let hap2 = hap1 + 1;
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                if a1 != 255 && a1 == a2 {
-                    query_alleles[i] =
-                        PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
+                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let qa1 = PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
+                let qa2 = PbwtQueryAllele::allele(a2).unwrap_or_else(PbwtQueryAllele::missing);
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(orig_m, sample_idx))
+                    .unwrap_or(0);
+                let wildcard_unphased_het = phased == 0
+                    && mask_unphased_hets
+                        .and_then(|flags| flags.get(sample_idx))
+                        .copied()
+                        .unwrap_or(false)
+                    && is_het;
+                cached_query_probs = biallelic_haplotype_probs(a1, a2, 1.0);
+                if wildcard_unphased_het {
+                    cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    cached_query_probs =
+                        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()];
+                } else if phased == 0 && a1 != 255 && a1 == a2 {
+                    cached_query_pair = [qa1, qa2];
+                } else if phased != 0 && is_het {
+                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                        &beams_bwd[i],
+                        n_ref_haps,
+                        qa1,
+                    );
+                    let peer_idx = if i > 0 && (batch_haps[i - 1] / 2) == sample_idx {
+                        Some(i - 1)
+                    } else if i + 1 < batch_haps.len() && (batch_haps[i + 1] / 2) == sample_idx {
+                        Some(i + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(peer_i) = peer_idx {
+                        let peer_query = if (batch_haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                        let peer_uncertainty = pbwt_beam_uncertainty(
+                            &beams_bwd[peer_i],
+                            n_ref_haps,
+                            peer_query,
+                        );
+                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                    }
+                    let phase_conf = target_gt
+                        .sample_phase_confidence_f32(marker_idx, sample_idx)
+                        .clamp(0.0, 1.0);
+                    cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
+                    let geno_conf = target_gt
+                        .sample_confidence_f32(marker_idx, sample_idx)
+                        .clamp(0.0, 1.0);
+                    let best_orient_err = phase_best_orientation_error(phase_conf);
+                    if best_orient_err
+                        > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
+                    {
+                        cached_query_pair =
+                            [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
+                    } else if phase_conf < 0.5 {
+                        cached_query_pair = [qa2, qa1];
+                    } else {
+                        cached_query_pair = [qa1, qa2];
+                    }
                 } else {
-                    query_alleles[i] = PbwtQueryAllele::wildcard();
+                    cached_query_pair = [qa1, qa2];
+                    if phased == 0 && is_het {
+                        cached_query_probs = [
+                            PbwtBiallelicQueryProb::uniform(),
+                            PbwtBiallelicQueryProb::uniform(),
+                        ];
+                    }
                 }
-            } else {
-                let qa = geno.get(orig_m, HapIdx::new(hap_idx as u32));
-                query_alleles[i] =
-                    PbwtQueryAllele::allele(qa).unwrap_or_else(PbwtQueryAllele::missing);
             }
+            query_alleles[i] = cached_query_pair[local];
+            query_allele_probs[i] = cached_query_probs[local];
         }
 
         if let Some(alignment) = alignment {
@@ -826,11 +1305,12 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
             (max_allele as usize).saturating_add(1).max(2)
         };
 
-        pbwt_bwd.advance_with_beams_query(
+        pbwt_bwd.advance_with_beams_query_probs(
             &ref_alleles,
             n_alleles,
             rev_step,
             &query_alleles,
+            Some(&query_allele_probs),
             &mut beams_bwd,
         );
 
@@ -839,54 +1319,10 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                 if query_alleles[i].is_missing() {
                     continue;
                 }
-                if query_alleles[i].is_wildcard() {
-                    pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
-                    for &d in donors_buf.iter() {
-                        let idx = d as usize;
-                        if idx >= n_ref_haps {
-                            continue;
-                        }
-                        if exclude_self && idx / 2 == hap_idx / 2 {
-                            continue;
-                        }
-                        let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
-                            continue;
-                        }
-                        if ref_allele != 0 && ref_allele != 1 {
-                            continue;
-                        }
-                        let freq = freqs
-                            .get(m)
-                            .and_then(|f| f.get(ref_allele as usize))
-                            .copied()
-                            .unwrap_or(0.0);
-                        if freq <= 0.0 {
-                            continue;
-                        }
-                        let weight = -(freq.max(min_freq)).ln();
-                        let w = &mut window_scores[i][idx];
-                        if w.is_finite() {
-                            *w += weight;
-                        } else {
-                            *w = weight;
-                        }
-                    }
-                    continue;
-                }
-                let targ = query_alleles[i]
-                    .as_allele()
-                    .expect("non-missing/non-wildcard query allele should be concrete");
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
-                if freq <= 0.0 {
-                    continue;
-                }
-                let weight = -(freq.max(min_freq)).ln();
-                pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
+                let donor_k =
+                    adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_bwd[i], query_alleles[i]);
+                pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
+                let allele_probs = query_allele_probs[i];
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
@@ -895,10 +1331,23 @@ fn score_window_batch_pbwt_segment<TargetSpace, RefSpace>(
                     if exclude_self && idx / 2 == hap_idx / 2 {
                         continue;
                     }
-                    let ref_a = ref_alleles[idx];
-                    if ref_a == 255 || ref_a != targ {
+                    let ref_allele = ref_alleles[idx];
+                    if ref_allele == 255 || ref_allele > 1 {
                         continue;
                     }
+                    let p_match = allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0);
+                    if p_match <= 0.0 {
+                        continue;
+                    }
+                    let freq = freqs
+                        .get(m)
+                        .and_then(|f| f.get(ref_allele as usize))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if freq <= 0.0 {
+                        continue;
+                    }
+                    let weight = p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
@@ -1985,6 +2434,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
             let mut frozen_streaks = vec![0usize; n_samples];
+            let mut cohort_calibration: Option<CohortCalibration> = None;
 
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
@@ -2010,6 +2460,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     None
                 };
 
+                let mut cohort_stats = if is_burnin && it == 0 {
+                    Some(vec![SampleCohortStats::default(); n_samples])
+                } else {
+                    None
+                };
                 let (total_switches, total_phased, sample_changed) = self
                     .run_phase_baum_iteration_stage1(
                         &target_gt,
@@ -2027,6 +2482,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         } else {
                             Some(&frozen_samples)
                         },
+                        cohort_calibration
+                            .as_ref()
+                            .map(|cal| cal.sample_p_mismatch.as_slice()),
+                        cohort_stats.as_deref_mut(),
                         atomic_estimates.as_ref(),
                         it,
                     )?;
@@ -2050,6 +2509,26 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         stage1_p_recomb = std::iter::once(0.0f32)
                             .chain(stage1_gen_dists.iter().map(|&d| self.params.p_recomb(d)))
                             .collect();
+                    }
+                }
+
+                if let Some(stats) = cohort_stats {
+                    if let Some(model) = fit_cohort_calibration(&stats, self.params.p_mismatch) {
+                        let n_cohorts = model.cohort_p_mismatch.len();
+                        let preview: Vec<String> = model
+                            .cohort_p_mismatch
+                            .iter()
+                            .zip(model.cohort_sizes.iter())
+                            .map(|(&p, &n)| format!("{:.6} (n={})", p, n))
+                            .collect();
+                        eprintln!(
+                            "Cohort calibration enabled: {} cohorts, p_mismatch={}",
+                            n_cohorts,
+                            preview.join(", ")
+                        );
+                        cohort_calibration = Some(model);
+                    } else {
+                        eprintln!("Cohort calibration skipped: insufficient structure in burn-in");
                     }
                 }
 
@@ -2519,6 +2998,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
             let mut frozen_streaks = vec![0usize; n_samples];
+            let mut cohort_calibration: Option<CohortCalibration> = None;
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
                 let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -2537,6 +3017,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 }
 
                 self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
+                let mut cohort_stats = if is_burnin && it == 0 {
+                    Some(vec![SampleCohortStats::default(); n_samples])
+                } else {
+                    None
+                };
                 let (total_switches, total_phased, sample_changed) = self
                     .run_phase_baum_iteration_stage1(
                         &target_gt,
@@ -2554,6 +3039,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         } else {
                             Some(&frozen_samples)
                         },
+                        cohort_calibration
+                            .as_ref()
+                            .map(|cal| cal.sample_p_mismatch.as_slice()),
+                        cohort_stats.as_deref_mut(),
                         None,
                         it,
                     )?;
@@ -2604,6 +3093,25 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         stable_main_iters = 0;
                     }
                     prev_remaining_hets = Some(remaining_hets);
+                }
+
+                if let Some(stats) = cohort_stats {
+                    if let Some(model) = fit_cohort_calibration(&stats, self.params.p_mismatch) {
+                        let preview: Vec<String> = model
+                            .cohort_p_mismatch
+                            .iter()
+                            .zip(model.cohort_sizes.iter())
+                            .map(|(&p, &n)| format!("{:.6} (n={})", p, n))
+                            .collect();
+                        eprintln!(
+                            "Cohort calibration enabled: {} cohorts, p_mismatch={}",
+                            model.cohort_p_mismatch.len(),
+                            preview.join(", ")
+                        );
+                        cohort_calibration = Some(model);
+                    } else {
+                        eprintln!("Cohort calibration skipped: insufficient structure in burn-in");
+                    }
                 }
             }
 
@@ -3195,6 +3703,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .collect();
 
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
+            let mut cohort_calibration: Option<CohortCalibration> = None;
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
                 self.params.lr_threshold = self.params.lr_threshold_for_iteration(it);
@@ -3216,6 +3725,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 } else {
                     None
                 };
+                let mut cohort_stats = if is_burnin && it == 0 {
+                    Some(vec![SampleCohortStats::default(); n_samples])
+                } else {
+                    None
+                };
 
                 self.run_phase_baum_iteration(
                     target_gt,
@@ -3224,6 +3738,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     &gen_dists,
                     &mut sample_phases,
                     &mut mcmc_paths,
+                    cohort_calibration
+                        .as_ref()
+                        .map(|cal| cal.sample_p_mismatch.as_slice()),
+                    cohort_stats.as_deref_mut(),
                     atomic_estimates.as_ref(),
                     &confidence_by_sample,
                 )?;
@@ -3247,6 +3765,25 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         p_recomb = std::iter::once(0.0f32)
                             .chain(gen_dists.iter().map(|&d| self.params.p_recomb(d)))
                             .collect();
+                    }
+                }
+
+                if let Some(stats) = cohort_stats {
+                    if let Some(model) = fit_cohort_calibration(&stats, self.params.p_mismatch) {
+                        let preview: Vec<String> = model
+                            .cohort_p_mismatch
+                            .iter()
+                            .zip(model.cohort_sizes.iter())
+                            .map(|(&p, &n)| format!("{:.6} (n={})", p, n))
+                            .collect();
+                        eprintln!(
+                            "Cohort calibration enabled: {} cohorts, p_mismatch={}",
+                            model.cohort_p_mismatch.len(),
+                            preview.join(", ")
+                        );
+                        cohort_calibration = Some(model);
+                    } else {
+                        eprintln!("Cohort calibration skipped: insufficient structure in burn-in");
                     }
                 }
             }
@@ -3471,6 +4008,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &ibs2,
                 &mut sample_phases,
                 &mut mcmc_paths,
+                None,
+                None,
                 None,
                 None,
                 0,
@@ -4053,6 +4592,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                 score_window_batch_pbwt_segment(
                     &batch_haps_buf,
+                    target_gt,
                     target_geno,
                     &ref_columns,
                     phase_mask,
@@ -4068,11 +4608,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     ref_index_map.as_deref(),
                 );
 
-                let top_m = per_window_cap
+                let base_top_m = per_window_cap
                     .saturating_mul(PBWT_PER_WINDOW_MULT)
                     .max(per_window_cap)
                     .min(n_ref_haps.max(1));
                 for (i, &hap_idx) in batch_haps_buf.iter().enumerate() {
+                    let top_m =
+                        adaptive_prescan_top_m(&window_scores_buf[i], base_top_m, n_ref_haps);
                     let top = select_top_k(&window_scores_buf[i], top_m);
                     scores_by_window_by_hap[hap_idx].push(top);
                 }
@@ -4481,6 +5023,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         gen_dists: &[f64],
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
+        sample_p_mismatch: Option<&[f32]>,
+        cohort_stats_out: Option<&mut [SampleCohortStats]>,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         confidence_by_sample: &[Vec<f32>],
     ) -> Result<()> {
@@ -4529,6 +5073,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Vec<(usize, f32)>,
             Vec<(usize, f32)>,
             Option<GlobalMosaicPaths>,
+            Option<SampleCohortStats>,
         )> = info_span!("build_composite_view").in_scope(|| {
             // Immutable borrow of geno for the entire read phase
             let ref_geno: &MutableGenotypes = geno;
@@ -4547,24 +5092,27 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
             let prior_paths = &mcmc_paths[..];
             let sample_phase_view: &[SamplePhase] = &*sample_phases;
+            let collect_cohort_stats = cohort_stats_out.is_some();
             let mut swap_results: Vec<(
                 BitVec<u8, Lsb0>,
                 Vec<(usize, f32)>,
                 Vec<(usize, f32)>,
                 Option<GlobalMosaicPaths>,
+                Option<SampleCohortStats>,
             )> = vec![
                 (
                     BitVec::repeat(false, n_markers),
                     Vec::new(),
                     Vec::new(),
-                    None
+                    None,
+                    None,
                 );
                 n_samples
             ];
 
             tracing::info_span!("hmm_samples").in_scope(|| {
                 swap_results.par_iter_mut().enumerate().for_each(
-                    |(s, (mask, het_lr_out, het_phase_out, paths_out))| {
+                    |(s, (mask, het_lr_out, het_phase_out, paths_out, cohort_stats_out_one))| {
                         let sample_idx = SampleIdx::new(s as u32);
                         let hap1 = sample_idx.hap1();
                         let hap2 = sample_idx.hap2();
@@ -4589,6 +5137,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let seq2 = ref_geno.haplotype(hap2);
                         // Use pre-computed confidence instead of recomputing
                         let sample_conf = &confidence_by_sample[s];
+                        let sample_p_err = MismatchProb::new_clamped(
+                            sample_p_mismatch
+                                .and_then(|v| v.get(s))
+                                .copied()
+                                .unwrap_or(self.params.p_mismatch),
+                        )
+                        .get();
+                        let sample_p_no_err = 1.0 - sample_p_err;
 
                         // 3. Run HMM with per-heterozygote swap probabilities
                         // Following Java PhaseBaum2.java: interleave phase decisions in the forward pass.
@@ -4603,8 +5159,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         // Collect EM statistics if requested (using original sequences)
                         // Only create HMM when needed to avoid unnecessary p_recomb.clone()
                         if n_states_full > final_states {
+                            let mut local_params = self.params.clone();
+                            local_params.p_mismatch = sample_p_err;
                             let hmm_full =
-                                MosaicHmm::new(ref_view, &self.params, n_states_full, p_recomb);
+                                MosaicHmm::new(ref_view, &local_params, n_states_full, p_recomb);
                             let mut fwd1 = Vec::new();
                             let mut bwd1 = Vec::new();
                             let mut fwd2 = Vec::new();
@@ -4693,13 +5251,21 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             selection_applied = true;
                         }
 
-                        if let Some(atomic) = atomic_estimates {
-                            let hmm = MosaicHmm::new(ref_view, &self.params, n_states, p_recomb);
+                        let local_estimates: Option<crate::model::parameters::ParamEstimates> =
+                            if atomic_estimates.is_some() || collect_cohort_stats {
+                            let mut local_params = self.params.clone();
+                            local_params.p_mismatch = sample_p_err;
+                            let hmm = MosaicHmm::new(ref_view, &local_params, n_states, p_recomb);
                             let mut local_est = crate::model::parameters::ParamEstimates::new();
                             hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
                             hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
-                            atomic.add_estimation_data(&local_est);
-                        }
+                            if let Some(atomic) = atomic_estimates {
+                                atomic.add_estimation_data(&local_est);
+                            }
+                            Some(local_est)
+                        } else {
+                            None
+                        };
 
                         // 3-Track HMM with Prior-First Approach
                         //
@@ -4721,9 +5287,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     && sample_phase_view[s].is_unphased(m)
                             })
                             .collect();
-
-                        let p_err = self.params.p_mismatch;
-                        let p_no_err = 1.0 - p_err;
 
                         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) =
                             THREAD_WORKSPACE.with(|ws| {
@@ -4771,8 +5334,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     sample_seed,
                                     self.config.mcmc_burnin,
                                     self.config.mcmc_lr_samples,
-                                    p_no_err,
-                                    p_err,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     ws,
                                 );
                                 result
@@ -4802,6 +5365,37 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         assert!(swap_probs_mask_sum.is_finite());
                         assert!(swap_lr.len() <= n_markers);
                         assert!(het_phase_out.len() <= het_positions.len());
+                        if collect_cohort_stats {
+                            let (mismatch_mass, emission_mass, expected_switches, genetic_dist_cm) =
+                                if let Some(est) = local_estimates.as_ref() {
+                                    (
+                                        est.mismatch_mass(),
+                                        est.emission_mass(),
+                                        est.expected_switches(),
+                                        est.genetic_distance_cm(),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0)
+                                };
+                            let mut uncertainty_sum = 0.0f64;
+                            let mut uncertainty_count = 0usize;
+                            for &m in &het_positions {
+                                uncertainty_sum +=
+                                    (1.0 - sample_phase_view[s].phase_confidence(m).clamp(0.0, 1.0))
+                                        as f64;
+                                uncertainty_count += 1;
+                            }
+                            *cohort_stats_out_one = Some(SampleCohortStats {
+                                mismatch_mass,
+                                emission_mass,
+                                expected_switches,
+                                genetic_dist_morgans: genetic_dist_cm / 100.0,
+                                phase_uncertainty_sum: uncertainty_sum,
+                                phase_uncertainty_count: uncertainty_count,
+                            });
+                        } else {
+                            *cohort_stats_out_one = None;
+                        }
                         let mut swapped = false;
                         let mut swap_idx = 0usize;
                         for m in 0..n_markers {
@@ -4824,9 +5418,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // After computing swap masks for all samples, apply them sequentially.
         // This is done sequentially because swap_haplotypes requires mutable access.
         info_span!("apply_swaps").in_scope(|| {
-            for (s, (mask, het_lr_values, het_phase_values, paths)) in
+            let mut cohort_stats_out = cohort_stats_out;
+            for (s, (mask, het_lr_values, het_phase_values, paths, cohort_stats_one)) in
                 swap_results.into_iter().enumerate()
             {
+                if let Some(out) = cohort_stats_out.as_deref_mut() {
+                    if s < out.len() {
+                        out[s] = cohort_stats_one.unwrap_or_default();
+                    }
+                }
                 let sample_idx = SampleIdx::new(s as u32);
                 let hap1 = sample_idx.hap1();
                 let hap2 = sample_idx.hap2();
@@ -4877,6 +5477,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         sample_phases: &mut [SamplePhase],
         mcmc_paths: &mut [Option<GlobalMosaicPaths>],
         frozen_samples: Option<&[bool]>,
+        sample_p_mismatch: Option<&[f32]>,
+        cohort_stats_out: Option<&mut [SampleCohortStats]>,
         atomic_estimates: Option<&crate::model::parameters::AtomicParamEstimates>,
         iteration: usize,
     ) -> Result<(usize, usize, Vec<bool>)> {
@@ -4928,6 +5530,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             orientation: Stage1OrientationUpdate,
             het_updates: Vec<Stage1HetUpdate>,
             paths: Option<GlobalMosaicPaths>,
+            cohort_stats: Option<SampleCohortStats>,
         }
         let phase_decisions: Vec<Stage1PhaseDecision> = {
             // Immutable borrow of geno for the entire read phase
@@ -4992,6 +5595,32 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 bb.set_dynamic_mcmc(self.config.dynamic_mcmc, k);
                 bb.reset_dyn_neighbors();
             }
+            let sample_phase_stability: Vec<f32> = sample_phases
+                .iter()
+                .map(|sp| stage1_sample_phase_stability(sp, hi_freq_to_orig))
+                .collect();
+            let emission_conf_scales = Arc::new(build_marker_emission_conf_scales(
+                target_gt,
+                sample_phases,
+                hi_freq_to_orig,
+                self.params.p_mismatch,
+            ));
+            if !emission_conf_scales.is_empty() {
+                let mut sum_scale = 0.0f32;
+                let mut min_scale = 1.0f32;
+                for &scale in emission_conf_scales.iter() {
+                    sum_scale += scale;
+                    min_scale = min_scale.min(scale);
+                }
+                let mean_scale = sum_scale / emission_conf_scales.len() as f32;
+                eprintln!(
+                    "[stage1 emission] markers={} mean_conf_scale={:.4} min_conf_scale={:.4}",
+                    emission_conf_scales.len(),
+                    mean_scale,
+                    min_scale
+                );
+            }
+            let collect_cohort_stats = cohort_stats_out.is_some();
             let sample_iter = || {
                 sample_phases.par_iter().enumerate().map(|(s, sp)| {
                     if frozen_samples
@@ -5003,6 +5632,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             orientation: Stage1OrientationUpdate::NoChange,
                             het_updates: Vec::new(),
                             paths: None,
+                            cohort_stats: None,
                         };
                     }
                     THREAD_WORKSPACE.with(|ws| {
@@ -5036,6 +5666,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 orientation: Stage1OrientationUpdate::NoChange,
                                 het_updates: Vec::new(),
                                 paths: None,
+                                cohort_stats: None,
                             };
                         }
 
@@ -5044,23 +5675,37 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         ws.seq1.clear();
                         ws.seq2.clear();
                         ws.sample_conf.clear();
+                        ws.sample_phase_conf.clear();
                         ws.seq1.reserve(n_hi_freq);
                         ws.seq2.reserve(n_hi_freq);
                         ws.sample_conf.reserve(n_hi_freq);
-                        for &m in hi_freq_to_orig {
+                        ws.sample_phase_conf.reserve(n_hi_freq);
+                        for (i, &m) in hi_freq_to_orig.iter().enumerate() {
                             ws.seq1.push(sp.allele1(m));
                             ws.seq2.push(sp.allele2(m));
-                            ws.sample_conf.push(sp.confidence(m));
+                            let conf_scale = emission_conf_scales[i];
+                            ws.sample_conf
+                                .push((sp.confidence(m) * conf_scale).clamp(0.0, 1.0));
+                            ws.sample_phase_conf.push(sp.phase_confidence(m));
                         }
                         let seq1 = std::mem::take(&mut ws.seq1);
                         let seq2 = std::mem::take(&mut ws.seq2);
                         let sample_conf = std::mem::take(&mut ws.sample_conf);
+                        let sample_phase_conf = std::mem::take(&mut ws.sample_phase_conf);
                         let t_seq = t0.elapsed();
 
                         let sample_seed = (self.config.seed as u64)
                             .wrapping_add(s as u64)
                             .wrapping_add((iteration as u64) << 32)
                             .wrapping_add(0xFEED_FACE_1234u64);
+                        let sample_p_err = MismatchProb::new_clamped(
+                            sample_p_mismatch
+                                .and_then(|v| v.get(s))
+                                .copied()
+                                .unwrap_or(self.params.p_mismatch),
+                        )
+                        .get();
+                        let sample_p_no_err = 1.0 - sample_p_err;
 
                         // Identify unresolved heterozygotes in hi-freq space.
                         let mut het_positions: Vec<usize> = Vec::new();
@@ -5081,16 +5726,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             ws.seq1 = seq1;
                             ws.seq2 = seq2;
                             ws.sample_conf = sample_conf;
+                            ws.sample_phase_conf = sample_phase_conf;
                             ws.het_positions = het_positions;
                             return Stage1PhaseDecision {
                                 orientation: Stage1OrientationUpdate::NoChange,
                                 het_updates: Vec::new(),
                                 paths: None,
+                                cohort_stats: None,
                             };
                         }
-
-                        let p_err = self.params.p_mismatch;
-                        let p_no_err = 1.0 - p_err;
 
                         let has_phase_anchors = sp.has_input_phase_anchor();
 
@@ -5125,10 +5769,22 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     for &(i, a1, a2) in &anchors {
                                         let ref_al = subset_view.allele(MarkerIdx::new(i as u32), hap_idx);
                                         let conf_m = sample_conf[i].clamp(0.0, 1.0);
-                                        score1 += emit_prob(ref_al, a1, conf_m, p_no_err, p_err)
+                                        score1 += emit_prob(
+                                            ref_al,
+                                            a1,
+                                            conf_m,
+                                            sample_p_no_err,
+                                            sample_p_err,
+                                        )
                                             .max(1e-30)
                                             .ln();
-                                        score2 += emit_prob(ref_al, a2, conf_m, p_no_err, p_err)
+                                        score2 += emit_prob(
+                                            ref_al,
+                                            a2,
+                                            conf_m,
+                                            sample_p_no_err,
+                                            sample_p_err,
+                                        )
                                             .max(1e-30)
                                             .ln();
                                     }
@@ -5169,10 +5825,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             let ref_al =
                                                 subset_view.allele(MarkerIdx::new(i as u32), hap_idx);
                                             let emit = if a1 == a2 {
-                                                emit_prob(ref_al, a1, conf_m, p_no_err, p_err)
+                                                emit_prob(
+                                                    ref_al,
+                                                    a1,
+                                                    conf_m,
+                                                    sample_p_no_err,
+                                                    sample_p_err,
+                                                )
                                             } else {
-                                                let keep = emit_prob(ref_al, a1, conf_m, p_no_err, p_err);
-                                                let swap = emit_prob(ref_al, a2, conf_m, p_no_err, p_err);
+                                                let keep = emit_prob(
+                                                    ref_al,
+                                                    a1,
+                                                    conf_m,
+                                                    sample_p_no_err,
+                                                    sample_p_err,
+                                                );
+                                                let swap = emit_prob(
+                                                    ref_al,
+                                                    a2,
+                                                    conf_m,
+                                                    sample_p_no_err,
+                                                    sample_p_err,
+                                                );
                                                 0.5 * (keep + swap)
                                             };
                                             score += emit.max(1e-30).ln();
@@ -5217,10 +5891,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
 
                         // Collect EM statistics if requested
-                        if let Some(atomic) = atomic_estimates {
+                        let local_estimates: Option<crate::model::parameters::ParamEstimates> =
+                            if atomic_estimates.is_some() || collect_cohort_stats {
+                            let mut local_params = self.params.clone();
+                            local_params.p_mismatch = sample_p_err;
                             let hmm = MosaicHmm::new(
                                 subset_view,
-                                &self.params,
+                                &local_params,
                                 n_states,
                                 stage1_p_recomb,
                             );
@@ -5237,12 +5914,40 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 stage1_gen_dists,
                                 &mut local_est,
                             );
-                            atomic.add_estimation_data(&local_est);
-                        }
+                            if let Some(atomic) = atomic_estimates {
+                                atomic.add_estimation_data(&local_est);
+                            }
+                            Some(local_est)
+                        } else {
+                            None
+                        };
 
                         let t_mcmc_start = Instant::now();
                         let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
-                            let dyn_k = self.config.dynamic_k.max(1).min(n_states.max(1));
+                            let dyn_k_max = self.config.dynamic_k.max(1).min(n_states.max(1));
+                            let dyn_k_min = dyn_k_max.min(PBWT_ADAPTIVE_K_FLOOR).max(1);
+                            let sample_uncertainty =
+                                1.0f32 - sample_phase_stability[s].clamp(0.0, 1.0);
+                            let dyn_k = if dyn_k_max > dyn_k_min {
+                                let span = (dyn_k_max - dyn_k_min) as f32;
+                                dyn_k_min
+                                    + (sample_uncertainty * span).round() as usize
+                            } else {
+                                dyn_k_max
+                            };
+                            let dyn_steps_max = self.config.mcmc_steps.max(1);
+                            let dyn_steps_min = if sample_phase_stability[s] >= 0.995 {
+                                1
+                            } else {
+                                dyn_steps_max.min(2).max(1)
+                            };
+                            let dyn_steps = if dyn_steps_max > dyn_steps_min {
+                                let step_span = (dyn_steps_max - dyn_steps_min) as f32;
+                                dyn_steps_min
+                                    + (sample_uncertainty * step_span).round() as usize
+                            } else {
+                                dyn_steps_max
+                            };
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
@@ -5256,8 +5961,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &seq1,
                                     &seq2,
                                     &sample_conf,
-                                    p_no_err,
-                                    p_err,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     &mut rp,
                                     &mut ws.scores,
                                     None,
@@ -5321,14 +6026,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         &seq1,
                                         &seq2,
                                         &sample_conf,
+                                        &sample_phase_conf,
                                         phase_ibs.as_ref().expect("phase_ibs"),
                                         ibs2,
+                                        hi_freq_to_orig,
                                         s as u32,
+                                        &sample_phase_stability,
                                         &het_positions,
                                         sample_seed,
-                                        self.config.mcmc_steps,
-                                        p_no_err,
-                                        p_err,
+                                        dyn_steps,
+                                        sample_p_no_err,
+                                        sample_p_err,
                                         prior_local.as_ref(),
                                         None,
                                         None,
@@ -5344,14 +6052,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &seq1,
                                     &seq2,
                                     &sample_conf,
+                                    &sample_phase_conf,
                                     phase_ibs.as_ref().expect("phase_ibs"),
                                     ibs2,
+                                    hi_freq_to_orig,
                                     s as u32,
+                                    &sample_phase_stability,
                                     &het_positions,
                                     sample_seed,
-                                    self.config.mcmc_steps,
-                                    p_no_err,
-                                    p_err,
+                                    dyn_steps,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     prior_local.as_ref(),
                                     None,
                                     None,
@@ -5418,8 +6129,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         sample_seed,
                                         self.config.mcmc_burnin,
                                         self.config.mcmc_lr_samples,
-                                        p_no_err,
-                                        p_err,
+                                        sample_p_no_err,
+                                        sample_p_err,
                                         ws,
                                     )
                                 })
@@ -5445,8 +6156,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     sample_seed,
                                     self.config.mcmc_burnin,
                                     self.config.mcmc_lr_samples,
-                                    p_no_err,
-                                    p_err,
+                                    sample_p_no_err,
+                                    sample_p_err,
                                     ws,
                                 )
                             };
@@ -5564,10 +6275,46 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             });
                         }
 
+                        let cohort_stats = if collect_cohort_stats {
+                            let (mismatch_mass, emission_mass, expected_switches, genetic_dist_cm) =
+                                if let Some(est) = local_estimates.as_ref() {
+                                    (
+                                        est.mismatch_mass(),
+                                        est.emission_mass(),
+                                        est.expected_switches(),
+                                        est.genetic_distance_cm(),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0)
+                                };
+                            let mut uncertainty_sum = 0.0f64;
+                            let mut uncertainty_count = 0usize;
+                            for i in 0..n_hi_freq {
+                                let a1 = seq1[i];
+                                let a2 = seq2[i];
+                                if a1 != 255 && a2 != 255 && a1 != a2 {
+                                    uncertainty_sum +=
+                                        (1.0 - sample_phase_conf[i].clamp(0.0, 1.0)) as f64;
+                                    uncertainty_count += 1;
+                                }
+                            }
+                            Some(SampleCohortStats {
+                                mismatch_mass,
+                                emission_mass,
+                                expected_switches,
+                                genetic_dist_morgans: genetic_dist_cm / 100.0,
+                                phase_uncertainty_sum: uncertainty_sum,
+                                phase_uncertainty_count: uncertainty_count,
+                            })
+                        } else {
+                            None
+                        };
+
                         let het_count = het_positions.len() as u64;
                         ws.seq1 = seq1;
                         ws.seq2 = seq2;
                         ws.sample_conf = sample_conf;
+                        ws.sample_phase_conf = sample_phase_conf;
                         ws.het_positions = het_positions;
 
                         let sample_total = t0.elapsed();
@@ -5622,6 +6369,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             orientation,
                             het_updates,
                             paths: new_paths,
+                            cohort_stats,
                         }
                     })
                 })
@@ -5643,8 +6391,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Determine if we're in burn-in (don't mark as phased during burn-in)
         let is_burnin = iteration < self.config.burnin;
         let lr_threshold = self.params.lr_threshold;
+        let mut cohort_stats_out = cohort_stats_out;
 
         for (s, decision) in phase_decisions.into_iter().enumerate() {
+            if let Some(out) = cohort_stats_out.as_deref_mut() {
+                if s < out.len() {
+                    out[s] = decision.cohort_stats.unwrap_or_default();
+                }
+            }
             let sp = &mut sample_phases[s];
 
             match decision.orientation {
@@ -5892,6 +6646,27 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         if n_stage1 < 2 {
             return None;
         }
+        let hi_freq_emit_conf_scale = build_marker_emission_conf_scales(
+            target_gt,
+            sample_phases,
+            hi_freq_markers,
+            self.params.p_mismatch,
+        );
+        if !hi_freq_emit_conf_scale.is_empty() {
+            let mut sum_scale = 0.0f32;
+            let mut min_scale = 1.0f32;
+            for &scale in &hi_freq_emit_conf_scale {
+                sum_scale += scale;
+                min_scale = min_scale.min(scale);
+            }
+            let mean_scale = sum_scale / hi_freq_emit_conf_scale.len() as f32;
+            eprintln!(
+                "[stage2 scaffold emission] markers={} mean_conf_scale={:.4} min_conf_scale={:.4}",
+                hi_freq_emit_conf_scale.len(),
+                mean_scale,
+                min_scale
+            );
+        }
 
         // Compute total haplotype count (target + reference)
 
@@ -5973,6 +6748,32 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             let rare_markers: Vec<usize> = (0..n_markers)
                 .filter(|&m| (maf[m] < rare_threshold && maf[m] > 0.0) || has_missing(m))
                 .collect();
+            let mut marker_emit_conf_scale = vec![1.0f32; n_markers];
+            if !rare_markers.is_empty() {
+                let rare_scales = build_marker_emission_conf_scales(
+                    target_gt,
+                    sample_phases,
+                    &rare_markers,
+                    self.params.p_mismatch,
+                );
+                for (idx, &m) in rare_markers.iter().enumerate() {
+                    marker_emit_conf_scale[m] = rare_scales[idx];
+                }
+                let mut sum_scale = 0.0f32;
+                let mut min_scale = 1.0f32;
+                for &m in &rare_markers {
+                    let scale = marker_emit_conf_scale[m];
+                    sum_scale += scale;
+                    min_scale = min_scale.min(scale);
+                }
+                let mean_scale = sum_scale / rare_markers.len() as f32;
+                eprintln!(
+                    "[stage2 emission] rare_markers={} mean_conf_scale={:.4} min_conf_scale={:.4}",
+                    rare_markers.len(),
+                    mean_scale,
+                    min_scale
+                );
+            }
 
             // Use CompositeSubset view when reference panel is available
             let subset_view =
@@ -6075,8 +6876,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     // Extract Stage 1 alleles from SamplePhase
                     let seq1: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele1(m)).collect();
                     let seq2: Vec<u8> = hi_freq_markers.iter().map(|&m| sp.allele2(m)).collect();
-                    let seq_conf: Vec<f32> =
-                        hi_freq_markers.iter().map(|&m| sp.confidence(m)).collect();
+                    let seq_conf: Vec<f32> = hi_freq_markers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &m)| (sp.confidence(m) * hi_freq_emit_conf_scale[i]).clamp(0.0, 1.0))
+                        .collect();
                     let hmm = MosaicHmm::new(subset_view, &self.params, n_states, stage1_p_recomb);
                     let plp = PlProvider {
                         gt: target_gt,
@@ -6373,7 +7177,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let is_rare_marker = marker_maf < rare_threshold;
                         let carriers = &carrier_haps[m];
                         let context_markers = &carrier_context_markers[m];
-                        let obs_conf = sp.confidence(m).clamp(0.05, 1.0);
+                        let obs_conf =
+                            (sp.confidence(m) * marker_emit_conf_scale[m]).clamp(0.05, 1.0);
                         let bridge_probs1 = if is_rare_marker && !carriers.is_empty() {
                             stage2_phaser.carrier_injected_bridge_hap_probs(
                                 m,
@@ -6884,6 +7689,124 @@ fn build_sample_confidence(target_gt: &GenotypeMatrix) -> Vec<Vec<f32>> {
         .collect()
 }
 
+fn build_marker_emission_conf_scales(
+    target_gt: &GenotypeMatrix,
+    sample_phases: &[SamplePhase],
+    markers: &[usize],
+    base_error_rate: f32,
+) -> Vec<f32> {
+    if markers.is_empty() {
+        return Vec::new();
+    }
+    let n_samples = sample_phases.len();
+    if n_samples == 0 {
+        return vec![1.0; markers.len()];
+    }
+
+    let base_error = base_error_rate.clamp(1e-6, 0.45);
+    let probe_target = n_samples.min(EMIT_PROFILE_MAX_PROBE_SAMPLES).max(1);
+    let stride = n_samples.div_ceil(probe_target).max(1);
+    let mut probe_samples = Vec::with_capacity(probe_target);
+    for s in (0..n_samples).step_by(stride) {
+        probe_samples.push(s);
+        if probe_samples.len() >= probe_target {
+            break;
+        }
+    }
+    if probe_samples.is_empty() {
+        probe_samples.push(0);
+    }
+
+    let mut marker_errors = vec![base_error; markers.len()];
+    for (idx, &m) in markers.iter().enumerate() {
+        let n_alleles = target_gt
+            .markers()
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles()
+            .max(2);
+        let type_scale = if n_alleles > 2 { 1.6 } else { 1.0 };
+        let prior_mean = (base_error * type_scale).clamp(base_error, 0.45);
+        let alpha = (prior_mean * EMIT_PROFILE_PRIOR_STRENGTH).max(1e-6);
+        let beta = ((1.0 - prior_mean) * EMIT_PROFILE_PRIOR_STRENGTH).max(1e-6);
+
+        let mut weighted_residual_sum = 0.0f32;
+        let mut weight_sum = 0.0f32;
+        let mut missing_count = 0usize;
+        for &s in &probe_samples {
+            let sp = &sample_phases[s];
+            let a1 = sp.allele1(m);
+            let a2 = sp.allele2(m);
+            if a1 == 255 || a2 == 255 {
+                missing_count += 1;
+                continue;
+            }
+            let conf = sp.confidence(m).clamp(0.0, 1.0);
+            let heterozygous = a1 != a2;
+            let gate = if !heterozygous {
+                1.0
+            } else {
+                let phase_conf = sp.phase_confidence(m).clamp(0.0, 1.0);
+                if phase_conf.min(1.0 - phase_conf) <= (1.0 - EMIT_PROFILE_HET_CONFIDENCE_GATE) {
+                    0.35
+                } else {
+                    0.0
+                }
+            };
+            if gate <= 0.0 {
+                continue;
+            }
+            let weight = gate * (0.15 + 0.85 * conf);
+            let residual = (1.0 - conf).clamp(0.0, 1.0);
+            weighted_residual_sum += weight * residual;
+            weight_sum += weight;
+        }
+
+        let probe_n = probe_samples.len().max(1) as f32;
+        let missing_rate = missing_count as f32 / probe_n;
+        let missing_weight = missing_rate * 2.0;
+        weighted_residual_sum += missing_weight * 0.25;
+        weight_sum += missing_weight;
+
+        let posterior =
+            (alpha + weighted_residual_sum) / (alpha + beta + weight_sum).max(alpha + beta + 1e-6);
+        marker_errors[idx] = posterior.clamp(base_error, 0.45);
+    }
+
+    if marker_errors.len() >= 3 {
+        let mut smoothed = marker_errors.clone();
+        for i in 1..(marker_errors.len() - 1) {
+            smoothed[i] =
+                0.25 * marker_errors[i - 1] + 0.5 * marker_errors[i] + 0.25 * marker_errors[i + 1];
+        }
+        marker_errors = smoothed;
+    }
+
+    let denom = (0.5 - base_error).max(1e-6);
+    marker_errors
+        .into_iter()
+        .map(|err| ((0.5 - err) / denom).clamp(EMIT_PROFILE_MIN_CONF_SCALE, 1.0))
+        .collect()
+}
+
+fn stage1_sample_phase_stability(sp: &SamplePhase, hi_freq_to_orig: &[usize]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for &m in hi_freq_to_orig {
+        let a1 = sp.allele1(m);
+        let a2 = sp.allele2(m);
+        if a1 == 255 || a2 == 255 || a1 == a2 {
+            continue;
+        }
+        sum += sp.phase_confidence(m).clamp(0.0, 1.0);
+        count += 1;
+    }
+    if count == 0 {
+        0.5
+    } else {
+        sum / count as f32
+    }
+}
+
 #[inline]
 fn pl_confidence_from_posterior(pl: &[u16]) -> f32 {
     if pl.is_empty() {
@@ -7101,6 +8024,24 @@ fn emit_haploid_constrained(
 
     // Blend with uniform based on confidence
     conf * raw_emit + (1.0 - conf) * 0.5
+}
+
+#[inline]
+fn constrained_emission_confidence(
+    geno_a1: u8,
+    geno_a2: u8,
+    fixed_allele: u8,
+    geno_conf: f32,
+    phase_conf: f32,
+) -> f32 {
+    let g = geno_conf.clamp(0.0, 1.0);
+    if geno_a1 != geno_a2 && fixed_allele != 255 {
+        // At constrained heterozygotes, partner orientation uncertainty must
+        // soften the emission even when genotype confidence is high.
+        (g * phase_conf.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    } else {
+        g
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7732,6 +8673,7 @@ fn ffbs_haploid_constrained(
     geno_a1: &[u8],
     geno_a2: &[u8],
     conf: &[f32],
+    phase_conf: &[f32],
     fixed_allele: &[u8], // Allele assigned to OTHER haplotype (255 = no constraint)
     neighbors: &[u32],   // Selected neighbor haplotype indices
     phase_ibs: &BidirectionalPhaseIbs,
@@ -7742,7 +8684,15 @@ fn ffbs_haploid_constrained(
 ) {
     use wide::f32x8;
 
-    if n_markers == 0 || n_states == 0 || neighbors.is_empty() {
+    if n_markers == 0
+        || n_states == 0
+        || neighbors.is_empty()
+        || conf.len() < n_markers
+        || phase_conf.len() < n_markers
+        || geno_a1.len() < n_markers
+        || geno_a2.len() < n_markers
+        || fixed_allele.len() < n_markers
+    {
         return;
     }
 
@@ -7758,6 +8708,13 @@ fn ffbs_haploid_constrained(
 
     // Initialize at marker 0
     let init = 1.0f32 / actual_n_states as f32;
+    let conf0 = constrained_emission_confidence(
+        geno_a1[0],
+        geno_a2[0],
+        fixed_allele[0],
+        conf[0],
+        phase_conf[0],
+    );
     for k in 0..actual_n_states {
         let ref_al = phase_ibs.allele(0, neighbors[k]);
         let emit = emit_haploid_constrained(
@@ -7765,7 +8722,7 @@ fn ffbs_haploid_constrained(
             geno_a1[0],
             geno_a2[0],
             fixed_allele[0],
-            conf[0],
+            conf0,
             p_no_err,
             p_err,
         );
@@ -7785,6 +8742,13 @@ fn ffbs_haploid_constrained(
         let stay_gap = params.0;
         let shift = params.1;
         let scale = stay_gap / fwd_sum;
+        let conf_m = constrained_emission_confidence(
+            geno_a1[m],
+            geno_a2[m],
+            fixed_allele[m],
+            conf[m],
+            phase_conf[m],
+        );
 
         // SIMD-optimized transition + emission
         let shift_vec = f32x8::splat(shift);
@@ -7804,7 +8768,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7813,7 +8777,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7822,7 +8786,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7831,7 +8795,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7840,7 +8804,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7849,7 +8813,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7858,7 +8822,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7867,7 +8831,7 @@ fn ffbs_haploid_constrained(
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
-                    conf[m],
+                    conf_m,
                     p_no_err,
                     p_err,
                 ),
@@ -7890,7 +8854,7 @@ fn ffbs_haploid_constrained(
                 geno_a1[m],
                 geno_a2[m],
                 fixed_allele[m],
-                conf[m],
+                conf_m,
                 p_no_err,
                 p_err,
             );
@@ -7948,9 +8912,12 @@ fn sample_dynamic_mcmc(
     seq1: &[u8],
     seq2: &[u8],
     conf: &[f32],
+    phase_conf: &[f32],
     phase_ibs: &BidirectionalPhaseIbs,
     ibs2: &Ibs2,
+    hi_freq_to_orig: &[usize],
     sample_idx: u32,
+    sample_phase_stability: &[f32],
     het_positions: &[usize],
     seed: u64,
     n_mcmc_steps: usize,
@@ -7964,7 +8931,51 @@ fn sample_dynamic_mcmc(
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, MosaicPaths) {
     use rand::SeedableRng;
 
-    if het_positions.is_empty() || n_markers == 0 || n_states == 0 {
+    #[derive(Clone, Copy)]
+    struct LocalMarkerIdx(usize);
+
+    #[inline]
+    fn adaptive_dynamic_state_target(
+        max_states: usize,
+        n_haps: u32,
+        local_phase_conf: f32,
+        sample_stability: f32,
+    ) -> usize {
+        if max_states == 0 || n_haps == 0 {
+            return 0;
+        }
+        let cap = max_states.min(n_haps.saturating_sub(2) as usize).max(1);
+        let min_states = (cap / 3).max(PBWT_ADAPTIVE_K_FLOOR).min(cap);
+        if min_states >= cap {
+            return cap;
+        }
+        let local_uncertainty = 1.0 - local_phase_conf.clamp(0.0, 1.0);
+        let sample_uncertainty = 1.0 - sample_stability.clamp(0.0, 1.0);
+        let uncertainty = (0.7 * local_uncertainty + 0.3 * sample_uncertainty).clamp(0.0, 1.0);
+        let span = (cap - min_states) as f32;
+        (min_states as f32 + span * uncertainty)
+            .round()
+            .clamp(min_states as f32, cap as f32) as usize
+    }
+
+    if het_positions.is_empty()
+        || n_markers == 0
+        || n_states == 0
+        || phase_conf.len() != n_markers
+        || hi_freq_to_orig.len() != n_markers
+    {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MosaicPaths {
+                path1: Vec::new(),
+                path2: Vec::new(),
+            },
+        );
+    }
+    if (sample_idx as usize) >= sample_phase_stability.len() {
         return (
             Vec::new(),
             Vec::new(),
@@ -7986,6 +8997,53 @@ fn sample_dynamic_mcmc(
         let a2 = anchor_h2.get(m).copied().unwrap_or(255);
         a1 != 255 || a2 != 255
     });
+    let recipient_sample = SampleIdx::new(sample_idx);
+    let recipient_stability = sample_phase_stability[sample_idx as usize].clamp(0.0, 1.0);
+    let mut ibs2_by_other: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    for seg in ibs2.segments(recipient_sample) {
+        ibs2_by_other
+            .entry(seg.other_sample.0)
+            .or_default()
+            .push((seg.start, seg.incl_end));
+    }
+    const IBD2_DIRECTION_MARGIN: f32 = 0.05;
+    const IBD2_HIGH_CONF: f32 = 0.985;
+
+    let allow_donor_at_marker = |donor_hap: u32, marker_idx: LocalMarkerIdx| -> bool {
+        if marker_idx.0 >= n_markers {
+            return false;
+        }
+        let donor_sample = donor_hap / 2;
+        if donor_sample == sample_idx {
+            return false;
+        }
+        let Some(global_m) = hi_freq_to_orig.get(marker_idx.0).copied() else {
+            return false;
+        };
+        let Some(segments) = ibs2_by_other.get(&donor_sample) else {
+            return true;
+        };
+        let mut in_ibs2 = false;
+        for &(start, incl_end) in segments {
+            if global_m >= start && global_m <= incl_end {
+                in_ibs2 = true;
+                break;
+            }
+        }
+        if !in_ibs2 {
+            return true;
+        }
+        let donor_stability = sample_phase_stability
+            .get(donor_sample as usize)
+            .copied()
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let local_recipient = phase_conf[marker_idx.0].clamp(0.0, 1.0);
+        if donor_stability >= IBD2_HIGH_CONF && local_recipient >= IBD2_HIGH_CONF {
+            return true;
+        }
+        donor_stability >= recipient_stability.max(local_recipient) + IBD2_DIRECTION_MARGIN
+    };
 
     // Initialize H1, H2 alleles from genotype (random phase at hets)
     let mut h1_alleles = vec![0u8; n_markers];
@@ -8059,7 +9117,40 @@ fn sample_dynamic_mcmc(
 
     // Initialize path with starting states from standard neighbor finding
     // This gives the first iteration something to work with
-    let initial_neighbors = phase_ibs.find_neighbors(hap1_idx, n_markers / 2, ibs2, n_states);
+    let center_init = n_markers / 2;
+    let initial_state_target = adaptive_dynamic_state_target(
+        n_states,
+        phase_ibs.n_haps() as u32,
+        phase_conf[center_init],
+        recipient_stability,
+    );
+    let mut initial_neighbors =
+        phase_ibs.find_neighbors(hap1_idx, center_init, ibs2, initial_state_target);
+    if !initial_neighbors.is_empty() {
+        let mut filtered = Vec::with_capacity(initial_neighbors.len());
+        for &h in &initial_neighbors {
+            if allow_donor_at_marker(h, LocalMarkerIdx(center_init)) {
+                filtered.push(h);
+            }
+        }
+        if filtered.is_empty() {
+            initial_neighbors.sort_unstable_by(|a, b| {
+                let a_score = sample_phase_stability
+                    .get((a / 2) as usize)
+                    .copied()
+                    .unwrap_or(0.5);
+                let b_score = sample_phase_stability
+                    .get((b / 2) as usize)
+                    .copied()
+                    .unwrap_or(0.5);
+                b_score
+                    .partial_cmp(&a_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            filtered.extend(initial_neighbors.iter().take(initial_state_target.max(1)).copied());
+        }
+        initial_neighbors = filtered;
+    }
     if initial_neighbors.is_empty() {
         return (
             Vec::new(),
@@ -8096,75 +9187,77 @@ fn sample_dynamic_mcmc(
     let mut seeded_from_heuristic = false;
     if initial_paths.is_none() && n_markers <= 2000 && !neighbors.is_empty() {
         let limit = neighbors.len().min(16);
-        let mut scores = vec![0.0f32; limit * limit];
-        let mut informative = 0usize;
-        for m in 0..n_markers {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 == 255 && a2 == 255 {
-                continue;
-            }
-            informative += 1;
-            let conf_m = conf[m].clamp(0.0, 1.0);
-            let is_het = a1 != a2 && a1 != 255 && a2 != 255;
-            for i in 0..limit {
-                let h1 = neighbors[i];
-                let r1 = phase_ibs.allele(m, h1);
-                for j in 0..i {
-                    let h2 = neighbors[j];
-                    let r2 = phase_ibs.allele(m, h2);
-                    let prob = if is_het {
-                        let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
-                            * emit_prob(r2, a2, conf_m, p_no_err, p_err);
-                        let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
-                            * emit_prob(r2, a1, conf_m, p_no_err, p_err);
-                        0.5 * (keep + swap)
-                    } else {
-                        let obs = if a1 != 255 { a1 } else { a2 };
-                        emit_prob(r1, obs, conf_m, p_no_err, p_err)
-                            * emit_prob(r2, obs, conf_m, p_no_err, p_err)
-                    };
-                    scores[i * limit + j] += prob.max(1e-30).ln();
+        if limit >= 2 {
+            let mut scores = vec![0.0f32; limit * limit];
+            let mut informative = 0usize;
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 && a2 == 255 {
+                    continue;
                 }
-            }
-        }
-
-        if informative > 0 {
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_pair = (0, 1);
-            for i in 0..limit {
-                for j in 0..i {
-                    let s = scores[i * limit + j];
-                    if s > best_score {
-                        best_score = s;
-                        best_pair = (i, j);
+                informative += 1;
+                let conf_m = conf[m].clamp(0.0, 1.0);
+                let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                for i in 0..limit {
+                    let h1 = neighbors[i];
+                    let r1 = phase_ibs.allele(m, h1);
+                    for j in 0..i {
+                        let h2 = neighbors[j];
+                        let r2 = phase_ibs.allele(m, h2);
+                        let prob = if is_het {
+                            let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
+                                * emit_prob(r2, a2, conf_m, p_no_err, p_err);
+                            let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
+                                * emit_prob(r2, a1, conf_m, p_no_err, p_err);
+                            0.5 * (keep + swap)
+                        } else {
+                            let obs = if a1 != 255 { a1 } else { a2 };
+                            emit_prob(r1, obs, conf_m, p_no_err, p_err)
+                                * emit_prob(r2, obs, conf_m, p_no_err, p_err)
+                        };
+                        scores[i * limit + j] += prob.max(1e-30).ln();
                     }
                 }
             }
 
-            let h1_best = neighbors[best_pair.0];
-            let h2_best = neighbors[best_pair.1];
-            path1_ref.fill(h1_best);
-            path2_ref.fill(h2_best);
-            for m in 0..n_markers {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    continue;
+            if informative > 0 {
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_pair = (0usize, 1usize);
+                for i in 0..limit {
+                    for j in 0..i {
+                        let s = scores[i * limit + j];
+                        if s > best_score {
+                            best_score = s;
+                            best_pair = (i, j);
+                        }
+                    }
                 }
-                let r1 = phase_ibs.allele(m, h1_best);
-                let r2 = phase_ibs.allele(m, h2_best);
-                let m1 = r1 == a1 && r2 == a2;
-                let m2 = r1 == a2 && r2 == a1;
-                if m1 && !m2 {
-                    h1_alleles[m] = a1;
-                    h2_alleles[m] = a2;
-                } else if m2 && !m1 {
-                    h1_alleles[m] = a2;
-                    h2_alleles[m] = a1;
+
+                let h1_best = neighbors[best_pair.0];
+                let h2_best = neighbors[best_pair.1];
+                path1_ref.fill(h1_best);
+                path2_ref.fill(h2_best);
+                for m in 0..n_markers {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                        continue;
+                    }
+                    let r1 = phase_ibs.allele(m, h1_best);
+                    let r2 = phase_ibs.allele(m, h2_best);
+                    let m1 = r1 == a1 && r2 == a2;
+                    let m2 = r1 == a2 && r2 == a1;
+                    if m1 && !m2 {
+                        h1_alleles[m] = a1;
+                        h2_alleles[m] = a2;
+                    } else if m2 && !m1 {
+                        h1_alleles[m] = a2;
+                        h2_alleles[m] = a1;
+                    }
                 }
+                seeded_from_heuristic = true;
             }
-            seeded_from_heuristic = true;
         }
     }
 
@@ -8185,6 +9278,7 @@ fn sample_dynamic_mcmc(
         n_states: usize,
         n_haps: u32,
         hap1_idx: u32,
+        sample_uncertainty: f32,
         rng: &mut impl rand::Rng,
     ) {
         if n_haps == 0 {
@@ -8228,7 +9322,13 @@ fn sample_dynamic_mcmc(
             return;
         }
 
-        let mix_count = (target / 10).max(4).min(target);
+        let mix_count = if sample_uncertainty >= 0.66 {
+            (target / 5).max(6).min(target)
+        } else if sample_uncertainty >= 0.33 {
+            (target / 8).max(4).min(target)
+        } else {
+            (target / 16).max(2).min(target)
+        };
         for _ in 0..mix_count {
             let h = rng.random_range(0..n_haps);
             if h == hap1_idx || h == hap1_idx + 1 {
@@ -8244,66 +9344,168 @@ fn sample_dynamic_mcmc(
         }
     }
 
+    fn refill_neighbors_for_marker(
+        neighbors: &mut Vec<u32>,
+        n_states: usize,
+        n_haps: u32,
+        hap1_idx: u32,
+        marker_idx: LocalMarkerIdx,
+        sample_uncertainty: f32,
+        rng: &mut impl rand::Rng,
+        allow_donor_at_marker: &impl Fn(u32, LocalMarkerIdx) -> bool,
+    ) {
+        if n_haps <= 2 {
+            return;
+        }
+        let target = n_states.min((n_haps.saturating_sub(2)) as usize).max(1);
+        let mut seen: HashSet<u32> = HashSet::with_capacity(target.saturating_mul(2).max(8));
+        neighbors.retain(|&h| {
+            h != hap1_idx
+                && h != hap1_idx + 1
+                && (h as usize) < n_haps as usize
+                && allow_donor_at_marker(h, marker_idx)
+                && seen.insert(h)
+        });
+        if neighbors.len() >= target {
+            neighbors.truncate(target);
+            return;
+        }
+
+        let max_attempts = if sample_uncertainty >= 0.66 {
+            target.saturating_mul(32).max(64)
+        } else if sample_uncertainty >= 0.33 {
+            target.saturating_mul(24).max(48)
+        } else {
+            target.saturating_mul(16).max(32)
+        };
+        let mut attempts = 0usize;
+        while neighbors.len() < target && attempts < max_attempts {
+            attempts += 1;
+            let h = rng.random_range(0..n_haps);
+            if h == hap1_idx || h == hap1_idx + 1 {
+                continue;
+            }
+            if !allow_donor_at_marker(h, marker_idx) {
+                continue;
+            }
+            if seen.insert(h) {
+                neighbors.push(h);
+            }
+        }
+    }
+
     let record_neighbors = |neighbors: &Vec<u32>| {
         if let Some(bb) = telemetry {
             bb.add_dyn_neighbors(neighbors.len() as u64);
         }
     };
 
-    mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
     record_neighbors(&neighbors);
 
-    let mut anchors_buf: Vec<usize> = Vec::new();
+    let sample_uncertainty = 1.0f32 - recipient_stability;
+    let anchor_bins = (6.0 + 10.0 * sample_uncertainty).round() as usize;
+    let stride = (n_markers / anchor_bins.max(1)).max(1);
+    let mut anchors_static: Vec<usize> = Vec::new();
+    // Prefer anchors with highest expected information under current emissions.
+    let mut start = 0usize;
+    while start < n_markers {
+        let end = (start + stride).min(n_markers);
+        let mut best_m = start;
+        let mut best_score = f32::NEG_INFINITY;
+        for m in start..end {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 == 255 && a2 == 255 {
+                continue;
+            }
+            let conf_score = conf[m].clamp(0.0, 1.0);
+            let emit_match = (p_no_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
+            let emit_mismatch = (p_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
+            let score = (emit_match / emit_mismatch).ln().abs();
+            if score > best_score {
+                best_score = score;
+                best_m = m;
+            }
+        }
+        anchors_static.push(best_m);
+        start = end;
+    }
+    if anchors_static.last().copied() != Some(n_markers.saturating_sub(1)) {
+        anchors_static.push(n_markers.saturating_sub(1));
+    }
+    anchors_static.sort_unstable();
+    anchors_static.dedup();
+
+    let base_radius = (n_markers / 40).clamp(12, 192);
+    let radius = ((base_radius as f32) * (1.0 + 1.5 * sample_uncertainty)).round() as usize;
+    let radius = radius.clamp(12, 320);
+    let score_step = if sample_uncertainty >= 0.66 {
+        1usize
+    } else if sample_uncertainty >= 0.33 {
+        2usize
+    } else {
+        3usize
+    };
+    let mut score_markers_static: Vec<usize> = Vec::new();
+    for &anchor in &anchors_static {
+        let start = anchor.saturating_sub(radius);
+        let end = (anchor + radius + 1).min(n_markers);
+        for m in start..end {
+            // Light subsampling in dense windows for speed; always keep anchor.
+            if m == anchor || ((m - start) % score_step == 0) {
+                score_markers_static.push(m);
+            }
+        }
+    }
+    score_markers_static.sort_unstable();
+    score_markers_static.dedup();
+    let mut score_markers_sparse: Vec<usize> = Vec::with_capacity(score_markers_static.len() / 2 + 1);
+    for (i, &m) in score_markers_static.iter().enumerate() {
+        if i % 2 == 0 {
+            score_markers_sparse.push(m);
+        }
+    }
+    if score_markers_sparse.is_empty() && !score_markers_static.is_empty() {
+        score_markers_sparse.push(score_markers_static[0]);
+    }
+
+    // Cache per-marker log emissions so donor scoring avoids repeated floating-point transforms.
+    let mut ll_match: Vec<f32> = vec![0.0; n_markers];
+    let mut ll_mismatch: Vec<f32> = vec![0.0; n_markers];
+    for m in 0..n_markers {
+        let conf_m = conf[m].clamp(0.0, 1.0);
+        let emit_match = (p_no_err * conf_m + 0.5 * (1.0 - conf_m)).max(1e-30);
+        let emit_mismatch = (p_err * conf_m + 0.5 * (1.0 - conf_m)).max(1e-30);
+        ll_match[m] = emit_match.ln();
+        ll_mismatch[m] = emit_mismatch.ln();
+    }
+
     let mut candidates_buf: Vec<u32> = Vec::new();
-    let mut score_markers_buf: Vec<usize> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut collect_dynamic_neighbors =
-        |path_ref: &[u32], query_hap: &[u8], sample_idx: u32, out: &mut Vec<u32>| {
-            let stride = (n_markers / 8).max(1);
-            // Prefer anchors that maximize expected information under the emission model.
-            let anchor_score = |m: usize| -> f32 {
-                let obs = query_hap[m];
-                if obs == 255 {
-                    return f32::NEG_INFINITY;
-                }
-                let conf_score = conf[m].clamp(0.0, 1.0);
-                let emit_match = (p_no_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
-                let emit_mismatch = (p_err * conf_score + 0.5 * (1.0 - conf_score)).max(1e-30);
-                // Information gain proxy: larger match/mismatch odds gives stronger donor discrimination.
-                (emit_match / emit_mismatch).ln().abs()
-            };
-
-            anchors_buf.clear();
-            let mut start = 0usize;
-            while start < n_markers {
-                let end = (start + stride).min(n_markers);
-                let mut best_m = start;
-                let mut best_score = f32::NEG_INFINITY;
-                for m in start..end {
-                    let score = anchor_score(m);
-                    if score > best_score {
-                        best_score = score;
-                        best_m = m;
-                    }
-                }
-                anchors_buf.push(best_m);
-                start = end;
-            }
-            if anchors_buf.last().copied() != Some(n_markers.saturating_sub(1)) {
-                anchors_buf.push(n_markers.saturating_sub(1));
-            }
+        |path_ref: &[u32], query_hap: &[u8], target_states: usize, out: &mut Vec<u32>| {
             seen_buf.clear();
             candidates_buf.clear();
 
-            for &m in &anchors_buf {
+            for &m in &anchors_static {
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
                 if (ref_hap as usize) < phase_ibs.n_haps() {
+                    let search_states = if recipient_stability < 0.95 {
+                        target_states
+                            .saturating_add((target_states / 2).max(1))
+                            .min(phase_ibs.n_haps().saturating_sub(2).max(1))
+                    } else {
+                        target_states
+                    };
                     let mut local =
-                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, n_states);
+                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, search_states);
                     local.push(ref_hap);
                     for h in local {
                         if h == hap1_idx || h == hap1_idx + 1 {
+                            continue;
+                        }
+                        if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
                             continue;
                         }
                         if seen_buf.insert(h) {
@@ -8320,27 +9522,17 @@ fn sample_dynamic_mcmc(
 
             // Phase-conditioned scoring:
             // score each donor haplotype by local log-likelihood under current sampled
-            // haplotype sequence (query_hap), using confidence-weighted mismatch model.
-            let radius = (n_markers / 32).clamp(16, 256);
-            score_markers_buf.clear();
-            for &anchor in &anchors_buf {
-                let start = anchor.saturating_sub(radius);
-                let end = (anchor + radius + 1).min(n_markers);
-                for m in start..end {
-                    // Light subsampling in dense windows for speed; always keep anchor.
-                    if m == anchor || ((m - start) % 2 == 0) {
-                        score_markers_buf.push(m);
-                    }
-                }
-            }
-            score_markers_buf.sort_unstable();
-            score_markers_buf.dedup();
-
+            // haplotype sequence (query_hap), using cached confidence-weighted mismatch terms.
             scored_buf.clear();
             scored_buf.reserve(candidates_buf.len().saturating_sub(scored_buf.len()));
+            let score_markers = if recipient_stability >= 0.95 && target_states <= n_states / 2 {
+                &score_markers_sparse
+            } else {
+                &score_markers_static
+            };
             for &h in &candidates_buf {
                 let mut ll = 0.0f32;
-                for &m in &score_markers_buf {
+                for &m in score_markers {
                     let obs = query_hap[m];
                     if obs == 255 {
                         continue;
@@ -8349,23 +9541,34 @@ fn sample_dynamic_mcmc(
                     if ref_al == 255 {
                         continue;
                     }
-                    let conf_m = conf[m].clamp(0.0, 1.0);
-                    let emit = if ref_al == obs {
-                        p_no_err * conf_m + 0.5 * (1.0 - conf_m)
+                    ll += if ref_al == obs {
+                        ll_match[m]
                     } else {
-                        p_err * conf_m + 0.5 * (1.0 - conf_m)
+                        ll_mismatch[m]
                     };
-                    ll += emit.max(1e-30).ln();
                 }
                 scored_buf.push((h, ll));
             }
 
-            scored_buf.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let keep = n_states.min(scored_buf.len()).max(1);
-            out.clear();
-            out.reserve(keep.saturating_sub(out.capacity()));
-            for (h, _) in scored_buf.iter().take(keep) {
-                out.push(*h);
+            let keep = target_states.min(scored_buf.len()).max(1);
+            if scored_buf.len() > keep {
+                scored_buf.select_nth_unstable_by(keep - 1, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                scored_buf[..keep].sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                out.clear();
+                out.reserve(keep.saturating_sub(out.capacity()));
+                for (h, _) in scored_buf.iter().take(keep) {
+                    out.push(*h);
+                }
+            } else {
+                out.clear();
+                out.reserve(scored_buf.len().saturating_sub(out.capacity()));
+                for (h, _) in &scored_buf {
+                    out.push(*h);
+                }
             }
         };
 
@@ -8381,15 +9584,47 @@ fn sample_dynamic_mcmc(
         } else {
             n_markers / 2
         };
-        collect_dynamic_neighbors(&path1_ref, &h1_alleles, sample_idx, &mut neighbors);
+        let state_target = adaptive_dynamic_state_target(
+            n_states,
+            n_haps,
+            phase_conf[center_marker],
+            recipient_stability,
+        );
+        collect_dynamic_neighbors(&path1_ref, &h1_alleles, state_target, &mut neighbors);
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
-        if (ref_hap as usize) < phase_ibs.n_haps() && !neighbors.contains(&ref_hap) {
+        if (ref_hap as usize) < phase_ibs.n_haps()
+            && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
+            && !neighbors.contains(&ref_hap)
+        {
             neighbors.push(ref_hap);
         }
         if neighbors.is_empty() {
             continue;
         }
-        mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
+        mix_neighbors(
+            &mut neighbors,
+            state_target,
+            n_haps,
+            hap1_idx,
+            sample_uncertainty,
+            &mut rng,
+        );
+        neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
+        if neighbors.is_empty() {
+            refill_neighbors_for_marker(
+                &mut neighbors,
+                state_target,
+                n_haps,
+                hap1_idx,
+                LocalMarkerIdx(center_marker),
+                sample_uncertainty,
+                &mut rng,
+                &allow_donor_at_marker,
+            );
+            if neighbors.is_empty() {
+                continue;
+            }
+        }
         record_neighbors(&neighbors);
 
         // 2. Build constraint: at hets, H1 must produce genotype with H2
@@ -8417,6 +9652,7 @@ fn sample_dynamic_mcmc(
             seq1,
             seq2,
             conf,
+            phase_conf,
             &fixed_allele,
             &neighbors,
             phase_ibs,
@@ -8465,15 +9701,41 @@ fn sample_dynamic_mcmc(
         // === Sample H2 | (G, H1_new) ===
 
         // 1. Select neighbors for H2 with H2-conditioned scoring (not H1's sequence).
-        collect_dynamic_neighbors(&path2_ref, &h2_alleles, sample_idx, &mut neighbors);
+        collect_dynamic_neighbors(&path2_ref, &h2_alleles, state_target, &mut neighbors);
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
-        if (ref_hap as usize) < phase_ibs.n_haps() && !neighbors.contains(&ref_hap) {
+        if (ref_hap as usize) < phase_ibs.n_haps()
+            && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
+            && !neighbors.contains(&ref_hap)
+        {
             neighbors.push(ref_hap);
         }
         if neighbors.is_empty() {
             continue;
         }
-        mix_neighbors(&mut neighbors, n_states, n_haps, hap1_idx, &mut rng);
+        mix_neighbors(
+            &mut neighbors,
+            state_target,
+            n_haps,
+            hap1_idx,
+            sample_uncertainty,
+            &mut rng,
+        );
+        neighbors.retain(|&h| allow_donor_at_marker(h, LocalMarkerIdx(center_marker)));
+        if neighbors.is_empty() {
+            refill_neighbors_for_marker(
+                &mut neighbors,
+                state_target,
+                n_haps,
+                hap1_idx,
+                LocalMarkerIdx(center_marker),
+                sample_uncertainty,
+                &mut rng,
+                &allow_donor_at_marker,
+            );
+            if neighbors.is_empty() {
+                continue;
+            }
+        }
         record_neighbors(&neighbors);
 
         // 2. Build constraint: at hets, H2 must produce genotype with H1
@@ -8501,6 +9763,7 @@ fn sample_dynamic_mcmc(
             seq1,
             seq2,
             conf,
+            phase_conf,
             &fixed_allele,
             &neighbors,
             phase_ibs,
@@ -11665,6 +12928,7 @@ mod tests {
         let mut window_scores = vec![vec![f32::NEG_INFINITY; ref_gt.n_haplotypes()]; 2];
         score_window_batch_pbwt_segment(
             &[0, 1],
+            &target_gt,
             &target_geno,
             &ref_columns,
             target_gt.phase_mask(),
@@ -11768,6 +13032,7 @@ mod tests {
             let mut window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; 2];
             score_window_batch_pbwt_segment(
                 &[0, 1],
+                &target_gt,
                 &target_geno,
                 &ref_columns,
                 phase_mask,
@@ -12150,6 +13415,8 @@ mod tests {
         let seq1 = vec![0u8; n_markers];
         let seq2 = vec![1u8; n_markers];
         let conf = vec![1.0f32; n_markers];
+        let phase_conf = vec![1.0f32; n_markers];
+        let sample_phase_stability = vec![0.5f32];
 
         // p_recomb: low recombination
         let p_recomb = vec![0.01f32; n_markers];
@@ -12165,9 +13432,12 @@ mod tests {
             &seq1,
             &seq2,
             &conf,
+            &phase_conf,
             &phase_ibs,
             &ibs2,
+            &subset_to_global,
             0, // sample_idx = 0 (haplotypes 0 and 1)
+            &sample_phase_stability,
             &het_positions,
             12345, // seed
             5,     // n_mcmc_steps
@@ -12241,6 +13511,8 @@ mod tests {
         let seq1 = vec![0u8; n_markers];
         let seq2 = vec![1u8; n_markers];
         let conf = vec![1.0f32; n_markers];
+        let phase_conf = vec![1.0f32; n_markers];
+        let sample_phase_stability = vec![0.5f32];
         let p_recomb = vec![0.01f32; n_markers];
         let het_positions: Vec<usize> = (0..n_markers).collect();
 
@@ -12252,9 +13524,12 @@ mod tests {
             &seq1,
             &seq2,
             &conf,
+            &phase_conf,
             &phase_ibs,
             &ibs2,
+            &subset_to_global,
             0, // sample_idx = 0 (haplotypes 0 and 1)
+            &sample_phase_stability,
             &het_positions,
             12345,
             5,
@@ -12353,5 +13628,53 @@ mod tests {
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
         );
+    }
+
+    #[test]
+    fn test_fit_cohort_calibration_small_n_skips() {
+        let stats = vec![SampleCohortStats::default(); 10];
+        let out = fit_cohort_calibration(&stats, 0.001);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_fit_cohort_calibration_produces_per_sample_rates() {
+        let mut stats = Vec::new();
+        for _ in 0..70 {
+            stats.push(SampleCohortStats {
+                mismatch_mass: 5.0,
+                emission_mass: 5000.0,
+                expected_switches: 15.0,
+                genetic_dist_morgans: 1.2,
+                phase_uncertainty_sum: 80.0,
+                phase_uncertainty_count: 200,
+            });
+        }
+        for _ in 0..70 {
+            stats.push(SampleCohortStats {
+                mismatch_mass: 200.0,
+                emission_mass: 5000.0,
+                expected_switches: 60.0,
+                genetic_dist_morgans: 1.2,
+                phase_uncertainty_sum: 120.0,
+                phase_uncertainty_count: 200,
+            });
+        }
+
+        let out = fit_cohort_calibration(&stats, 0.001).expect("expected calibration model");
+        assert_eq!(out.sample_p_mismatch.len(), stats.len());
+        assert!(!out.cohort_p_mismatch.is_empty());
+        let min_p = out
+            .sample_p_mismatch
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let max_p = out
+            .sample_p_mismatch
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(min_p.is_finite() && max_p.is_finite());
+        assert!(max_p > min_p);
     }
 }

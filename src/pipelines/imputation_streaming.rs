@@ -192,6 +192,77 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     posterior.clamp(1e-6, 0.5)
 }
 
+#[inline]
+fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32) -> f32 {
+    let base = 0.08 + 0.17 * genotype_conf.clamp(0.0, 1.0);
+    let scale = 0.55 + 0.9 * beam_uncertainty.clamp(0.0, 1.0);
+    (base * scale).clamp(0.04, 0.30)
+}
+
+#[inline]
+fn phase_best_orientation_error(phase_conf: f32) -> f32 {
+    let p = phase_conf.clamp(0.0, 1.0);
+    p.min(1.0 - p)
+}
+
+#[inline]
+fn phase_orientation_weight(phase_conf: f32, err_limit: f32) -> f32 {
+    let best_orient_err = phase_best_orientation_error(phase_conf);
+    let limit = err_limit.max(1e-6);
+    (limit / best_orient_err.max(limit)).clamp(0.0, 1.0)
+}
+
+#[inline]
+fn pbwt_beam_uncertainty(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> f32 {
+    if n_ref_haps == 0 {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    let mut sq_sum = 0.0f32;
+    let mut n_intervals = 0usize;
+    for &(l, r) in beam.intervals() {
+        if r <= l {
+            continue;
+        }
+        let len = (r - l) as f32;
+        total += len;
+        sq_sum += len * len;
+        n_intervals += 1;
+    }
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let coverage = (total / n_ref_haps as f32).clamp(0.0, 1.0);
+    let spread = if n_intervals > 1 && sq_sum > 0.0 {
+        let neff = (total * total / sq_sum).clamp(1.0, n_intervals as f32);
+        (neff - 1.0) / (n_intervals as f32 - 1.0)
+    } else {
+        0.0
+    };
+    let mut uncertainty = (0.7 * coverage + 0.3 * spread).clamp(0.0, 1.0);
+    if query.is_wildcard() {
+        uncertainty = uncertainty.max(0.85);
+    }
+    uncertainty
+}
+
+#[inline]
+fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> usize {
+    if n_ref_haps == 0 {
+        return 1;
+    }
+    let min_k = SM_MATCH_MIN_DONORS.max(1);
+    let max_k = SM_MATCH_DONORS.saturating_mul(2).max(min_k).min(n_ref_haps);
+    if max_k <= min_k {
+        return min_k.min(n_ref_haps).max(1);
+    }
+    let u = pbwt_beam_uncertainty(beam, n_ref_haps, query);
+    let span = (max_k - min_k) as f32;
+    (min_k as f32 + span * u)
+        .round()
+        .clamp(min_k as f32, max_k as f32) as usize
+}
+
 #[derive(Clone, Debug)]
 struct ImputationPlan {
     n_ref_haps: usize,
@@ -4107,13 +4178,15 @@ impl crate::pipelines::ImputationPipeline {
         {
             let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
             let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+            let phase_mask = target_win.phase_mask();
             let batch_size = 4096usize;
             let mut batches: Vec<(
                 Vec<usize>,
                 Vec<RankBeam>,
                 Vec<PbwtQueryAllele>,
+                Vec<f32>,
                 Vec<u32>,
-                Vec<(u32, u32, u32)>,
+                Vec<(u32, u32, u64)>,
             )> = Vec::new();
             let mut start = 0usize;
             while start < n_target_haps {
@@ -4121,9 +4194,17 @@ impl crate::pipelines::ImputationPipeline {
                 let haps: Vec<usize> = (start..end).collect();
                 let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
                 let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+                let query_info_weight = vec![0.0f32; haps.len()];
                 let current_donor = vec![0u32; haps.len()];
                 let scratch = Vec::new();
-                batches.push((haps, beams, query_alleles, current_donor, scratch));
+                batches.push((
+                    haps,
+                    beams,
+                    query_alleles,
+                    query_info_weight,
+                    current_donor,
+                    scratch,
+                ));
                 start = end;
             }
 
@@ -4131,6 +4212,9 @@ impl crate::pipelines::ImputationPipeline {
                 let entry = counts.entry(hap).or_insert(0);
                 *entry = entry.saturating_add(1);
             };
+            // Information weight in natural log space for one informative allele observation.
+            let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
+            let info_llr = ((1.0 - theta) / theta).ln();
 
             for ref_m in 0..n_ref_markers {
                 let col = &ref_columns[ref_m];
@@ -4139,90 +4223,183 @@ impl crate::pipelines::ImputationPipeline {
                     .marker(MarkerIdx::new(ref_m as u32))
                     .n_alleles()
                     .max(1);
+                let target_m_opt = alignment.ref_to_target.get(ref_m).and_then(|v| *v);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
-                    if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
+                for (haps, beams, query_alleles, query_info_weight, _, scratch) in
+                    batches.iter_mut()
+                {
+                    if let Some(target_m) = target_m_opt {
                         let target_idx = target_m.as_usize();
+                        let target_marker = MarkerIdx::new(target_idx as u32);
                         let mapping = alignment
                             .allele_mappings
                             .get(target_idx)
                             .and_then(|m| m.as_ref());
 
+                        let mut cached_sample_idx = usize::MAX;
+                        let mut cached_query_pair = [255u8; 2];
+                        let mut cached_wildcard_weight = 0.0f32;
+                        let mut cached_allele_weight = 0.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
-                            let h = HapIdx::new((sample_idx * 2 + local) as u32);
-                            let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
-                            if let Some(missing) = target_missing {
-                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                    a = 255;
+                            if sample_idx != cached_sample_idx {
+                                cached_sample_idx = sample_idx;
+                                cached_wildcard_weight = 0.0;
+                                cached_allele_weight = 0.0;
+                                let hap1 = sample_idx * 2;
+                                let hap2 = hap1 + 1;
+                                let h1 = HapIdx::new(hap1 as u32);
+                                let h2 = HapIdx::new(hap2 as u32);
+                                let mut a1 = target_win.allele(target_marker, h1);
+                                let mut a2 = target_win.allele(target_marker, h2);
+                                if let Some(missing) = target_missing {
+                                    if missing.allele(target_marker, h1) == 255 {
+                                        a1 = 255;
+                                    }
+                                    if missing.allele(target_marker, h2) == 255 {
+                                        a2 = 255;
+                                    }
+                                }
+                                let map_to_ref = |a: u8| -> u8 {
+                                    if a == 255 {
+                                        return 255;
+                                    }
+                                    if let Some(mapping) = mapping {
+                                        if (a as usize) < mapping.targ_to_ref.len() {
+                                            let r = mapping.targ_to_ref[a as usize];
+                                            if r >= 0 {
+                                                return r as u8;
+                                            }
+                                        }
+                                        255
+                                    } else {
+                                        a
+                                    }
+                                };
+                                let mapped1 = map_to_ref(a1);
+                                let mapped2 = map_to_ref(a2);
+                                let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
+                                let input_phased = phase_mask
+                                    .and_then(|mask| mask.get(target_idx, sample_idx))
+                                    .map(|v| v != 0)
+                                    .unwrap_or(true);
+                                if is_het && !input_phased {
+                                    cached_query_pair = [255, 255];
+                                } else if is_het && input_phased {
+                                    let qa1 = PbwtQueryAllele::allele(mapped1)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let qa2 = PbwtQueryAllele::allele(mapped2)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                                        &beams[i],
+                                        plan.n_ref_haps,
+                                        qa1,
+                                    );
+                                    let peer_idx = if i > 0 && (haps[i - 1] / 2) == sample_idx {
+                                        Some(i - 1)
+                                    } else if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx
+                                    {
+                                        Some(i + 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(peer_i) = peer_idx {
+                                        let peer_query = if (haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                                        let peer_uncertainty = pbwt_beam_uncertainty(
+                                            &beams[peer_i],
+                                            plan.n_ref_haps,
+                                            peer_query,
+                                        );
+                                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                                    }
+                                    let phase_conf = target_win
+                                        .sample_phase_confidence_f32(target_marker, sample_idx)
+                                        .clamp(0.0, 1.0);
+                                    let geno_conf = target_win
+                                        .sample_confidence_f32(target_marker, sample_idx)
+                                        .clamp(0.0, 1.0);
+                                    let err_limit =
+                                        phase_query_orientation_error_limit(
+                                            geno_conf,
+                                            beam_uncertainty,
+                                        )
+                                        .max(1e-6);
+                                    let orientation_weight =
+                                        phase_orientation_weight(phase_conf, err_limit);
+                                    cached_allele_weight = orientation_weight;
+                                    if phase_best_orientation_error(phase_conf) > err_limit {
+                                        cached_query_pair = [255, 255];
+                                        cached_wildcard_weight = info_llr * orientation_weight;
+                                    } else if phase_conf < 0.5 {
+                                        cached_query_pair = [mapped2, mapped1];
+                                    } else {
+                                        cached_query_pair = [mapped1, mapped2];
+                                    }
+                                } else {
+                                    cached_query_pair = [mapped1, mapped2];
+                                    cached_allele_weight = 1.0;
                                 }
                             }
-                            let a = if a == 255 {
-                                255
-                            } else if let Some(mapping) = mapping {
-                                if (a as usize) < mapping.targ_to_ref.len() {
-                                    let r = mapping.targ_to_ref[a as usize];
-                                    if r >= 0 { r as u8 } else { 255 }
-                                } else {
-                                    255
-                                }
-                            } else {
-                                a
-                            };
-                            query_alleles[i] = PbwtQueryAllele::allele(a)
+                            let query = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
+                            let target_allele = query.as_allele().unwrap_or(255);
+                            query_info_weight[i] = if target_allele != 255
+                                && (target_allele as usize) < n_alleles
+                            {
+                                info_llr * cached_allele_weight
+                            } else if query.is_wildcard() {
+                                cached_wildcard_weight
+                            } else {
+                                0.0
+                            };
+                            query_alleles[i] = query;
                         }
                     } else {
-                        for qa in query_alleles.iter_mut() {
+                        for (qa, iw) in query_alleles.iter_mut().zip(query_info_weight.iter_mut()) {
                             *qa = PbwtQueryAllele::wildcard();
+                            *iw = 0.0;
                         }
                     }
 
-                    pbwt.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch);
+                    pbwt.update_beams_with_scratch_query(
+                        beams,
+                        query_alleles,
+                        None,
+                        n_alleles,
+                        scratch,
+                    );
                 }
                 pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 
                 // Donor/confusion evidence should be collected where the target
                 // is informative in this window, and across the overlap tail for
                 // handoff continuity.
-                let aligned_here = alignment
-                    .ref_to_target
-                    .get(ref_m)
-                    .and_then(|v| *v)
-                    .is_some();
+                let aligned_here = target_m_opt.is_some();
                 let in_overlap = ref_m >= overlap_start && ref_m < output_end;
                 let store = aligned_here || in_overlap;
 
-                // Information weight in natural log space for one informative allele observation.
-                let theta = self.params.p_mismatch.max(1e-9).min(1.0 - 1e-9) as f32;
-                let info_llr = ((1.0 - theta) / theta).ln();
-
                 if store {
-                    for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
-                        let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                    for (haps, beams, query_alleles, query_info_weight, current_donor, _) in
+                        batches.iter_mut()
+                    {
+                        let mut donor_candidates: Vec<u32> =
+                            Vec::with_capacity(SM_MATCH_DONORS.saturating_mul(2));
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let beam = &beams[i];
+                            let donor_k =
+                                adaptive_sm_donor_k(beam, plan.n_ref_haps, query_alleles[i]);
                             donor_candidates.clear();
-                            pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                            pbwt.select_donors_into(beam, donor_k, &mut donor_candidates);
                             let donor = donor_candidates
                                 .first()
                                 .copied()
                                 .unwrap_or(current_donor[i]);
                             current_donor[i] = donor;
 
-                            let target_allele = query_alleles
-                                .get(i)
-                                .and_then(|qa| qa.as_allele())
-                                .unwrap_or(255);
-                            let info_weight =
-                                if target_allele == 255 || (target_allele as usize) >= n_alleles {
-                                    0.0
-                                } else {
-                                    info_llr
-                                };
-                            if target_allele != 255 {
+                            let info_weight = query_info_weight[i];
+                            if info_weight > 0.0 {
                                 sm_total_info[hap_idx] += info_weight;
                             }
 
@@ -5107,13 +5284,15 @@ impl crate::pipelines::ImputationPipeline {
         if !sm_haps.is_empty() && output_markers > 0 {
             let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
             let mut ref_alleles: Vec<u8> = vec![0u8; plan.n_ref_haps];
+            let phase_mask = target_win.phase_mask();
             let batch_size = 4096usize;
             let mut batches: Vec<(
                 Vec<usize>,
                 Vec<RankBeam>,
                 Vec<PbwtQueryAllele>,
+                Vec<f32>,
                 Vec<u32>,
-                Vec<(u32, u32, u32)>,
+                Vec<(u32, u32, u64)>,
             )> = Vec::new();
             let mut start = 0usize;
             while start < sm_haps.len() {
@@ -5121,12 +5300,20 @@ impl crate::pipelines::ImputationPipeline {
                 let haps: Vec<usize> = sm_haps[start..end].to_vec();
                 let beams = vec![RankBeam::full(plan.n_ref_haps as u32); haps.len()];
                 let query_alleles = vec![PbwtQueryAllele::wildcard(); haps.len()];
+                let query_allele_weight = vec![1.0f32; haps.len()];
                 let current_donor = vec![0u32; haps.len()];
                 let scratch = Vec::new();
                 for &hap in &haps {
                     sm_alt_probs_by_hap[hap] = Some(Vec::with_capacity(output_markers));
                 }
-                batches.push((haps, beams, query_alleles, current_donor, scratch));
+                batches.push((
+                    haps,
+                    beams,
+                    query_alleles,
+                    query_allele_weight,
+                    current_donor,
+                    scratch,
+                ));
                 start = end;
             }
 
@@ -5139,57 +5326,160 @@ impl crate::pipelines::ImputationPipeline {
                     .max(1);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, _, scratch) in batches.iter_mut() {
+                for (haps, beams, query_alleles, query_allele_weight, _, scratch) in
+                    batches.iter_mut()
+                {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
+                        let target_marker = MarkerIdx::new(target_idx as u32);
                         let mapping = alignment
                             .allele_mappings
                             .get(target_idx)
                             .and_then(|m| m.as_ref());
 
+                        let mut cached_sample_idx = usize::MAX;
+                        let mut cached_query_pair = [255u8; 2];
+                        let mut cached_wildcard_weight = 0.0f32;
+                        let mut cached_allele_weight = 1.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
-                            let h = HapIdx::new((sample_idx * 2 + local) as u32);
-                            let mut a = target_win.allele(MarkerIdx::new(target_idx as u32), h);
-                            if let Some(missing) = target_missing {
-                                if missing.allele(MarkerIdx::new(target_idx as u32), h) == 255 {
-                                    a = 255;
+                            if sample_idx != cached_sample_idx {
+                                cached_sample_idx = sample_idx;
+                                cached_wildcard_weight = 0.0;
+                                let hap1 = sample_idx * 2;
+                                let hap2 = hap1 + 1;
+                                let h1 = HapIdx::new(hap1 as u32);
+                                let h2 = HapIdx::new(hap2 as u32);
+                                let mut a1 = target_win.allele(target_marker, h1);
+                                let mut a2 = target_win.allele(target_marker, h2);
+                                if let Some(missing) = target_missing {
+                                    if missing.allele(target_marker, h1) == 255 {
+                                        a1 = 255;
+                                    }
+                                    if missing.allele(target_marker, h2) == 255 {
+                                        a2 = 255;
+                                    }
+                                }
+                                let map_to_ref = |a: u8| -> u8 {
+                                    if a == 255 {
+                                        return 255;
+                                    }
+                                    if let Some(mapping) = mapping {
+                                        if (a as usize) < mapping.targ_to_ref.len() {
+                                            let r = mapping.targ_to_ref[a as usize];
+                                            if r >= 0 {
+                                                return r as u8;
+                                            }
+                                        }
+                                        255
+                                    } else {
+                                        a
+                                    }
+                                };
+                                let mapped1 = map_to_ref(a1);
+                                let mapped2 = map_to_ref(a2);
+                                let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
+                                let input_phased = phase_mask
+                                    .and_then(|mask| mask.get(target_idx, sample_idx))
+                                    .map(|v| v != 0)
+                                    .unwrap_or(true);
+                                if is_het && !input_phased {
+                                    cached_query_pair = [255, 255];
+                                    cached_allele_weight = 0.0;
+                                } else if is_het && input_phased {
+                                    let qa1 = PbwtQueryAllele::allele(mapped1)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let qa2 = PbwtQueryAllele::allele(mapped2)
+                                        .unwrap_or_else(PbwtQueryAllele::missing);
+                                    let mut beam_uncertainty = pbwt_beam_uncertainty(
+                                        &beams[i],
+                                        plan.n_ref_haps,
+                                        qa1,
+                                    );
+                                    let peer_idx = if i > 0 && (haps[i - 1] / 2) == sample_idx {
+                                        Some(i - 1)
+                                    } else if i + 1 < haps.len() && (haps[i + 1] / 2) == sample_idx
+                                    {
+                                        Some(i + 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(peer_i) = peer_idx {
+                                        let peer_query = if (haps[peer_i] % 2) == 0 { qa1 } else { qa2 };
+                                        let peer_uncertainty = pbwt_beam_uncertainty(
+                                            &beams[peer_i],
+                                            plan.n_ref_haps,
+                                            peer_query,
+                                        );
+                                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                                    }
+                                    let phase_conf = target_win
+                                        .sample_phase_confidence_f32(target_marker, sample_idx)
+                                        .clamp(0.0, 1.0);
+                                    let geno_conf = target_win
+                                        .sample_confidence_f32(target_marker, sample_idx)
+                                        .clamp(0.0, 1.0);
+                                    let err_limit =
+                                        phase_query_orientation_error_limit(
+                                            geno_conf,
+                                            beam_uncertainty,
+                                        )
+                                        .max(1e-6);
+                                    cached_allele_weight =
+                                        phase_orientation_weight(phase_conf, err_limit);
+                                    if phase_best_orientation_error(phase_conf) > err_limit {
+                                        cached_query_pair = [255, 255];
+                                        cached_wildcard_weight = cached_allele_weight;
+                                    } else if phase_conf < 0.5 {
+                                        cached_query_pair = [mapped2, mapped1];
+                                    } else {
+                                        cached_query_pair = [mapped1, mapped2];
+                                    }
+                                } else {
+                                    cached_query_pair = [mapped1, mapped2];
+                                    cached_allele_weight = 1.0;
                                 }
                             }
-                            let a = if a == 255 {
-                                255
-                            } else if let Some(mapping) = mapping {
-                                if (a as usize) < mapping.targ_to_ref.len() {
-                                    let r = mapping.targ_to_ref[a as usize];
-                                    if r >= 0 { r as u8 } else { 255 }
-                                } else {
-                                    255
-                                }
-                            } else {
-                                a
-                            };
-                            query_alleles[i] = PbwtQueryAllele::allele(a)
+                            query_alleles[i] = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
+                            query_allele_weight[i] = if query_alleles[i].is_wildcard() {
+                                cached_wildcard_weight
+                            } else {
+                                cached_allele_weight
+                            };
                         }
                     } else {
-                        for qa in query_alleles.iter_mut() {
+                        for (qa, qw) in query_alleles.iter_mut().zip(query_allele_weight.iter_mut())
+                        {
                             *qa = PbwtQueryAllele::wildcard();
+                            *qw = 0.0;
                         }
                     }
 
-                    pbwt.update_beams_with_scratch_query(beams, query_alleles, n_alleles, scratch);
+                    pbwt.update_beams_with_scratch_query(
+                        beams,
+                        query_alleles,
+                        None,
+                        n_alleles,
+                        scratch,
+                    );
                 }
                 pbwt.finalize_step(&ref_alleles, n_alleles, ref_m);
 
                 if ref_m < output_start || ref_m >= output_end {
                     continue;
                 }
-                for (haps, beams, query_alleles, current_donor, _) in batches.iter_mut() {
-                    let mut donor_candidates: Vec<u32> = Vec::with_capacity(SM_MATCH_DONORS);
+                for (haps, beams, query_alleles, query_allele_weight, current_donor, _) in
+                    batches.iter_mut()
+                {
+                    let mut donor_candidates: Vec<u32> =
+                        Vec::with_capacity(SM_MATCH_DONORS.saturating_mul(2));
                     for (i, &hap_idx) in haps.iter().enumerate() {
                         let beam = &beams[i];
-                        pbwt.select_donors_into(beam, SM_MATCH_DONORS, &mut donor_candidates);
+                        let donor_k = adaptive_sm_donor_k(beam, plan.n_ref_haps, query_alleles[i]);
+                        donor_candidates.clear();
+                        pbwt.select_donors_into(beam, donor_k, &mut donor_candidates);
                         let mut donor = current_donor[i];
                         let mut found = false;
                         for &cand in &donor_candidates {
@@ -5223,11 +5513,21 @@ impl crate::pipelines::ImputationPipeline {
                                         alt_sum += 1;
                                     }
                                 }
-                                (alt_sum as f32 / donor_candidates.len() as f32)
+                                let donor_alt =
+                                    (alt_sum as f32 / donor_candidates.len() as f32).clamp(0.0, 1.0);
+                                let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
+                                (orient_weight * donor_alt + (1.0 - orient_weight) * 0.5)
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
-                                let allele = col.get(HapIdx::new(donor));
-                                if allele == 1 { 1.0 } else { 0.0 }
+                                let hard = if donor_candidates.is_empty() {
+                                    if target_allele == 1 { 1.0 } else { 0.0 }
+                                } else {
+                                    let allele = col.get(HapIdx::new(donor));
+                                    if allele == 1 { 1.0 } else { 0.0 }
+                                };
+                                let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
+                                (orient_weight * hard + (1.0 - orient_weight) * 0.5)
+                                    .clamp(1e-6, 1.0 - 1e-6)
                             }
                         } else {
                             0.0

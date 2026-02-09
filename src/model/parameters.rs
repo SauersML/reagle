@@ -291,6 +291,26 @@ impl ParamEstimates {
     pub fn n_emit_obs(&self) -> usize {
         self.n_emit_obs
     }
+
+    /// Sum of expected mismatches accumulated during emission statistics.
+    pub fn mismatch_mass(&self) -> f64 {
+        self.sum_mismatch_probs
+    }
+
+    /// Total emission probability mass (matches + mismatches).
+    pub fn emission_mass(&self) -> f64 {
+        self.sum_match_probs + self.sum_mismatch_probs
+    }
+
+    /// Sum of expected switch counts accumulated during transition statistics.
+    pub fn expected_switches(&self) -> f64 {
+        self.sum_expected_switches
+    }
+
+    /// Sum of genetic distances in cM used for transition statistics.
+    pub fn genetic_distance_cm(&self) -> f64 {
+        self.sum_gen_dist
+    }
 }
 
 /// Thread-safe wrapper for ParamEstimates using Mutex
