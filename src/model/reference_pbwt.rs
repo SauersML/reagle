@@ -1,6 +1,6 @@
 use crate::model::pbwt::{PbwtAllele, PbwtAlphabet, PbwtDivUpdater, PbwtIndex};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 const MAX_RANK_INTERVALS: usize = 8;
 
@@ -83,6 +83,8 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     offsets: Vec<u32>,
     intervals_buf: Vec<(usize, usize)>,
     donor_candidate_pos: Vec<usize>,
+    donor_seen_marks: Vec<u32>,
+    donor_seen_tick: u32,
     step_scratch: Vec<(u32, u32, u32)>,
     wanted_map: HashMap<u32, usize>,
     found_pos_start: Vec<(usize, i32)>,
@@ -218,6 +220,24 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     #[inline]
+    fn ensure_donor_seen_marks(&mut self, n_ref: usize) {
+        if self.donor_seen_marks.len() < n_ref {
+            self.donor_seen_marks.resize(n_ref, 0);
+        }
+    }
+
+    #[inline]
+    fn next_donor_seen_tick(&mut self) -> u32 {
+        if self.donor_seen_tick == u32::MAX {
+            self.donor_seen_marks.fill(0);
+            self.donor_seen_tick = 1;
+        } else {
+            self.donor_seen_tick += 1;
+        }
+        self.donor_seen_tick
+    }
+
+    #[inline]
     fn load_top_intervals(
         scratch: &mut Vec<(u32, u32, u32)>,
         next: &mut RankBeam,
@@ -255,6 +275,8 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             offsets: Vec::new(),
             intervals_buf: Vec::new(),
             donor_candidate_pos: Vec::new(),
+            donor_seen_marks: Vec::new(),
+            donor_seen_tick: 0,
             step_scratch: Vec::new(),
             wanted_map: HashMap::new(),
             found_pos_start: Vec::new(),
@@ -271,6 +293,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         if n_ref == 0 {
             return;
         }
+        self.ensure_donor_seen_marks(n_ref);
 
         self.intervals_buf.clear();
         self.intervals_buf.reserve(beam.intervals().len());
@@ -330,6 +353,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 k.saturating_mul(APPROX_SCAN_FACTOR)
                     .max(MIN_APPROX_SCAN_POINTS),
             );
+            let candidate_tick = self.next_donor_seen_tick();
             self.donor_candidate_pos.clear();
             self.donor_candidate_pos.reserve(
                 n_scan_targets
@@ -350,7 +374,10 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let start = center.saturating_sub(LOCAL_REFINE_RADIUS).max(l);
                         let end = (center + LOCAL_REFINE_RADIUS + 1).min(r);
                         for pos in start..end {
-                            self.donor_candidate_pos.push(pos);
+                            if self.donor_seen_marks[pos] != candidate_tick {
+                                self.donor_seen_marks[pos] = candidate_tick;
+                                self.donor_candidate_pos.push(pos);
+                            }
                         }
                         break;
                     }
@@ -362,9 +389,20 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             // Ensure interval edges and centers are represented.
             for &(l, r) in &self.intervals_buf {
                 if l < r {
-                    self.donor_candidate_pos.push(l);
-                    self.donor_candidate_pos.push(r - 1);
-                    self.donor_candidate_pos.push(l + (r - l) / 2);
+                    if self.donor_seen_marks[l] != candidate_tick {
+                        self.donor_seen_marks[l] = candidate_tick;
+                        self.donor_candidate_pos.push(l);
+                    }
+                    let rr = r - 1;
+                    if self.donor_seen_marks[rr] != candidate_tick {
+                        self.donor_seen_marks[rr] = candidate_tick;
+                        self.donor_candidate_pos.push(rr);
+                    }
+                    let mid = l + (r - l) / 2;
+                    if self.donor_seen_marks[mid] != candidate_tick {
+                        self.donor_seen_marks[mid] = candidate_tick;
+                        self.donor_candidate_pos.push(mid);
+                    }
                 }
             }
 
@@ -379,7 +417,11 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                         let len = r - l;
                         if target < spread_interval_start_offset + len {
                             let offset_in_interval = target - spread_interval_start_offset;
-                            self.donor_candidate_pos.push(l + offset_in_interval);
+                            let pos = l + offset_in_interval;
+                            if self.donor_seen_marks[pos] != candidate_tick {
+                                self.donor_seen_marks[pos] = candidate_tick;
+                                self.donor_candidate_pos.push(pos);
+                            }
                             break;
                         }
                         spread_interval_start_offset += len;
@@ -387,9 +429,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                     }
                 }
             }
-
-            self.donor_candidate_pos.sort_unstable();
-            self.donor_candidate_pos.dedup();
 
             let mut best: std::collections::BinaryHeap<DonorChoice> =
                 std::collections::BinaryHeap::with_capacity(k + 1);
@@ -403,15 +442,16 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
 
             // Safety net: if approximation produced too few unique candidates, backfill exactly.
             if best.len() < k {
-                let mut seen_pos: HashSet<usize> = HashSet::with_capacity(best.len() * 2 + 1);
+                let chosen_tick = self.next_donor_seen_tick();
                 for c in best.iter() {
-                    seen_pos.insert(c.pos);
+                    self.donor_seen_marks[c.pos] = chosen_tick;
                 }
                 for &(l, r) in &self.intervals_buf {
                     for pos in l..r {
-                        if !seen_pos.insert(pos) {
+                        if self.donor_seen_marks[pos] == chosen_tick {
                             continue;
                         }
+                        self.donor_seen_marks[pos] = chosen_tick;
                         let choice = DonorChoice {
                             div: self.div[pos],
                             pos,
