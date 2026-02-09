@@ -467,6 +467,21 @@ fn boundary_pool_sizes_from_scores(
         out.push(local_pool.min(cap_pool));
         b += 1;
     }
+    if out.len() >= 3 {
+        let mut smoothed = out.clone();
+        let mut i = 1usize;
+        while i + 1 < out.len() {
+            let prev = out[i - 1].as_f32();
+            let cur = out[i].as_f32();
+            let next = out[i + 1].as_f32();
+            let mixed = (0.2 * prev + 0.6 * cur + 0.2 * next).round().max(2.0) as usize;
+            let c0 = DonorPoolSize::new(per_window_caps.get(i).copied().unwrap_or(n_pool));
+            let c1 = DonorPoolSize::new(per_window_caps.get(i + 1).copied().unwrap_or(n_pool));
+            smoothed[i] = DonorPoolSize::new(mixed).min(c0).min(c1).min(panel_pool);
+            i += 1;
+        }
+        out = smoothed;
+    }
     out
 }
 
@@ -507,6 +522,106 @@ fn recompute_counts_logz_used(
     }
 
     (counts, z_w, used)
+}
+
+fn fill_residual_capacity(
+    scores_by_hap: &[Vec<(usize, f32)>],
+    per_window_caps: &[usize],
+    t11: &[f32],
+    t10: &[f32],
+    t01: &[f32],
+    selected_states: &mut [Option<AllocationState>],
+    counts: &mut [usize],
+    z_w: &mut [f32],
+    remaining: &mut usize,
+    dp_scratch: &mut DpScratch,
+) {
+    let n = scores_by_hap.len();
+    let w = per_window_caps.len();
+    while *remaining > 0 {
+        let blocked: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let mut best_idx: Option<usize> = None;
+        let mut best_gain = NEG_INF;
+        let mut best_gain_per_slot = NEG_INF;
+        let mut best_len = 0usize;
+
+        let mut h = 0usize;
+        while h < n {
+            if selected_states[h].is_some() {
+                h += 1;
+                continue;
+            }
+            let (gain, len) = dp_intervals_sparse_scratch(
+                &scores_by_hap[h],
+                z_w,
+                0.0,
+                &blocked,
+                t11,
+                t10,
+                t01,
+                dp_scratch,
+            );
+            if gain > 0.0 && len > 0 && len <= *remaining {
+                let gain_per_slot = gain / len as f32;
+                if gain_per_slot > best_gain_per_slot
+                    || (gain_per_slot == best_gain_per_slot
+                        && (gain > best_gain || (gain == best_gain && len > best_len)))
+                {
+                    best_idx = Some(h);
+                    best_gain = gain;
+                    best_gain_per_slot = gain_per_slot;
+                    best_len = len;
+                }
+            }
+            h += 1;
+        }
+
+        let Some(chosen_idx) = best_idx else {
+            break;
+        };
+
+        let blocked_verify: Vec<bool> = counts
+            .iter()
+            .enumerate()
+            .map(|(w_i, &c)| c >= per_window_caps[w_i])
+            .collect();
+        let (gain_chk, len_chk) = dp_intervals_sparse_scratch(
+            &scores_by_hap[chosen_idx],
+            z_w,
+            0.0,
+            &blocked_verify,
+            t11,
+            t10,
+            t01,
+            dp_scratch,
+        );
+        if gain_chk <= 0.0 || len_chk == 0 || len_chk > *remaining {
+            break;
+        }
+        let chosen_active = dp_scratch.active[..w].to_vec();
+
+        selected_states[chosen_idx] = Some(AllocationState {
+            active: chosen_active.clone(),
+            len: len_chk,
+        });
+        let mut win = 0usize;
+        while win < w {
+            if chosen_active[win] && counts[win] < per_window_caps[win] {
+                counts[win] += 1;
+            }
+            win += 1;
+        }
+        for &(win_idx, score) in &scores_by_hap[chosen_idx] {
+            if win_idx < w && chosen_active[win_idx] && score.is_finite() {
+                z_w[win_idx] = logaddexp(z_w[win_idx], score);
+            }
+        }
+        *remaining = remaining.saturating_sub(len_chk);
+    }
 }
 
 /// Allocate active haplotypes per window for a single target haplotype.
@@ -557,12 +672,14 @@ pub fn allocate_lms_sparse(
             .collect();
         return WindowAllocation { intervals_by_hap };
     }
+
     let mut counts = vec![0usize; w];
-    let mut z_w = vec![0.0f32; w]; // log(1)
+    let mut z_w = vec![0.0f32; w];
     let mut selected_states: Vec<Option<AllocationState>> = vec![None; n];
     let mut remaining = total_budget;
 
-    let n_pool_by_boundary = boundary_pool_sizes_from_scores(scores_by_hap, w, per_window_caps, n_pool);
+    let n_pool_by_boundary =
+        boundary_pool_sizes_from_scores(scores_by_hap, w, per_window_caps, n_pool);
     let (t11, t10, t01) = continuity_terms(boundary_cm, params, &n_pool_by_boundary);
 
     // Determine mu by bracket + coarse search + local refinement.
@@ -570,7 +687,6 @@ pub fn allocate_lms_sparse(
     let mut mu_low = -10.0f32;
     let mut mu_high = 10.0f32;
 
-    // Ensure bounds bracket a feasible range.
     let mut low_iter = 0usize;
     while low_iter < 5 {
         let (used, _) =
@@ -592,7 +708,6 @@ pub fn allocate_lms_sparse(
         high_iter += 1;
     }
 
-    // Coarse grid search over mu to avoid non-monotone behavior in the greedy outer loop.
     let mut mu_best = mu_high;
     let mut best_used = 0usize;
     let mut best_gain = NEG_INF;
@@ -621,7 +736,6 @@ pub fn allocate_lms_sparse(
     }
 
     if found_feasible {
-        // Refine around the best coarse sample.
         let mut left = if best_k > 0 {
             coarse_samples[best_k - 1].0
         } else {
@@ -644,7 +758,9 @@ pub fn allocate_lms_sparse(
                 let mu = left + step * j as f32;
                 let (used, gain) =
                     simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
-                if used <= total_budget && (gain > best_gain || (gain == best_gain && used > best_used)) {
+                if used <= total_budget
+                    && (gain > best_gain || (gain == best_gain && used > best_used))
+                {
                     mu_best = mu;
                     best_used = used;
                     best_gain = gain;
@@ -655,6 +771,25 @@ pub fn allocate_lms_sparse(
             right = (mu_best + step).min(mu_high);
             refine_iter += 1;
         }
+    } else if !coarse_samples.is_empty() {
+        // Fallback under non-monotone allocation behavior: minimize overuse first,
+        // then maximize gain.
+        let mut fallback_mu = coarse_samples[0].0;
+        let mut fallback_overuse = coarse_samples[0].1.saturating_sub(total_budget);
+        let mut fallback_gain = coarse_samples[0].2;
+        let mut i = 1usize;
+        while i < coarse_samples.len() {
+            let (mu_i, used_i, gain_i) = coarse_samples[i];
+            let overuse = used_i.saturating_sub(total_budget);
+            if overuse < fallback_overuse || (overuse == fallback_overuse && gain_i > fallback_gain)
+            {
+                fallback_mu = mu_i;
+                fallback_overuse = overuse;
+                fallback_gain = gain_i;
+            }
+            i += 1;
+        }
+        mu_best = fallback_mu;
     }
     let mu = mu_best;
 
@@ -688,7 +823,6 @@ pub fn allocate_lms_sparse(
         }
     }
 
-    // Lazy-greedy allocation using tuned mu.
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut dp_scratch = DpScratch::default();
     {
@@ -697,7 +831,8 @@ pub fn allocate_lms_sparse(
             .enumerate()
             .map(|(w_i, &c)| c >= per_window_caps[w_i])
             .collect();
-        for h in 0..n {
+        let mut h = 0usize;
+        while h < n {
             let scores = &scores_by_hap[h];
             let (gain, len) = dp_intervals_sparse_scratch(
                 scores,
@@ -709,20 +844,22 @@ pub fn allocate_lms_sparse(
                 &t01,
                 &mut dp_scratch,
             );
-            let active = dp_scratch.active[..w].to_vec();
             if gain > 0.0 && len > 0 && len <= remaining {
                 heap.push(HeapEntry {
                     gain,
                     idx: h,
-                    active,
+                    active: dp_scratch.active[..w].to_vec(),
                     len,
                 });
             }
+            h += 1;
         }
     }
 
     while remaining > 0 {
-        let Some(mut entry) = heap.pop() else { break };
+        let Some(mut entry) = heap.pop() else {
+            break;
+        };
         if selected_states[entry.idx].is_some() {
             continue;
         }
@@ -741,24 +878,26 @@ pub fn allocate_lms_sparse(
             &t01,
             &mut dp_scratch,
         );
-        let active = dp_scratch.active[..w].to_vec();
         if gain <= 0.0 || len == 0 || len > remaining {
             continue;
         }
+        let active = dp_scratch.active[..w].to_vec();
         let next_gain = heap.peek().map(|e| e.gain).unwrap_or(NEG_INF);
         if gain >= next_gain {
             selected_states[entry.idx] = Some(AllocationState {
                 active: active.clone(),
                 len,
             });
-            for win in 0..w {
+            let mut win = 0usize;
+            while win < w {
                 if active[win] && counts[win] < per_window_caps[win] {
                     counts[win] += 1;
                 }
+                win += 1;
             }
-            for &(win, score) in scores_by_hap[entry.idx].iter() {
-                if win < w && active[win] && score.is_finite() {
-                    z_w[win] = logaddexp(z_w[win], score);
+            for &(win_idx, score) in &scores_by_hap[entry.idx] {
+                if win_idx < w && active[win_idx] && score.is_finite() {
+                    z_w[win_idx] = logaddexp(z_w[win_idx], score);
                 }
             }
             remaining = remaining.saturating_sub(len);
@@ -770,90 +909,19 @@ pub fn allocate_lms_sparse(
         }
     }
 
-    // Residual-capacity pass: once Lagrangian filtering stops, continue to fill
-    // positive-gain states under hard caps/budget using mu=0 (true objective).
-    while remaining > 0 {
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
-        let mut best_idx: Option<usize> = None;
-        let mut best_gain = NEG_INF;
-        let mut best_gain_per_slot = NEG_INF;
-        let mut best_len = 0usize;
-
-        let mut h = 0usize;
-        while h < n {
-            if selected_states[h].is_some() {
-                h += 1;
-                continue;
-            }
-            let (gain, len) = dp_intervals_sparse_scratch(
-                &scores_by_hap[h],
-                &z_w,
-                0.0,
-                &blocked,
-                &t11,
-                &t10,
-                &t01,
-                &mut dp_scratch,
-            );
-            if gain > 0.0 && len > 0 && len <= remaining {
-                let gain_per_slot = gain / len as f32;
-                if gain_per_slot > best_gain_per_slot
-                    || (gain_per_slot == best_gain_per_slot
-                        && (gain > best_gain || (gain == best_gain && len > best_len)))
-                {
-                    best_idx = Some(h);
-                    best_gain = gain;
-                    best_gain_per_slot = gain_per_slot;
-                    best_len = len;
-                }
-            }
-            h += 1;
-        }
-
-        let Some(chosen_idx) = best_idx else {
-            break;
-        };
-
-        let blocked: Vec<bool> = counts
-            .iter()
-            .enumerate()
-            .map(|(w_i, &c)| c >= per_window_caps[w_i])
-            .collect();
-        let (gain_chk, len_chk) = dp_intervals_sparse_scratch(
-            &scores_by_hap[chosen_idx],
-            &z_w,
-            0.0,
-            &blocked,
-            &t11,
-            &t10,
-            &t01,
-            &mut dp_scratch,
-        );
-        if gain_chk <= 0.0 || len_chk == 0 || len_chk > remaining {
-            break;
-        }
-        let chosen_active = dp_scratch.active[..w].to_vec();
-
-        selected_states[chosen_idx] = Some(AllocationState {
-            active: chosen_active.clone(),
-            len: len_chk,
-        });
-        for win in 0..w {
-            if chosen_active[win] && counts[win] < per_window_caps[win] {
-                counts[win] += 1;
-            }
-        }
-        for &(win, score) in &scores_by_hap[chosen_idx] {
-            if win < w && chosen_active[win] && score.is_finite() {
-                z_w[win] = logaddexp(z_w[win], score);
-            }
-        }
-        remaining = remaining.saturating_sub(len_chk);
-    }
+    // Residual-capacity fill under true objective (mu=0).
+    fill_residual_capacity(
+        scores_by_hap,
+        per_window_caps,
+        &t11,
+        &t10,
+        &t01,
+        &mut selected_states,
+        &mut counts,
+        &mut z_w,
+        &mut remaining,
+        &mut dp_scratch,
+    );
 
     // One coordinate-ascent polish sweep over selected donors.
     let mut polish_idx = 0usize;
@@ -891,14 +959,16 @@ pub fn allocate_lms_sparse(
                 active: active.clone(),
                 len,
             });
-            for win in 0..w {
+            let mut win = 0usize;
+            while win < w {
                 if active[win] && counts[win] < per_window_caps[win] {
                     counts[win] += 1;
                 }
+                win += 1;
             }
-            for &(win, score) in &scores_by_hap[polish_idx] {
-                if win < w && active[win] && score.is_finite() {
-                    z_w[win] = logaddexp(z_w[win], score);
+            for &(win_idx, score) in &scores_by_hap[polish_idx] {
+                if win_idx < w && active[win_idx] && score.is_finite() {
+                    z_w[win_idx] = logaddexp(z_w[win_idx], score);
                 }
             }
             remaining = remaining.saturating_sub(len);
@@ -907,14 +977,16 @@ pub fn allocate_lms_sparse(
             let restored = selected_states[polish_idx]
                 .as_ref()
                 .expect("just restored allocation state");
-            for win in 0..w {
+            let mut win = 0usize;
+            while win < w {
                 if restored.active[win] && counts[win] < per_window_caps[win] {
                     counts[win] += 1;
                 }
+                win += 1;
             }
-            for &(win, score) in &scores_by_hap[polish_idx] {
-                if win < w && restored.active[win] && score.is_finite() {
-                    z_w[win] = logaddexp(z_w[win], score);
+            for &(win_idx, score) in &scores_by_hap[polish_idx] {
+                if win_idx < w && restored.active[win_idx] && score.is_finite() {
+                    z_w[win_idx] = logaddexp(z_w[win_idx], score);
                 }
             }
             remaining = remaining.saturating_sub(restored.len);
@@ -922,6 +994,20 @@ pub fn allocate_lms_sparse(
 
         polish_idx += 1;
     }
+
+    // Final residual pass after polish.
+    fill_residual_capacity(
+        scores_by_hap,
+        per_window_caps,
+        &t11,
+        &t10,
+        &t01,
+        &mut selected_states,
+        &mut counts,
+        &mut z_w,
+        &mut remaining,
+        &mut dp_scratch,
+    );
 
     let mut intervals_by_hap: Vec<(usize, Vec<WindowSpan>)> = Vec::new();
     let mut idx = 0usize;
@@ -937,7 +1023,6 @@ pub fn allocate_lms_sparse(
 
     WindowAllocation { intervals_by_hap }
 }
-
 fn simulate_allocation(
     scores_by_hap: &[Vec<(usize, f32)>],
     num_windows: usize,
