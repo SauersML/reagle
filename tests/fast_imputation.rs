@@ -263,6 +263,57 @@ fn inspect_dosages(path: &std::path::Path, _: usize) -> Vec<Vec<f32>> {
     all_dosages
 }
 
+/// Inspect per-sample max genotype posterior probability from GP.
+/// Returns marker x sample matrix where each value is max(GP) in [0,1], or -1 if missing.
+fn inspect_max_gp(path: &std::path::Path) -> Vec<Vec<f32>> {
+    let file = File::open(path).expect("Open output VCF");
+    let decoder = bgzf_io::Reader::new(file);
+    let mut reader = noodles_vcf::io::Reader::new(decoder);
+
+    let header = reader.read_header().expect("Read header");
+    assert!(header.formats().contains_key("GP"), "GP format missing");
+
+    let mut all_conf = Vec::new();
+    for result in reader.records() {
+        let result: std::io::Result<Record> = result;
+        let record = result.expect("Read record");
+        let samples = record.samples();
+        let gp_col = samples.select("GP").expect("GP column missing");
+        let mut site_conf = Vec::new();
+
+        for value in gp_col.iter(&header) {
+            match value {
+                Ok(Some(v)) => {
+                    let s = format!("{:?}", v);
+                    let mut probs = Vec::new();
+                    let mut start = 0usize;
+                    while let Some(rel) = s[start..].find("Some(") {
+                        let abs = start + rel + 5;
+                        if let Some(end_rel) = s[abs..].find(')') {
+                            let end = abs + end_rel;
+                            if let Ok(p) = s[abs..end].trim().parse::<f32>() {
+                                probs.push(p);
+                            }
+                            start = end + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if probs.is_empty() {
+                        site_conf.push(-1.0);
+                    } else {
+                        site_conf.push(probs.into_iter().fold(0.0f32, f32::max));
+                    }
+                }
+                Ok(None) => site_conf.push(-1.0),
+                Err(e) => panic!("Error reading GP: {}", e),
+            }
+        }
+        all_conf.push(site_conf);
+    }
+    all_conf
+}
+
 /// Compute R² between estimated dosages and true dosages
 /// R² = 1 - (SS_res / SS_tot) = Var(estimated) / Var(true) when means match
 fn compute_r_squared(estimated: &[f32], truth: &[f32]) -> f64 {
@@ -1647,6 +1698,7 @@ fn test_ultra_dense_markers() {
 
     let out_vcf = temp_dir.path().join("output_dense.vcf.gz");
     let dosages = inspect_dosages(&out_vcf, 2);
+    let max_gp = inspect_max_gp(&out_vcf);
 
     // With perfect LD, imputed dosages should be very close to 0 (match target pattern)
     let mut sum_dosage = 0.0f32;
@@ -1667,49 +1719,79 @@ fn test_ultra_dense_markers() {
         avg_dosage
     );
 
-    // DR2 validation for ultra-dense markers test
-    let dr2_values = inspect_dr2(&out_vcf);
-    let mean_dr2 = compute_mean_dr2(&dr2_values);
-    println!(
-        "Ultra-dense test - Mean DR2: {:.4}, count: {}",
-        mean_dr2,
-        dr2_values.len()
-    );
-    for (i, &dr2) in dr2_values.iter().enumerate() {
-        if dr2 >= 0.0 {
-            assert!(dr2 <= 1.0, "DR2 at marker {} out of range: {:.4}", i, dr2);
-        }
-    }
-    // In each 10-marker chunk, only offset 0 is genotyped; offsets 1-9 are non-genotyped/imputed.
-    // Evaluate DR2 on non-genotyped markers only.
-    let non_genotyped_dr2: Vec<f64> = dr2_values
+    // Accuracy validation on non-genotyped markers only.
+    // In each 10-marker chunk, offset 0 is genotyped; offsets 1-9 are imputed.
+    // Truth in this synthetic setup is ALT dosage 0 at all markers, so imputed DS should stay near 0.
+    let non_genotyped_ds: Vec<f32> = dosages
         .iter()
         .enumerate()
-        .filter_map(|(i, &dr2)| {
+        .flat_map(|(i, marker_dosages)| {
             let within_block = i % 10;
-            if within_block != 0 && dr2 >= 0.0 && dr2 <= 1.0 {
-                Some(dr2)
+            if within_block != 0 {
+                marker_dosages.to_vec()
             } else {
-                None
+                Vec::new()
             }
         })
         .collect();
     assert!(
-        !non_genotyped_dr2.is_empty(),
-        "Expected at least one valid DR2 value for non-genotyped sites"
+        !non_genotyped_ds.is_empty(),
+        "Expected non-genotyped dosages for ultra-dense marker test"
     );
-    let non_genotyped_mean_dr2 =
-        non_genotyped_dr2.iter().sum::<f64>() / non_genotyped_dr2.len() as f64;
+
+    let non_genotyped_mean_ds =
+        non_genotyped_ds.iter().map(|&x| x as f64).sum::<f64>() / non_genotyped_ds.len() as f64;
+    let non_genotyped_max_ds = non_genotyped_ds.iter().copied().fold(0.0f32, f32::max);
     println!(
-        "Ultra-dense test - Non-genotyped mean DR2: {:.4}, count: {}",
-        non_genotyped_mean_dr2,
-        non_genotyped_dr2.len()
+        "Ultra-dense test - Non-genotyped DS mean: {:.6}, max: {:.6}, count: {}",
+        non_genotyped_mean_ds,
+        non_genotyped_max_ds,
+        non_genotyped_ds.len()
     );
-    // Assert on the non-genotyped subset only.
+
+    // Imputed dosages should be very low for this all-group-0 target.
     assert!(
-        (0.0..=1.0).contains(&non_genotyped_mean_dr2),
-        "Non-genotyped mean DR2 must be in [0, 1], got {:.4}",
-        non_genotyped_mean_dr2
+        non_genotyped_mean_ds < 0.05,
+        "Non-genotyped mean DS should be near 0, got {:.6}",
+        non_genotyped_mean_ds
+    );
+    assert!(
+        non_genotyped_max_ds < 0.2,
+        "Non-genotyped max DS should remain low, got {:.6}",
+        non_genotyped_max_ds
+    );
+
+    // Confidence on non-genotyped sites via GP: use max genotype posterior per sample/site.
+    let non_genotyped_conf: Vec<f32> = max_gp
+        .iter()
+        .enumerate()
+        .flat_map(|(i, marker_conf)| {
+            if i % 10 != 0 {
+                marker_conf
+                    .iter()
+                    .copied()
+                    .filter(|&x| (0.0..=1.0).contains(&x))
+                    .collect::<Vec<f32>>()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    assert!(
+        !non_genotyped_conf.is_empty(),
+        "Expected non-genotyped GP confidences in ultra-dense marker test"
+    );
+    let non_genotyped_mean_conf = non_genotyped_conf.iter().map(|&x| x as f64).sum::<f64>()
+        / non_genotyped_conf.len() as f64;
+    println!(
+        "Ultra-dense test - Non-genotyped mean max(GP): {:.6}, count: {}",
+        non_genotyped_mean_conf,
+        non_genotyped_conf.len()
+    );
+    assert!(
+        non_genotyped_mean_conf > 0.70,
+        "Non-genotyped mean max(GP) should be high, got {:.6}",
+        non_genotyped_mean_conf
     );
 }
 
