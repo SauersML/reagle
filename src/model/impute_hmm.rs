@@ -842,7 +842,9 @@ fn compute_nearest_observed_lambda(
         ws.nearest_obs_bwd[m_rev] = dist;
     }
 
-    let cluster_scale = (smoothing_cluster_cm.max(1e-6) / BASE_CLUSTER_CM).max(0.0);
+    // Larger cluster distance means slower information decay, so lambda should
+    // shrink (less smoothing pressure) as cluster grows.
+    let cluster_scale = (BASE_CLUSTER_CM / smoothing_cluster_cm.max(1e-6)).max(0.0);
     const MIN_SAME_POS_LAMBDA: f32 = 0.05;
     for m in 0..n {
         let left = ws.nearest_obs_fwd[m];
@@ -941,60 +943,58 @@ fn apply_marker_prior_smoothing(
     } else {
         0.0
     };
+    let floor_mix = min_prior_mix.clamp(0.0, 0.5);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
-        let mix = min_prior_mix.clamp(0.0, 0.9);
         match panel {
             AllelePosteriors::Biallelic(p_alt) => {
                 if allele_probs.len() == 2 {
                     let p_alt = p_alt.clamp(0.0, 1.0);
                     let panel_probs = [1.0 - p_alt, p_alt];
-                    if mix > 0.0 {
-                        let keep = 1.0 - mix;
-                        allele_probs[0] = keep * allele_probs[0] + mix * panel_probs[0];
-                        allele_probs[1] = keep * allele_probs[1] + mix * panel_probs[1];
+                    if floor_mix > 0.0 {
+                        // Panel prior acts as a one-sided floor: prevent allele
+                        // extinction on sparse windows without pulling confident
+                        // posteriors toward panel frequencies.
+                        for i in 0..2 {
+                            let floor = floor_mix * panel_probs[i];
+                            if allele_probs[i] < floor {
+                                allele_probs[i] = floor;
+                            }
+                        }
                         normalize_probs(allele_probs);
                     }
                     if missing_mass > 0.0 {
-                        let keep = 1.0 - missing_mass;
-                        allele_probs[0] = keep * allele_probs[0] + missing_mass * panel_probs[0];
-                        allele_probs[1] = keep * allele_probs[1] + missing_mass * panel_probs[1];
+                        for i in 0..2 {
+                            let panel_p = panel_probs[i];
+                            if panel_p > allele_probs[i] {
+                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
+                            }
+                        }
                         normalize_probs(allele_probs);
                     }
-                    smooth_allele_posteriors_subset(
-                        allele_probs,
-                        NormalizedAlleleProbs::from_trusted(&panel_probs),
-                        nearest_obs_lambda,
-                        true,
-                    );
-                    return;
                 }
             }
             AllelePosteriors::Multiallelic(p) => {
                 if p.len() == allele_probs.len() {
-                    if mix > 0.0 {
-                        let keep = 1.0 - mix;
+                    if floor_mix > 0.0 {
                         for (i, prob) in allele_probs.iter_mut().enumerate() {
-                            let prior = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                            *prob = keep * *prob + mix * prior;
+                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            let floor = floor_mix * panel_p;
+                            if *prob < floor {
+                                *prob = floor;
+                            }
                         }
                         normalize_probs(allele_probs);
                     }
                     if missing_mass > 0.0 {
-                        let keep = 1.0 - missing_mass;
                         for (i, prob) in allele_probs.iter_mut().enumerate() {
-                            let prior = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                            *prob = keep * *prob + missing_mass * prior;
+                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            if panel_p > *prob {
+                                *prob += missing_mass * (panel_p - *prob);
+                            }
                         }
                         normalize_probs(allele_probs);
                     }
-                    smooth_allele_posteriors_subset(
-                        allele_probs,
-                        NormalizedAlleleProbs::from_trusted(p),
-                        nearest_obs_lambda,
-                        true,
-                    );
-                    return;
                 }
             }
         }

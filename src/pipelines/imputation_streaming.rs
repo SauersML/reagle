@@ -194,10 +194,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Do not let calibration make emissions sharper than the base Li-Stephens
-    // model: on sparse arrays with high-confidence typed calls, residual-only
-    // shrinkage can underestimate error and induce AF collapse.
-    posterior.clamp(base, 0.5)
+    // Allow sharpening below base when typed evidence is strong, but limit
+    // maximum sharpening to avoid sparse-array collapse.
+    let evidence_strength = (weight_sum / (weight_sum + PRIOR_STRENGTH_MARKERS)).clamp(0.0, 1.0);
+    let min_error = (base * (1.0 - 0.5 * evidence_strength)).clamp(1e-6, base);
+    posterior.clamp(min_error, 0.5)
 }
 
 #[inline]
@@ -3665,14 +3666,18 @@ impl crate::pipelines::ImputationPipeline {
         let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.3f32 * scale
+            0.2f32 * scale
         } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.15f32 * scale
+            0.1f32 * scale
         } else {
             0.0f32
         };
+        let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
+        let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
+        let min_untyped_prior_mix =
+            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
         let overlap_size = 1000.min(output_end);
         let overlap_start = output_end.saturating_sub(overlap_size);
         let build_input_probs_pair = |hap1: HapIdx,
