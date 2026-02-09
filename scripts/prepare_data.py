@@ -132,6 +132,17 @@ def _find_genotypes_vcf(output_dir):
     return None
 
 
+def _compress_panel_if_needed(output_dir):
+    panel_vcf = os.path.join(output_dir, "panel.vcf")
+    panel_vcfgz = os.path.join(output_dir, "panel.vcf.gz")
+    if not os.path.exists(panel_vcf):
+        return
+    print(f"Compressing large panel artifact: {panel_vcf} -> {panel_vcfgz}")
+    subprocess.check_call(["bcftools", "view", panel_vcf, "-Oz", "-o", panel_vcfgz])
+    subprocess.check_call(["bcftools", "index", "-f", panel_vcfgz])
+    os.remove(panel_vcf)
+
+
 def _clear_convert_genome_cache():
     """Removes any existing convert_genome binary and caches to force a fresh install."""
     binary_candidates = [
@@ -309,15 +320,17 @@ def prepare_truth(source, output_vcf, panel_path):
     _bump_nofile_limit()
 
     ref_hg38_fasta = _ensure_chr22_reference_fasta()
-    truth_output_dir = "convert_genome_truth_out"
-    _clean_output_dir(truth_output_dir)
+    # Truth conversion only needs harmonized sample genotypes; it does not use
+    # the rewritten panel artifact. Use direct-output mode to avoid materializing
+    # convert_genome_truth_out/panel.vcf, which can consume tens of GB.
+    truth_raw_vcf = "truth_hg38_raw.vcf"
     truth_hg38_vcf = "truth_hg38.vcf.gz"
 
     cmd = [
         "convert_genome",
         source_vcf,
         ref_hg38_fasta,
-        "--output-dir", truth_output_dir,
+        truth_raw_vcf,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
@@ -328,9 +341,8 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
     subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
 
-    truth_raw_vcf = _find_genotypes_vcf(truth_output_dir)
-    if not truth_raw_vcf:
-        raise RuntimeError("convert_genome failed to produce genotypes.vcf")
+    if not os.path.exists(truth_raw_vcf):
+        raise RuntimeError("convert_genome failed to produce truth_hg38_raw.vcf")
 
     subprocess.check_call(["bcftools", "view", truth_raw_vcf, "-Oz", "-o", truth_hg38_vcf])
     subprocess.check_call(["bcftools", "index", "-f", truth_hg38_vcf])
@@ -384,7 +396,7 @@ def prepare_truth(source, output_vcf, panel_path):
         if os.path.exists(header_txt):
             os.remove(header_txt)
 
-    for f in [source_vcf, truth_hg38_vcf, truth_hg38_vcf + ".csi", "chr_map.txt"]:
+    for f in [source_vcf, truth_raw_vcf, truth_hg38_vcf, truth_hg38_vcf + ".csi", "chr_map.txt"]:
         if os.path.exists(f):
             os.remove(f)
     print(f"Truth prepared: {output_vcf}")
@@ -451,6 +463,7 @@ def run_conversion(input_path, output_vcf, panel_path):
     # After this command succeeds, convert_genome has written its outputs under
     # convert_genome_array_out/. We deliberately do not delete panel.vcf here
     # so quality assessment scripts can inspect or reuse it.
+    _compress_panel_if_needed(temp_output_dir)
 
     temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
     if not temp_hg38_vcf:
