@@ -4208,12 +4208,13 @@ impl crate::pipelines::ImputationPipeline {
                     .marker(MarkerIdx::new(ref_m as u32))
                     .n_alleles()
                     .max(1);
+                let target_m_opt = alignment.ref_to_target.get(ref_m).and_then(|v| *v);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
                 for (haps, beams, query_alleles, query_info_weight, _, scratch) in
                     batches.iter_mut()
                 {
-                    if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
+                    if let Some(target_m) = target_m_opt {
                         let target_idx = target_m.as_usize();
                         let target_marker = MarkerIdx::new(target_idx as u32);
                         let mapping = alignment
@@ -4325,11 +4326,7 @@ impl crate::pipelines::ImputationPipeline {
                 // Donor/confusion evidence should be collected where the target
                 // is informative in this window, and across the overlap tail for
                 // handoff continuity.
-                let aligned_here = alignment
-                    .ref_to_target
-                    .get(ref_m)
-                    .and_then(|v| *v)
-                    .is_some();
+                let aligned_here = target_m_opt.is_some();
                 let in_overlap = ref_m >= overlap_start && ref_m < output_end;
                 let store = aligned_here || in_overlap;
 
