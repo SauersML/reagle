@@ -5289,12 +5289,14 @@ impl crate::pipelines::ImputationPipeline {
 
                         let mut cached_sample_idx = usize::MAX;
                         let mut cached_query_pair = [255u8; 2];
+                        let mut cached_wildcard_weight = 0.0f32;
                         let mut cached_allele_weight = 1.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
                             let sample_idx = hap_idx / 2;
                             let local = hap_idx % 2;
                             if sample_idx != cached_sample_idx {
                                 cached_sample_idx = sample_idx;
+                                cached_wildcard_weight = 0.0;
                                 cached_allele_weight = 1.0;
                                 let hap1 = sample_idx * 2;
                                 let hap2 = hap1 + 1;
@@ -5350,6 +5352,7 @@ impl crate::pipelines::ImputationPipeline {
                                         (err_limit / best_orient_err.max(err_limit)).clamp(0.0, 1.0);
                                     if best_orient_err > err_limit {
                                         cached_query_pair = [255, 255];
+                                        cached_wildcard_weight = cached_allele_weight;
                                     } else if phase_conf < 0.5 {
                                         cached_query_pair = [mapped2, mapped1];
                                     } else {
@@ -5363,7 +5366,7 @@ impl crate::pipelines::ImputationPipeline {
                             query_alleles[i] = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
                             query_allele_weight[i] = if query_alleles[i].is_wildcard() {
-                                0.0
+                                cached_wildcard_weight
                             } else {
                                 cached_allele_weight
                             };
@@ -5426,7 +5429,10 @@ impl crate::pipelines::ImputationPipeline {
                                         alt_sum += 1;
                                     }
                                 }
-                                (alt_sum as f32 / donor_candidates.len() as f32)
+                                let donor_alt =
+                                    (alt_sum as f32 / donor_candidates.len() as f32).clamp(0.0, 1.0);
+                                let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
+                                (orient_weight * donor_alt + (1.0 - orient_weight) * 0.5)
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
                                 let hard = if donor_candidates.is_empty() {
