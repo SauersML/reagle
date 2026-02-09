@@ -54,7 +54,7 @@ jobs:
 
       - name: Install System Tools
         if: steps.cache-reference.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget
+        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl git
 
       - name: Prepare reference panel
         if: steps.cache-reference.outputs.cache-hit != 'true'
@@ -120,6 +120,7 @@ jobs:
             ref_beagle.vcf.gz
             ref_beagle.vcf.gz.csi
             ref_beagle.vcf.gz.tbi
+            beagle.jar
             target.vcf.gz
             target.vcf.gz.csi
             target.vcf.gz.tbi
@@ -171,7 +172,7 @@ jobs:
 
       - name: Install System Tools
         if: steps.cache-results.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y bcftools tabix
+        run: sudo apt-get update && sudo apt-get install -y bcftools tabix wget curl git
 
       - name: Download reference panel
         if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'
