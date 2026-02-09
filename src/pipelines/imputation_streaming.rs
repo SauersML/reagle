@@ -200,8 +200,14 @@ fn phase_query_orientation_error_limit(genotype_conf: f32, beam_uncertainty: f32
 }
 
 #[inline]
+fn phase_best_orientation_error(phase_conf: f32) -> f32 {
+    let p = phase_conf.clamp(0.0, 1.0);
+    p.min(1.0 - p)
+}
+
+#[inline]
 fn phase_orientation_weight(phase_conf: f32, err_limit: f32) -> f32 {
-    let best_orient_err = phase_conf.clamp(0.0, 1.0).min(1.0 - phase_conf.clamp(0.0, 1.0));
+    let best_orient_err = phase_best_orientation_error(phase_conf);
     let limit = err_limit.max(1e-6);
     (limit / best_orient_err.max(limit)).clamp(0.0, 1.0)
 }
@@ -4314,7 +4320,7 @@ impl crate::pipelines::ImputationPipeline {
                                     let orientation_weight =
                                         phase_orientation_weight(phase_conf, err_limit);
                                     cached_allele_weight = orientation_weight;
-                                    if phase_conf.min(1.0 - phase_conf) > err_limit {
+                                    if phase_best_orientation_error(phase_conf) > err_limit {
                                         cached_query_pair = [255, 255];
                                         cached_wildcard_weight = info_llr * orientation_weight;
                                     } else if phase_conf < 0.5 {
@@ -5399,7 +5405,7 @@ impl crate::pipelines::ImputationPipeline {
                                         .max(1e-6);
                                     cached_allele_weight =
                                         phase_orientation_weight(phase_conf, err_limit);
-                                    if phase_conf.min(1.0 - phase_conf) > err_limit {
+                                    if phase_best_orientation_error(phase_conf) > err_limit {
                                         cached_query_pair = [255, 255];
                                         cached_wildcard_weight = cached_allele_weight;
                                     } else if phase_conf < 0.5 {
