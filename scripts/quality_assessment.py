@@ -96,36 +96,39 @@ def print_vcf_diagnostics(vcf_path, label):
     except Exception as e:
         print(f"Range: Error - {e}")
 
-def run_benchmark(person, file_path):
-    print_tool_versions()
-    # 1. Prepare Data
-    print(f"=== Preparing data for {person} ({file_path}) ===")
-    run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
-    run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz", "ref.vcf.gz"])
 
-    truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"
-    run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz", "ref.vcf.gz"])
-    print_vcf_diagnostics("ref.vcf.gz", "Reference Panel")
-    print_vcf_diagnostics("target.vcf.gz", "Target Array")
-    print_vcf_diagnostics("truth.vcf.gz", "Truth WGS")
+def prepare_reagle_reference_from_convert_genome(output_vcf="reagle_ref.vcf.gz"):
+    """Uses convert_genome's panel output as Reagle reference and normalizes it to bgzipped VCF."""
+    if os.path.exists(output_vcf) and (
+        os.path.exists(output_vcf + ".csi") or os.path.exists(output_vcf + ".tbi")
+    ):
+        print(f"Reusing Reagle reference from cache: {output_vcf}")
+        return output_vcf
 
-    # 2. Run Reagle
-    print("=== Running Reagle ===")
-    if not os.path.exists("target.vcf.gz"):
-        print("ERROR: target.vcf.gz missing after prep!")
-        run_cmd(["ls", "-l"])
-    
-    run_cmd(["./target/release/reagle", "--ref", "ref.vcf.gz", "--target", "target.vcf.gz", "--out", "reagle_out"])
+    panel_candidates = [
+        "convert_genome_array_out/panel.vcf.gz",
+        "convert_genome_array_out/panel.vcf",
+    ]
+    panel_src = next((p for p in panel_candidates if os.path.exists(p)), None)
+    if panel_src is None:
+        raise RuntimeError(
+            "convert_genome panel output not found in convert_genome_array_out/"
+        )
 
-    # 3. Run Beagle
-    print("=== Running Beagle ===")
-    # Reference panels used for Beagle imputation must be fully phased and contain no missing data.
-    # We create a derivative panel that excludes sites with missing calls and forces phased separators.
-    # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
-    # NOTE: +setGT must run BEFORE filtering missing data to handle sparse panels correctly.
-    # We first fill missing values with Reference (0) to ensure the panel is dense, then force phasing.
+    print(f"Using convert_genome panel for Reagle reference: {panel_src}")
+    run_cmd(["bcftools", "view", panel_src, "-Oz", "-o", output_vcf])
+    run_cmd(["bcftools", "index", "-f", output_vcf])
+    return output_vcf
+
+
+def prepare_beagle_reference():
+    if os.path.exists("ref_beagle.vcf.gz") and (
+        os.path.exists("ref_beagle.vcf.gz.csi") or os.path.exists("ref_beagle.vcf.gz.tbi")
+    ):
+        print("Reusing Beagle reference from cache: ref_beagle.vcf.gz")
+        return
+
     print("Preparing Beagle reference panel (bcftools +setGT)...")
-    # Capture stderr so bcftools messages don't look like Reagle output.
     prep_log = "ref_beagle_prep.log"
     prep_cmd = (
         "bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0 "
@@ -144,6 +147,40 @@ def run_benchmark(person, file_path):
                         print("  [bcftools] Note: count is per marker×sample entries in ref panel, not target alleles")
         os.remove(prep_log)
     run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
+
+
+def run_benchmark(person, file_path):
+    print_tool_versions()
+    # 1. Prepare Data
+    print(f"=== Preparing data for {person} ({file_path}) ===")
+    run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
+    run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz", "ref.vcf.gz"])
+
+    truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"
+    run_cmd(["python3", "scripts/prepare_data.py", "truth", truth_dir, "truth.vcf.gz", "ref.vcf.gz"])
+    reagle_ref = prepare_reagle_reference_from_convert_genome("reagle_ref.vcf.gz")
+
+    print_vcf_diagnostics("ref.vcf.gz", "Reference Panel (Downloaded)")
+    print_vcf_diagnostics(reagle_ref, "Reference Panel (convert_genome)")
+    print_vcf_diagnostics("target.vcf.gz", "Target Array")
+    print_vcf_diagnostics("truth.vcf.gz", "Truth WGS")
+
+    # 2. Run Reagle
+    print("=== Running Reagle ===")
+    if not os.path.exists("target.vcf.gz"):
+        print("ERROR: target.vcf.gz missing after prep!")
+        run_cmd(["ls", "-l"])
+    
+    run_cmd(["./target/release/reagle", "--ref", reagle_ref, "--target", "target.vcf.gz", "--out", "reagle_out"])
+
+    # 3. Run Beagle
+    print("=== Running Beagle ===")
+    # Reference panels used for Beagle imputation must be fully phased and contain no missing data.
+    # We create a derivative panel that excludes sites with missing calls and forces phased separators.
+    # The original ref.vcf.gz is preserved for Reagle to ensure no loss of data in the primary pipeline.
+    # NOTE: +setGT must run BEFORE filtering missing data to handle sparse panels correctly.
+    # We first fill missing values with Reference (0) to ensure the panel is dense, then force phasing.
+    prepare_beagle_reference()
     print_vcf_diagnostics("ref_beagle.vcf.gz", "Reference Panel (Beagle)")
 
     beagle_jar = ensure_beagle()

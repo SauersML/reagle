@@ -108,8 +108,21 @@ def _clear_convert_genome_cache():
 
 def install_convert_genome():
     """Installs convert_genome using the official install script (pre-compiled binary)."""
-    print("Installing convert_genome (fresh install)...")
-    _clear_convert_genome_cache()
+    existing = shutil.which("convert_genome")
+    if existing:
+        try:
+            subprocess.check_call(
+                ["convert_genome", "--help"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"convert_genome already available: {existing}")
+            return
+        except Exception:
+            print("Existing convert_genome is not usable; reinstalling...")
+            _clear_convert_genome_cache()
+    else:
+        print("convert_genome not found; installing...")
 
     install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh"
     subprocess.check_call(["bash", "-c", f"curl -fsSL {install_script_url} | bash"])
@@ -315,6 +328,10 @@ def prepare_truth(source, output_vcf, panel_path):
 
 def run_conversion(input_path, output_vcf, panel_path):
     """Runs convert_genome to convert input to hg38 VCF."""
+    output_path = Path(output_vcf)
+    if output_path.exists() and _has_vcf_index(output_path) and output_path.stat().st_size > 0:
+        print(f"Array conversion already exists: {output_vcf}")
+        return
 
     raw_file = prepare_input_file(input_path)
 
