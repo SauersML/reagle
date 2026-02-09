@@ -41,6 +41,45 @@ def _download_file(url, dest):
     raise RuntimeError("Neither wget nor curl found; cannot download reference panel.")
 
 
+def _replace_vcf_and_index(tmp_vcf: str, out_vcf: str):
+    os.replace(tmp_vcf, out_vcf)
+    tmp_csi = tmp_vcf + ".csi"
+    tmp_tbi = tmp_vcf + ".tbi"
+    out_csi = out_vcf + ".csi"
+    out_tbi = out_vcf + ".tbi"
+    if os.path.exists(tmp_csi):
+        os.replace(tmp_csi, out_csi)
+        if os.path.exists(out_tbi):
+            os.remove(out_tbi)
+    elif os.path.exists(tmp_tbi):
+        os.replace(tmp_tbi, out_tbi)
+        if os.path.exists(out_csi):
+            os.remove(out_csi)
+    else:
+        raise RuntimeError(f"Index missing for temporary VCF: {tmp_vcf}")
+
+
+def _atomic_bgzip_view(input_vcf: str, output_vcf: str, extra_args=None):
+    args = list(extra_args or [])
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=".",
+        prefix=f".{Path(output_vcf).name}.",
+        suffix=".tmp.vcf.gz",
+    ) as tmp:
+        tmp_vcf = tmp.name
+    try:
+        subprocess.check_call(["bcftools", "view", input_vcf, *args, "-Oz", "-o", tmp_vcf])
+        subprocess.check_call(["bcftools", "index", "-f", tmp_vcf])
+        _replace_vcf_and_index(tmp_vcf, output_vcf)
+    finally:
+        for suffix in ("", ".csi", ".tbi"):
+            p = tmp_vcf + suffix
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def _ensure_chr22_reference_fasta(local_gz: str = ".cache/reference/chr22.fa.gz",
                                   local_fa: str = ".cache/reference/chr22.fa") -> str:
     gz_path = Path(local_gz)
@@ -211,8 +250,7 @@ def download_reference(output_vcf):
     _download_file(PANEL_BCF_URL, raw_bcf)
 
     print("Converting BCF to VCF.gz...")
-    subprocess.check_call(["bcftools", "view", str(raw_bcf), "-Oz", "-o", str(output_path)])
-    subprocess.check_call(["bcftools", "index", "-f", str(output_path)])
+    _atomic_bgzip_view(str(raw_bcf), str(output_path))
 
     if raw_bcf.exists():
         raw_bcf.unlink()
@@ -301,12 +339,27 @@ def prepare_truth(source, output_vcf, panel_path):
         f.write("22\tchr22\n")
 
     print("Filtering Truth to Chr22...")
-    cmd = (
-        f"bcftools view {truth_hg38_vcf} --regions 22,chr22 -Ou | "
-        f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {output_vcf}"
-    )
-    subprocess.check_call(cmd, shell=True)
-    subprocess.check_call(["tabix", "-p", "vcf", output_vcf])
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=".",
+        prefix=f".{Path(output_vcf).name}.",
+        suffix=".tmp.vcf.gz",
+    ) as tmp:
+        tmp_truth = tmp.name
+    try:
+        cmd = (
+            f"bcftools view {truth_hg38_vcf} --regions 22,chr22 -Ou | "
+            f"bcftools annotate --rename-chrs chr_map.txt -Oz -o {tmp_truth}"
+        )
+        subprocess.check_call(cmd, shell=True)
+        subprocess.check_call(["tabix", "-f", "-p", "vcf", tmp_truth])
+        _replace_vcf_and_index(tmp_truth, output_vcf)
+    finally:
+        for suffix in ("", ".csi", ".tbi"):
+            p = tmp_truth + suffix
+            if os.path.exists(p):
+                os.remove(p)
 
     def _truth_header_ok(vcf_path):
         try:
@@ -338,9 +391,38 @@ def prepare_truth(source, output_vcf, panel_path):
 
 
 def run_conversion(input_path, output_vcf, panel_path):
-    """Runs convert_genome to convert input to hg38 VCF."""
+    """
+    Runs convert_genome on a microarray/raw consumer file and produces:
+
+    1) output_vcf:
+       The harmonized sample genotype VCF used as downstream target input.
+       In this pipeline this is typically target.vcf.gz.
+
+    2) convert_genome_array_out/genotypes.vcf(.gz):
+       The direct converted per-sample genotypes emitted by convert_genome.
+       We use this as the source for output_vcf after a final validity filter.
+
+    3) convert_genome_array_out/panel.vcf(.gz):
+       A rewritten panel produced by convert_genome to keep allele/site
+       compatibility with genotypes.vcf.
+
+       IMPORTANT:
+       - This is expected to be a FULL panel rewrite (original panel streamed
+         and rewritten with any required compatibility edits), not a tiny
+         QA-only delta by design.
+       - If this file appears suspiciously small, the likely causes are stale
+         cache/artifacts or an incomplete prior run, not intended semantics.
+       - We keep the file in convert_genome_array_out for diagnostics and for
+         optional downstream use by other tools.
+    """
     output_path = Path(output_vcf)
     if output_path.exists() and _has_vcf_index(output_path) and output_path.stat().st_size > 0:
+        # Early return keeps conversion deterministic across repeated workflow
+        # invocations, but also means convert_genome_array_out artifacts from a
+        # previous run are reused as-is. When debugging panel anomalies, clear:
+        #   - convert_genome_array_out/
+        #   - output_vcf (+ index)
+        # before rerunning.
         print(f"Array conversion already exists: {output_vcf}")
         return
 
@@ -366,16 +448,20 @@ def run_conversion(input_path, output_vcf, panel_path):
     print(f"Running: {' '.join(cmd)}")
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
     subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+    # After this command succeeds, convert_genome has written its outputs under
+    # convert_genome_array_out/. We deliberately do not delete panel.vcf here
+    # so quality assessment scripts can inspect or reuse it.
 
     temp_hg38_vcf = _find_genotypes_vcf(temp_output_dir)
     if not temp_hg38_vcf:
         raise RuntimeError("convert_genome failed to produce genotypes.vcf")
 
     print("Finalizing GRCh38 output...")
+    # Safety filter for edge cases where ALT='.' but genotype encodes non-ref.
+    # This protects downstream tools from invalid VCF records while keeping
+    # the converted target focused on valid sites.
     print("Filtering invalid records (missing ALT but non-ref GT)...")
-    filter_cmd = f"bcftools view {temp_hg38_vcf} -e 'ALT=\".\" && GT[*]=\"alt\"' -Oz -o {output_vcf}"
-    subprocess.check_call(filter_cmd, shell=True)
-    subprocess.check_call(["bcftools", "index", "-f", output_vcf])
+    _atomic_bgzip_view(temp_hg38_vcf, output_vcf, extra_args=["-e", 'ALT="." && GT[*]="alt"'])
     print("Conversion complete.")
 
     if "extracted" in raw_file:

@@ -3,6 +3,7 @@ import sys
 import subprocess
 import argparse
 import shutil
+import tempfile
 import urllib.request
 from urllib.error import URLError, HTTPError
 
@@ -18,6 +19,44 @@ def run_cmd(cmd, shell=False):
         subprocess.check_call(cmd)
 
 
+def _replace_vcf_and_index(tmp_vcf, out_vcf):
+    os.replace(tmp_vcf, out_vcf)
+    tmp_csi = tmp_vcf + ".csi"
+    tmp_tbi = tmp_vcf + ".tbi"
+    out_csi = out_vcf + ".csi"
+    out_tbi = out_vcf + ".tbi"
+    if os.path.exists(tmp_csi):
+        os.replace(tmp_csi, out_csi)
+        if os.path.exists(out_tbi):
+            os.remove(out_tbi)
+    elif os.path.exists(tmp_tbi):
+        os.replace(tmp_tbi, out_tbi)
+        if os.path.exists(out_csi):
+            os.remove(out_csi)
+    else:
+        raise RuntimeError(f"Index missing for temporary VCF: {tmp_vcf}")
+
+
+def _atomic_bgzip_copy(src_vcf, out_vcf):
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=".",
+        prefix=f".{os.path.basename(out_vcf)}.",
+        suffix=".tmp.vcf.gz",
+    ) as tmp:
+        tmp_vcf = tmp.name
+    try:
+        run_cmd(["bcftools", "view", src_vcf, "-Oz", "-o", tmp_vcf])
+        run_cmd(["bcftools", "index", "-f", tmp_vcf])
+        _replace_vcf_and_index(tmp_vcf, out_vcf)
+    finally:
+        for suffix in ("", ".csi", ".tbi"):
+            p = tmp_vcf + suffix
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def ensure_beagle():
     """Download Beagle JAR if not present."""
     if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
@@ -25,6 +64,14 @@ def ensure_beagle():
     download_errors = []
     print(f"Downloading Beagle from {BEAGLE_URL}...")
     for attempt in range(3):
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            delete=False,
+            dir=".",
+            prefix=f".{BEAGLE_JAR}.",
+            suffix=".tmp",
+        ) as tmp:
+            tmp_jar = tmp.name
         try:
             if shutil.which("wget"):
                 run_cmd(
@@ -35,7 +82,7 @@ def ensure_beagle():
                         "--timeout=30",
                         BEAGLE_URL,
                         "-O",
-                        BEAGLE_JAR,
+                        tmp_jar,
                     ]
                 )
             elif shutil.which("curl"):
@@ -49,19 +96,23 @@ def ensure_beagle():
                         "30",
                         BEAGLE_URL,
                         "-o",
-                        BEAGLE_JAR,
+                        tmp_jar,
                     ]
                 )
             else:
                 with urllib.request.urlopen(BEAGLE_URL, timeout=30) as resp, open(
-                    BEAGLE_JAR, "wb"
+                    tmp_jar, "wb"
                 ) as out:
                     out.write(resp.read())
-            if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
+            if os.path.exists(tmp_jar) and os.path.getsize(tmp_jar) > 0:
+                os.replace(tmp_jar, BEAGLE_JAR)
                 return BEAGLE_JAR
             download_errors.append(f"attempt {attempt + 1}: downloaded empty file")
         except (subprocess.CalledProcessError, URLError, HTTPError, TimeoutError) as e:
             download_errors.append(f"attempt {attempt + 1}: {e}")
+        finally:
+            if os.path.exists(tmp_jar):
+                os.remove(tmp_jar)
     raise RuntimeError("Failed to download Beagle jar from official URL: " + " | ".join(download_errors))
 
 
@@ -133,7 +184,22 @@ def print_vcf_diagnostics(vcf_path, label):
 
 
 def prepare_reagle_reference_from_convert_genome(output_vcf="reagle_ref.vcf.gz"):
-    """Uses convert_genome's panel output as Reagle reference and normalizes it to bgzipped VCF."""
+    """
+    Materialize the convert_genome-produced panel as a bgzipped/indexed VCF.
+
+    Context:
+    - `scripts/prepare_data.py array ...` runs convert_genome and writes
+      `convert_genome_array_out/panel.vcf(.gz)`.
+    - That panel is intended to be a FULL rewritten panel artifact from
+      convert_genome (not a QA-only mini-reference by design).
+    - This function does not create a custom reduced panel; it only normalizes
+      whichever convert_genome panel artifact currently exists into `output_vcf`.
+
+    Operational note:
+    - If `output_vcf` already exists, we reuse it (cache behavior).
+    - If you need to force regeneration from fresh convert_genome outputs,
+      remove `output_vcf*` and `convert_genome_array_out/` first.
+    """
     if os.path.exists(output_vcf) and (
         os.path.exists(output_vcf + ".csi") or os.path.exists(output_vcf + ".tbi")
     ):
@@ -151,8 +217,7 @@ def prepare_reagle_reference_from_convert_genome(output_vcf="reagle_ref.vcf.gz")
         )
 
     print(f"Using convert_genome panel for Reagle reference: {panel_src}")
-    run_cmd(["bcftools", "view", panel_src, "-Oz", "-o", output_vcf])
-    run_cmd(["bcftools", "index", "-f", output_vcf])
+    _atomic_bgzip_copy(panel_src, output_vcf)
     return output_vcf
 
 
@@ -165,12 +230,18 @@ def prepare_beagle_reference():
 
     print("Preparing Beagle reference panel (bcftools +setGT)...")
     prep_log = "ref_beagle_prep.log"
+    tmp_out = "ref_beagle.vcf.gz.tmp"
+    tmp_log = prep_log + ".tmp"
     prep_cmd = (
         "bcftools +setGT ref.vcf.gz -Ou -- -t . -n 0 "
         "| bcftools +setGT - -Ou -- -t a -n p "
-        "| bcftools view -Oz -o ref_beagle.vcf.gz"
+        f"| bcftools view -Oz -o {tmp_out}"
     )
-    run_cmd(f"{prep_cmd} 2> {prep_log}", shell=True)
+    run_cmd(f"{prep_cmd} 2> {tmp_log}", shell=True)
+    run_cmd(["bcftools", "index", "-f", tmp_out])
+    _replace_vcf_and_index(tmp_out, "ref_beagle.vcf.gz")
+    if os.path.exists(tmp_log):
+        os.replace(tmp_log, prep_log)
     if os.path.exists(prep_log):
         print("Beagle ref prep logs (bcftools):")
         with open(prep_log, "r") as f:
@@ -181,7 +252,6 @@ def prepare_beagle_reference():
                     if line.startswith("Filled"):
                         print("  [bcftools] Note: count is per marker×sample entries in ref panel, not target alleles")
         os.remove(prep_log)
-    run_cmd(["bcftools", "index", "-f", "ref_beagle.vcf.gz"])
 
 
 def run_benchmark(person, file_path):
@@ -189,6 +259,11 @@ def run_benchmark(person, file_path):
     # 1. Prepare Data
     print(f"=== Preparing data for {person} ({file_path}) ===")
     run_cmd(["python3", "scripts/prepare_data.py", "reference", "ref.vcf.gz"])
+    # convert_genome array conversion writes:
+    #   - target.vcf.gz (final target used by benchmark)
+    #   - convert_genome_array_out/genotypes.vcf(.gz)
+    #   - convert_genome_array_out/panel.vcf(.gz) [full rewritten panel artifact]
+    # We keep these artifacts for diagnostics and compatibility checks.
     run_cmd(["python3", "scripts/prepare_data.py", "array", file_path, "target.vcf.gz", "ref.vcf.gz"])
 
     truth_dir = "data/kat_suricata" if person == "Kat" else "data/christopher_smith"

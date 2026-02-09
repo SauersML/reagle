@@ -60,6 +60,14 @@ jobs:
         if: steps.cache-reference.outputs.cache-hit != 'true'
         run: python3 scripts/prepare_data.py reference ref.vcf.gz
 
+      - name: Validate reference artifact before cache save
+        if: steps.cache-reference.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          [ -s ref.vcf.gz ]
+          [ -s ref.vcf.gz.csi ] || [ -s ref.vcf.gz.tbi ]
+          bcftools index -n ref.vcf.gz >/dev/null
+
       - name: Upload reference panel
         uses: actions/upload-artifact@v4
         with:
@@ -188,6 +196,32 @@ jobs:
       - name: Run Quality Assessment
         if: steps.cache-results.outputs.cache-hit != 'true'
         run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}"
+
+      - name: Validate prep artifacts before cache save
+        if: steps.cache-results.outputs.cache-hit != 'true' && steps.cache-prep.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          check_vcf () {
+            local vcf="$1"
+            [ -s "$vcf" ]
+            [ -s "$vcf.csi" ] || [ -s "$vcf.tbi" ]
+            bcftools index -n "$vcf" >/dev/null
+          }
+          check_vcf ref.vcf.gz
+          check_vcf target.vcf.gz
+          check_vcf truth.vcf.gz
+          check_vcf reagle_ref.vcf.gz
+          check_vcf ref_beagle.vcf.gz
+          if [ -f convert_genome_array_out/panel.vcf.gz ]; then
+            check_vcf convert_genome_array_out/panel.vcf.gz
+          elif [ -f convert_genome_array_out/panel.vcf ]; then
+            [ -s convert_genome_array_out/panel.vcf ]
+            bcftools view -h convert_genome_array_out/panel.vcf >/dev/null
+          else
+            echo "Missing convert_genome array panel artifact"
+            exit 1
+          fi
+          [ -s beagle.jar ]
 
       - name: Diagnostics (post-run)
         if: always()
