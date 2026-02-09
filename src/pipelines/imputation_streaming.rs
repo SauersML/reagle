@@ -5391,6 +5391,7 @@ impl crate::pipelines::ImputationPipeline {
                     for (i, &hap_idx) in haps.iter().enumerate() {
                         let beam = &beams[i];
                         let donor_k = adaptive_sm_donor_k(beam, plan.n_ref_haps, query_alleles[i]);
+                        donor_candidates.clear();
                         pbwt.select_donors_into(beam, donor_k, &mut donor_candidates);
                         let mut donor = current_donor[i];
                         let mut found = false;
