@@ -1904,7 +1904,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 }
                 self.hap2_use_combined[m] = false;
                 self.hap2_allele[m] = a2;
-                self.hap2_hard_match[m] = false;
+                self.hap2_hard_match[m] = self.anchor_drop_prob == 0.0;
                 let a1 = self.anchor_hap1.get(m).copied().unwrap_or(255);
                 if a1 != 255 {
                     self.hap2_partner_allele[m] = a1;
@@ -1966,7 +1966,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 }
                 self.hap1_use_combined[m] = false;
                 self.hap1_allele[m] = a1;
-                self.hap1_hard_match[m] = false;
+                self.hap1_hard_match[m] = self.anchor_drop_prob == 0.0;
                 let a2 = self.anchor_hap2.get(m).copied().unwrap_or(255);
                 if a2 != 255 {
                     self.hap1_partner_allele[m] = a2;
@@ -8575,16 +8575,15 @@ fn build_fwd_checkpoints<RefSpace>(
                             pl_emit_lut[ref_row[k + 7] as usize],
                         ]
                     } else {
-                        let p = inputs.partner_allele[m];
                         [
-                            emit_prob(ref_row[k], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 1], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 1], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 2], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 2], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 3], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 3], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 4], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 4], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 5], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 5], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 6], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 6], a1, a2, p, conf_m, p_no_err, p_err),
-                            emit_prob(ref_row[k + 7], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[k + 7], a1, a2, p, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 1], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 2], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 3], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 4], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 5], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 6], target_al, conf_m, p_no_err, p_err),
+                            emit_prob(ref_row[k + 7], target_al, conf_m, p_no_err, p_err),
                         ]
                     };
                     let emit_vec = f32x8::from(emit_arr);
@@ -8601,8 +8600,7 @@ fn build_fwd_checkpoints<RefSpace>(
                     let emit = if has_pl {
                         pl_emit_lut[ref_row[i] as usize]
                     } else {
-                        let p = inputs.partner_allele[m];
-                        emit_prob(ref_row[i], target_al, conf_m, p_no_err, p_err) * emit_haploid_constrained(ref_row[i], a1, a2, p, conf_m, p_no_err, p_err)
+                        emit_prob(ref_row[i], target_al, conf_m, p_no_err, p_err)
                     };
                     fwd[i] = fwd_prior[i] * emit;
                     fwd_sum += fwd[i];
@@ -12402,8 +12400,14 @@ mod tests {
             anchor_h1[m] = hero_pattern[m];
             anchor_h2[m] = 1 - hero_pattern[m];
         }
+        // Anchor the last marker to prevent tail drift
+        if n_markers > 0 {
+            let last = n_markers - 1;
+            anchor_h1[last] = hero_pattern[last];
+            anchor_h2[last] = 1 - hero_pattern[last];
+        }
 
-        let p_recomb = vec![0.001f32; n_markers];
+        let p_recomb = vec![0.0001f32; n_markers];
         let block_starts: Arc<[usize]> = blocks_to_starts(&[(0, n_markers)], n_markers)
             .into_boxed_slice()
             .into();
