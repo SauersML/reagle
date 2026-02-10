@@ -78,10 +78,7 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
 
 #[inline]
 fn fill_ref_alleles(col: &GenotypeColumn, out: &mut [u8]) {
-    let n = out.len();
-    for (i, v) in out.iter_mut().enumerate().take(n) {
-        *v = col.get(HapIdx::new(i as u32));
-    }
+    col.fill_all(out);
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;

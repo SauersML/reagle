@@ -1052,13 +1052,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 }
                             }
                         } else {
-                            let used_pattern = try_fill_pattern_emissions(
-                                m,
-                                partner,
-                                None,
-                                emissions_row,
-                                &[],
-                            );
+                            let used_pattern =
+                                try_fill_pattern_emissions(m, partner, None, emissions_row, &[]);
                             if !used_pattern {
                                 fill_conf_emissions_fast(m, emissions_row, ref_row);
                             }

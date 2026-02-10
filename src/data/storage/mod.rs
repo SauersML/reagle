@@ -95,6 +95,44 @@ impl GenotypeColumn {
         }
     }
 
+    /// Fill alleles for haplotypes `0..n` where `n = min(out.len(), n_haplotypes())`.
+    ///
+    /// This enables storage-specific contiguous fast paths (especially dictionary-backed
+    /// columns where many haplotypes share the same pattern).
+    #[inline]
+    pub fn fill_all(&self, out: &mut [u8]) {
+        let n = out.len().min(self.n_haplotypes());
+        match self {
+            Self::Dense(col) => {
+                for (i, v) in out.iter_mut().enumerate().take(n) {
+                    *v = col.get(HapIdx::new(i as u32));
+                }
+            }
+            Self::Sparse(col) => {
+                for (i, v) in out.iter_mut().enumerate().take(n) {
+                    *v = col.get(HapIdx::new(i as u32));
+                }
+            }
+            Self::Dictionary(col, offset) => {
+                let marker_offset = *offset;
+                let n_patterns = col.n_patterns();
+                let mut pattern_alleles = vec![0u8; n_patterns];
+                for (p, v) in pattern_alleles.iter_mut().enumerate().take(n_patterns) {
+                    *v = col.pattern_allele(marker_offset, p);
+                }
+                for (i, v) in out.iter_mut().enumerate().take(n) {
+                    let p = col.hap_pattern_idx_usize(i);
+                    *v = pattern_alleles[p];
+                }
+            }
+            Self::SeqCoded(col) => {
+                for (i, v) in out.iter_mut().enumerate().take(n) {
+                    *v = col.get(HapIdx::new(i as u32));
+                }
+            }
+        }
+    }
+
     /// Number of haplotypes in this column
     pub fn n_haplotypes(&self) -> usize {
         match self {

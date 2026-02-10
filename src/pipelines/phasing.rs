@@ -885,7 +885,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
 ) where
     TargetState: crate::data::storage::phase_state::PhaseState,
 {
-    const ANCHOR_RESCUE_WEIGHT: f32 = 0.35;
     let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
     if batch_haps.is_empty() || n_ref_haps == 0 {
         return;
@@ -1105,48 +1104,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 if allele_certainty <= f32::EPSILON {
                     continue;
                 }
-                for &d in donors_buf.iter() {
-                    let idx = d as usize;
-                    if idx >= n_ref_haps {
-                        continue;
-                    }
-                    if exclude_self && idx / 2 == hap_idx / 2 {
-                        continue;
-                    }
-                    let ref_allele = ref_alleles[idx];
-                    if ref_allele == 255 {
-                        continue;
-                    }
-                    let p_match = if ref_allele <= 1 {
-                        allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
-                    } else {
-                        match query_allele {
-                            Some(a) if a == ref_allele => 1.0,
-                            _ => 0.0,
-                        }
-                    };
-                    if p_match <= 0.0 {
-                        continue;
-                    }
-                    let freq = freqs
-                        .get(m)
-                        .and_then(|f| f.get(ref_allele as usize))
-                        .copied()
-                        .unwrap_or(0.0);
-                    if freq <= 0.0 {
-                        continue;
-                    }
-                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
-                    let w = &mut window_scores[i][idx];
-                    if w.is_finite() {
-                        *w += weight;
-                    } else {
-                        *w = weight;
-                    }
-                }
-                // For explicitly phased heterozygous scaffold sites, inject a small
-                // full-panel allele-consistency signal so true long-range donors are
-                // not dropped by PBWT donor subsampling ties.
                 let sample_idx = hap_idx / 2;
                 let hap1 = sample_idx * 2;
                 let hap2 = hap1 + 1;
@@ -1156,29 +1113,81 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let phased = phase_mask
                     .and_then(|mask| mask.get(orig_m, sample_idx))
                     .unwrap_or(0);
-                if phased != 0 && is_het {
-                    let q = query_alleles[i].as_allele();
-                    if let Some(q_allele) = q {
+                let full_anchor_scoring = phased != 0 && is_het;
+                if full_anchor_scoring {
+                    for idx in 0..n_ref_haps {
+                        if exclude_self && idx / 2 == hap_idx / 2 {
+                            continue;
+                        }
+                        let ref_allele = ref_alleles[idx];
+                        if ref_allele == 255 {
+                            continue;
+                        }
+                        let p_match = if ref_allele <= 1 {
+                            allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
+                        } else {
+                            match query_allele {
+                                Some(a) if a == ref_allele => 1.0,
+                                _ => 0.0,
+                            }
+                        };
+                        if p_match <= 0.0 {
+                            continue;
+                        }
                         let freq = freqs
                             .get(m)
-                            .and_then(|f| f.get(q_allele as usize))
+                            .and_then(|f| f.get(ref_allele as usize))
                             .copied()
-                            .unwrap_or(0.0)
-                            .max(min_freq);
-                        let rescue = ANCHOR_RESCUE_WEIGHT * allele_certainty * -(freq).ln();
-                        for idx in 0..n_ref_haps {
-                            if exclude_self && idx / 2 == hap_idx / 2 {
-                                continue;
+                            .unwrap_or(0.0);
+                        if freq <= 0.0 {
+                            continue;
+                        }
+                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
+                    }
+                } else {
+                    for &d in donors_buf.iter() {
+                        let idx = d as usize;
+                        if idx >= n_ref_haps {
+                            continue;
+                        }
+                        if exclude_self && idx / 2 == hap_idx / 2 {
+                            continue;
+                        }
+                        let ref_allele = ref_alleles[idx];
+                        if ref_allele == 255 {
+                            continue;
+                        }
+                        let p_match = if ref_allele <= 1 {
+                            allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
+                        } else {
+                            match query_allele {
+                                Some(a) if a == ref_allele => 1.0,
+                                _ => 0.0,
                             }
-                            if ref_alleles[idx] != q_allele {
-                                continue;
-                            }
-                            let w = &mut window_scores[i][idx];
-                            if w.is_finite() {
-                                *w += rescue;
-                            } else {
-                                *w = rescue;
-                            }
+                        };
+                        if p_match <= 0.0 {
+                            continue;
+                        }
+                        let freq = freqs
+                            .get(m)
+                            .and_then(|f| f.get(ref_allele as usize))
+                            .copied()
+                            .unwrap_or(0.0);
+                        if freq <= 0.0 {
+                            continue;
+                        }
+                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
                         }
                     }
                 }
@@ -1389,45 +1398,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 if allele_certainty <= f32::EPSILON {
                     continue;
                 }
-                for &d in donors_buf.iter() {
-                    let idx = d as usize;
-                    if idx >= n_ref_haps {
-                        continue;
-                    }
-                    if exclude_self && idx / 2 == hap_idx / 2 {
-                        continue;
-                    }
-                    let ref_allele = ref_alleles[idx];
-                    if ref_allele == 255 {
-                        continue;
-                    }
-                    let p_match = if ref_allele <= 1 {
-                        allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
-                    } else {
-                        match query_allele {
-                            Some(a) if a == ref_allele => 1.0,
-                            _ => 0.0,
-                        }
-                    };
-                    if p_match <= 0.0 {
-                        continue;
-                    }
-                    let freq = freqs
-                        .get(m)
-                        .and_then(|f| f.get(ref_allele as usize))
-                        .copied()
-                        .unwrap_or(0.0);
-                    if freq <= 0.0 {
-                        continue;
-                    }
-                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
-                    let w = &mut window_scores[i][idx];
-                    if w.is_finite() {
-                        *w += weight;
-                    } else {
-                        *w = weight;
-                    }
-                }
                 let sample_idx = hap_idx / 2;
                 let hap1 = sample_idx * 2;
                 let hap2 = hap1 + 1;
@@ -1437,29 +1407,81 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let phased = phase_mask
                     .and_then(|mask| mask.get(orig_m, sample_idx))
                     .unwrap_or(0);
-                if phased != 0 && is_het {
-                    let q = query_alleles[i].as_allele();
-                    if let Some(q_allele) = q {
+                let full_anchor_scoring = phased != 0 && is_het;
+                if full_anchor_scoring {
+                    for idx in 0..n_ref_haps {
+                        if exclude_self && idx / 2 == hap_idx / 2 {
+                            continue;
+                        }
+                        let ref_allele = ref_alleles[idx];
+                        if ref_allele == 255 {
+                            continue;
+                        }
+                        let p_match = if ref_allele <= 1 {
+                            allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
+                        } else {
+                            match query_allele {
+                                Some(a) if a == ref_allele => 1.0,
+                                _ => 0.0,
+                            }
+                        };
+                        if p_match <= 0.0 {
+                            continue;
+                        }
                         let freq = freqs
                             .get(m)
-                            .and_then(|f| f.get(q_allele as usize))
+                            .and_then(|f| f.get(ref_allele as usize))
                             .copied()
-                            .unwrap_or(0.0)
-                            .max(min_freq);
-                        let rescue = ANCHOR_RESCUE_WEIGHT * allele_certainty * -(freq).ln();
-                        for idx in 0..n_ref_haps {
-                            if exclude_self && idx / 2 == hap_idx / 2 {
-                                continue;
+                            .unwrap_or(0.0);
+                        if freq <= 0.0 {
+                            continue;
+                        }
+                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
+                        }
+                    }
+                } else {
+                    for &d in donors_buf.iter() {
+                        let idx = d as usize;
+                        if idx >= n_ref_haps {
+                            continue;
+                        }
+                        if exclude_self && idx / 2 == hap_idx / 2 {
+                            continue;
+                        }
+                        let ref_allele = ref_alleles[idx];
+                        if ref_allele == 255 {
+                            continue;
+                        }
+                        let p_match = if ref_allele <= 1 {
+                            allele_probs.prob_for_allele(ref_allele).clamp(0.0, 1.0)
+                        } else {
+                            match query_allele {
+                                Some(a) if a == ref_allele => 1.0,
+                                _ => 0.0,
                             }
-                            if ref_alleles[idx] != q_allele {
-                                continue;
-                            }
-                            let w = &mut window_scores[i][idx];
-                            if w.is_finite() {
-                                *w += rescue;
-                            } else {
-                                *w = rescue;
-                            }
+                        };
+                        if p_match <= 0.0 {
+                            continue;
+                        }
+                        let freq = freqs
+                            .get(m)
+                            .and_then(|f| f.get(ref_allele as usize))
+                            .copied()
+                            .unwrap_or(0.0);
+                        if freq <= 0.0 {
+                            continue;
+                        }
+                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let w = &mut window_scores[i][idx];
+                        if w.is_finite() {
+                            *w += weight;
+                        } else {
+                            *w = weight;
                         }
                     }
                 }
@@ -5292,7 +5314,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                             let mut can_reuse_prior_subset = false;
                             if let Some(prior) = local_prior.as_ref() {
-                                if prior.path1.len() == n_markers && prior.path2.len() == n_markers {
+                                if prior.path1.len() == n_markers && prior.path2.len() == n_markers
+                                {
                                     let marker_pairs = n_markers.saturating_sub(1).max(1);
                                     let mut switches1 = 0usize;
                                     let mut switches2 = 0usize;
@@ -5333,8 +5356,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             if !can_reuse_prior_subset {
                                 let mut local_params = self.params.clone();
                                 local_params.p_mismatch = sample_p_err;
-                                let hmm_full =
-                                    MosaicHmm::new(ref_view, &local_params, n_states_full, p_recomb);
+                                let hmm_full = MosaicHmm::new(
+                                    ref_view,
+                                    &local_params,
+                                    n_states_full,
+                                    p_recomb,
+                                );
                                 let mut fwd1 = Vec::new();
                                 let mut bwd1 = Vec::new();
                                 let mut fwd2 = Vec::new();
@@ -5896,6 +5923,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let t_anchor_start = Instant::now();
                         if self.reference_gt.is_some() && has_phase_anchors {
                             let threaded_haps = threaded_haps.to_mut();
+                            let direct_ref = self
+                                .reference_gt
+                                .as_ref()
+                                .zip(self.alignment.as_ref())
+                                .map(|(ref_gt, alignment)| (ref_gt.as_ref(), alignment));
                             let mut anchors: Vec<(usize, u8, u8)> = Vec::new();
                             for (i, &m) in hi_freq_to_orig.iter().enumerate() {
                                 if !sp.is_input_phased_het(m) {
@@ -5922,7 +5954,19 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     let mut score1 = 0.0f32;
                                     let mut score2 = 0.0f32;
                                     for &(i, a1, a2) in &anchors {
-                                        let ref_al = subset_view.allele(MarkerIdx::new(i as u32), hap_idx);
+                                        let ref_al = if let Some((ref_gt, alignment)) = direct_ref {
+                                            let orig_marker = hi_freq_to_orig[i];
+                                            if let Some(ref_m) =
+                                                alignment.target_to_ref(MarkerIdx::new(orig_marker as u32))
+                                            {
+                                                let ra = ref_gt.allele(ref_m, HapIdx::new(h as u32));
+                                                alignment.reverse_map_allele(orig_marker, ra)
+                                            } else {
+                                                255
+                                            }
+                                        } else {
+                                            subset_view.allele(MarkerIdx::new(i as u32), hap_idx)
+                                        };
                                         let conf_m = sample_conf[i].clamp(0.0, 1.0);
                                         score1 += emit_prob(
                                             ref_al,
@@ -5977,8 +6021,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                                 continue;
                                             }
                                             let conf_m = sample_conf[i].clamp(0.0, 1.0);
-                                            let ref_al =
-                                                subset_view.allele(MarkerIdx::new(i as u32), hap_idx);
+                                            let ref_al = if let Some((ref_gt, alignment)) = direct_ref {
+                                                let orig_marker = hi_freq_to_orig[i];
+                                                if let Some(ref_m) =
+                                                    alignment.target_to_ref(MarkerIdx::new(orig_marker as u32))
+                                                {
+                                                    let ra =
+                                                        ref_gt.allele(ref_m, HapIdx::new(h as u32));
+                                                    alignment.reverse_map_allele(orig_marker, ra)
+                                                } else {
+                                                    255
+                                                }
+                                            } else {
+                                                subset_view.allele(MarkerIdx::new(i as u32), hap_idx)
+                                            };
                                             let emit = if a1 == a2 {
                                                 emit_prob(
                                                     ref_al,
@@ -7816,7 +7872,11 @@ fn select_reduction_sparse_markers(seq1: &[u8], seq2: &[u8], sample_conf: &[f32]
     };
 
     let het_quota = budget * REDUCTION_SPARSE_HET_FRAC_NUM / REDUCTION_SPARSE_HET_FRAC_DEN;
-    take_evenly(&het_markers, het_quota.min(het_markers.len()), &mut selected);
+    take_evenly(
+        &het_markers,
+        het_quota.min(het_markers.len()),
+        &mut selected,
+    );
 
     let remaining = budget.saturating_sub(selected.len());
     if remaining > 0 {

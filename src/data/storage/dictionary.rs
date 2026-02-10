@@ -160,6 +160,12 @@ impl DictionaryColumn {
         self.hap_to_pattern[hap.as_usize()] as usize
     }
 
+    /// Pattern index for a haplotype index.
+    #[inline]
+    pub fn hap_pattern_idx_usize(&self, hap_idx: usize) -> usize {
+        self.hap_to_pattern[hap_idx] as usize
+    }
+
     /// Get allele for a specific pattern at a marker offset
     #[inline]
     pub fn pattern_allele(&self, marker_offset: usize, pattern_idx: usize) -> u8 {
