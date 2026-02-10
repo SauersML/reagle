@@ -957,8 +957,17 @@ fn apply_marker_prior_smoothing(
         return;
     }
 
+    // Scale missing mass mixing by the uncertainty of the local HMM posterior.
+    // If the local HMM is confident (max_prob ~ 1.0), we trust it and do not
+    // dilute with the global prior. If it is uncertain, we mix in the global
+    // prior to regularize. This fixes "fuzzy dosages" in perfect-match scenarios
+    // while retaining robustness for ambiguous regions.
+    let max_prob = allele_probs.iter().copied().fold(0.0f32, f32::max);
+    let uncertainty = (1.0 - max_prob).clamp(0.0, 1.0);
+
     let missing_mass = if panel_haps > 0 && active_states < panel_haps {
-        ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0)
+        let base_mass = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
+        base_mass * uncertainty
     } else {
         0.0
     };
@@ -991,6 +1000,15 @@ fn apply_marker_prior_smoothing(
                         }
                         normalize_probs(allele_probs);
                     }
+                    if missing_mass > 0.0 {
+                        for i in 0..2 {
+                            let panel_p = panel_probs[i];
+                            if panel_p > allele_probs[i] {
+                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
+                            }
+                        }
+                        normalize_probs(allele_probs);
+                    }
                 }
             }
             AllelePosteriors::Multiallelic(p) => {
@@ -1001,6 +1019,15 @@ fn apply_marker_prior_smoothing(
                             let floor = floor_mix * panel_p;
                             if *prob < floor {
                                 *prob = floor;
+                            }
+                        }
+                        normalize_probs(allele_probs);
+                    }
+                    if missing_mass > 0.0 {
+                        for (i, prob) in allele_probs.iter_mut().enumerate() {
+                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            if panel_p > *prob {
+                                *prob += missing_mass * (panel_p - *prob);
                             }
                         }
                         normalize_probs(allele_probs);
