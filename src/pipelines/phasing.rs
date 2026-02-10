@@ -70,10 +70,10 @@ use crate::data::ref_packed::PackedRefView;
 use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, PbwtInjector};
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
+use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::phase_query::{
     build_peer_indices, phase_best_orientation_error, phase_query_orientation_error_limit,
 };
-use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{
     PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
 };
@@ -340,8 +340,8 @@ fn fit_cohort_calibration(
         let s = stats[sample_idx];
         let weight = (s.emission_mass / (s.emission_mass + 500.0)).clamp(0.0, 1.0) as f32;
         let cohort_p = cohort_p_mismatch[label];
-        sample_p_mismatch[sample_idx] = ((1.0 - weight) * global_p + weight * cohort_p)
-            .clamp(1e-6, 0.25);
+        sample_p_mismatch[sample_idx] =
+            ((1.0 - weight) * global_p + weight * cohort_p).clamp(1e-6, 0.25);
     }
 
     Some(CohortCalibration {
@@ -820,11 +820,7 @@ fn adaptive_pbwt_donor_k(
 }
 
 #[inline]
-fn biallelic_haplotype_probs(
-    a1: u8,
-    a2: u8,
-    phase_conf: f32,
-) -> [PbwtBiallelicQueryProb; 2] {
+fn biallelic_haplotype_probs(a1: u8, a2: u8, phase_conf: f32) -> [PbwtBiallelicQueryProb; 2] {
     if a1 == 0 && a2 == 1 {
         let p = phase_conf.clamp(0.0, 1.0);
         [
@@ -848,7 +844,10 @@ fn biallelic_haplotype_probs(
             PbwtBiallelicQueryProb::deterministic(1),
         ]
     } else {
-        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()]
+        [
+            PbwtBiallelicQueryProb::uniform(),
+            PbwtBiallelicQueryProb::uniform(),
+        ]
     }
 }
 
@@ -922,8 +921,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 cached_query_probs = biallelic_haplotype_probs(a1, a2, 1.0);
                 if wildcard_unphased_het {
                     cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
-                    cached_query_probs =
-                        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()];
+                    cached_query_probs = [
+                        PbwtBiallelicQueryProb::uniform(),
+                        PbwtBiallelicQueryProb::uniform(),
+                    ];
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
@@ -936,20 +937,14 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         [qa1, qa2]
                     };
                     let self_query = oriented_pair[local];
-                    let mut beam_uncertainty = pbwt_beam_uncertainty(
-                        &beams_fwd[i],
-                        n_ref_haps,
-                        self_query,
-                    );
+                    let mut beam_uncertainty =
+                        pbwt_beam_uncertainty(&beams_fwd[i], n_ref_haps, self_query);
                     let peer_idx = peer_idx_by_hap[i];
                     if let Some(peer_i) = peer_idx {
                         let peer_local = batch_haps[peer_i] % 2;
                         let peer_query = oriented_pair[peer_local];
-                        let peer_uncertainty = pbwt_beam_uncertainty(
-                            &beams_fwd[peer_i],
-                            n_ref_haps,
-                            peer_query,
-                        );
+                        let peer_uncertainty =
+                            pbwt_beam_uncertainty(&beams_fwd[peer_i], n_ref_haps, peer_query);
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
                     cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
@@ -1169,8 +1164,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 cached_query_probs = biallelic_haplotype_probs(a1, a2, 1.0);
                 if wildcard_unphased_het {
                     cached_query_pair = [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
-                    cached_query_probs =
-                        [PbwtBiallelicQueryProb::uniform(), PbwtBiallelicQueryProb::uniform()];
+                    cached_query_probs = [
+                        PbwtBiallelicQueryProb::uniform(),
+                        PbwtBiallelicQueryProb::uniform(),
+                    ];
                 } else if phased == 0 && a1 != 255 && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
@@ -1183,20 +1180,14 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         [qa1, qa2]
                     };
                     let self_query = oriented_pair[local];
-                    let mut beam_uncertainty = pbwt_beam_uncertainty(
-                        &beams_bwd[i],
-                        n_ref_haps,
-                        self_query,
-                    );
+                    let mut beam_uncertainty =
+                        pbwt_beam_uncertainty(&beams_bwd[i], n_ref_haps, self_query);
                     let peer_idx = peer_idx_by_hap[i];
                     if let Some(peer_i) = peer_idx {
                         let peer_local = batch_haps[peer_i] % 2;
                         let peer_query = oriented_pair[peer_local];
-                        let peer_uncertainty = pbwt_beam_uncertainty(
-                            &beams_bwd[peer_i],
-                            n_ref_haps,
-                            peer_query,
-                        );
+                        let peer_uncertainty =
+                            pbwt_beam_uncertainty(&beams_bwd[peer_i], n_ref_haps, peer_query);
                         beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
                     }
                     cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
@@ -5275,19 +5266,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         let local_estimates: Option<crate::model::parameters::ParamEstimates> =
                             if atomic_estimates.is_some() || collect_cohort_stats {
-                            let mut local_params = self.params.clone();
-                            local_params.p_mismatch = sample_p_err;
-                            let hmm = MosaicHmm::new(ref_view, &local_params, n_states, p_recomb);
-                            let mut local_est = crate::model::parameters::ParamEstimates::new();
-                            hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
-                            hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
-                            if let Some(atomic) = atomic_estimates {
-                                atomic.add_estimation_data(&local_est);
-                            }
-                            Some(local_est)
-                        } else {
-                            None
-                        };
+                                let mut local_params = self.params.clone();
+                                local_params.p_mismatch = sample_p_err;
+                                let hmm =
+                                    MosaicHmm::new(ref_view, &local_params, n_states, p_recomb);
+                                let mut local_est = crate::model::parameters::ParamEstimates::new();
+                                hmm.collect_stats(&seq1, &threaded_haps, gen_dists, &mut local_est);
+                                hmm.collect_stats(&seq2, &threaded_haps, gen_dists, &mut local_est);
+                                if let Some(atomic) = atomic_estimates {
+                                    atomic.add_estimation_data(&local_est);
+                                }
+                                Some(local_est)
+                            } else {
+                                None
+                            };
 
                         // 3-Track HMM with Prior-First Approach
                         //
@@ -5402,9 +5394,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let mut uncertainty_sum = 0.0f64;
                             let mut uncertainty_count = 0usize;
                             for &m in &het_positions {
-                                uncertainty_sum +=
-                                    (1.0 - sample_phase_view[s].phase_confidence(m).clamp(0.0, 1.0))
-                                        as f64;
+                                uncertainty_sum += (1.0
+                                    - sample_phase_view[s].phase_confidence(m).clamp(0.0, 1.0))
+                                    as f64;
                                 uncertainty_count += 1;
                             }
                             *cohort_stats_out_one = Some(SampleCohortStats {
@@ -6881,9 +6873,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
             eprintln!(
                 "Stage 2: rare-carrier conditioning markers with carriers={} with_context={} total_rare={}",
-                rare_with_carriers,
-                rare_with_carrier_context,
-                total_conditioned_rare
+                rare_with_carriers, rare_with_carrier_context, total_conditioned_rare
             );
 
             // Process samples in parallel - collect results: Stage2Decision
@@ -6901,7 +6891,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     let seq_conf: Vec<f32> = hi_freq_markers
                         .iter()
                         .enumerate()
-                        .map(|(i, &m)| (sp.confidence(m) * hi_freq_emit_conf_scale[i]).clamp(0.0, 1.0))
+                        .map(|(i, &m)| {
+                            (sp.confidence(m) * hi_freq_emit_conf_scale[i]).clamp(0.0, 1.0)
+                        })
                         .collect();
                     let hmm = MosaicHmm::new(subset_view, &self.params, n_states, stage1_p_recomb);
                     let plp = PlProvider {
@@ -7822,11 +7814,7 @@ fn stage1_sample_phase_stability(sp: &SamplePhase, hi_freq_to_orig: &[usize]) ->
         sum += sp.phase_confidence(m).clamp(0.0, 1.0);
         count += 1;
     }
-    if count == 0 {
-        0.5
-    } else {
-        sum / count as f32
-    }
+    if count == 0 { 0.5 } else { sum / count as f32 }
 }
 
 #[inline]
@@ -9169,7 +9157,12 @@ fn sample_dynamic_mcmc(
                     .partial_cmp(&a_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            filtered.extend(initial_neighbors.iter().take(initial_state_target.max(1)).copied());
+            filtered.extend(
+                initial_neighbors
+                    .iter()
+                    .take(initial_state_target.max(1))
+                    .copied(),
+            );
         }
         initial_neighbors = filtered;
     }
@@ -9207,12 +9200,19 @@ fn sample_dynamic_mcmc(
     let n_haps = phase_ibs.n_haps() as u32;
 
     let mut seeded_from_heuristic = false;
-    if initial_paths.is_none() && n_markers <= 2000 && !neighbors.is_empty() {
+    if initial_paths.is_none() && !neighbors.is_empty() {
         let limit = neighbors.len().min(16);
         if limit >= 2 {
+            // Keep this seed-search bounded on long windows.
+            const MAX_INIT_EVAL_MARKERS: usize = 2000;
+            let marker_stride = n_markers
+                .saturating_add(MAX_INIT_EVAL_MARKERS - 1)
+                .checked_div(MAX_INIT_EVAL_MARKERS)
+                .unwrap_or(1)
+                .max(1);
             let mut scores = vec![0.0f32; limit * limit];
             let mut informative = 0usize;
-            for m in 0..n_markers {
+            for m in (0..n_markers).step_by(marker_stride) {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
                 if a1 == 255 && a2 == 255 {
@@ -9289,7 +9289,30 @@ fn sample_dynamic_mcmc(
             path2_ref.copy_from_slice(&paths.path2);
         }
     } else if !seeded_from_heuristic {
-        if let Some(&seed_hap) = neighbors.first() {
+        if neighbors.len() >= 2 {
+            let h1_seed = neighbors[0];
+            let h2_seed = neighbors[1];
+            path1_ref.fill(h1_seed);
+            path2_ref.fill(h2_seed);
+            for m in 0..n_markers {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
+                }
+                let r1 = phase_ibs.allele(m, h1_seed);
+                let r2 = phase_ibs.allele(m, h2_seed);
+                let m1 = r1 == a1 && r2 == a2;
+                let m2 = r1 == a2 && r2 == a1;
+                if m1 && !m2 {
+                    h1_alleles[m] = a1;
+                    h2_alleles[m] = a2;
+                } else if m2 && !m1 {
+                    h1_alleles[m] = a2;
+                    h2_alleles[m] = a1;
+                }
+            }
+        } else if let Some(&seed_hap) = neighbors.first() {
             path1_ref.fill(seed_hap);
             path2_ref.fill(seed_hap);
         }
@@ -9481,7 +9504,8 @@ fn sample_dynamic_mcmc(
     }
     score_markers_static.sort_unstable();
     score_markers_static.dedup();
-    let mut score_markers_sparse: Vec<usize> = Vec::with_capacity(score_markers_static.len() / 2 + 1);
+    let mut score_markers_sparse: Vec<usize> =
+        Vec::with_capacity(score_markers_static.len() / 2 + 1);
     for (i, &m) in score_markers_static.iter().enumerate() {
         if i % 2 == 0 {
             score_markers_sparse.push(m);
@@ -10066,14 +10090,16 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
 ) -> Option<MosaicPaths> {
-    // This heuristic is O(n_markers * n_states^2). For long windows we skip it
-    // entirely and rely on the other initialization paths.
-    if n_markers > 2000 {
-        return None;
-    }
     if n_states < 2 {
         return None;
     }
+    // Bound compute on long windows by evaluating a sparse marker grid.
+    const MAX_EVAL_MARKERS: usize = 2000;
+    let marker_stride = n_markers
+        .saturating_add(MAX_EVAL_MARKERS - 1)
+        .checked_div(MAX_EVAL_MARKERS)
+        .unwrap_or(1)
+        .max(1);
 
     let need = n_states * n_states;
     if scores.len() < need {
@@ -10094,7 +10120,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
 
     let mut ref_alleles = vec![255u8; n_states];
     let mut informative = 0usize;
-    for m in 0..n_markers {
+    for m in (0..n_markers).step_by(marker_stride) {
         let a1 = seq1[m];
         let a2 = seq2[m];
         if a1 == 255 && a2 == 255 {
@@ -13649,6 +13675,52 @@ mod tests {
                 || (paths.path1[0] == 0 && paths.path2[0] == 1)
                 || (paths.path1[0] == 3 && paths.path2[0] == 2)
                 || (paths.path1[0] == 2 && paths.path2[0] == 3)
+        );
+    }
+
+    #[test]
+    fn test_find_best_constant_pair_long_window_uses_sparse_eval() {
+        use crate::data::storage::MutableGenotypes;
+        use crate::model::states::ThreadedHaps;
+
+        let n_markers = 4001;
+        let n_states = 4;
+
+        // Build two complementary "hero" haplotypes and two distractors.
+        let geno = MutableGenotypes::from_fn(n_markers, n_states, |m, h| match h {
+            0 => (m % 2) as u8,
+            1 => 1u8 - (m % 2) as u8,
+            2 => 0,
+            _ => 1,
+        });
+        let mut threaded = ThreadedHaps::<CombinedHapSpace>::new(n_states, n_states, n_markers);
+        for h in 0..n_states {
+            threaded.push_new(CombinedHapId::new(h as u32));
+        }
+        let mut ref_provider: RefAlleleProvider<'_, AnyMarkerSpace, AnyMarkerSpace> =
+            RefAlleleProvider::new(GenotypeView::Mutable(&geno), &threaded);
+
+        // Fully heterozygous target.
+        let seq1 = vec![0u8; n_markers];
+        let seq2 = vec![1u8; n_markers];
+        let conf = vec![1.0f32; n_markers];
+        let mut scores = Vec::new();
+
+        let paths = find_best_constant_pair_with_buffer(
+            n_markers,
+            n_states,
+            &seq1,
+            &seq2,
+            &conf,
+            0.999,
+            0.001,
+            &mut ref_provider,
+            &mut scores,
+            None,
+        );
+        assert!(
+            paths.is_some(),
+            "long-window heuristic should not be disabled"
         );
     }
 
