@@ -62,7 +62,7 @@ fn validate_reference_marker_count(
 
 #[cfg(test)]
 mod tests {
-    use super::transition_only_forward_update;
+    use super::{subset_transition_params, transition_only_forward_update};
 
     #[test]
     fn test_recomb_mass_subset_sums_to_one() {
@@ -108,6 +108,25 @@ mod tests {
             "Expected full-panel mass 1.0, got {:.6}",
             sum
         );
+    }
+
+    #[test]
+    fn test_subset_transition_panel_aware_shift_small_vs_k_scaled() {
+        let recomb_rate = 0.02f32;
+        let active_states = 60usize;
+        let n_ref_haps = 6_546usize;
+        let (stay, shift) = subset_transition_params(recomb_rate, active_states, n_ref_haps);
+
+        // panel-aware expectation
+        let k = active_states as f32;
+        let n = n_ref_haps as f32;
+        let expected = (recomb_rate / n) / ((1.0 - recomb_rate) + k * (recomb_rate / n));
+        assert!((shift - expected).abs() < 1e-8);
+        assert!(stay.is_finite() && stay > 0.0);
+
+        // Ensure we are not effectively using r/K scaling.
+        let k_scaled = (recomb_rate / k) / ((1.0 - recomb_rate) + k * (recomb_rate / k));
+        assert!(shift < k_scaled * 0.1);
     }
 }
 
@@ -1019,12 +1038,7 @@ fn apply_marker_prior_smoothing(
             NormalizedAlleleProbs::from_trusted(probs),
         )
     };
-    smooth_allele_posteriors_subset(
-        allele_probs,
-        prior_probs,
-        nearest_obs_lambda,
-        true,
-    );
+    smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
 }
 
 #[inline]
@@ -1092,13 +1106,13 @@ fn subset_transition_params(
         return (0.0, 0.0);
     }
     let r = recomb_rate.clamp(0.0, 1.0);
-    let k_raw = active_states as f32;
+    let k = active_states as f32;
     let n = n_ref_haps.max(1) as f32;
-    // Condition Li-Stephens transitions on the active-state support.
-    // In subset HMM mode the active support is the tractable state space;
-    // scaling by k prevents under-switching when k << n.
-    let k = k_raw.clamp(1.0, n);
-    let switch_full = r / k.max(1.0);
+    // Panel-aware subset conditioning:
+    //   full-panel switch-to-specific-haplotype mass is r / N
+    //   active subset retains k/N of recombination mass and we renormalize
+    //   onto the tracked subset support.
+    let switch_full = r / n;
     let z = ((1.0 - r) + k * switch_full).max(1e-30);
     let stay_gap = (1.0 - r) / z;
     let shift = switch_full / z;
@@ -1436,7 +1450,7 @@ fn run_impute_hmm_impl(
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
-    let transition_haps = active_states.max(1).min(panel_haps);
+    let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
@@ -1445,8 +1459,8 @@ fn run_impute_hmm_impl(
         ws.nearest_obs_lambda.clear();
     }
     if active_states > 0 {
-        // The active subset is the imputation state space for this haplotype/window.
-        // Scale transitions to that subset to avoid suppressing switch mass by K/N_ref.
+        // Use unit weights unless prior-weighting is explicitly enabled; transition
+        // scaling is handled panel-aware inside the HMM kernels.
         ws.weights.fill(1.0);
     }
 
@@ -1623,14 +1637,14 @@ fn run_impute_hmm_impl(
                                         if !warned_af_fallback {
                                             eprintln!(
                                                 "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
-                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                                context.window_idx,
+                                                context.sample_idx,
+                                                context.hap_idx,
+                                                m_rev
                                             );
                                             warned_af_fallback = true;
                                         }
-                                        normalized_allele_prior(
-                                            &mut ws.allele_prior_scratch,
-                                            probs,
-                                        )
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
                                     };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
@@ -1766,7 +1780,7 @@ fn run_impute_hmm_seqcoded(
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
-    let transition_haps = active_states.max(1).min(panel_haps);
+    let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
@@ -1955,14 +1969,14 @@ fn run_impute_hmm_seqcoded(
                                         if !warned_af_fallback {
                                             eprintln!(
                                                 "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
-                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                                context.window_idx,
+                                                context.sample_idx,
+                                                context.hap_idx,
+                                                m_rev
                                             );
                                             warned_af_fallback = true;
                                         }
-                                        normalized_allele_prior(
-                                            &mut ws.allele_prior_scratch,
-                                            probs,
-                                        )
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
                                     };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
@@ -2096,7 +2110,7 @@ fn run_impute_hmm_dict(
     let active_markers = ws.active_markers();
     let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
-    let transition_haps = active_states.max(1).min(panel_haps);
+    let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
@@ -2285,14 +2299,14 @@ fn run_impute_hmm_dict(
                                         if !warned_af_fallback {
                                             eprintln!(
                                                 "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
-                                                context.window_idx, context.sample_idx, context.hap_idx, m_rev
+                                                context.window_idx,
+                                                context.sample_idx,
+                                                context.hap_idx,
+                                                m_rev
                                             );
                                             warned_af_fallback = true;
                                         }
-                                        normalized_allele_prior(
-                                            &mut ws.allele_prior_scratch,
-                                            probs,
-                                        )
+                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
                                     };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];

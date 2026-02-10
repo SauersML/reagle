@@ -75,7 +75,7 @@ impl WeightedHmmUpdater {
         } else {
             1.0
         };
-        let switch_full = r / k.max(1.0);
+        let switch_full = r / n;
         let z = ((1.0 - r) + k * switch_full).max(1e-30);
         let scale = (1.0 - r) / (z * fwd_sum.max(1e-30));
         let base_shift = switch_full / z;
@@ -352,13 +352,12 @@ mod tests {
             n_patterns,
         );
 
-        // Manual verification for the current subset-space transition model:
-        //   effective = min(K, N)
-        //   z = (1-r) + K * (r/effective)
-        //   P'(i) = ((1-r)*P(i) + (r/effective)*count[i]) / z
+        // Manual verification for panel-aware subset-conditioned transitions:
+        //   switch_full = r / N
+        //   z = (1-r) + K * switch_full
+        //   P'(i) = ((1-r)*P(i) + switch_full*count[i]) / z
         let active_haps: f32 = pattern_counts.iter().sum();
-        let effective = active_haps.min(n_ref_haps as f32).max(1.0);
-        let switch_full = recomb_rate / effective;
+        let switch_full = recomb_rate / n_ref_haps as f32;
         let z = (1.0 - recomb_rate) + active_haps * switch_full;
         let mut expected_pre_emit = vec![0.0; n_patterns];
         for i in 0..n_patterns {
@@ -420,6 +419,40 @@ mod tests {
         assert!(new_sum.is_finite() && new_sum > 0.0);
         for &v in &fwd {
             assert!(v.is_finite() && v >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_panel_aware_shift_uses_global_n_not_subset_k() {
+        let n_patterns = 4;
+        let mut fwd = vec![0.25, 0.25, 0.25, 0.25];
+        let fwd_sum: f32 = fwd.iter().sum();
+        let recomb_rate = 0.02;
+        let n_ref_haps = 10_000;
+        // Active subset mass is tiny relative to panel.
+        let pattern_counts = vec![1.0, 1.0, 1.0, 1.0];
+        let emissions = vec![1.0, 1.0, 1.0, 1.0];
+
+        let new_sum = WeightedHmmUpdater::fwd_update_weighted(
+            &mut fwd,
+            fwd_sum,
+            recomb_rate,
+            n_ref_haps,
+            PatternCounts::new(&pattern_counts),
+            EmissionProbs::new(&emissions),
+            n_patterns,
+        );
+        assert!(new_sum.is_finite() && new_sum > 0.0);
+
+        // Under panel-aware transitions with uniform starting mass/counts and unit emissions,
+        // each state remains close to 1/K with only a tiny recombination-induced perturbation.
+        // If r/K were used instead, the perturbation would be orders of magnitude larger.
+        for &v in &fwd {
+            assert!(
+                (v - 0.25).abs() < 1e-3,
+                "unexpectedly large transition perturbation: {}",
+                v
+            );
         }
     }
 }
