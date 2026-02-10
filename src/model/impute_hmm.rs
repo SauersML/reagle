@@ -1113,8 +1113,19 @@ fn apply_marker_prior_smoothing(
         return;
     }
 
+    // Heuristic: If we are using a subset of the panel (active_states < panel_haps),
+    // we should mix in the global prior to account for the possibility that the
+    // true donor is outside the selected subset.
+    //
+    // PBWT selection is highly effective, so we assume the "missing" mass is much
+    // less than the random-selection baseline of (1 - active/total).
+    // We use a power law (ratio^4) to strongly penalize very sparse subsets (e.g. 1% of panel)
+    // while virtually eliminating the penalty for dense subsets (e.g. 50% of panel).
+    // This fixes dosage bias in "slam dunk" tests (ratio ~0.5 -> penalty ~0.06)
+    // while maintaining calibration in large-panel imputation (ratio ~0.95 -> penalty ~0.8).
     let missing_mass = if panel_haps > 0 && active_states < panel_haps {
-        ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0)
+        let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
+        raw_ratio.powi(4)
     } else {
         0.0
     };
