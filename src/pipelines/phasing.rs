@@ -9529,15 +9529,20 @@ fn sample_dynamic_mcmc(
     let mut candidates_buf: Vec<u32> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    const DATA_DRIVEN_INJECT_DIV: usize = 3;
     let mut collect_dynamic_neighbors =
-        |path_ref: &[u32], query_hap: &[u8], target_states: usize, out: &mut Vec<u32>| {
+        |path_ref: &[u32],
+         query_hap: &[u8],
+         target_states: usize,
+         mcmc_step: usize,
+         out: &mut Vec<u32>| {
             seen_buf.clear();
             candidates_buf.clear();
-            let inject_target = target_states
-                .checked_div(DATA_DRIVEN_INJECT_DIV)
-                .unwrap_or(0)
-                .max(1);
+            let burnin_steps = (n_mcmc_steps / 2).max(1);
+            let inject_target = if mcmc_step < burnin_steps {
+                target_states.saturating_div(2).max(2)
+            } else {
+                target_states.saturating_div(8).max(1)
+            };
 
             for &m in &anchors_static {
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
@@ -9640,6 +9645,9 @@ fn sample_dynamic_mcmc(
 
     // MCMC loop: Gibbs sampling alternating between H1 and H2
     for step in 0..n_mcmc_steps {
+        let prev_path1_ref = path1_ref.clone();
+        let prev_path2_ref = path2_ref.clone();
+
         // === Sample H1 | (G, H2_fixed) ===
 
         // 1. Select neighbors with phase-conditioned scoring:
@@ -9656,7 +9664,7 @@ fn sample_dynamic_mcmc(
             phase_conf[center_marker],
             recipient_stability,
         );
-        collect_dynamic_neighbors(&path1_ref, &h1_alleles, state_target, &mut neighbors);
+        collect_dynamic_neighbors(&path1_ref, &h1_alleles, state_target, step, &mut neighbors);
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
             && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
@@ -9767,7 +9775,7 @@ fn sample_dynamic_mcmc(
         // === Sample H2 | (G, H1_new) ===
 
         // 1. Select neighbors for H2 with H2-conditioned scoring (not H1's sequence).
-        collect_dynamic_neighbors(&path2_ref, &h2_alleles, state_target, &mut neighbors);
+        collect_dynamic_neighbors(&path2_ref, &h2_alleles, state_target, step, &mut neighbors);
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
             && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
@@ -9867,6 +9875,58 @@ fn sample_dynamic_mcmc(
                 // Just ensure consistency - H2 is the allele NOT assigned to H1.
                 h2_alleles[m] = if h1_alleles[m] == a1 { a2 } else { a1 };
             }
+        }
+
+        // Keep label orientation consistent across iterations to avoid H1/H2 drift.
+        let mut keep_score = 0.0f32;
+        let mut swap_score = 0.0f32;
+        for &m in &anchors_static {
+            let w = phase_conf
+                .get(m)
+                .copied()
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0)
+                .max(0.1);
+            if prev_path1_ref.get(m).copied().unwrap_or(0) == path1_ref.get(m).copied().unwrap_or(0)
+            {
+                keep_score += w;
+            }
+            if prev_path2_ref.get(m).copied().unwrap_or(0) == path2_ref.get(m).copied().unwrap_or(0)
+            {
+                keep_score += w;
+            }
+            if prev_path1_ref.get(m).copied().unwrap_or(0) == path2_ref.get(m).copied().unwrap_or(0)
+            {
+                swap_score += w;
+            }
+            if prev_path2_ref.get(m).copied().unwrap_or(0) == path1_ref.get(m).copied().unwrap_or(0)
+            {
+                swap_score += w;
+            }
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            if anchor_a1 != 255 && anchor_a2 != 255 {
+                let mut anchor_keep = 0.0f32;
+                let mut anchor_swap = 0.0f32;
+                if h1_alleles[m] == anchor_a1 {
+                    anchor_keep += 1.0;
+                }
+                if h2_alleles[m] == anchor_a2 {
+                    anchor_keep += 1.0;
+                }
+                if h2_alleles[m] == anchor_a1 {
+                    anchor_swap += 1.0;
+                }
+                if h1_alleles[m] == anchor_a2 {
+                    anchor_swap += 1.0;
+                }
+                keep_score += 2.0 * anchor_keep;
+                swap_score += 2.0 * anchor_swap;
+            }
+        }
+        if swap_score > keep_score {
+            std::mem::swap(&mut path1_ref, &mut path2_ref);
+            std::mem::swap(&mut h1_alleles, &mut h2_alleles);
         }
 
         // After first step, we have a valid path to use for latent state lookup
