@@ -655,7 +655,7 @@ impl HmmUpdater {
 use crate::model::pl_emission::{
     PlProvider, allele_probs_cond_from_pl, allele_probs_uncond_from_pl,
 };
-use crate::model::states::{MosaicCursor, StateSwitch, ThreadedHaps};
+use crate::model::states::{MosaicCursor, ThreadedHaps};
 use crate::model::types::{CombinedHapSpace, HapId};
 
 /// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
@@ -1424,19 +1424,13 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         const CHECKPOINT_INTERVAL: usize = 64;
         let n_checkpoints = (n_markers + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
 
-        // Create cursor and record history during forward traversal
-        let mut cursor = MosaicCursor::from_threaded(threaded_haps);
-        let mut history: Vec<StateSwitch<HapSpace>> = Vec::with_capacity(n_markers);
-
-        // First pass: advance cursor to end while recording history AND storing checkpoints
+        // First pass: forward traversal with checkpoint storage
         let mut fwd_checkpoints = vec![0.0f32; n_checkpoints * n_states];
         let mut fwd = vec![1.0f32 / n_states as f32; n_states];
         let mut fwd_sums = vec![1.0f32; n_markers];
         let mut last_fwd_sum = 1.0f32;
 
         for m in 0..n_markers {
-            cursor.advance_with_history(m, threaded_haps, &mut history);
-
             let targ_al = target_alleles[m];
             let row_offset = m * n_states_padded;
             let ref_row = &ref_alleles_flat[row_offset..row_offset + n_states];
@@ -1497,11 +1491,9 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let h_factor = n_states as f32 / (n_states - 1) as f32;
 
         for m in (0..n_markers).rev() {
-            let marker_idx = MarkerIdx::new(m as u32);
             let targ_al = target_alleles[m];
-
-            // Rewind cursor to this marker
-            cursor.rewind(m, &mut history);
+            let row_offset = m * n_states_padded;
+            let ref_row = &ref_alleles_flat[row_offset..row_offset + n_states];
 
             // Recompute forward values from nearest checkpoint
             let checkpoint_idx = m / CHECKPOINT_INTERVAL;
@@ -1512,32 +1504,19 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             fwd_recomp.copy_from_slice(&fwd_checkpoints[checkpoint_off..checkpoint_off + n_states]);
             let mut recomp_sum = fwd_sums[checkpoint_start];
 
-            // Recompute forward from checkpoint to m
-            // Need a separate cursor for recomputation
-            let mut recomp_cursor = MosaicCursor::from_threaded(threaded_haps);
-            let mut recomp_history: Vec<StateSwitch<HapSpace>> = Vec::with_capacity(m + 1);
-
-            // Advance recomp cursor to checkpoint_start
-            for recomp_m in 0..=checkpoint_start {
-                recomp_cursor.advance_with_history(recomp_m, threaded_haps, &mut recomp_history);
-            }
-
-            // Now advance from checkpoint_start+1 to m while recomputing forward
+            // Recompute forward from checkpoint_start+1 to m
             for recomp_m in (checkpoint_start + 1)..=m {
-                recomp_cursor.advance_with_history(recomp_m, threaded_haps, &mut recomp_history);
-
-                let recomp_marker_idx = MarkerIdx::new(recomp_m as u32);
                 let recomp_targ_al = target_alleles[recomp_m];
                 let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
                 let shift = p_switch / n_states as f32;
                 let scale = (1.0 - p_switch) / recomp_sum.max(1e-30);
+                let recomp_row_offset = recomp_m * n_states_padded;
+                let recomp_ref_row =
+                    &ref_alleles_flat[recomp_row_offset..recomp_row_offset + n_states];
 
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
-                    let ref_al = self.ref_gt.allele(
-                        recomp_marker_idx,
-                        HapIdx::new(recomp_cursor.active_haps()[k].as_u32()),
-                    );
+                    let ref_al = recomp_ref_row[k];
                     let is_mismatch = ref_al != recomp_targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
                     fwd_recomp[k] = em * (scale * fwd_recomp[k] + shift);
@@ -1559,9 +1538,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             let mut mismatch_sum = 0.0f32;
 
             for k in 0..n_states {
-                let ref_al = self
-                    .ref_gt
-                    .allele(marker_idx, HapIdx::new(cursor.active_haps()[k].as_u32()));
+                let ref_al = ref_row[k];
                 let is_mismatch = ref_al != targ_al;
                 let em = if is_mismatch { p_err } else { p_no_err };
 
@@ -1603,8 +1580,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
 
                 for k in 0..n_states {
-                    let h = cursor.active_haps()[k];
-                    let r = self.ref_gt.allele(marker_idx, HapIdx::new(h.as_u32()));
+                    let r = ref_row[k];
                     mismatches[k] = if r == targ_al_next { 0 } else { 1 };
                 }
 

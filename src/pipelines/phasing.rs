@@ -389,8 +389,9 @@ const INVALID_ALLELE: u8 = 254;
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
-    state_buf: Vec<CombinedHapId>,
     state_haps: Vec<HapIdx>,
+    cursor: crate::model::states::MosaicCursor<CombinedHapSpace>,
+    cursor_marker: Option<usize>,
 }
 
 impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
@@ -402,25 +403,33 @@ impl<'a, TargetSpace, RefSpace> RefAlleleProvider<'a, TargetSpace, RefSpace> {
         Self {
             ref_gt,
             threaded_haps,
-            state_buf: vec![CombinedHapId::from(0u32); n_states],
             state_haps: vec![HapIdx::new(0); n_states],
+            cursor: crate::model::states::MosaicCursor::from_threaded(threaded_haps),
+            cursor_marker: None,
         }
     }
 
     #[inline]
     fn fill_ref_alleles(&mut self, marker: usize, out: &mut [u8]) {
         let n_states = self.threaded_haps.n_states().min(out.len());
-        if self.state_buf.len() < n_states {
-            self.state_buf.resize(n_states, CombinedHapId::from(0u32));
-        }
         if self.state_haps.len() < n_states {
             self.state_haps.resize(n_states, HapIdx::new(0));
         }
-        self.threaded_haps
-            .materialize_at(marker, &mut self.state_buf);
+        let can_advance = self
+            .cursor_marker
+            .map(|last| marker >= last)
+            .unwrap_or(true);
+        if can_advance {
+            self.cursor.advance_to_marker(marker, self.threaded_haps);
+        } else {
+            self.cursor = crate::model::states::MosaicCursor::from_threaded(self.threaded_haps);
+            self.cursor.advance_to_marker(marker, self.threaded_haps);
+        }
+        self.cursor_marker = Some(marker);
+        let active = self.cursor.active_haps();
         let marker_idx = MarkerIdx::new(marker as u32);
         for i in 0..n_states {
-            self.state_haps[i] = HapIdx::new(self.state_buf[i].as_u32());
+            self.state_haps[i] = HapIdx::new(active[i].as_u32());
         }
         self.ref_gt.fill_batch(
             marker_idx,

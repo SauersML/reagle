@@ -28,6 +28,39 @@ pub struct DictionaryColumn {
 }
 
 impl DictionaryColumn {
+    #[inline]
+    fn extract_bits(words: &[u64], bit_start: usize, width: usize) -> u64 {
+        if width == 0 {
+            return 0;
+        }
+        let word_idx = bit_start >> 6;
+        let bit_off = bit_start & 63;
+        if bit_off + width <= 64 {
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            (words[word_idx] >> bit_off) & mask
+        } else {
+            let low_bits = 64 - bit_off;
+            let high_bits = width - low_bits;
+            let low_mask = if low_bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << low_bits) - 1
+            };
+            let low = (words[word_idx] >> bit_off) & low_mask;
+            let high_mask = if high_bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << high_bits) - 1
+            };
+            let high = words.get(word_idx + 1).copied().unwrap_or(0) & high_mask;
+            low | (high << low_bits)
+        }
+    }
+
     /// Compress a set of marker columns into a dictionary block
     pub fn compress<F>(
         get_allele: F,
@@ -98,22 +131,27 @@ impl DictionaryColumn {
     pub fn get(&self, marker_offset: usize, hap: HapIdx) -> u8 {
         let pattern_idx = self.hap_to_pattern[hap.as_usize()] as usize;
         let pattern = &self.patterns[pattern_idx];
+        let words = pattern.as_raw_slice();
 
         let bits_per_marker = self.bits_per_allele as usize + 1;
         let start = marker_offset * bits_per_marker;
 
-        // Check the missing bit
-        if pattern[start + bits_per_marker - 1] {
-            return 255;
-        }
-
-        let mut allele = 0u8;
-        for b in 0..self.bits_per_allele as usize {
-            if pattern[start + b] {
-                allele |= 1 << b;
+        // Common hot path: biallelic markers use exactly 2 bits (allele + missing flag).
+        if bits_per_marker == 2 {
+            let bits = Self::extract_bits(words, start, 2);
+            if (bits & 0b10) != 0 {
+                255
+            } else {
+                (bits & 0b1) as u8
             }
+        } else {
+            let packed = Self::extract_bits(words, start, bits_per_marker);
+            let missing_bit = 1u64 << (bits_per_marker - 1);
+            if (packed & missing_bit) != 0 {
+                return 255;
+            }
+            (packed & (missing_bit - 1)) as u8
         }
-        allele
     }
 
     /// Pattern index for a haplotype
@@ -126,20 +164,24 @@ impl DictionaryColumn {
     #[inline]
     pub fn pattern_allele(&self, marker_offset: usize, pattern_idx: usize) -> u8 {
         let pattern = &self.patterns[pattern_idx];
+        let words = pattern.as_raw_slice();
         let bits_per_marker = self.bits_per_allele as usize + 1;
         let start = marker_offset * bits_per_marker;
-
-        if pattern[start + bits_per_marker - 1] {
-            return 255;
-        }
-
-        let mut allele = 0u8;
-        for b in 0..self.bits_per_allele as usize {
-            if pattern[start + b] {
-                allele |= 1 << b;
+        if bits_per_marker == 2 {
+            let bits = Self::extract_bits(words, start, 2);
+            if (bits & 0b10) != 0 {
+                255
+            } else {
+                (bits & 0b1) as u8
             }
+        } else {
+            let packed = Self::extract_bits(words, start, bits_per_marker);
+            let missing_bit = 1u64 << (bits_per_marker - 1);
+            if (packed & missing_bit) != 0 {
+                return 255;
+            }
+            (packed & (missing_bit - 1)) as u8
         }
-        allele
     }
 
     /// Number of haplotypes
