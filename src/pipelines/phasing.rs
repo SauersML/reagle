@@ -348,6 +348,118 @@ fn fit_cohort_calibration(
     })
 }
 
+#[derive(Default, Debug, Clone, Copy)]
+struct OrientationPolishStats {
+    markers_swapped: usize,
+    samples_changed: usize,
+}
+
+fn orientation_emit_cost(sp: &SamplePhase, marker: usize, swapped: bool) -> f64 {
+    let p = sp.phase_confidence(marker).clamp(1.0e-4, 1.0 - 1.0e-4) as f64;
+    let orient_p = if swapped { 1.0 - p } else { p };
+    let conf_w = 0.35 + 0.65 * sp.confidence(marker).clamp(0.0, 1.0) as f64;
+    -orient_p.ln() * conf_w
+}
+
+fn orientation_transition_cost(p_switch: f64, switched: bool) -> f64 {
+    let ps = p_switch.clamp(1.0e-6, 0.45);
+    if switched { -ps.ln() } else { -(1.0 - ps).ln() }
+}
+
+fn polish_sample_orientation_viterbi(
+    sp: &mut SamplePhase,
+    gen_positions: &[f64],
+    params: &ModelParams,
+) -> usize {
+    const ORIENTATION_POLISH_CONF_MAX: f32 = 0.80;
+    let mut het_idxs = Vec::new();
+    for m in 0..sp.len() {
+        if sp.is_missing(m) || sp.is_input_phased_het(m) {
+            continue;
+        }
+        if sp.allele1(m) != sp.allele2(m) && sp.phase_confidence(m) <= ORIENTATION_POLISH_CONF_MAX {
+            het_idxs.push(m);
+        }
+    }
+    if het_idxs.len() < 2 {
+        return 0;
+    }
+
+    // Genome-wide orientation decoding: state 0 keeps local orientation,
+    // state 1 flips local orientation. This aggressively removes phase jitter
+    // while still allowing true recombination where supported.
+    let n = het_idxs.len();
+    let mut back = vec![[0u8; 2]; n];
+    let first = het_idxs[0];
+    let mut prev0 = orientation_emit_cost(sp, first, false);
+    let mut prev1 = orientation_emit_cost(sp, first, true);
+
+    for i in 1..n {
+        let m_prev = het_idxs[i - 1];
+        let m = het_idxs[i];
+        let dist = (gen_positions[m] - gen_positions[m_prev]).max(0.0);
+        let local_uncert = (1.0
+            - 0.5
+                * (sp.phase_confidence(m_prev).clamp(0.0, 1.0)
+                    + sp.phase_confidence(m).clamp(0.0, 1.0))) as f64;
+        let p_switch = (params.p_recomb(dist) as f64) * (0.4 + 1.6 * local_uncert);
+
+        let emit0 = orientation_emit_cost(sp, m, false);
+        let emit1 = orientation_emit_cost(sp, m, true);
+
+        let c00 = prev0 + orientation_transition_cost(p_switch, false);
+        let c10 = prev1 + orientation_transition_cost(p_switch, true);
+        let (next0, b0) = if c00 <= c10 { (c00, 0u8) } else { (c10, 1u8) };
+
+        let c01 = prev0 + orientation_transition_cost(p_switch, true);
+        let c11 = prev1 + orientation_transition_cost(p_switch, false);
+        let (next1, b1) = if c01 <= c11 { (c01, 0u8) } else { (c11, 1u8) };
+
+        back[i][0] = b0;
+        back[i][1] = b1;
+        prev0 = next0 + emit0;
+        prev1 = next1 + emit1;
+    }
+
+    let mut state = if prev0 <= prev1 { 0u8 } else { 1u8 };
+    let mut chosen = vec![0u8; n];
+    for i in (0..n).rev() {
+        chosen[i] = state;
+        if i > 0 {
+            state = back[i][state as usize];
+        }
+    }
+
+    let mut swaps = 0usize;
+    for (i, &m) in het_idxs.iter().enumerate() {
+        let p = sp.phase_confidence(m).clamp(1.0e-4, 1.0 - 1.0e-4);
+        if chosen[i] == 1 {
+            sp.swap_alleles(m);
+            sp.set_phase_confidence(m, 1.0 - p);
+            swaps += 1;
+        } else {
+            sp.set_phase_confidence(m, p);
+        }
+    }
+    swaps
+}
+
+fn polish_orientation_genome_wide(
+    sample_phases: &mut [SamplePhase],
+    gen_positions: &[f64],
+    params: &ModelParams,
+) -> OrientationPolishStats {
+    let mut stats = OrientationPolishStats::default();
+    for sp in sample_phases.iter_mut() {
+        let swaps = polish_sample_orientation_viterbi(sp, gen_positions, params);
+        if swaps > 0 {
+            stats.samples_changed += 1;
+            stats.markers_swapped += swaps;
+        }
+    }
+    stats
+}
+
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
@@ -3247,6 +3359,22 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
         }
 
+        // Final global orientation polish pass.
+        // This Viterbi decoding over heterozygous-marker orientation strongly
+        // suppresses residual switch jitter while preserving true long-range
+        // transitions implied by recombination prior and local confidence.
+        if self.reference_gt.is_none() {
+            let orientation_stats =
+                polish_orientation_genome_wide(&mut sample_phases, &gen_positions, &self.params);
+            if orientation_stats.markers_swapped > 0 {
+                eprintln!(
+                    "Final orientation polish: swapped {} markers across {} samples",
+                    orientation_stats.markers_swapped, orientation_stats.samples_changed
+                );
+                self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
+            }
+        }
+
         // Build final GenotypeMatrix from mutable genotypes
         let final_gt = self.build_final_matrix(&target_gt, &geno, &sample_phases);
 
@@ -4440,9 +4568,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
             per_window_cap.min(auto_target).max(1)
         } else {
-            per_window_cap
-                .min(n_ref_haps)
-                .max(1)
+            per_window_cap.min(n_ref_haps).max(1)
         };
         if self.config.phase_states == 0 {
             eprintln!(
@@ -10964,7 +11090,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
         } else {
             (p_keep, p_swap)
         };
-        let lr = if min_p < 1e-30 { 1e6_f32 } else { (max_p / min_p).min(1e6_f32) };
+        let lr = if min_p < 1e-30 {
+            1e6_f32
+        } else {
+            (max_p / min_p).min(1e6_f32)
+        };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
@@ -10989,13 +11119,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let conf_m = conf[m].clamp(0.0, 1.0);
                 if a1_anchor != 255 {
-                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
                 if a2_anchor != 255 {
-                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
             }
@@ -11045,7 +11183,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
             swap_probs[i] = p_swap.clamp(0.0, 1.0);
             swap_probs_conf[i] = swap_probs[i];
-            swap_lr[i] = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
+            swap_lr[i] = if min_p < 1e-30 {
+                1e6
+            } else {
+                (max_p / min_p).min(1e6)
+            };
         }
     }
 
@@ -12043,6 +12185,33 @@ mod tests {
 
         let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
         assert_eq!(pipeline.params.n_states, 280);
+    }
+
+    #[test]
+    fn test_orientation_polish_removes_alternating_switches() {
+        use crate::model::parameters::ModelParams;
+
+        let n_markers = 40usize;
+        let gen_positions: Vec<f64> = (0..n_markers).map(|i| i as f64 * 0.001).collect();
+        let hap1: Vec<u8> = (0..n_markers)
+            .map(|i| if i % 2 == 0 { 0 } else { 1 })
+            .collect();
+        let hap2: Vec<u8> = hap1.iter().map(|&a| 1 - a).collect();
+        let conf = vec![1.0f32; n_markers];
+        let unphased = vec![];
+        let missing = vec![];
+        let mut sp = SamplePhase::new(n_markers, &hap1, &hap2, &conf, &unphased, &missing);
+        for m in 0..n_markers {
+            sp.set_phase_confidence(m, 0.25);
+        }
+
+        let params = ModelParams::for_phasing(256, 10_000.0, Some(0.001));
+        let swaps = polish_sample_orientation_viterbi(&mut sp, &gen_positions, &params);
+        assert!(swaps <= n_markers);
+        for m in 0..n_markers {
+            let p = sp.phase_confidence(m);
+            assert!((0.0..=1.0).contains(&p));
+        }
     }
 
     #[test]
