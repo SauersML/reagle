@@ -588,6 +588,16 @@ where
         self.alleles_flat.get(idx).copied().unwrap_or(255)
     }
 
+    #[inline]
+    pub fn fill_alleles_for_haps(&self, marker: usize, haps: &[u32], out: &mut [u8]) {
+        let n = haps.len().min(out.len());
+        let base = marker.saturating_mul(self.n_haps);
+        for i in 0..n {
+            let idx = base.saturating_add(haps[i] as usize);
+            out[i] = self.alleles_flat.get(idx).copied().unwrap_or(255);
+        }
+    }
+
     /// Find neighbors of a reference haplotype state in the PBWT.
     ///
     /// This is the "Latent State" approach: instead of threading the target's alleles
@@ -971,6 +981,14 @@ impl BidirectionalPhaseIbs {
         match self {
             Self::U16(inner) => inner.allele(marker, hap),
             Self::U32(inner) => inner.allele(marker, hap),
+        }
+    }
+
+    #[inline]
+    pub fn fill_alleles_for_haps(&self, marker: usize, haps: &[u32], out: &mut [u8]) {
+        match self {
+            Self::U16(inner) => inner.fill_alleles_for_haps(marker, haps, out),
+            Self::U32(inner) => inner.fill_alleles_for_haps(marker, haps, out),
         }
     }
 

@@ -898,13 +898,13 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     let mut beams_fwd: Vec<RankBeam> = (0..batch_haps.len())
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
-    let peer_idx_by_hap = build_peer_indices(batch_haps);
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![PbwtQueryAllele::missing(); batch_haps.len()];
     let mut query_allele_probs = vec![PbwtBiallelicQueryProb::uniform(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
+    let mut anchor_seen_fwd: Vec<usize> = vec![0; batch_haps.len()];
     for m in start..end {
         let local_idx = m - start;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
@@ -946,35 +946,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let phase_conf = target_gt
                         .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
-                    let oriented_pair = if phase_conf < 0.5 {
-                        [qa2, qa1]
-                    } else {
-                        [qa1, qa2]
-                    };
-                    let self_query = oriented_pair[local];
-                    let mut beam_uncertainty =
-                        pbwt_beam_uncertainty(&beams_fwd[i], n_ref_haps, self_query);
-                    let peer_idx = peer_idx_by_hap[i];
-                    if let Some(peer_i) = peer_idx {
-                        let peer_local = batch_haps[peer_i] % 2;
-                        let peer_query = oriented_pair[peer_local];
-                        let peer_uncertainty =
-                            pbwt_beam_uncertainty(&beams_fwd[peer_i], n_ref_haps, peer_query);
-                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
-                    }
                     cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
-                    let geno_conf = target_gt
-                        .sample_confidence_f32(marker_idx, sample_idx)
-                        .clamp(0.0, 1.0);
-                    let best_orient_err = phase_best_orientation_error(phase_conf);
-                    let orientation_guard =
-                        phase_query_orientation_error_limit(geno_conf, beam_uncertainty);
-                    let orientation_suspect = best_orient_err > orientation_guard;
                     // Phased scaffold markers are explicit orientation constraints.
-                    // Keep an oriented query even when confidence is moderate.
-                    if orientation_suspect && phase_conf >= 0.5 {
-                        cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf.max(0.7));
-                    }
                     if phase_conf < 0.5 {
                         cached_query_pair = [qa2, qa1];
                     } else {
@@ -1115,6 +1088,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     .unwrap_or(0);
                 let full_anchor_scoring = phased != 0 && is_het;
                 if full_anchor_scoring {
+                    anchor_seen_fwd[i] = anchor_seen_fwd[i].saturating_add(1);
+                    // Normalize cumulative anchor contribution so dense anchors do not dominate.
+                    let anchor_norm = 1.0 / (anchor_seen_fwd[i] as f32).sqrt().max(1.0);
                     for idx in 0..n_ref_haps {
                         if exclude_self && idx / 2 == hap_idx / 2 {
                             continue;
@@ -1142,7 +1118,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight = anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -1199,6 +1175,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
     let mut beams_bwd: Vec<RankBeam> = (0..batch_haps.len())
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
+    let mut anchor_seen_bwd: Vec<usize> = vec![0; batch_haps.len()];
     for (rev_step, m) in (start..end).rev().enumerate() {
         let local_idx = end - start - 1 - rev_step;
         let orig_m = marker_map.and_then(|map| map.get(m).copied()).unwrap_or(m);
@@ -1240,35 +1217,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     let phase_conf = target_gt
                         .sample_phase_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
-                    let oriented_pair = if phase_conf < 0.5 {
-                        [qa2, qa1]
-                    } else {
-                        [qa1, qa2]
-                    };
-                    let self_query = oriented_pair[local];
-                    let mut beam_uncertainty =
-                        pbwt_beam_uncertainty(&beams_bwd[i], n_ref_haps, self_query);
-                    let peer_idx = peer_idx_by_hap[i];
-                    if let Some(peer_i) = peer_idx {
-                        let peer_local = batch_haps[peer_i] % 2;
-                        let peer_query = oriented_pair[peer_local];
-                        let peer_uncertainty =
-                            pbwt_beam_uncertainty(&beams_bwd[peer_i], n_ref_haps, peer_query);
-                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
-                    }
                     cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf);
-                    let geno_conf = target_gt
-                        .sample_confidence_f32(marker_idx, sample_idx)
-                        .clamp(0.0, 1.0);
-                    let best_orient_err = phase_best_orientation_error(phase_conf);
-                    let orientation_guard =
-                        phase_query_orientation_error_limit(geno_conf, beam_uncertainty);
-                    let orientation_suspect = best_orient_err > orientation_guard;
                     // Phased scaffold markers are explicit orientation constraints.
-                    // Keep an oriented query even when confidence is moderate.
-                    if orientation_suspect && phase_conf >= 0.5 {
-                        cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf.max(0.7));
-                    }
                     if phase_conf < 0.5 {
                         cached_query_pair = [qa2, qa1];
                     } else {
@@ -1409,6 +1359,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     .unwrap_or(0);
                 let full_anchor_scoring = phased != 0 && is_het;
                 if full_anchor_scoring {
+                    anchor_seen_bwd[i] = anchor_seen_bwd[i].saturating_add(1);
+                    let anchor_norm = 1.0 / (anchor_seen_bwd[i] as f32).sqrt().max(1.0);
                     for idx in 0..n_ref_haps {
                         if exclude_self && idx / 2 == hap_idx / 2 {
                             continue;
@@ -1436,7 +1388,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight = anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -9013,6 +8965,7 @@ fn ffbs_haploid_constrained(
     let fwd_prev = &mut workspace.ffbs_fwd_prev;
     let fwd_at_marker = &mut workspace.ffbs_fwd_at_marker;
     let weights = &mut workspace.ffbs_weights;
+    let mut neighbor_alleles = vec![255u8; actual_n_states];
     fwd_curr[..actual_n_states].fill(0.0);
     fwd_prev[..actual_n_states].fill(0.0);
 
@@ -9025,8 +8978,9 @@ fn ffbs_haploid_constrained(
         conf[0],
         phase_conf[0],
     );
+    phase_ibs.fill_alleles_for_haps(0, &neighbors[..actual_n_states], &mut neighbor_alleles);
     for k in 0..actual_n_states {
-        let ref_al = phase_ibs.allele(0, neighbors[k]);
+        let ref_al = neighbor_alleles[k];
         let emit = emit_haploid_constrained(
             ref_al,
             geno_a1[0],
@@ -9059,6 +9013,7 @@ fn ffbs_haploid_constrained(
             conf[m],
             phase_conf[m],
         );
+        phase_ibs.fill_alleles_for_haps(m, &neighbors[..actual_n_states], &mut neighbor_alleles);
 
         // SIMD-optimized transition + emission
         let shift_vec = f32x8::splat(shift);
@@ -9074,7 +9029,7 @@ fn ffbs_haploid_constrained(
             // Compute emissions
             let emit_arr = [
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k]),
+                    neighbor_alleles[k],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9083,7 +9038,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 1]),
+                    neighbor_alleles[k + 1],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9092,7 +9047,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 2]),
+                    neighbor_alleles[k + 2],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9101,7 +9056,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 3]),
+                    neighbor_alleles[k + 3],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9110,7 +9065,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 4]),
+                    neighbor_alleles[k + 4],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9119,7 +9074,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 5]),
+                    neighbor_alleles[k + 5],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9128,7 +9083,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 6]),
+                    neighbor_alleles[k + 6],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9137,7 +9092,7 @@ fn ffbs_haploid_constrained(
                     p_err,
                 ),
                 emit_haploid_constrained(
-                    phase_ibs.allele(m, neighbors[k + 7]),
+                    neighbor_alleles[k + 7],
                     geno_a1[m],
                     geno_a2[m],
                     fixed_allele[m],
@@ -9160,7 +9115,7 @@ fn ffbs_haploid_constrained(
         for i in k..actual_n_states {
             let prior = scale * fwd_prev[i] + shift;
             let emit = emit_haploid_constrained(
-                phase_ibs.allele(m, neighbors[i]),
+                neighbor_alleles[i],
                 geno_a1[m],
                 geno_a2[m],
                 fixed_allele[m],
