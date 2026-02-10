@@ -1594,22 +1594,23 @@ fn local_to_global_paths(
     n_markers: usize,
 ) -> GlobalMosaicPaths {
     let n_states = threaded.n_states();
-    let mut buffer = vec![CombinedHapId::from(0u32); n_states];
+    let mut cursor = crate::model::states::MosaicCursor::from_threaded(threaded);
     let mut path1 = Vec::with_capacity(n_markers);
     let mut path2 = Vec::with_capacity(n_markers);
 
     for m in 0..n_markers {
-        threaded.materialize_at(m, &mut buffer);
+        cursor.advance_to_marker(m, threaded);
+        let active = cursor.active_haps();
         let s1 = local.path1[m] as usize;
         let s2 = local.path2[m] as usize;
 
         path1.push(if s1 < n_states {
-            buffer[s1]
+            active[s1]
         } else {
             CombinedHapId::from(0u32)
         });
         path2.push(if s2 < n_states {
-            buffer[s2]
+            active[s2]
         } else {
             CombinedHapId::from(0u32)
         });
@@ -1623,17 +1624,17 @@ fn global_to_local_paths(
     threaded: &crate::model::states::ThreadedHaps<CombinedHapSpace>,
     n_markers: usize,
 ) -> Option<MosaicPaths> {
-    let n_states = threaded.n_states();
-    let mut buffer = vec![CombinedHapId::from(0u32); n_states];
+    let mut cursor = crate::model::states::MosaicCursor::from_threaded(threaded);
     let mut path1 = Vec::with_capacity(n_markers);
     let mut path2 = Vec::with_capacity(n_markers);
 
     for m in 0..n_markers {
-        threaded.materialize_at(m, &mut buffer);
+        cursor.advance_to_marker(m, threaded);
+        let active = cursor.active_haps();
 
         let g1 = global.path1[m];
         let mut s1 = None;
-        for (i, &gid) in buffer.iter().enumerate() {
+        for (i, &gid) in active.iter().enumerate() {
             if gid == g1 {
                 s1 = Some(i as u32);
                 break;
@@ -1642,7 +1643,7 @@ fn global_to_local_paths(
 
         let g2 = global.path2[m];
         let mut s2 = None;
-        for (i, &gid) in buffer.iter().enumerate() {
+        for (i, &gid) in active.iter().enumerate() {
             if gid == g2 {
                 s2 = Some(i as u32);
                 break;
@@ -6359,14 +6360,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             // Preserve current orientation if path is unavailable at this marker.
                                             a1
                                         } else {
-                                            let r1 = subset_view.allele(
-                                                MarkerIdx::new(idx as u32),
-                                                HapIdx::new(h1),
-                                            );
-                                            let r2 = subset_view.allele(
-                                                MarkerIdx::new(idx as u32),
-                                                HapIdx::new(h2),
-                                            );
+                                            let marker_idx = MarkerIdx::new(idx as u32);
+                                            let haps = [HapIdx::new(h1), HapIdx::new(h2)];
+                                            let mut row = [255u8; 2];
+                                            subset_view.fill_batch(marker_idx, &haps, &mut row);
+                                            let r1 = row[0];
+                                            let r2 = row[1];
                                             if r1 == a1 && r2 == a2 {
                                                 a1
                                             } else if r1 == a2 && r2 == a1 {
@@ -9470,6 +9469,7 @@ fn sample_dynamic_mcmc(
                 .unwrap_or(1)
                 .max(1);
             let mut scores = vec![0.0f32; limit * limit];
+            let mut neighbor_alleles = vec![255u8; limit];
             let mut informative = 0usize;
             for m in (0..n_markers).step_by(marker_stride) {
                 let a1 = seq1[m];
@@ -9480,12 +9480,11 @@ fn sample_dynamic_mcmc(
                 informative += 1;
                 let conf_m = conf[m].clamp(0.0, 1.0);
                 let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                phase_ibs.fill_alleles_for_haps(m, &neighbors[..limit], &mut neighbor_alleles);
                 for i in 0..limit {
-                    let h1 = neighbors[i];
-                    let r1 = phase_ibs.allele(m, h1);
+                    let r1 = neighbor_alleles[i];
                     for j in 0..i {
-                        let h2 = neighbors[j];
-                        let r2 = phase_ibs.allele(m, h2);
+                        let r2 = neighbor_alleles[j];
                         let prob = if is_het {
                             let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
                                 * emit_prob(r2, a2, conf_m, p_no_err, p_err);
