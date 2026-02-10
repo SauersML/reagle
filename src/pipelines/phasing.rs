@@ -351,6 +351,7 @@ fn fit_cohort_calibration(
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
 const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
+const STAGE1_BLOCK_TARGET_MARKERS_FAST_MAX: usize = 800;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MIN_MARKER_STEP: usize = 50;
@@ -486,9 +487,50 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
     if gen_positions.len() < 2 {
         return STAGE1_BLOCK_MIN_CM;
     }
-    let span = (gen_positions[gen_positions.len() - 1] - gen_positions[0]).abs();
-    let avg = span / (gen_positions.len().saturating_sub(1).max(1) as f64);
-    let block = avg * STAGE1_BLOCK_TARGET_MARKERS as f64;
+
+    let mut sum_dist = 0.0f64;
+    let mut sum_sq_dist = 0.0f64;
+    let mut n_dist = 0usize;
+    for w in gen_positions.windows(2) {
+        let d = (w[1] - w[0]).abs().max(f64::EPSILON);
+        sum_dist += d;
+        sum_sq_dist += d * d;
+        n_dist += 1;
+    }
+    if n_dist == 0 {
+        return STAGE1_BLOCK_MIN_CM;
+    }
+
+    let avg = sum_dist / n_dist as f64;
+    let variance = (sum_sq_dist / n_dist as f64 - avg * avg).max(0.0);
+    let std_dev = variance.sqrt();
+    let cv = std_dev / avg.max(f64::EPSILON);
+
+    // Fast, accuracy-safe adaptive block sizing:
+    // - In stable marker-density regions (low CV), use larger blocks to cut Stage 1 transitions.
+    // - On very large windows, increase block marker targets further to reduce MCMC overhead.
+    // - In volatile/sparse regions (high CV), stay close to legacy behavior.
+    let density_stability_boost = if cv < 0.65 {
+        1.0 + ((0.65 - cv) / 0.65) * 1.4
+    } else {
+        1.0
+    };
+    let window_scale_boost = match gen_positions.len() {
+        0..=4_999 => 1.0,
+        5_000..=11_999 => 1.2,
+        12_000..=24_999 => 1.5,
+        _ => 1.8,
+    };
+    let target_markers = ((STAGE1_BLOCK_TARGET_MARKERS as f64
+        * density_stability_boost
+        * window_scale_boost)
+        .round() as usize)
+        .clamp(
+            STAGE1_BLOCK_TARGET_MARKERS,
+            STAGE1_BLOCK_TARGET_MARKERS_FAST_MAX,
+        );
+
+    let block = avg * target_markers as f64;
     block.clamp(STAGE1_BLOCK_MIN_CM, STAGE1_BLOCK_MAX_CM)
 }
 
@@ -4440,9 +4482,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
             per_window_cap.min(auto_target).max(1)
         } else {
-            per_window_cap
-                .min(n_ref_haps)
-                .max(1)
+            per_window_cap.min(n_ref_haps).max(1)
         };
         if self.config.phase_states == 0 {
             eprintln!(
@@ -10964,7 +11004,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
         } else {
             (p_keep, p_swap)
         };
-        let lr = if min_p < 1e-30 { 1e6_f32 } else { (max_p / min_p).min(1e6_f32) };
+        let lr = if min_p < 1e-30 {
+            1e6_f32
+        } else {
+            (max_p / min_p).min(1e6_f32)
+        };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
@@ -10989,13 +11033,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let conf_m = conf[m].clamp(0.0, 1.0);
                 if a1_anchor != 255 {
-                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
                 if a2_anchor != 255 {
-                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
             }
@@ -11045,7 +11097,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
             swap_probs[i] = p_swap.clamp(0.0, 1.0);
             swap_probs_conf[i] = swap_probs[i];
-            swap_lr[i] = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
+            swap_lr[i] = if min_p < 1e-30 {
+                1e6
+            } else {
+                (max_p / min_p).min(1e6)
+            };
         }
     }
 
