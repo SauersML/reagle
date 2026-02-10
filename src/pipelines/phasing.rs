@@ -630,17 +630,147 @@ fn adaptive_prescan_top_m(scores: &[f32], base_top: usize, n_ref_haps: usize) ->
 }
 
 fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(fwd.len());
-    for i in 0..fwd.len() {
+    #[inline]
+    fn logit(p: f32) -> f32 {
+        let q = p.clamp(1e-6, 1.0 - 1e-6);
+        (q / (1.0 - q)).ln()
+    }
+
+    #[inline]
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    #[inline]
+    fn certainty(p: f32) -> f32 {
+        ((p - 0.5).abs() * 2.0).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn legacy_combine(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(fwd.len());
+        for i in 0..fwd.len() {
+            let pf = fwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
+            let pb = bwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
+            let lf = (pf / (1.0 - pf)).ln();
+            let lb = (pb / (1.0 - pb)).ln();
+            let logit = lf + lb;
+            let p = 1.0 / (1.0 + (-logit).exp());
+            out.push(p.clamp(1e-6, 1.0 - 1e-6));
+        }
+        out
+    }
+
+    let n = fwd.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Preserve legacy behavior on very short windows where broad contextual
+    // smoothing can blur intended synthetic block boundaries.
+    if n < 128 {
+        return legacy_combine(fwd, bwd);
+    }
+
+    let mut fused_logits = vec![0.0f32; n];
+    let mut local_disagreement = vec![0.0f32; n];
+
+    for i in 0..n {
         let pf = fwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
         let pb = bwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
-        let lf = (pf / (1.0 - pf)).ln();
-        let lb = (pb / (1.0 - pb)).ln();
-        let logit = lf + lb;
-        let p = 1.0 / (1.0 + (-logit).exp());
-        out.push(p.clamp(1e-6, 1.0 - 1e-6));
+        let lf = logit(pf);
+        let lb = logit(pb);
+        let cf = certainty(pf);
+        let cb = certainty(pb);
+        let agreement = (1.0 - (pf - pb).abs()).clamp(0.0, 1.0);
+        local_disagreement[i] = 1.0 - agreement;
+
+        // Build a short-range contextual prior from neighboring markers.
+        // This stabilizes difficult rare-variant sites where directional passes
+        // may disagree but local phase context is coherent.
+        let lo = i.saturating_sub(3);
+        let hi = (i + 3).min(n.saturating_sub(1));
+        let mut prior_acc = 0.0f32;
+        let mut prior_w = 0.0f32;
+        for j in lo..=hi {
+            if j == i {
+                continue;
+            }
+            let dist = i.abs_diff(j) as f32;
+            let kernel = (4.0 - dist).max(0.0);
+            if kernel <= 0.0 {
+                continue;
+            }
+            let pjf = fwd.get(j).copied().unwrap_or(0.5);
+            let pjb = bwd.get(j).copied().unwrap_or(0.5);
+            let cj = certainty(0.5 * (pjf + pjb));
+            let lw = kernel * (0.35 + 0.65 * cj);
+            prior_acc += lw * 0.5 * (logit(pjf) + logit(pjb));
+            prior_w += lw;
+        }
+        let prior_logit = if prior_w > 0.0 {
+            prior_acc / prior_w
+        } else {
+            0.0
+        };
+
+        // Confidence-aware directional weighting + contextual Bayesian shrinkage.
+        let wf = 0.75 + 1.25 * cf + 0.5 * agreement;
+        let wb = 0.75 + 1.25 * cb + 0.5 * agreement;
+        let wc = 0.35 + 1.1 * (1.0 - agreement) + 0.6 * (1.0 - cf.max(cb));
+        let denom = (wf + wb + wc).max(1e-6);
+        fused_logits[i] = (wf * lf + wb * lb + wc * prior_logit) / denom;
     }
-    out
+
+    // Two-direction confidence-adaptive smoothing in logit space to suppress
+    // isolated spikes while preserving sharp block boundaries.
+    let mut smoothed = fused_logits;
+    for i in 1..n {
+        let alpha = (0.08 + 0.42 * local_disagreement[i]).clamp(0.05, 0.5);
+        smoothed[i] = (1.0 - alpha) * smoothed[i] + alpha * smoothed[i - 1];
+    }
+    for i in (0..n.saturating_sub(1)).rev() {
+        let alpha = (0.08 + 0.42 * local_disagreement[i]).clamp(0.05, 0.5);
+        smoothed[i] = (1.0 - alpha) * smoothed[i] + alpha * smoothed[i + 1];
+    }
+
+    smoothed
+        .into_iter()
+        .map(|l| sigmoid(l).clamp(1e-6, 1.0 - 1e-6))
+        .collect()
+}
+
+#[cfg(test)]
+mod combine_swap_prob_tests {
+    use super::combine_swap_probs;
+
+    #[test]
+    fn preserves_confident_directional_consensus() {
+        let fwd = vec![0.97, 0.95, 0.96, 0.98, 0.97];
+        let bwd = vec![0.96, 0.94, 0.97, 0.98, 0.95];
+        let out = combine_swap_probs(&fwd, &bwd);
+        assert_eq!(out.len(), fwd.len());
+        assert!(out.iter().all(|&p| p > 0.95));
+    }
+
+    #[test]
+    fn resolves_isolated_conflict_using_local_context() {
+        let mut fwd = vec![0.93; 160];
+        let mut bwd = vec![0.92; 160];
+        fwd[80] = 0.05;
+        bwd[80] = 0.08;
+        let out = combine_swap_probs(&fwd, &bwd);
+        // Local flanks strongly support a swapped configuration; the
+        // center marker should be pulled away from an isolated anti-signal.
+        assert!(out[80] > fwd[80]);
+        assert!(out[80] > bwd[80]);
+    }
+
+    #[test]
+    fn tolerates_length_mismatch_by_falling_back_to_neutral_probs() {
+        let out = combine_swap_probs(&[0.9, 0.1, 0.8], &[0.9]);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|p| *p > 0.0 && *p < 1.0));
+    }
 }
 
 fn build_sparse_scores(
@@ -4440,9 +4570,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
             per_window_cap.min(auto_target).max(1)
         } else {
-            per_window_cap
-                .min(n_ref_haps)
-                .max(1)
+            per_window_cap.min(n_ref_haps).max(1)
         };
         if self.config.phase_states == 0 {
             eprintln!(
@@ -10964,7 +11092,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
         } else {
             (p_keep, p_swap)
         };
-        let lr = if min_p < 1e-30 { 1e6_f32 } else { (max_p / min_p).min(1e6_f32) };
+        let lr = if min_p < 1e-30 {
+            1e6_f32
+        } else {
+            (max_p / min_p).min(1e6_f32)
+        };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
@@ -10989,13 +11121,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let conf_m = conf[m].clamp(0.0, 1.0);
                 if a1_anchor != 255 {
-                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
                 if a2_anchor != 255 {
-                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
             }
@@ -11045,7 +11185,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
             swap_probs[i] = p_swap.clamp(0.0, 1.0);
             swap_probs_conf[i] = swap_probs[i];
-            swap_lr[i] = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
+            swap_lr[i] = if min_p < 1e-30 {
+                1e6
+            } else {
+                (max_p / min_p).min(1e6)
+            };
         }
     }
 
