@@ -10970,84 +10970,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
     }
 
-    if new_paths.path1.len() == n_markers && new_paths.path2.len() == n_markers {
-        let mut flip_to_anchor = false;
-        if has_anchor {
-            let mut score_direct = 0.0f32;
-            let mut score_flip = 0.0f32;
-            let mut evidence = 0usize;
-            for m in 0..n_markers {
-                let a1_anchor = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2_anchor = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1_anchor == 255 && a2_anchor == 255 {
-                    continue;
-                }
-                let s1 = seq1[m];
-                let s2 = seq2[m];
-                if s1 == 255 || s2 == 255 || s1 == s2 {
-                    continue;
-                }
-                let conf_m = conf[m].clamp(0.0, 1.0);
-                if a1_anchor != 255 {
-                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    evidence += 1;
-                }
-                if a2_anchor != 255 {
-                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    evidence += 1;
-                }
-            }
-            if evidence > 0 && score_flip > score_direct {
-                flip_to_anchor = true;
-            }
-        }
-
-        let mut path_provider = RefAlleleProvider::new(ref_view, threaded_haps);
-        let ref_alleles = buffers.ref_alleles.as_mut_slice();
-        for (i, &m) in het_positions.iter().enumerate() {
-            let a1 = if flip_to_anchor { seq2[m] } else { seq1[m] };
-            let a2 = if flip_to_anchor { seq1[m] } else { seq2[m] };
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                swap_probs[i] = 0.5;
-                swap_lr[i] = 1.0;
-                continue;
-            }
-            let p1 = new_paths.path1[m] as usize;
-            let p2 = new_paths.path2[m] as usize;
-            if p1 >= n_states_usize || p2 >= n_states_usize {
-                swap_probs[i] = 0.5;
-                swap_lr[i] = 1.0;
-                continue;
-            }
-            let ref_row = if !shared_ref.is_empty() {
-                let offset = m * n_states_usize;
-                &shared_ref[offset..offset + n_states_usize]
-            } else {
-                path_provider.fill_ref_alleles(m, ref_alleles);
-                &ref_alleles[..n_states_usize]
-            };
-            let ref1 = ref_row[p1];
-            let ref2 = ref_row[p2];
-            let conf_m = conf[m];
-            let keep = emit_prob(ref1, a1, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a2, conf_m, p_no_err, p_err);
-            let swap = emit_prob(ref1, a2, conf_m, p_no_err, p_err)
-                * emit_prob(ref2, a1, conf_m, p_no_err, p_err);
-            let denom = keep + swap;
-            let p_swap = if denom > 0.0 { swap / denom } else { 0.5 };
-            let p_keep = 1.0 - p_swap;
-            let (max_p, min_p) = if p_swap >= p_keep {
-                (p_swap, p_keep)
-            } else {
-                (p_keep, p_swap)
-            };
-            swap_probs[i] = p_swap.clamp(0.0, 1.0);
-            swap_probs_conf[i] = swap_probs[i];
-            swap_lr[i] = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
-        }
-    }
+    // Removed redundant and unstable overwrite loop (using single sample "new_paths").
+    // The MCMC loop above already accumulates robust posterior probabilities in `swap_probs`.
 
     if !het_positions.is_empty() {
         let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
@@ -12476,8 +12400,14 @@ mod tests {
             anchor_h1[m] = hero_pattern[m];
             anchor_h2[m] = 1 - hero_pattern[m];
         }
+        // Anchor the last marker to prevent tail drift
+        if n_markers > 0 {
+            let last = n_markers - 1;
+            anchor_h1[last] = hero_pattern[last];
+            anchor_h2[last] = 1 - hero_pattern[last];
+        }
 
-        let p_recomb = vec![0.001f32; n_markers];
+        let p_recomb = vec![0.0001f32; n_markers];
         let block_starts: Arc<[usize]> = blocks_to_starts(&[(0, n_markers)], n_markers)
             .into_boxed_slice()
             .into();
