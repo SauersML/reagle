@@ -375,7 +375,6 @@ const FAST_BEAM_INJECT_K: usize = 8;
 const FAST_BEAM_FIX_CONF: f32 = 0.99;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
-const PHASE_STATE_HARD_CAP: usize = 200;
 const PHASE_AUTO_PRESCAN_MULT: usize = 4;
 const PHASE_AUTO_PRESCAN_MIN: usize = 512;
 const PHASE_AUTO_PRESCAN_MAX: usize = 2048;
@@ -4442,7 +4441,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             per_window_cap.min(auto_target).max(1)
         } else {
             per_window_cap
-                .min(PHASE_STATE_HARD_CAP)
                 .min(n_ref_haps)
                 .max(1)
         };
@@ -6422,9 +6420,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let mut het_updates = Vec::with_capacity(het_positions.len());
                         for (map_idx, &idx) in het_positions.iter().enumerate() {
                             let lr = PhaseLogOdds(*swap_lr.get(map_idx).unwrap_or(&1.0));
-                            let confidence = if use_dynamic_mcmc {
-                                PhaseConfidence(0.5)
-                            } else {
+                            let confidence = {
                                 let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
                                 let swap_bit = *swap_bits.get(map_idx).unwrap_or(&0);
                                 let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
@@ -10547,51 +10543,69 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     });
     ranked_states.truncate(target_k.max(2));
 
-    // Stage 2: O(M*Kc^2) pair scoring over reduced candidate set.
+    // Stage 2: Greedy beam pair scoring over reduced candidate set.
+    // Use top unary states as first-haplotype seeds, then score all partners per seed.
+    const BEAM_SEEDS: usize = 8;
     let cand_k = ranked_states.len();
-    let need = cand_k * cand_k;
-    if scores.len() < need {
-        scores.resize(need, 0.0);
-    } else {
-        scores[..need].fill(0.0);
+    if scores.len() < cand_k {
+        scores.resize(cand_k, 0.0);
     }
-    let mut emit_a1 = vec![0.0f32; cand_k];
-    let mut emit_a2 = vec![0.0f32; cand_k];
-    let mut emit_obs = vec![0.0f32; cand_k];
-    for (row_i, &m) in sparse_markers.iter().enumerate() {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
-        let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-        let obs = if a1 != 255 { a1 } else { a2 };
-        let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
-        for (ci, &state_idx) in ranked_states.iter().enumerate() {
-            let r = ref_row[state_idx];
-            emit_a1[ci] = emit_prob(r, a1, conf_m, p_no_err, p_err);
-            emit_a2[ci] = emit_prob(r, a2, conf_m, p_no_err, p_err);
-            emit_obs[ci] = emit_prob(r, obs, conf_m, p_no_err, p_err);
-        }
 
-        for i in 0..cand_k {
-            for j in 0..i {
-                let prob = if is_het {
-                    0.5 * (emit_a1[i] * emit_a2[j] + emit_a2[i] * emit_a1[j])
-                } else {
-                    emit_obs[i] * emit_obs[j]
-                };
-                scores[i * cand_k + j] += prob.max(1e-30).ln();
-            }
-        }
-    }
+    let mut seed_states = ranked_states.clone();
+    seed_states.sort_by(|&a, &b| {
+        state_unary[b]
+            .partial_cmp(&state_unary[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    seed_states.truncate(BEAM_SEEDS.min(cand_k));
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (ranked_states[0], ranked_states[1]);
-    for i in 0..cand_k {
-        let si = ranked_states[i];
+    for &si in seed_states.iter() {
+        scores[..cand_k].fill(0.0);
         let bonus_i = state_bonus[si];
-        for j in 0..i {
-            let sj = ranked_states[j];
-            let s = scores[i * cand_k + j] + bonus_i + state_bonus[sj];
+
+        for (row_i, &m) in sparse_markers.iter().enumerate() {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+            let obs = if a1 != 255 { a1 } else { a2 };
+            let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
+            let r_seed = ref_row[si];
+
+            if is_het {
+                let seed_a1 = emit_prob(r_seed, a1, conf_m, p_no_err, p_err);
+                let seed_a2 = emit_prob(r_seed, a2, conf_m, p_no_err, p_err);
+                for (cj, &sj) in ranked_states.iter().enumerate() {
+                    if sj == si {
+                        continue;
+                    }
+                    let rj = ref_row[sj];
+                    let e1j = emit_prob(rj, a1, conf_m, p_no_err, p_err);
+                    let e2j = emit_prob(rj, a2, conf_m, p_no_err, p_err);
+                    let prob = 0.5 * (seed_a1 * e2j + seed_a2 * e1j);
+                    scores[cj] += prob.max(1e-30).ln();
+                }
+            } else {
+                let seed_obs = emit_prob(r_seed, obs, conf_m, p_no_err, p_err);
+                for (cj, &sj) in ranked_states.iter().enumerate() {
+                    if sj == si {
+                        continue;
+                    }
+                    let rj = ref_row[sj];
+                    let obs_j = emit_prob(rj, obs, conf_m, p_no_err, p_err);
+                    let prob = seed_obs * obs_j;
+                    scores[cj] += prob.max(1e-30).ln();
+                }
+            }
+        }
+
+        for (cj, &sj) in ranked_states.iter().enumerate() {
+            if sj == si {
+                continue;
+            }
+            let s = scores[cj] + bonus_i + state_bonus[sj];
             if s > best_score {
                 best_score = s;
                 best_pair = (si, sj);

@@ -153,7 +153,6 @@ impl<Space> ThreadedHaps<Space> {
 /// in reverse to restore the cursor to its previous state.
 ///
 /// This approach is O(switches) memory vs O(markers × states) for snapshots.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct StateSwitch<Space> {
     /// Marker index where switch occurred (inclusive start of new segment)
@@ -298,7 +297,6 @@ impl<Space> MosaicCursor<Space> {
     /// history stack whenever a state crosses a segment boundary. This enables
     /// efficient backward pass rewinding without O(M×K) snapshots.
     #[inline]
-    #[cfg(test)]
     pub fn advance_with_history(
         &mut self,
         marker: usize,
@@ -337,7 +335,6 @@ impl<Space> MosaicCursor<Space> {
     /// Note: This only restores `active_haps`, not internal cursor pointers.
     /// This is safe because the backward pass only reads `active_haps`.
     #[inline]
-    #[cfg(test)]
     pub fn rewind(&mut self, target_marker: usize, history: &mut Vec<StateSwitch<Space>>) {
         while let Some(event) = history.last() {
             if event.marker as usize > target_marker {

@@ -31,7 +31,7 @@ impl HmmUpdater {
     const LOG8_LEVELS: f32 = 255.0;
     const LOG8_RANGE_NATS: f32 = 24.0;
     const LOG8_EPS: f32 = 1e-30;
-    const LOG8_SWITCH_STATES: usize = 1024;
+    const LOG8_SWITCH_STATES: usize = usize::MAX;
     const LOG8_RANGE_LOG2: f32 = Self::LOG8_RANGE_NATS / std::f32::consts::LN_2;
     const LOG8_STEP_LOG2: f32 = Self::LOG8_RANGE_LOG2 / Self::LOG8_LEVELS;
     const LOG8_INV_STEP_LOG2: f32 = 1.0 / Self::LOG8_STEP_LOG2;
@@ -655,7 +655,7 @@ impl HmmUpdater {
 use crate::model::pl_emission::{
     PlProvider, allele_probs_cond_from_pl, allele_probs_uncond_from_pl,
 };
-use crate::model::states::{MosaicCursor, ThreadedHaps};
+use crate::model::states::{MosaicCursor, StateSwitch, ThreadedHaps};
 use crate::model::types::{CombinedHapSpace, HapId};
 
 /// High-performance Li-Stephens HMM using mosaic states with A-B-C loop pattern.
@@ -754,22 +754,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let mut log_likelihood = 0.0f64;
 
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
-        let mut ref_alleles_flat =
-            AVec::<u8, ConstAlign<64>>::from_iter(64, std::iter::repeat(255u8).take(total_size));
+        let mut ref_alleles_row =
+            AVec::<u8, ConstAlign<64>>::from_iter(64, std::iter::repeat(255u8).take(n_states_padded));
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
-        for m in 0..n_markers {
-            cursor.advance_to_marker(m, threaded_haps);
-            let active = cursor.active_haps();
-            for k in 0..n_states {
-                state_haps[k] = HapIdx::new(active[k].as_u32());
-            }
-            let row_offset = m * n_states_padded;
-            self.ref_gt.fill_batch(
-                MarkerIdx::new(m as u32),
-                &state_haps,
-                &mut ref_alleles_flat[row_offset..row_offset + n_states],
-            );
-        }
+        let mut cursor_history: Vec<StateSwitch<HapSpace>> = Vec::new();
         let inv_n_states = 1.0 / n_states as f32;
         let mut shift_by_marker = vec![0.0f32; n_markers];
         let mut one_minus_by_marker = vec![0.0f32; n_markers];
@@ -928,19 +916,13 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let try_fill_pattern_emissions =
             |_: usize, _: u8, _: Option<&[f32]>, _: &mut [f32], _: &[HapId<HapSpace>]| false;
 
-        let mut process_marker = |m: usize, kind: MarkerKind| {
+        let mut process_marker = |m: usize, kind: MarkerKind, ref_row: &[u8]| {
             let row_offset = m * n_states_padded;
             let emissions_row = &mut emissions[..n_states];
-            let ref_row = &ref_alleles_flat[row_offset..row_offset + n_states];
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             if m + PREFETCH_DISTANCE < n_markers {
-                let prefetch_ref = (m + PREFETCH_DISTANCE) * n_states_padded;
                 let prefetch_fwd = (m + PREFETCH_DISTANCE) * n_states_padded;
                 unsafe {
-                    _mm_prefetch(
-                        ref_alleles_flat.as_ptr().add(prefetch_ref) as *const i8,
-                        _MM_HINT_T0,
-                    );
                     _mm_prefetch(
                         fwd_aligned.as_ptr().add(prefetch_fwd) as *const i8,
                         _MM_HINT_T0,
@@ -1158,7 +1140,17 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let tile_end = (m + TILE_SIZE).min(end);
                 let mut i = m;
                 while i < tile_end {
-                    process_marker(i, seg.kind);
+                    cursor.advance_with_history(i, threaded_haps, &mut cursor_history);
+                    let active = cursor.active_haps();
+                    for k in 0..n_states {
+                        state_haps[k] = HapIdx::new(active[k].as_u32());
+                    }
+                    self.ref_gt.fill_batch(
+                        MarkerIdx::new(i as u32),
+                        &state_haps,
+                        &mut ref_alleles_row[..n_states],
+                    );
+                    process_marker(i, seg.kind, &ref_alleles_row[..n_states]);
                     i += 1;
                 }
                 m = tile_end;
@@ -1176,18 +1168,23 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             let tile_start = tile_end.saturating_sub(TILE_SIZE).max(1);
             for m in (tile_start - 1..tile_end - 1).rev() {
                 let m_next = m + 1;
-                let next_row_offset = m_next * n_states_padded;
-                let ref_row = &ref_alleles_flat[next_row_offset..next_row_offset + n_states];
+                // Stream ref alleles for m_next via cursor rewind
+                cursor.rewind(m_next, &mut cursor_history);
+                let active = cursor.active_haps();
+                for k in 0..n_states {
+                    state_haps[k] = HapIdx::new(active[k].as_u32());
+                }
+                self.ref_gt.fill_batch(
+                    MarkerIdx::new(m_next as u32),
+                    &state_haps,
+                    &mut ref_alleles_row[..n_states],
+                );
+                let ref_row = &ref_alleles_row[..n_states];
                 let emissions_row = &mut emissions[..n_states];
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 if m_next >= PREFETCH_DISTANCE {
-                    let prefetch_row = (m_next - PREFETCH_DISTANCE) * n_states_padded;
                     let prefetch_bwd = (m_next - PREFETCH_DISTANCE) * n_states_padded;
                     unsafe {
-                        _mm_prefetch(
-                            ref_alleles_flat.as_ptr().add(prefetch_row) as *const i8,
-                            _MM_HINT_T0,
-                        );
                         _mm_prefetch(
                             bwd_aligned.as_ptr().add(prefetch_bwd) as *const i8,
                             _MM_HINT_T0,
