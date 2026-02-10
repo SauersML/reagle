@@ -1104,7 +1104,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 if allele_certainty <= f32::EPSILON {
                     continue;
                 }
-                for &d in donors_buf.iter() {
+                for (rank, &d) in donors_buf.iter().enumerate() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
                         continue;
@@ -1135,7 +1135,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if freq <= 0.0 {
                         continue;
                     }
-                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                    let rank_weight = 1.0 / (1.0 + 0.25 * rank as f32);
+                    let weight =
+                        allele_certainty * p_match * -(freq.max(min_freq)).ln() * rank_weight;
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
@@ -1350,7 +1352,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 if allele_certainty <= f32::EPSILON {
                     continue;
                 }
-                for &d in donors_buf.iter() {
+                for (rank, &d) in donors_buf.iter().enumerate() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
                         continue;
@@ -1381,7 +1383,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if freq <= 0.0 {
                         continue;
                     }
-                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                    let rank_weight = 1.0 / (1.0 + 0.25 * rank as f32);
+                    let weight =
+                        allele_certainty * p_match * -(freq.max(min_freq)).ln() * rank_weight;
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
@@ -10346,24 +10350,19 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         .unwrap_or(1)
         .max(1);
 
-    let need = n_states * n_states;
-    if scores.len() < need {
-        scores.resize(need, 0.0);
-    } else {
-        scores[..need].fill(0.0);
-    }
-
-    // Compute hint bonuses to break ties (prefer states present in initial/beam paths)
+    // Compute hint bonuses to break ties (prefer states present in prior paths).
     let mut state_bonus = vec![0.0f32; n_states];
     if let Some(h) = hint {
         for &s in h.path1.iter().chain(h.path2.iter()) {
             if (s as usize) < n_states {
-                state_bonus[s as usize] += 0.001; // Small bonus per occurrence
+                state_bonus[s as usize] += 0.001;
             }
         }
     }
 
+    // Stage 1: O(M*K) unary compatibility to prefilter candidate states.
     let mut ref_alleles = vec![255u8; n_states];
+    let mut state_unary = vec![0.0f32; n_states];
     let mut informative = 0usize;
     for m in (0..n_markers).step_by(marker_stride) {
         let a1 = seq1[m];
@@ -10372,48 +10371,89 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             continue;
         }
         informative += 1;
-
         let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+        let obs = if a1 != 255 { a1 } else { a2 };
 
         ref_provider.fill_ref_alleles(m, &mut ref_alleles);
         for i in 0..n_states {
-            let r1 = ref_alleles[i];
-            // Symmetric scan: only check j < i (lower triangle)
-            // We can infer upper triangle or just pick best from lower.
+            let r = ref_alleles[i];
+            let p = if is_het {
+                let e1 = emit_prob(r, a1, conf_m, p_no_err, p_err);
+                let e2 = emit_prob(r, a2, conf_m, p_no_err, p_err);
+                0.5 * (e1 + e2)
+            } else {
+                emit_prob(r, obs, conf_m, p_no_err, p_err)
+            };
+            state_unary[i] += p.max(1e-30).ln();
+        }
+    }
+
+    if informative == 0 {
+        return None;
+    }
+
+    let target_k = n_states.min((n_states / 3).max(48).min(128));
+    let mut ranked_states: Vec<usize> = (0..n_states).collect();
+    ranked_states.sort_by(|&a, &b| {
+        let sa = state_unary[a] + state_bonus[a];
+        let sb = state_unary[b] + state_bonus[b];
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked_states.truncate(target_k.max(2));
+
+    // Stage 2: O(M*Kc^2) pair scoring over reduced candidate set.
+    let cand_k = ranked_states.len();
+    let need = cand_k * cand_k;
+    if scores.len() < need {
+        scores.resize(need, 0.0);
+    } else {
+        scores[..need].fill(0.0);
+    }
+    let mut emit_a1 = vec![0.0f32; cand_k];
+    let mut emit_a2 = vec![0.0f32; cand_k];
+    let mut emit_obs = vec![0.0f32; cand_k];
+    for m in (0..n_markers).step_by(marker_stride) {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+        if a1 == 255 && a2 == 255 {
+            continue;
+        }
+        let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+        let obs = if a1 != 255 { a1 } else { a2 };
+
+        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
+        for (ci, &state_idx) in ranked_states.iter().enumerate() {
+            let r = ref_alleles[state_idx];
+            emit_a1[ci] = emit_prob(r, a1, conf_m, p_no_err, p_err);
+            emit_a2[ci] = emit_prob(r, a2, conf_m, p_no_err, p_err);
+            emit_obs[ci] = emit_prob(r, obs, conf_m, p_no_err, p_err);
+        }
+
+        for i in 0..cand_k {
             for j in 0..i {
-                let r2 = ref_alleles[j];
                 let prob = if is_het {
-                    // Unordered diploid genotype likelihood under both phase orientations.
-                    let keep = emit_prob(r1, a1, conf_m, p_no_err, p_err)
-                        * emit_prob(r2, a2, conf_m, p_no_err, p_err);
-                    let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
-                        * emit_prob(r2, a1, conf_m, p_no_err, p_err);
-                    0.5 * (keep + swap)
+                    0.5 * (emit_a1[i] * emit_a2[j] + emit_a2[i] * emit_a1[j])
                 } else {
-                    // Hom (or one missing): need r1=obs and r2=obs
-                    // If a1 or a2 is missing, we match the present one.
-                    let obs = if a1 != 255 { a1 } else { a2 };
-                    emit_prob(r1, obs, conf_m, p_no_err, p_err)
-                        * emit_prob(r2, obs, conf_m, p_no_err, p_err)
+                    emit_obs[i] * emit_obs[j]
                 };
-                scores[i * n_states + j] += prob.max(1e-30).ln();
+                scores[i * cand_k + j] += prob.max(1e-30).ln();
             }
         }
     }
 
-    // Find best pair
     let mut best_score = f32::NEG_INFINITY;
-    let mut best_pair = (0, 1);
-
-    for i in 0..n_states {
-        let bonus_i = state_bonus[i];
+    let mut best_pair = (ranked_states[0], ranked_states[1]);
+    for i in 0..cand_k {
+        let si = ranked_states[i];
+        let bonus_i = state_bonus[si];
         for j in 0..i {
-            let bonus = bonus_i + state_bonus[j];
-            let s = scores[i * n_states + j] + bonus;
+            let sj = ranked_states[j];
+            let s = scores[i * cand_k + j] + bonus_i + state_bonus[sj];
             if s > best_score {
                 best_score = s;
-                best_pair = (i, j);
+                best_pair = (si, sj);
             }
         }
     }
@@ -10421,10 +10461,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
-    if informative == 0 {
-        return None;
-    }
-
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
