@@ -5749,6 +5749,7 @@ impl crate::pipelines::ImputationPipeline {
     ) -> Result<()> {
         let markers_range = output_start..output_end;
         let n_markers = markers_range.len();
+        let use_large_panel_calibration = n_markers >= 5_000 && target_win.n_samples() >= 4;
 
         if n_markers == 0 || all_results.is_empty() {
             return Ok(());
@@ -6158,6 +6159,87 @@ impl crate::pipelines::ImputationPipeline {
             dosage
         };
 
+        // --- Empirical-Bayes dosage calibration for imputed biallelic markers ---
+        // Build a per-marker pooled dosage baseline from all successfully-imputed samples.
+        // This acts as a robust shrink target for low-confidence outliers.
+        let mut pooled_dosage_sum: Vec<f32> = vec![0.0; output_end.max(ref_is_biallelic.len())];
+        let mut pooled_dosage_n: Vec<u16> = vec![0; pooled_dosage_sum.len()];
+        if use_large_panel_calibration {
+            for sample_idx in 0..n_samples {
+                let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) else {
+                    continue;
+                };
+                for marker_idx in output_start..output_end {
+                    if !ref_is_biallelic.get(marker_idx).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let local_m = marker_idx.saturating_sub(output_start);
+                    let p1 = result
+                        .hap_posteriors
+                        .0
+                        .as_ref()
+                        .and_then(|p| p.get(local_m))
+                        .map(|p| p.prob(1))
+                        .or_else(|| {
+                            result
+                                .hap_alt_probs
+                                .0
+                                .as_ref()
+                                .and_then(|v| v.get(local_m).copied())
+                        });
+                    let p2 = result
+                        .hap_posteriors
+                        .1
+                        .as_ref()
+                        .and_then(|p| p.get(local_m))
+                        .map(|p| p.prob(1))
+                        .or_else(|| {
+                            result
+                                .hap_alt_probs
+                                .1
+                                .as_ref()
+                                .and_then(|v| v.get(local_m).copied())
+                        });
+                    let (Some(p1), Some(p2)) = (p1, p2) else {
+                        continue;
+                    };
+                    pooled_dosage_sum[marker_idx] += (p1 + p2).clamp(0.0, 2.0);
+                    pooled_dosage_n[marker_idx] = pooled_dosage_n[marker_idx].saturating_add(1);
+                }
+            }
+        }
+
+        let mut nearest_typed_bp: Vec<u32> = vec![u32::MAX; output_end.max(ref_is_biallelic.len())];
+        let mut last_typed: Option<u32> = None;
+        if use_large_panel_calibration {
+            for marker_idx in output_start..output_end {
+                let pos = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).pos;
+                if alignment
+                    .target_marker(MarkerIdx::new(marker_idx as u32))
+                    .is_some()
+                {
+                    last_typed = Some(pos);
+                    nearest_typed_bp[marker_idx] = 0;
+                } else if let Some(prev) = last_typed {
+                    nearest_typed_bp[marker_idx] = pos.saturating_sub(prev);
+                }
+            }
+            let mut next_typed: Option<u32> = None;
+            for marker_idx in (output_start..output_end).rev() {
+                let pos = ref_markers.marker(MarkerIdx::new(marker_idx as u32)).pos;
+                if alignment
+                    .target_marker(MarkerIdx::new(marker_idx as u32))
+                    .is_some()
+                {
+                    next_typed = Some(pos);
+                    nearest_typed_bp[marker_idx] = 0;
+                } else if let Some(next) = next_typed {
+                    let right = next.saturating_sub(pos);
+                    nearest_typed_bp[marker_idx] = nearest_typed_bp[marker_idx].min(right);
+                }
+            }
+        }
+
         let error_rate = self.params.p_mismatch;
         let use_hard_call_fallback = !correct_errors;
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
@@ -6323,6 +6405,72 @@ impl crate::pipelines::ImputationPipeline {
             } else {
                 0.0
             };
+
+            let mut dosage = dosage;
+
+            // Calibrate uncertain imputed dosages: shrink low-confidence outliers
+            // toward pooled dosage at that marker, with shrinkage increasing when
+            // farther from typed sites.
+            if use_large_panel_calibration
+                && hard_call.is_none()
+                && ref_is_biallelic.get(marker_idx).copied().unwrap_or(false)
+            {
+                let local_m = marker_idx.saturating_sub(output_start);
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    let p1 = result
+                        .hap_posteriors
+                        .0
+                        .as_ref()
+                        .and_then(|p| p.get(local_m))
+                        .map(|p| p.prob(1))
+                        .or_else(|| {
+                            result
+                                .hap_alt_probs
+                                .0
+                                .as_ref()
+                                .and_then(|v| v.get(local_m).copied())
+                        });
+                    let p2 = result
+                        .hap_posteriors
+                        .1
+                        .as_ref()
+                        .and_then(|p| p.get(local_m))
+                        .map(|p| p.prob(1))
+                        .or_else(|| {
+                            result
+                                .hap_alt_probs
+                                .1
+                                .as_ref()
+                                .and_then(|v| v.get(local_m).copied())
+                        });
+                    if let (Some(p1), Some(p2)) = (p1, p2) {
+                        let conf1 = (2.0 * (p1 - 0.5).abs()).clamp(0.0, 1.0);
+                        let conf2 = (2.0 * (p2 - 0.5).abs()).clamp(0.0, 1.0);
+                        let confidence = 0.5 * (conf1 + conf2);
+
+                        let pooled = if pooled_dosage_n[marker_idx] > 0 {
+                            pooled_dosage_sum[marker_idx] / pooled_dosage_n[marker_idx] as f32
+                        } else {
+                            dosage
+                        };
+                        let disagreement = ((dosage - pooled).abs() * 0.5).clamp(0.0, 1.0);
+                        let dist = nearest_typed_bp[marker_idx] as f32;
+                        let far_factor = (dist / (dist + 2_000.0)).clamp(0.0, 1.0);
+                        let shrink = ((1.0 - confidence).powf(1.15)
+                            * (0.45 + 0.55 * disagreement)
+                            * (0.40 + 0.60 * far_factor))
+                            .clamp(0.0, 0.92);
+                        let shrink = if confidence < 0.20 {
+                            shrink.max(0.85)
+                        } else if confidence < 0.35 {
+                            shrink.max(0.65)
+                        } else {
+                            shrink
+                        };
+                        dosage = dosage * (1.0 - shrink) + pooled * shrink;
+                    }
+                }
+            }
 
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
                 dosage
