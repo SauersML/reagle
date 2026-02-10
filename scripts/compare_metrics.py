@@ -4,6 +4,28 @@ import json
 import math
 from pathlib import Path
 
+SELECTED_METRICS = [
+    ("Accuracy", "Dosage R^2", "r_squared"),
+    ("Accuracy", "IQS", "iqs"),
+    ("Accuracy", "INFO score (approx)", "info_score_approx"),
+    ("Accuracy", "Unphased concordance", "unphased_concordance"),
+    ("Accuracy", "Non-ref concordance", "nonref_concordance"),
+    ("Accuracy", "Precision", "precision"),
+    ("Accuracy", "Recall", "recall"),
+    ("Accuracy", "F1 score", "f1_score"),
+    ("Accuracy", "SEN mean", "sen_mean"),
+    ("Phasing", "Switch error rate", "switch_error_rate"),
+    ("Phasing", "Phase concordance", "phase_concordance"),
+    ("Phasing", "N50 phase block", "n50_phase_block"),
+    ("Runtime", "Calculation time (sec)", "calculation_time_sec"),
+    ("Runtime", "AF time (sec)", "af_time_sec"),
+    ("Runtime", "Diagnostics time (sec)", "diagnostic_time_sec"),
+    ("Runtime", "Metrics loop time (sec)", "metrics_loop_time_sec"),
+    ("Context", "Sites compared", "sites_compared"),
+    ("Context", "Total genotypes", "total_genotypes"),
+    ("Context", "Non-ref total", "nonref_total"),
+]
+
 
 def is_numeric(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -46,38 +68,50 @@ def compare_metrics(reagle_metrics, beagle_metrics):
     beagle_flat = flatten_numeric_values(beagle_metrics)
 
     shared_keys = sorted(set(reagle_flat.keys()) & set(beagle_flat.keys()))
-    rows = []
-    for key in shared_keys:
-        reagle_val = reagle_flat[key]
-        beagle_val = beagle_flat[key]
-        rows.append((key, reagle_val, beagle_val, reagle_val - beagle_val))
+    section_rows = {}
 
-    return rows, len(reagle_flat), len(beagle_flat)
+    for section, label, key in SELECTED_METRICS:
+        reagle_val = reagle_flat.get(key)
+        beagle_val = beagle_flat.get(key)
+        if reagle_val is None or beagle_val is None:
+            continue
+
+        delta = reagle_val - beagle_val
+        section_rows.setdefault(section, []).append((label, key, reagle_val, beagle_val, delta))
+
+    return section_rows, len(shared_keys), len(reagle_flat), len(beagle_flat)
 
 
-def build_markdown(label, rows, reagle_total, beagle_total):
+def build_markdown(label, section_rows, shared_count, reagle_total, beagle_total):
     lines = []
-    lines.append(f"### Full Metrics Comparison: {label}")
+    lines.append(f"### Metrics Comparison: {label}")
     lines.append("")
     lines.append(
-        f"Shared numeric metrics compared: **{len(rows)}** "
+        f"Shared numeric metrics compared: **{shared_count}** "
         f"(Reagle numeric metrics: {reagle_total}, Beagle numeric metrics: {beagle_total})"
     )
     lines.append("")
-    lines.append("| Metric | Reagle | Beagle | Delta (Reagle - Beagle) |")
-    lines.append("|---|---:|---:|---:|")
 
-    for key, reagle_val, beagle_val, delta in rows:
-        lines.append(
-            f"| `{key}` | {format_number(reagle_val)} | {format_number(beagle_val)} | {format_number(delta)} |"
-        )
+    section_order = ["Accuracy", "Phasing", "Runtime", "Context"]
+    for section in section_order:
+        rows = section_rows.get(section, [])
+        if not rows:
+            continue
+        lines.append(f"#### {section}")
+        lines.append("")
+        lines.append("| Metric | Key | Reagle | Beagle | Delta (Reagle - Beagle) |")
+        lines.append("|---|---|---:|---:|---:|")
+        for metric_label, metric_key, reagle_val, beagle_val, delta in rows:
+            lines.append(
+                f"| {metric_label} | `{metric_key}` | {format_number(reagle_val)} | {format_number(beagle_val)} | {format_number(delta)} |"
+            )
+        lines.append("")
 
-    lines.append("")
     return "\n".join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare all shared numeric metrics between Reagle and Beagle JSON outputs.")
+    parser = argparse.ArgumentParser(description="Compare Reagle and Beagle on a curated set of useful metrics.")
     parser.add_argument("--reagle", required=True, help="Path to reagle_metrics.json")
     parser.add_argument("--beagle", required=True, help="Path to beagle_metrics.json")
     parser.add_argument("--label", default="metrics", help="Label shown in output heading")
@@ -92,8 +126,8 @@ def main():
     with beagle_path.open("r") as f:
         beagle_metrics = json.load(f)
 
-    rows, reagle_total, beagle_total = compare_metrics(reagle_metrics, beagle_metrics)
-    markdown = build_markdown(args.label, rows, reagle_total, beagle_total)
+    section_rows, shared_count, reagle_total, beagle_total = compare_metrics(reagle_metrics, beagle_metrics)
+    markdown = build_markdown(args.label, section_rows, shared_count, reagle_total, beagle_total)
 
     print(markdown)
 
