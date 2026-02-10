@@ -14,8 +14,6 @@ use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpd
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
-const SMOOTHING_GAIN: f32 = 2.0;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImputeHmmContext {
     pub window_idx: usize,
@@ -921,10 +919,12 @@ fn smooth_allele_posteriors_subset(
     if prior_sq_sum <= 0.0 {
         return;
     }
+    let max_effective = allele_probs.len().max(1) as f32;
+    let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
     // Pseudo-count mass should track information decay only. Extra gain
     // over-regularizes sparse arrays and can collapse rare-allele posteriors.
-    let prior_mass = (SMOOTHING_GAIN * (1.0 - retain) / retain).max(0.0);
+    let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
