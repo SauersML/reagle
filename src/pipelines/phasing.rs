@@ -10817,12 +10817,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let burnin_steps = burnin.min(2);
+    let complexity_steps = (het_positions.len() / 64).min(4);
+    let burnin_steps = burnin.saturating_add(complexity_steps).clamp(2, 6);
     for _ in 0..burnin_steps {
         chain.step();
     }
 
-    let lr_samples = lr_samples_param.clamp(2, 8);
+    let lr_samples = lr_samples_param.max(12).min(32);
     let mut swap_counts = vec![0.0f32; het_positions.len()];
     let mut obs_counts = vec![0.0f32; het_positions.len()];
 
