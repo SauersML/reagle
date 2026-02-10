@@ -4,10 +4,10 @@
 //! reference haplotypes (state set). Emissions are computed using per-haplotype
 //! allele probabilities from the target, and reference alleles are read on demand.
 
-use crate::data::HapIdx;
 use crate::data::storage::{
     DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
+use crate::data::HapIdx;
 use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
 use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
@@ -23,7 +23,7 @@ pub struct ImputeHmmContext {
 
 // For distant untyped markers, HMM state posteriors contribute negligibly after
 // distance-based smoothing, so we can safely emit panel priors directly.
-const SKIP_RETAIN_THRESHOLD: f32 = 0.01;
+const SKIP_RETAIN_THRESHOLD: f32 = 0.005;
 
 #[inline]
 fn validate_target_probs_nonempty(
@@ -801,11 +801,12 @@ fn adjusted_recomb_rate(recomb_rate: f32) -> f32 {
 #[inline]
 fn marker_recomb_rate(p_recomb: &[f32], marker_idx: usize) -> f32 {
     let rate = p_recomb.get(marker_idx).copied().unwrap_or(0.0);
-    if marker_idx == 0 {
-        adjusted_recomb_rate(rate)
-    } else {
-        adjusted_recomb_rate(rate)
-    }
+    adjusted_recomb_rate(rate)
+}
+
+#[inline]
+fn build_recomb_rates(p_recomb: &[f32], n_markers: usize) -> Vec<f32> {
+    (0..n_markers).map(|m| marker_recomb_rate(p_recomb, m)).collect()
 }
 
 #[inline]
@@ -819,7 +820,7 @@ fn recomb_lambda_from_p(p: f32) -> f32 {
 fn compute_nearest_observed_lambda(
     ws: &mut ImputeWorkspace,
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rates: &[f32],
     smoothing_cluster_cm: f32,
 ) {
     const BASE_CLUSTER_CM: f32 = 0.005;
@@ -844,7 +845,7 @@ fn compute_nearest_observed_lambda(
         if target_probs.is_observed_marker(m) {
             dist = 0.0;
         } else if m > 0 && dist.is_finite() {
-            dist += recomb_lambda_from_p(marker_recomb_rate(p_recomb, m));
+            dist += recomb_lambda_from_p(recomb_rates.get(m).copied().unwrap_or(0.0));
         }
         ws.nearest_obs_fwd[m] = dist;
     }
@@ -855,7 +856,7 @@ fn compute_nearest_observed_lambda(
             dist = 0.0;
         } else if m_rev + 1 < n && dist.is_finite() {
             let next = m_rev + 1;
-            dist += recomb_lambda_from_p(marker_recomb_rate(p_recomb, next));
+            dist += recomb_lambda_from_p(recomb_rates.get(next).copied().unwrap_or(0.0));
         }
         ws.nearest_obs_bwd[m_rev] = dist;
     }
@@ -1182,6 +1183,96 @@ fn transition_only_backward_update(
 }
 
 #[inline]
+fn batched_transition_forward(
+    fwd: &mut [f32],
+    recomb_rates: &[f32],
+    start: usize,
+    end: usize,
+    active_states: usize,
+    transition_haps: usize,
+) {
+    if active_states == 0 || start >= end {
+        return;
+    }
+    let k = active_states as f64;
+    let mut a = 1.0f64;
+    let mut b = 0.0f64;
+    let mut touched = false;
+    for m in start..end {
+        let recomb_rate = recomb_rates.get(m).copied().unwrap_or(0.0);
+        if recomb_rate <= 0.0 {
+            continue;
+        }
+        touched = true;
+        let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+        let stay = stay as f64;
+        let shift = shift as f64;
+        a *= stay;
+        b = stay.mul_add(b, shift);
+    }
+    if !touched {
+        return;
+    }
+    // Ensure mass conservation under finite precision.
+    b = ((1.0 - a) / k).max(0.0);
+    let a = a as f32;
+    let b = b as f32;
+    let mut sum = 0.0f32;
+    for v in fwd.iter_mut().take(active_states) {
+        *v = a.mul_add(*v, b);
+        sum += *v;
+    }
+    let sum = sum.max(1e-30);
+    if (sum - 1.0).abs() > 1e-4 {
+        let inv = 1.0 / sum;
+        for v in fwd.iter_mut().take(active_states) {
+            *v *= inv;
+        }
+    }
+}
+
+#[inline]
+fn batched_transition_backward(
+    bwd: &mut [f32],
+    bwd_sum: f32,
+    recomb_rates: &[f32],
+    start: usize,
+    end: usize,
+    active_states: usize,
+    transition_haps: usize,
+) -> f32 {
+    if active_states == 0 || start >= end {
+        return bwd_sum;
+    }
+    let k = active_states as f64;
+    let mut a = 1.0f64;
+    let mut b_coeff = 0.0f64;
+    let mut touched = false;
+    for m in (start..end).rev() {
+        let recomb_rate = recomb_rates.get(m).copied().unwrap_or(0.0);
+        if recomb_rate <= 0.0 {
+            continue;
+        }
+        touched = true;
+        let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+        let stay = stay as f64;
+        let shift = shift as f64;
+        a *= stay;
+        b_coeff = stay.mul_add(b_coeff, shift);
+    }
+    if !touched {
+        return bwd_sum;
+    }
+    b_coeff = ((1.0 - a) / k).max(0.0);
+    let a = a as f32;
+    let add = b_coeff as f32 * bwd_sum;
+    for v in bwd.iter_mut().take(active_states) {
+        *v = a.mul_add(*v, add);
+    }
+    bwd_sum
+}
+
+#[inline]
 fn should_skip_untyped_posterior(
     target_probs: &TargetAlleleProbs,
     nearest_obs_lambda: &[f32],
@@ -1211,6 +1302,38 @@ fn panel_freq_posterior(
 }
 
 #[inline]
+fn build_uniform_mask(target_probs: &TargetAlleleProbs, n_markers: usize) -> Vec<bool> {
+    (0..n_markers)
+        .map(|m| target_probs.is_uniform_marker(m))
+        .collect()
+}
+
+#[inline]
+fn build_skip_untyped_mask(
+    target_probs: &TargetAlleleProbs,
+    nearest_obs_lambda: &[f32],
+    uniform_mask: &[bool],
+    n_markers: usize,
+    use_prior_smoothing: bool,
+) -> Vec<bool> {
+    let panel_priors = target_probs.panel_priors();
+    (0..n_markers)
+        .map(|m| {
+            if !uniform_mask.get(m).copied().unwrap_or(true) || target_probs.is_observed_marker(m) {
+                return false;
+            }
+            panel_priors.and_then(|p| p.get(m)).is_some()
+                && should_skip_untyped_posterior(
+                    target_probs,
+                    nearest_obs_lambda,
+                    m,
+                    use_prior_smoothing,
+                )
+        })
+        .collect()
+}
+
+#[inline]
 fn fill_state_patterns_seqcoded(hap_to_seq: &[u16], state_haps: &[RefHapId], out: &mut [u16]) {
     for (i, hap) in state_haps.iter().enumerate() {
         out[i] = hap_to_seq[hap.as_usize()];
@@ -1232,14 +1355,14 @@ fn forward_update_impl<C: RefColumnLike>(
     state_haps: &[RefHapId],
     ref_columns: &[C],
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rates: &[f32],
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
 ) -> f32 {
     let probs = target_probs.probs_for_marker_normalized(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = marker_recomb_rate(p_recomb, m);
+    let recomb_rate = recomb_rates.get(m).copied().unwrap_or(0.0);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -1312,7 +1435,7 @@ fn forward_update_seqcoded(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rates: &[f32],
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
@@ -1320,10 +1443,7 @@ fn forward_update_seqcoded(
 ) -> f32 {
     let probs = target_probs.probs_for_marker_normalized(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = marker_recomb_rate(p_recomb, m);
-
-    let col = seqcoded_col(&ref_columns[m]);
-    let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
+    let recomb_rate = recomb_rates.get(m).copied().unwrap_or(0.0);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -1333,6 +1453,9 @@ fn forward_update_seqcoded(
             transition_haps,
         )
     } else {
+        let col = seqcoded_col(&ref_columns[m]);
+        let seq_patterns =
+            refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
         fill_pattern_emissions(
             seq_patterns.seq_alleles,
             probs,
@@ -1394,7 +1517,7 @@ fn forward_update_dict(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rates: &[f32],
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
@@ -1402,7 +1525,7 @@ fn forward_update_dict(
 ) -> f32 {
     let probs = target_probs.probs_for_marker_normalized(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = marker_recomb_rate(p_recomb, m);
+    let recomb_rate = recomb_rates.get(m).copied().unwrap_or(0.0);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -1509,6 +1632,15 @@ fn run_impute_hmm_impl(
         // scaling is handled panel-aware inside the HMM kernels.
         ws.weights.fill(1.0);
     }
+    let uniform_mask = build_uniform_mask(target_probs, active_markers);
+    let skip_untyped_mask = build_skip_untyped_mask(
+        target_probs,
+        &ws.nearest_obs_lambda,
+        &uniform_mask,
+        active_markers,
+        use_prior_smoothing,
+    );
+    let panel_priors = target_probs.panel_priors();
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -1531,30 +1663,76 @@ fn run_impute_hmm_impl(
             ws.fwd[..active_states].fill(uniform);
         }
 
-        for m in 0..active_markers {
-            let use_prior_weighting = m == 0 && state_priors.is_some();
-            forward_update_impl(
-                ws,
-                m,
-                use_prior_weighting,
-                state_haps,
-                ref_columns,
-                target_probs,
-                p_recomb,
-                current_error,
-                active_states,
-                transition_haps,
-            );
-            if m % checkpoint_stride == 0 {
-                let cp = (m / checkpoint_stride) * active_states;
-                ws.fwd_checkpoints[cp..cp + active_states]
-                    .copy_from_slice(&ws.fwd[..active_states]);
+        let mut m = 0usize;
+        while m < active_markers {
+            if !uniform_mask[m] {
+                let use_prior_weighting = m == 0 && state_priors.is_some();
+                forward_update_impl(
+                    ws,
+                    m,
+                    use_prior_weighting,
+                    state_haps,
+                    ref_columns,
+                    target_probs,
+                    p_recomb,
+                    current_error,
+                    active_states,
+                    transition_haps,
+                );
+                if m % checkpoint_stride == 0 {
+                    let cp = (m / checkpoint_stride) * active_states;
+                    ws.fwd_checkpoints[cp..cp + active_states]
+                        .copy_from_slice(&ws.fwd[..active_states]);
+                }
+                if prior_marker_idx == Some(m) {
+                    let mut snapshot = ws.fwd[..active_states].to_vec();
+                    normalize_probs(&mut snapshot);
+                    forward_prior_state_post = Some(snapshot);
+                }
+                m += 1;
+                continue;
             }
-            if prior_marker_idx == Some(m) {
-                let mut snapshot = ws.fwd[..active_states].to_vec();
-                normalize_probs(&mut snapshot);
-                forward_prior_state_post = Some(snapshot);
+
+            let mut run_end = m + 1;
+            while run_end < active_markers && uniform_mask[run_end] {
+                run_end += 1;
             }
+            let mut seg_start = m;
+            while seg_start < run_end {
+                let mut seg_end = run_end;
+                let next_cp =
+                    ((seg_start + checkpoint_stride - 1) / checkpoint_stride) * checkpoint_stride;
+                if next_cp < seg_end {
+                    seg_end = next_cp + 1;
+                }
+                if let Some(pm) = prior_marker_idx {
+                    if pm >= seg_start && pm < seg_end {
+                        seg_end = pm + 1;
+                    }
+                }
+                batched_transition_forward(
+                    &mut ws.fwd[..active_states],
+                    p_recomb,
+                    seg_start,
+                    seg_end,
+                    active_states,
+                    transition_haps,
+                );
+                ws.fwd_scales[seg_start..seg_end].fill(1.0);
+                let last = seg_end - 1;
+                if last % checkpoint_stride == 0 {
+                    let cp = (last / checkpoint_stride) * active_states;
+                    ws.fwd_checkpoints[cp..cp + active_states]
+                        .copy_from_slice(&ws.fwd[..active_states]);
+                }
+                if prior_marker_idx == Some(last) {
+                    let mut snapshot = ws.fwd[..active_states].to_vec();
+                    normalize_probs(&mut snapshot);
+                    forward_prior_state_post = Some(snapshot);
+                }
+                seg_start = seg_end;
+            }
+            m = run_end;
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1579,7 +1757,33 @@ fn run_impute_hmm_impl(
                 ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
 
                 if block_start + 1 < block_end {
-                    for m in (block_start + 1)..block_end {
+                    let mut m = block_start + 1;
+                    while m < block_end {
+                        let replay_skip = is_final
+                            && prior_marker_idx != Some(m)
+                            && skip_untyped_mask[m]
+                            && uniform_mask[m];
+                        if replay_skip {
+                            let mut run_end = m + 1;
+                            while run_end < block_end
+                                && is_final
+                                && prior_marker_idx != Some(run_end)
+                                && skip_untyped_mask[run_end]
+                                && uniform_mask[run_end]
+                            {
+                                run_end += 1;
+                            }
+                            batched_transition_forward(
+                                &mut ws.fwd[..active_states],
+                                p_recomb,
+                                m,
+                                run_end,
+                                active_states,
+                                transition_haps,
+                            );
+                            m = run_end;
+                            continue;
+                        }
                         forward_update_impl(
                             ws,
                             m,
@@ -1595,12 +1799,36 @@ fn run_impute_hmm_impl(
                         let local_idx = (m - block_start) * active_states;
                         ws.fwd_history[local_idx..local_idx + active_states]
                             .copy_from_slice(&ws.fwd[..active_states]);
+                        m += 1;
                     }
                 }
 
+                let mut skipped_run_start: Option<usize> = None;
+                let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
-                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
+                    let skip_untyped_posterior =
+                        is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev];
+                    if skip_untyped_posterior {
+                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                        if skipped_run_start.is_none() {
+                            skipped_run_end = m_rev + 1;
+                        }
+                        skipped_run_start = Some(m_rev);
+                        continue;
+                    }
+                    if let Some(run_start) = skipped_run_start.take() {
+                        bwd_sum = batched_transition_backward(
+                            &mut ws.bwd[..active_states],
+                            bwd_sum,
+                            p_recomb,
+                            run_start,
+                            skipped_run_end,
+                            active_states,
+                            transition_haps,
+                        );
+                    }
+                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let n_alleles = probs.len();
                     if prior_marker_idx == Some(m_rev) {
                         ws.ensure_state_posterior_scratch(active_states);
@@ -1637,119 +1865,106 @@ fn run_impute_hmm_impl(
                     );
 
                     if is_final {
-                        if should_skip_untyped_posterior(
-                            target_probs,
-                            &ws.nearest_obs_lambda,
-                            m_rev,
-                            use_prior_smoothing,
-                        ) && prior_marker_idx != Some(m_rev)
-                        {
-                            posteriors[m_rev] =
-                                panel_freq_posterior(target_probs.panel_priors(), m_rev);
-                        } else {
-                            // Compute posteriors using beta at time t (current ws.bwd), before updating
-                            // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
-                            ws.allele_probs.clear();
-                            if n_alleles > 0 {
-                                ws.allele_probs.resize(n_alleles, 0.0f32);
-                                let subset_counts = &mut ws.subset_counts[..n_alleles];
-                                let smoothing_prior_counts =
-                                    &mut ws.smoothing_prior_counts[..n_alleles];
-                                subset_counts.fill(0.0);
-                                smoothing_prior_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
-                                let mut smoothing_prior_total = 0.0f32;
-                                let mut total = 0.0f32;
-                                let mut missing_mass = 0.0f32;
-                                for i in 0..active_states {
-                                    let state_prob = fwd_slice[i] * ws.bwd[i];
-                                    total += state_prob;
-                                    let ref_allele = ref_alleles.get(i);
-                                    if ref_allele == 255 {
-                                        missing_mass += state_prob;
-                                        continue;
-                                    }
-                                    let idx = ref_allele as usize;
-                                    if idx < ws.allele_probs.len() {
-                                        ws.allele_probs[idx] += state_prob;
-                                        subset_counts[idx] += state_prob;
-                                        subset_total += state_prob;
-                                        let w = ws.weights[i].max(0.0);
-                                        if w > 0.0 {
-                                            smoothing_prior_counts[idx] += w;
-                                            smoothing_prior_total += w;
-                                        }
+                        // Compute posteriors using beta at time t (current ws.bwd), before updating
+                        // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
+                        ws.allele_probs.clear();
+                        if n_alleles > 0 {
+                            ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let subset_counts = &mut ws.subset_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
+                            subset_counts.fill(0.0);
+                            smoothing_prior_counts.fill(0.0);
+                            let mut subset_total = 0.0f32;
+                            let mut smoothing_prior_total = 0.0f32;
+                            let mut total = 0.0f32;
+                            let mut missing_mass = 0.0f32;
+                            for i in 0..active_states {
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob;
+                                let ref_allele = ref_alleles.get(i);
+                                if ref_allele == 255 {
+                                    missing_mass += state_prob;
+                                    continue;
+                                }
+                                let idx = ref_allele as usize;
+                                if idx < ws.allele_probs.len() {
+                                    ws.allele_probs[idx] += state_prob;
+                                    subset_counts[idx] += state_prob;
+                                    subset_total += state_prob;
+                                    let w = ws.weights[i].max(0.0);
+                                    if w > 0.0 {
+                                        smoothing_prior_counts[idx] += w;
+                                        smoothing_prior_total += w;
                                     }
                                 }
-                                if total > 0.0 {
-                                    if missing_mass > 0.0 {
-                                        let prior = if subset_total > 0.0 {
-                                            let inv = 1.0 / subset_total;
-                                            for v in subset_counts.iter_mut() {
-                                                *v *= inv;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(subset_counts)
-                                        } else if smoothing_prior_total > 0.0 {
-                                            let inv = 1.0 / smoothing_prior_total;
-                                            for v in smoothing_prior_counts.iter_mut() {
-                                                *v *= inv;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(
-                                                smoothing_prior_counts,
-                                            )
-                                        } else {
-                                            if !warned_af_fallback {
-                                                eprintln!(
+                            }
+                            if total > 0.0 {
+                                if missing_mass > 0.0 {
+                                    let prior = if subset_total > 0.0 {
+                                        let inv = 1.0 / subset_total;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
                                                     "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
                                                     context.window_idx,
                                                     context.sample_idx,
                                                     context.hap_idx,
                                                     m_rev
                                                 );
-                                                warned_af_fallback = true;
-                                            }
-                                            if ws.allele_prior_scratch.len() < n_alleles {
-                                                ws.allele_prior_scratch.resize(n_alleles, 0.0);
-                                            }
-                                            let uniform = 1.0f32 / n_alleles.max(1) as f32;
-                                            for v in
-                                                ws.allele_prior_scratch.iter_mut().take(n_alleles)
-                                            {
-                                                *v = uniform;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(
-                                                &ws.allele_prior_scratch[..n_alleles],
-                                            )
-                                        };
-                                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                            *p += missing_mass * prior.as_slice()[i];
+                                            warned_af_fallback = true;
                                         }
+                                        if ws.allele_prior_scratch.len() < n_alleles {
+                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                        }
+                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles)
+                                        {
+                                            *v = uniform;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(
+                                            &ws.allele_prior_scratch[..n_alleles],
+                                        )
+                                    };
+                                    for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                        *p += missing_mass * prior.as_slice()[i];
                                     }
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p /= total;
-                                    }
-                                    if use_prior_smoothing {
-                                        apply_marker_prior_smoothing(
-                                            &mut ws.allele_probs,
-                                            target_probs.panel_priors(),
-                                            m_rev,
-                                            smoothing_prior_counts,
-                                            smoothing_prior_total,
-                                            &mut ws.allele_prior_scratch,
-                                            ws.nearest_obs_lambda
-                                                .get(m_rev)
-                                                .copied()
-                                                .unwrap_or(f32::INFINITY),
-                                            target_probs.is_untyped_uniform_marker(m_rev),
-                                            active_states,
-                                            panel_haps,
-                                            target_probs.min_untyped_prior_mix(),
-                                            &mut warned_af_fallback,
-                                            context,
-                                        );
-                                    }
-                                } else {
-                                    return Err(ReagleError::vcf(format!(
+                                }
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p /= total;
+                                }
+                                if use_prior_smoothing {
+                                    apply_marker_prior_smoothing(
+                                        &mut ws.allele_probs,
+                                        panel_priors,
+                                        m_rev,
+                                        smoothing_prior_counts,
+                                        smoothing_prior_total,
+                                        &mut ws.allele_prior_scratch,
+                                        ws.nearest_obs_lambda
+                                            .get(m_rev)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
+                                        target_probs.min_untyped_prior_mix(),
+                                        &mut warned_af_fallback,
+                                        context,
+                                    );
+                                }
+                            } else {
+                                return Err(ReagleError::vcf(format!(
                                         "Posterior mass collapse in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
                                         context.window_idx,
                                         context.sample_idx,
@@ -1757,17 +1972,16 @@ fn run_impute_hmm_impl(
                                         m_rev,
                                         active_states
                                     )));
-                                }
-                                if ws.allele_probs.len() == 2 {
-                                    posteriors[m_rev] =
-                                        AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                                } else {
-                                    let mut out = Vec::with_capacity(ws.allele_probs.len());
-                                    out.extend_from_slice(&ws.allele_probs);
-                                    posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                                }
+                            }
+                            if ws.allele_probs.len() == 2 {
+                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
                             } else {
-                                return Err(ReagleError::vcf(format!(
+                                let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                out.extend_from_slice(&ws.allele_probs);
+                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                            }
+                        } else {
+                            return Err(ReagleError::vcf(format!(
                                     "No allele space available in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
                                     context.window_idx,
                                     context.sample_idx,
@@ -1775,7 +1989,6 @@ fn run_impute_hmm_impl(
                                     m_rev,
                                     active_states
                                 )));
-                            }
                         }
                     }
 
@@ -1784,7 +1997,7 @@ fn run_impute_hmm_impl(
                     //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
                     // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
                     // at marker t (sum of unnormalized alpha_t).
-                    if target_probs.is_uniform_marker(m_rev) {
+                    if uniform_mask[m_rev] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -1815,6 +2028,17 @@ fn run_impute_hmm_impl(
                         }
                         bwd_sum = new_sum.max(1e-30);
                     }
+                }
+                if let Some(run_start) = skipped_run_start.take() {
+                    bwd_sum = batched_transition_backward(
+                        &mut ws.bwd[..active_states],
+                        bwd_sum,
+                        p_recomb,
+                        run_start,
+                        skipped_run_end,
+                        active_states,
+                        transition_haps,
+                    );
                 }
                 if block_start == 0 {
                     break;
@@ -1867,6 +2091,15 @@ fn run_impute_hmm_seqcoded(
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
+    let uniform_mask = build_uniform_mask(target_probs, active_markers);
+    let skip_untyped_mask = build_skip_untyped_mask(
+        target_probs,
+        &ws.nearest_obs_lambda,
+        &uniform_mask,
+        active_markers,
+        use_prior_smoothing,
+    );
+    let panel_priors = target_probs.panel_priors();
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -1890,31 +2123,77 @@ fn run_impute_hmm_seqcoded(
         }
 
         let mut last_hap_ptr: *const u16 = std::ptr::null();
-        for m in 0..active_markers {
-            let use_prior_weighting = m == 0 && state_priors.is_some();
-            forward_update_seqcoded(
-                ws,
-                m,
-                use_prior_weighting,
-                state_haps,
-                ref_columns,
-                target_probs,
-                p_recomb,
-                current_error,
-                active_states,
-                transition_haps,
-                &mut last_hap_ptr,
-            );
-            if m % checkpoint_stride == 0 {
-                let cp = (m / checkpoint_stride) * active_states;
-                ws.fwd_checkpoints[cp..cp + active_states]
-                    .copy_from_slice(&ws.fwd[..active_states]);
+        let mut m = 0usize;
+        while m < active_markers {
+            if !uniform_mask[m] {
+                let use_prior_weighting = m == 0 && state_priors.is_some();
+                forward_update_seqcoded(
+                    ws,
+                    m,
+                    use_prior_weighting,
+                    state_haps,
+                    ref_columns,
+                    target_probs,
+                    p_recomb,
+                    current_error,
+                    active_states,
+                    transition_haps,
+                    &mut last_hap_ptr,
+                );
+                if m % checkpoint_stride == 0 {
+                    let cp = (m / checkpoint_stride) * active_states;
+                    ws.fwd_checkpoints[cp..cp + active_states]
+                        .copy_from_slice(&ws.fwd[..active_states]);
+                }
+                if prior_marker_idx == Some(m) {
+                    let mut snapshot = ws.fwd[..active_states].to_vec();
+                    normalize_probs(&mut snapshot);
+                    forward_prior_state_post = Some(snapshot);
+                }
+                m += 1;
+                continue;
             }
-            if prior_marker_idx == Some(m) {
-                let mut snapshot = ws.fwd[..active_states].to_vec();
-                normalize_probs(&mut snapshot);
-                forward_prior_state_post = Some(snapshot);
+
+            let mut run_end = m + 1;
+            while run_end < active_markers && uniform_mask[run_end] {
+                run_end += 1;
             }
+            let mut seg_start = m;
+            while seg_start < run_end {
+                let mut seg_end = run_end;
+                let next_cp =
+                    ((seg_start + checkpoint_stride - 1) / checkpoint_stride) * checkpoint_stride;
+                if next_cp < seg_end {
+                    seg_end = next_cp + 1;
+                }
+                if let Some(pm) = prior_marker_idx {
+                    if pm >= seg_start && pm < seg_end {
+                        seg_end = pm + 1;
+                    }
+                }
+                batched_transition_forward(
+                    &mut ws.fwd[..active_states],
+                    p_recomb,
+                    seg_start,
+                    seg_end,
+                    active_states,
+                    transition_haps,
+                );
+                ws.fwd_scales[seg_start..seg_end].fill(1.0);
+                let last = seg_end - 1;
+                if last % checkpoint_stride == 0 {
+                    let cp = (last / checkpoint_stride) * active_states;
+                    ws.fwd_checkpoints[cp..cp + active_states]
+                        .copy_from_slice(&ws.fwd[..active_states]);
+                }
+                if prior_marker_idx == Some(last) {
+                    let mut snapshot = ws.fwd[..active_states].to_vec();
+                    normalize_probs(&mut snapshot);
+                    forward_prior_state_post = Some(snapshot);
+                }
+                seg_start = seg_end;
+            }
+            m = run_end;
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1941,7 +2220,33 @@ fn run_impute_hmm_seqcoded(
 
                 if block_start + 1 < block_end {
                     let mut last_hap_ptr_re: *const u16 = std::ptr::null();
-                    for m in (block_start + 1)..block_end {
+                    let mut m = block_start + 1;
+                    while m < block_end {
+                        let replay_skip = is_final
+                            && prior_marker_idx != Some(m)
+                            && skip_untyped_mask[m]
+                            && uniform_mask[m];
+                        if replay_skip {
+                            let mut run_end = m + 1;
+                            while run_end < block_end
+                                && is_final
+                                && prior_marker_idx != Some(run_end)
+                                && skip_untyped_mask[run_end]
+                                && uniform_mask[run_end]
+                            {
+                                run_end += 1;
+                            }
+                            batched_transition_forward(
+                                &mut ws.fwd[..active_states],
+                                p_recomb,
+                                m,
+                                run_end,
+                                active_states,
+                                transition_haps,
+                            );
+                            m = run_end;
+                            continue;
+                        }
                         forward_update_seqcoded(
                             ws,
                             m,
@@ -1958,12 +2263,36 @@ fn run_impute_hmm_seqcoded(
                         let local_idx = (m - block_start) * active_states;
                         ws.fwd_history[local_idx..local_idx + active_states]
                             .copy_from_slice(&ws.fwd[..active_states]);
+                        m += 1;
                     }
                 }
 
+                let mut skipped_run_start: Option<usize> = None;
+                let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
-                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
+                    let skip_untyped_posterior =
+                        is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev];
+                    if skip_untyped_posterior {
+                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                        if skipped_run_start.is_none() {
+                            skipped_run_end = m_rev + 1;
+                        }
+                        skipped_run_start = Some(m_rev);
+                        continue;
+                    }
+                    if let Some(run_start) = skipped_run_start.take() {
+                        bwd_sum = batched_transition_backward(
+                            &mut ws.bwd[..active_states],
+                            bwd_sum,
+                            p_recomb,
+                            run_start,
+                            skipped_run_end,
+                            active_states,
+                            transition_haps,
+                        );
+                    }
+                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let n_alleles = probs.len();
                     if prior_marker_idx == Some(m_rev) {
                         ws.ensure_state_posterior_scratch(active_states);
@@ -2001,117 +2330,104 @@ fn run_impute_hmm_seqcoded(
                     }
 
                     if is_final {
-                        if should_skip_untyped_posterior(
-                            target_probs,
-                            &ws.nearest_obs_lambda,
-                            m_rev,
-                            use_prior_smoothing,
-                        ) && prior_marker_idx != Some(m_rev)
-                        {
-                            posteriors[m_rev] =
-                                panel_freq_posterior(target_probs.panel_priors(), m_rev);
-                        } else {
-                            ws.allele_probs.clear();
-                            if n_alleles > 0 {
-                                ws.allele_probs.resize(n_alleles, 0.0f32);
-                                let subset_counts = &mut ws.subset_counts[..n_alleles];
-                                let smoothing_prior_counts =
-                                    &mut ws.smoothing_prior_counts[..n_alleles];
-                                subset_counts.fill(0.0);
-                                smoothing_prior_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
-                                let mut smoothing_prior_total = 0.0f32;
-                                let mut total = 0.0f32;
-                                let mut missing_mass = 0.0f32;
-                                for i in 0..active_states {
-                                    let state_prob = fwd_slice[i] * ws.bwd[i];
-                                    total += state_prob;
-                                    let ref_allele = seq_patterns.allele_for_state(i);
-                                    if ref_allele == 255 {
-                                        missing_mass += state_prob;
-                                        continue;
-                                    }
-                                    let idx = ref_allele as usize;
-                                    if idx < ws.allele_probs.len() {
-                                        ws.allele_probs[idx] += state_prob;
-                                        subset_counts[idx] += state_prob;
-                                        subset_total += state_prob;
-                                        let w = ws.weights[i].max(0.0);
-                                        if w > 0.0 {
-                                            smoothing_prior_counts[idx] += w;
-                                            smoothing_prior_total += w;
-                                        }
+                        ws.allele_probs.clear();
+                        if n_alleles > 0 {
+                            ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let subset_counts = &mut ws.subset_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
+                            subset_counts.fill(0.0);
+                            smoothing_prior_counts.fill(0.0);
+                            let mut subset_total = 0.0f32;
+                            let mut smoothing_prior_total = 0.0f32;
+                            let mut total = 0.0f32;
+                            let mut missing_mass = 0.0f32;
+                            for i in 0..active_states {
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob;
+                                let ref_allele = seq_patterns.allele_for_state(i);
+                                if ref_allele == 255 {
+                                    missing_mass += state_prob;
+                                    continue;
+                                }
+                                let idx = ref_allele as usize;
+                                if idx < ws.allele_probs.len() {
+                                    ws.allele_probs[idx] += state_prob;
+                                    subset_counts[idx] += state_prob;
+                                    subset_total += state_prob;
+                                    let w = ws.weights[i].max(0.0);
+                                    if w > 0.0 {
+                                        smoothing_prior_counts[idx] += w;
+                                        smoothing_prior_total += w;
                                     }
                                 }
-                                if total > 0.0 {
-                                    if missing_mass > 0.0 {
-                                        let prior = if subset_total > 0.0 {
-                                            let inv = 1.0 / subset_total;
-                                            for v in subset_counts.iter_mut() {
-                                                *v *= inv;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(subset_counts)
-                                        } else if smoothing_prior_total > 0.0 {
-                                            let inv = 1.0 / smoothing_prior_total;
-                                            for v in smoothing_prior_counts.iter_mut() {
-                                                *v *= inv;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(
-                                                smoothing_prior_counts,
-                                            )
-                                        } else {
-                                            if !warned_af_fallback {
-                                                eprintln!(
+                            }
+                            if total > 0.0 {
+                                if missing_mass > 0.0 {
+                                    let prior = if subset_total > 0.0 {
+                                        let inv = 1.0 / subset_total;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
                                                     "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
                                                     context.window_idx,
                                                     context.sample_idx,
                                                     context.hap_idx,
                                                     m_rev
                                                 );
-                                                warned_af_fallback = true;
-                                            }
-                                            if ws.allele_prior_scratch.len() < n_alleles {
-                                                ws.allele_prior_scratch.resize(n_alleles, 0.0);
-                                            }
-                                            let uniform = 1.0f32 / n_alleles.max(1) as f32;
-                                            for v in
-                                                ws.allele_prior_scratch.iter_mut().take(n_alleles)
-                                            {
-                                                *v = uniform;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(
-                                                &ws.allele_prior_scratch[..n_alleles],
-                                            )
-                                        };
-                                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                            *p += missing_mass * prior.as_slice()[i];
+                                            warned_af_fallback = true;
                                         }
+                                        if ws.allele_prior_scratch.len() < n_alleles {
+                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                        }
+                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles)
+                                        {
+                                            *v = uniform;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(
+                                            &ws.allele_prior_scratch[..n_alleles],
+                                        )
+                                    };
+                                    for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                        *p += missing_mass * prior.as_slice()[i];
                                     }
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p /= total;
-                                    }
-                                    if use_prior_smoothing {
-                                        apply_marker_prior_smoothing(
-                                            &mut ws.allele_probs,
-                                            target_probs.panel_priors(),
-                                            m_rev,
-                                            smoothing_prior_counts,
-                                            smoothing_prior_total,
-                                            &mut ws.allele_prior_scratch,
-                                            ws.nearest_obs_lambda
-                                                .get(m_rev)
-                                                .copied()
-                                                .unwrap_or(f32::INFINITY),
-                                            target_probs.is_untyped_uniform_marker(m_rev),
-                                            active_states,
-                                            panel_haps,
-                                            target_probs.min_untyped_prior_mix(),
-                                            &mut warned_af_fallback,
-                                            context,
-                                        );
-                                    }
-                                } else {
-                                    return Err(ReagleError::vcf(format!(
+                                }
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p /= total;
+                                }
+                                if use_prior_smoothing {
+                                    apply_marker_prior_smoothing(
+                                        &mut ws.allele_probs,
+                                        panel_priors,
+                                        m_rev,
+                                        smoothing_prior_counts,
+                                        smoothing_prior_total,
+                                        &mut ws.allele_prior_scratch,
+                                        ws.nearest_obs_lambda
+                                            .get(m_rev)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
+                                        target_probs.min_untyped_prior_mix(),
+                                        &mut warned_af_fallback,
+                                        context,
+                                    );
+                                }
+                            } else {
+                                return Err(ReagleError::vcf(format!(
                                         "Posterior mass collapse in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
                                         context.window_idx,
                                         context.sample_idx,
@@ -2119,17 +2435,16 @@ fn run_impute_hmm_seqcoded(
                                         m_rev,
                                         active_states
                                     )));
-                                }
-                                if ws.allele_probs.len() == 2 {
-                                    posteriors[m_rev] =
-                                        AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                                } else {
-                                    let mut out = Vec::with_capacity(ws.allele_probs.len());
-                                    out.extend_from_slice(&ws.allele_probs);
-                                    posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                                }
+                            }
+                            if ws.allele_probs.len() == 2 {
+                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
                             } else {
-                                return Err(ReagleError::vcf(format!(
+                                let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                out.extend_from_slice(&ws.allele_probs);
+                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                            }
+                        } else {
+                            return Err(ReagleError::vcf(format!(
                                     "No allele space available in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
                                     context.window_idx,
                                     context.sample_idx,
@@ -2137,11 +2452,10 @@ fn run_impute_hmm_seqcoded(
                                     m_rev,
                                     active_states
                                 )));
-                            }
                         }
                     }
 
-                    if target_probs.is_uniform_marker(m_rev) {
+                    if uniform_mask[m_rev] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2175,6 +2489,17 @@ fn run_impute_hmm_seqcoded(
                         }
                         bwd_sum = new_sum.max(1e-30);
                     }
+                }
+                if let Some(run_start) = skipped_run_start.take() {
+                    bwd_sum = batched_transition_backward(
+                        &mut ws.bwd[..active_states],
+                        bwd_sum,
+                        p_recomb,
+                        run_start,
+                        skipped_run_end,
+                        active_states,
+                        transition_haps,
+                    );
                 }
                 if block_start == 0 {
                     break;
@@ -2227,6 +2552,15 @@ fn run_impute_hmm_dict(
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
+    let uniform_mask = build_uniform_mask(target_probs, active_markers);
+    let skip_untyped_mask = build_skip_untyped_mask(
+        target_probs,
+        &ws.nearest_obs_lambda,
+        &uniform_mask,
+        active_markers,
+        use_prior_smoothing,
+    );
+    let panel_priors = target_probs.panel_priors();
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -2249,31 +2583,77 @@ fn run_impute_hmm_dict(
         }
 
         let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
-        for m in 0..active_markers {
-            let use_prior_weighting = m == 0 && state_priors.is_some();
-            forward_update_dict(
-                ws,
-                m,
-                use_prior_weighting,
-                state_haps,
-                ref_columns,
-                target_probs,
-                p_recomb,
-                current_error,
-                active_states,
-                transition_haps,
-                &mut last_dict_ptr,
-            );
-            if m % checkpoint_stride == 0 {
-                let cp = (m / checkpoint_stride) * active_states;
-                ws.fwd_checkpoints[cp..cp + active_states]
-                    .copy_from_slice(&ws.fwd[..active_states]);
+        let mut m = 0usize;
+        while m < active_markers {
+            if !uniform_mask[m] {
+                let use_prior_weighting = m == 0 && state_priors.is_some();
+                forward_update_dict(
+                    ws,
+                    m,
+                    use_prior_weighting,
+                    state_haps,
+                    ref_columns,
+                    target_probs,
+                    p_recomb,
+                    current_error,
+                    active_states,
+                    transition_haps,
+                    &mut last_dict_ptr,
+                );
+                if m % checkpoint_stride == 0 {
+                    let cp = (m / checkpoint_stride) * active_states;
+                    ws.fwd_checkpoints[cp..cp + active_states]
+                        .copy_from_slice(&ws.fwd[..active_states]);
+                }
+                if prior_marker_idx == Some(m) {
+                    let mut snapshot = ws.fwd[..active_states].to_vec();
+                    normalize_probs(&mut snapshot);
+                    forward_prior_state_post = Some(snapshot);
+                }
+                m += 1;
+                continue;
             }
-            if prior_marker_idx == Some(m) {
-                let mut snapshot = ws.fwd[..active_states].to_vec();
-                normalize_probs(&mut snapshot);
-                forward_prior_state_post = Some(snapshot);
+
+            let mut run_end = m + 1;
+            while run_end < active_markers && uniform_mask[run_end] {
+                run_end += 1;
             }
+            let mut seg_start = m;
+            while seg_start < run_end {
+                let mut seg_end = run_end;
+                let next_cp =
+                    ((seg_start + checkpoint_stride - 1) / checkpoint_stride) * checkpoint_stride;
+                if next_cp < seg_end {
+                    seg_end = next_cp + 1;
+                }
+                if let Some(pm) = prior_marker_idx {
+                    if pm >= seg_start && pm < seg_end {
+                        seg_end = pm + 1;
+                    }
+                }
+                batched_transition_forward(
+                    &mut ws.fwd[..active_states],
+                    p_recomb,
+                    seg_start,
+                    seg_end,
+                    active_states,
+                    transition_haps,
+                );
+                ws.fwd_scales[seg_start..seg_end].fill(1.0);
+                let last = seg_end - 1;
+                if last % checkpoint_stride == 0 {
+                    let cp = (last / checkpoint_stride) * active_states;
+                    ws.fwd_checkpoints[cp..cp + active_states]
+                        .copy_from_slice(&ws.fwd[..active_states]);
+                }
+                if prior_marker_idx == Some(last) {
+                    let mut snapshot = ws.fwd[..active_states].to_vec();
+                    normalize_probs(&mut snapshot);
+                    forward_prior_state_post = Some(snapshot);
+                }
+                seg_start = seg_end;
+            }
+            m = run_end;
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -2300,7 +2680,33 @@ fn run_impute_hmm_dict(
 
                 if block_start + 1 < block_end {
                     let mut last_dict_ptr_re: *const DictionaryColumn = std::ptr::null();
-                    for m in (block_start + 1)..block_end {
+                    let mut m = block_start + 1;
+                    while m < block_end {
+                        let replay_skip = is_final
+                            && prior_marker_idx != Some(m)
+                            && skip_untyped_mask[m]
+                            && uniform_mask[m];
+                        if replay_skip {
+                            let mut run_end = m + 1;
+                            while run_end < block_end
+                                && is_final
+                                && prior_marker_idx != Some(run_end)
+                                && skip_untyped_mask[run_end]
+                                && uniform_mask[run_end]
+                            {
+                                run_end += 1;
+                            }
+                            batched_transition_forward(
+                                &mut ws.fwd[..active_states],
+                                p_recomb,
+                                m,
+                                run_end,
+                                active_states,
+                                transition_haps,
+                            );
+                            m = run_end;
+                            continue;
+                        }
                         forward_update_dict(
                             ws,
                             m,
@@ -2317,12 +2723,36 @@ fn run_impute_hmm_dict(
                         let local_idx = (m - block_start) * active_states;
                         ws.fwd_history[local_idx..local_idx + active_states]
                             .copy_from_slice(&ws.fwd[..active_states]);
+                        m += 1;
                     }
                 }
 
+                let mut skipped_run_start: Option<usize> = None;
+                let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
-                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
+                    let skip_untyped_posterior =
+                        is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev];
+                    if skip_untyped_posterior {
+                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                        if skipped_run_start.is_none() {
+                            skipped_run_end = m_rev + 1;
+                        }
+                        skipped_run_start = Some(m_rev);
+                        continue;
+                    }
+                    if let Some(run_start) = skipped_run_start.take() {
+                        bwd_sum = batched_transition_backward(
+                            &mut ws.bwd[..active_states],
+                            bwd_sum,
+                            p_recomb,
+                            run_start,
+                            skipped_run_end,
+                            active_states,
+                            transition_haps,
+                        );
+                    }
+                    let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let n_alleles = probs.len();
                     if prior_marker_idx == Some(m_rev) {
                         ws.ensure_state_posterior_scratch(active_states);
@@ -2361,117 +2791,104 @@ fn run_impute_hmm_dict(
                     }
 
                     if is_final {
-                        if should_skip_untyped_posterior(
-                            target_probs,
-                            &ws.nearest_obs_lambda,
-                            m_rev,
-                            use_prior_smoothing,
-                        ) && prior_marker_idx != Some(m_rev)
-                        {
-                            posteriors[m_rev] =
-                                panel_freq_posterior(target_probs.panel_priors(), m_rev);
-                        } else {
-                            ws.allele_probs.clear();
-                            if n_alleles > 0 {
-                                ws.allele_probs.resize(n_alleles, 0.0f32);
-                                let subset_counts = &mut ws.subset_counts[..n_alleles];
-                                let smoothing_prior_counts =
-                                    &mut ws.smoothing_prior_counts[..n_alleles];
-                                subset_counts.fill(0.0);
-                                smoothing_prior_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
-                                let mut smoothing_prior_total = 0.0f32;
-                                let mut total = 0.0f32;
-                                let mut missing_mass = 0.0f32;
-                                for i in 0..active_states {
-                                    let state_prob = fwd_slice[i] * ws.bwd[i];
-                                    total += state_prob;
-                                    let ref_allele = dict_patterns.allele_for_state(i);
-                                    if ref_allele == 255 {
-                                        missing_mass += state_prob;
-                                        continue;
-                                    }
-                                    let idx = ref_allele as usize;
-                                    if idx < ws.allele_probs.len() {
-                                        ws.allele_probs[idx] += state_prob;
-                                        subset_counts[idx] += state_prob;
-                                        subset_total += state_prob;
-                                        let w = ws.weights[i].max(0.0);
-                                        if w > 0.0 {
-                                            smoothing_prior_counts[idx] += w;
-                                            smoothing_prior_total += w;
-                                        }
+                        ws.allele_probs.clear();
+                        if n_alleles > 0 {
+                            ws.allele_probs.resize(n_alleles, 0.0f32);
+                            let subset_counts = &mut ws.subset_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
+                            subset_counts.fill(0.0);
+                            smoothing_prior_counts.fill(0.0);
+                            let mut subset_total = 0.0f32;
+                            let mut smoothing_prior_total = 0.0f32;
+                            let mut total = 0.0f32;
+                            let mut missing_mass = 0.0f32;
+                            for i in 0..active_states {
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob;
+                                let ref_allele = dict_patterns.allele_for_state(i);
+                                if ref_allele == 255 {
+                                    missing_mass += state_prob;
+                                    continue;
+                                }
+                                let idx = ref_allele as usize;
+                                if idx < ws.allele_probs.len() {
+                                    ws.allele_probs[idx] += state_prob;
+                                    subset_counts[idx] += state_prob;
+                                    subset_total += state_prob;
+                                    let w = ws.weights[i].max(0.0);
+                                    if w > 0.0 {
+                                        smoothing_prior_counts[idx] += w;
+                                        smoothing_prior_total += w;
                                     }
                                 }
-                                if total > 0.0 {
-                                    if missing_mass > 0.0 {
-                                        let prior = if subset_total > 0.0 {
-                                            let inv = 1.0 / subset_total;
-                                            for v in subset_counts.iter_mut() {
-                                                *v *= inv;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(subset_counts)
-                                        } else if smoothing_prior_total > 0.0 {
-                                            let inv = 1.0 / smoothing_prior_total;
-                                            for v in smoothing_prior_counts.iter_mut() {
-                                                *v *= inv;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(
-                                                smoothing_prior_counts,
-                                            )
-                                        } else {
-                                            if !warned_af_fallback {
-                                                eprintln!(
+                            }
+                            if total > 0.0 {
+                                if missing_mass > 0.0 {
+                                    let prior = if subset_total > 0.0 {
+                                        let inv = 1.0 / subset_total;
+                                        for v in subset_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
+                                    } else {
+                                        if !warned_af_fallback {
+                                            eprintln!(
                                                     "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
                                                     context.window_idx,
                                                     context.sample_idx,
                                                     context.hap_idx,
                                                     m_rev
                                                 );
-                                                warned_af_fallback = true;
-                                            }
-                                            if ws.allele_prior_scratch.len() < n_alleles {
-                                                ws.allele_prior_scratch.resize(n_alleles, 0.0);
-                                            }
-                                            let uniform = 1.0f32 / n_alleles.max(1) as f32;
-                                            for v in
-                                                ws.allele_prior_scratch.iter_mut().take(n_alleles)
-                                            {
-                                                *v = uniform;
-                                            }
-                                            NormalizedAlleleProbs::from_trusted(
-                                                &ws.allele_prior_scratch[..n_alleles],
-                                            )
-                                        };
-                                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                            *p += missing_mass * prior.as_slice()[i];
+                                            warned_af_fallback = true;
                                         }
+                                        if ws.allele_prior_scratch.len() < n_alleles {
+                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                        }
+                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles)
+                                        {
+                                            *v = uniform;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(
+                                            &ws.allele_prior_scratch[..n_alleles],
+                                        )
+                                    };
+                                    for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                        *p += missing_mass * prior.as_slice()[i];
                                     }
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p /= total;
-                                    }
-                                    if use_prior_smoothing {
-                                        apply_marker_prior_smoothing(
-                                            &mut ws.allele_probs,
-                                            target_probs.panel_priors(),
-                                            m_rev,
-                                            smoothing_prior_counts,
-                                            smoothing_prior_total,
-                                            &mut ws.allele_prior_scratch,
-                                            ws.nearest_obs_lambda
-                                                .get(m_rev)
-                                                .copied()
-                                                .unwrap_or(f32::INFINITY),
-                                            target_probs.is_untyped_uniform_marker(m_rev),
-                                            active_states,
-                                            panel_haps,
-                                            target_probs.min_untyped_prior_mix(),
-                                            &mut warned_af_fallback,
-                                            context,
-                                        );
-                                    }
-                                } else {
-                                    return Err(ReagleError::vcf(format!(
+                                }
+                                for p in ws.allele_probs.iter_mut() {
+                                    *p /= total;
+                                }
+                                if use_prior_smoothing {
+                                    apply_marker_prior_smoothing(
+                                        &mut ws.allele_probs,
+                                        panel_priors,
+                                        m_rev,
+                                        smoothing_prior_counts,
+                                        smoothing_prior_total,
+                                        &mut ws.allele_prior_scratch,
+                                        ws.nearest_obs_lambda
+                                            .get(m_rev)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
+                                        target_probs.min_untyped_prior_mix(),
+                                        &mut warned_af_fallback,
+                                        context,
+                                    );
+                                }
+                            } else {
+                                return Err(ReagleError::vcf(format!(
                                         "Posterior mass collapse in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
                                         context.window_idx,
                                         context.sample_idx,
@@ -2479,17 +2896,16 @@ fn run_impute_hmm_dict(
                                         m_rev,
                                         active_states
                                     )));
-                                }
-                                if ws.allele_probs.len() == 2 {
-                                    posteriors[m_rev] =
-                                        AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                                } else {
-                                    let mut out = Vec::with_capacity(ws.allele_probs.len());
-                                    out.extend_from_slice(&ws.allele_probs);
-                                    posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                                }
+                            }
+                            if ws.allele_probs.len() == 2 {
+                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
                             } else {
-                                return Err(ReagleError::vcf(format!(
+                                let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                out.extend_from_slice(&ws.allele_probs);
+                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                            }
+                        } else {
+                            return Err(ReagleError::vcf(format!(
                                     "No allele space available in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
                                     context.window_idx,
                                     context.sample_idx,
@@ -2497,11 +2913,10 @@ fn run_impute_hmm_dict(
                                     m_rev,
                                     active_states
                                 )));
-                            }
                         }
                     }
 
-                    if target_probs.is_uniform_marker(m_rev) {
+                    if uniform_mask[m_rev] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2535,6 +2950,17 @@ fn run_impute_hmm_dict(
                         }
                         bwd_sum = new_sum.max(1e-30);
                     }
+                }
+                if let Some(run_start) = skipped_run_start.take() {
+                    bwd_sum = batched_transition_backward(
+                        &mut ws.bwd[..active_states],
+                        bwd_sum,
+                        p_recomb,
+                        run_start,
+                        skipped_run_end,
+                        active_states,
+                        transition_haps,
+                    );
                 }
                 if block_start == 0 {
                     break;
