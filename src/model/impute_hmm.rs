@@ -924,7 +924,8 @@ fn smooth_allele_posteriors_subset(
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
     // Pseudo-count mass should track information decay only. Extra gain
     // over-regularizes sparse arrays and can collapse rare-allele posteriors.
-    let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
+    const SMOOTHING_GAIN: f32 = 2.0;
+    let prior_mass = (SMOOTHING_GAIN * effective_alleles * (1.0 - retain) / retain).max(0.0);
     if prior_mass <= 0.0 {
         return;
     }
