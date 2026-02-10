@@ -505,6 +505,41 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.sample_confidence(marker, sample_idx) as f32 / 255.0
     }
 
+    /// Returns true if any sample has a missing genotype call at `marker`.
+    ///
+    /// Fast path: if a precomputed missing-genotype mask exists, this is an O(1)
+    /// bitmap row query. Otherwise we fall back to a direct scan of alleles.
+    #[inline]
+    pub fn marker_has_missing_genotype(&self, marker: MarkerIdx<Space>) -> bool {
+        let marker_idx = marker.as_usize();
+        assert!(
+            marker_idx < self.columns.len(),
+            "marker index {} out of bounds for {} markers",
+            marker_idx,
+            self.columns.len()
+        );
+
+        if let Some(mask) = &self.missing_genotypes {
+            return mask.row_has_any_set(marker_idx);
+        }
+
+        let samples = self.samples_arc();
+        for sample_idx in 0..samples.len() {
+            let s = SampleIdx::new(sample_idx as u32);
+            let h1 = s.hap1();
+            if GenotypeColumn::is_missing_allele(self.allele(marker, h1)) {
+                return true;
+            }
+            if samples.is_diploid(s) {
+                let h2 = s.hap2();
+                if GenotypeColumn::is_missing_allele(self.allele(marker, h2)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Clone the confidence data (for transferring to a new matrix)
     pub fn confidence_clone(&self) -> Option<Vec<Vec<u8>>> {
         self.confidence.as_ref().map(FlatU8Matrix::to_nested_clone)

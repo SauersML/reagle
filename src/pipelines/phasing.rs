@@ -2397,10 +2397,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         let hi_freq_markers: Vec<usize> = (0..n_markers)
             .filter(|&m| maf[m] >= rare_threshold)
             .collect();
-        let has_missing = |m: usize| -> bool {
-            let m_idx = MarkerIdx::new(m as u32);
-            (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == 255)
-        };
+        let has_missing =
+            |m: usize| -> bool { target_gt.marker_has_missing_genotype(MarkerIdx::new(m as u32)) };
         let rare_markers: Vec<usize> = (0..n_markers)
             .filter(|&m| (maf[m] < rare_threshold && maf[m] > 0.0) || has_missing(m))
             .collect();
