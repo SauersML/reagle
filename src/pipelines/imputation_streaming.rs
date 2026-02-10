@@ -3741,6 +3741,14 @@ impl crate::pipelines::ImputationPipeline {
             let mut probs2: Vec<f32> = Vec::new();
             let mut observed1: Vec<bool> = Vec::with_capacity(n_ref_markers);
             let mut observed2: Vec<bool> = Vec::with_capacity(n_ref_markers);
+            // Reuse scratch buffers across markers to avoid allocator churn in the hot loop.
+            let mut aligned1: Vec<f32> = Vec::new();
+            let mut aligned2: Vec<f32> = Vec::new();
+            let mut pl_probs_buf: Vec<f32> = Vec::new();
+            let mut cond_probs_buf: Vec<f32> = Vec::new();
+            let mut mapped_buf: Vec<f32> = Vec::new();
+            let mut weights_buf: Vec<f32> = Vec::new();
+            let mut target_priors_buf: Vec<f32> = Vec::new();
             offsets1.push(0);
             offsets2.push(0);
             let mut last_info1: Option<usize> = None;
@@ -3766,8 +3774,8 @@ impl crate::pipelines::ImputationPipeline {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles();
                 let mut observed1_marker = false;
                 let mut observed2_marker = false;
-                let mut aligned1: Vec<f32> = Vec::new();
-                let mut aligned2: Vec<f32> = Vec::new();
+                aligned1.clear();
+                aligned2.clear();
                 let mut use1 = false;
                 let mut use2 = false;
 
@@ -3834,11 +3842,6 @@ impl crate::pipelines::ImputationPipeline {
                         .allele_mappings
                         .get(target_m)
                         .and_then(|m| m.as_ref());
-                    let mut pl_probs_buf: Vec<f32> = Vec::new();
-                    let mut cond_probs_buf: Vec<f32> = Vec::new();
-                    let mut mapped_buf: Vec<f32> = Vec::new();
-                    let mut weights_buf: Vec<f32> = Vec::new();
-                    let mut target_priors_buf: Vec<f32> = Vec::new();
 
                     // If the input is unphased, avoid conditioning on a partner
                     // allele. Use unconditional allele probabilities from PL
@@ -4200,12 +4203,12 @@ impl crate::pipelines::ImputationPipeline {
                 offsets2.push(probs2.len());
             }
             (
-            TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix),
-            TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix),
-            last_info1,
-            last_info2,
-        )
-    };
+                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix),
+                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix),
+                last_info1,
+                last_info2,
+            )
+        };
 
         let n_target_haps = n_target_samples * 2;
         let min_info_nats = (plan.n_ref_haps as f32).ln() * 1.5;
@@ -4360,17 +4363,17 @@ impl crate::pipelines::ImputationPipeline {
                                             plan.n_ref_haps,
                                             peer_query,
                                         );
-                                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                                        beam_uncertainty =
+                                            0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
-                                    let err_limit =
-                                        phase_query_orientation_error_limit(
-                                            geno_conf,
-                                            beam_uncertainty,
-                                        )
-                                        .max(1e-6);
+                                    let err_limit = phase_query_orientation_error_limit(
+                                        geno_conf,
+                                        beam_uncertainty,
+                                    )
+                                    .max(1e-6);
                                     let orientation_weight =
                                         phase_orientation_weight(phase_conf, err_limit);
                                     cached_allele_weight = orientation_weight;
@@ -4391,15 +4394,14 @@ impl crate::pipelines::ImputationPipeline {
                             let query = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
                             let target_allele = query.as_allele().unwrap_or(255);
-                            query_info_weight[i] = if target_allele != 255
-                                && (target_allele as usize) < n_alleles
-                            {
-                                info_llr * cached_allele_weight
-                            } else if query.is_wildcard() {
-                                cached_wildcard_weight
-                            } else {
-                                0.0
-                            };
+                            query_info_weight[i] =
+                                if target_allele != 255 && (target_allele as usize) < n_alleles {
+                                    info_llr * cached_allele_weight
+                                } else if query.is_wildcard() {
+                                    cached_wildcard_weight
+                                } else {
+                                    0.0
+                                };
                             query_alleles[i] = query;
                         }
                     } else {
@@ -4687,8 +4689,9 @@ impl crate::pipelines::ImputationPipeline {
 
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
+                let mut posts_probs_buf: Vec<f32> = Vec::new();
                 let posts_from_priors =
-                    |priors: &HaplotypePriors| -> Result<Vec<AllelePosteriors>> {
+                    |priors: &HaplotypePriors, probs_buf: &mut Vec<f32>| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
                         Vec::with_capacity(output_end.saturating_sub(output_start));
                     for ref_m in output_start..output_end {
@@ -4696,7 +4699,8 @@ impl crate::pipelines::ImputationPipeline {
                             .marker(MarkerIdx::new(ref_m as u32))
                             .n_alleles()
                             .max(1);
-                        let mut probs = vec![0.0f32; n_alleles];
+                        probs_buf.clear();
+                        probs_buf.resize(n_alleles, 0.0);
                         for (id, p) in priors.ids().iter().zip(priors.probs().iter()) {
                             let hap = HapIdx::new(id.0);
                             let allele = ref_columns
@@ -4707,11 +4711,11 @@ impl crate::pipelines::ImputationPipeline {
                                 continue;
                             }
                             let idx = allele as usize;
-                            if idx < probs.len() {
-                                probs[idx] += *p;
+                            if idx < probs_buf.len() {
+                                probs_buf[idx] += *p;
                             }
                         }
-                        let sum: f32 = probs.iter().sum();
+                        let sum: f32 = probs_buf.iter().sum();
                         if sum <= 0.0 {
                             return Err(ReagleError::vcf(format!(
                                 "Subset prior collapsed while building allele posteriors: window={} sample={} marker={} source=handoff_priors",
@@ -4720,22 +4724,22 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         if sum > 0.0 {
                             let inv = 1.0 / sum;
-                            for v in probs.iter_mut() {
+                            for v in probs_buf.iter_mut() {
                                 *v *= inv;
                             }
                         }
                         if n_alleles == 2 {
                             out.push(AllelePosteriors::Biallelic(
-                                probs.get(1).copied().unwrap_or(0.0),
+                                probs_buf.get(1).copied().unwrap_or(0.0),
                             ));
                         } else {
-                            out.push(AllelePosteriors::Multiallelic(probs));
+                            out.push(AllelePosteriors::Multiallelic(probs_buf.clone()));
                         }
                     }
                     Ok(out)
                 };
                 let posts_from_donors =
-                    |donors: &[(RefHapId, u32)]| -> Result<Vec<AllelePosteriors>> {
+                    |donors: &[(RefHapId, u32)], probs_buf: &mut Vec<f32>| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
                         Vec::with_capacity(output_end.saturating_sub(output_start));
                     let total: u32 = donors.iter().map(|(_, c)| *c).sum();
@@ -4751,7 +4755,8 @@ impl crate::pipelines::ImputationPipeline {
                             .marker(MarkerIdx::new(ref_m as u32))
                             .n_alleles()
                             .max(1);
-                        let mut probs = vec![0.0f32; n_alleles];
+                        probs_buf.clear();
+                        probs_buf.resize(n_alleles, 0.0);
                         for (hap, c) in donors.iter() {
                             let allele = ref_columns
                                 .get(ref_m)
@@ -4761,11 +4766,11 @@ impl crate::pipelines::ImputationPipeline {
                                 continue;
                             }
                             let idx = allele as usize;
-                            if idx < probs.len() {
-                                probs[idx] += *c as f32 * inv_total;
+                            if idx < probs_buf.len() {
+                                probs_buf[idx] += *c as f32 * inv_total;
                             }
                         }
-                        let sum: f32 = probs.iter().sum();
+                        let sum: f32 = probs_buf.iter().sum();
                         if sum <= 0.0 {
                             return Err(ReagleError::vcf(format!(
                                 "Donor-based posterior collapsed at marker: window={} sample={} marker={} donors={}",
@@ -4776,15 +4781,15 @@ impl crate::pipelines::ImputationPipeline {
                             )));
                         }
                         let inv = 1.0 / sum;
-                        for v in probs.iter_mut() {
+                        for v in probs_buf.iter_mut() {
                             *v *= inv;
                         }
                         if n_alleles == 2 {
                             out.push(AllelePosteriors::Biallelic(
-                                probs.get(1).copied().unwrap_or(0.0),
+                                probs_buf.get(1).copied().unwrap_or(0.0),
                             ));
                         } else {
-                            out.push(AllelePosteriors::Multiallelic(probs));
+                            out.push(AllelePosteriors::Multiallelic(probs_buf.clone()));
                         }
                     }
                     Ok(out)
@@ -4825,16 +4830,16 @@ impl crate::pipelines::ImputationPipeline {
                         prior_haps.extend(weighted.into_iter().map(|(hap, _)| hap));
                     }
 
-                    let window_haps: Vec<RefHapId> = state_haps_by_hap
+                    let empty_haps: &[RefHapId] = &[];
+                    let window_haps: &[RefHapId] = state_haps_by_hap
                         .get(hap_idx.as_usize())
-                        .cloned()
-                        .unwrap_or_default();
-                    let donor_haps: Vec<RefHapId> = donors.iter().map(|(hap, _)| *hap).collect();
-                    let core_haps: Vec<RefHapId> = plan
+                        .map(|v| v.as_slice())
+                        .unwrap_or(empty_haps);
+                    let core_haps: &[RefHapId] = plan
                         .core_states
                         .get(hap_idx.as_usize())
-                        .cloned()
-                        .unwrap_or_default();
+                        .map(|v| v.as_slice())
+                        .unwrap_or(empty_haps);
 
                     let fill_from = |out: &mut Vec<RefHapId>,
                                      seen: &mut std::collections::HashSet<RefHapId>,
@@ -4857,10 +4862,32 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         added
                     };
+                    let fill_from_donors =
+                        |out: &mut Vec<RefHapId>,
+                         seen: &mut std::collections::HashSet<RefHapId>,
+                         source: &[(RefHapId, u32)],
+                         want: usize,
+                         k: usize|
+                         -> usize {
+                            if want == 0 || out.len() >= k {
+                                return 0;
+                            }
+                            let mut added = 0usize;
+                            for &(hap, _) in source {
+                                if out.len() >= k || added >= want {
+                                    break;
+                                }
+                                if seen.insert(hap) {
+                                    out.push(hap);
+                                    added += 1;
+                                }
+                            }
+                            added
+                        };
 
                     let mut q_prior = k * STATE_MIX_PRIOR_FRAC_NUM / STATE_MIX_FRAC_DEN;
                     let mut q_window = k * STATE_MIX_WINDOW_FRAC_NUM / STATE_MIX_FRAC_DEN;
-                    let mut q_donor = if donor_haps.is_empty() {
+                    let mut q_donor = if donors.is_empty() {
                         0
                     } else {
                         k * STATE_MIX_DONOR_FRAC_NUM / STATE_MIX_FRAC_DEN
@@ -4911,20 +4938,20 @@ impl crate::pipelines::ImputationPipeline {
                     };
                     fill_from(&mut out, &mut seen, &prior_haps, prior_floor, k);
                     fill_from(&mut out, &mut seen, &prior_haps, q_prior, k);
-                    fill_from(&mut out, &mut seen, &window_haps, q_window, k);
-                    fill_from(&mut out, &mut seen, &donor_haps, q_donor, k);
-                    fill_from(&mut out, &mut seen, &core_haps, q_core, k);
+                    fill_from(&mut out, &mut seen, window_haps, q_window, k);
+                    fill_from_donors(&mut out, &mut seen, donors, q_donor, k);
+                    fill_from(&mut out, &mut seen, core_haps, q_core, k);
 
                     while out.len() < k {
                         let before = out.len();
                         let remaining = k - out.len();
                         fill_from(&mut out, &mut seen, &prior_haps, remaining, k);
                         let remaining = k - out.len();
-                        fill_from(&mut out, &mut seen, &window_haps, remaining, k);
+                        fill_from(&mut out, &mut seen, window_haps, remaining, k);
                         let remaining = k - out.len();
-                        fill_from(&mut out, &mut seen, &donor_haps, remaining, k);
+                        fill_from_donors(&mut out, &mut seen, donors, remaining, k);
                         let remaining = k - out.len();
-                        fill_from(&mut out, &mut seen, &core_haps, remaining, k);
+                        fill_from(&mut out, &mut seen, core_haps, remaining, k);
                         if out.len() == before {
                             break;
                         }
@@ -5146,7 +5173,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         let decayed = decay_prior(p);
-                        hap1_posts = Some(posts_from_priors(&decayed)?);
+                        hap1_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
                         p1_out = decayed;
                     }
                 } else if use_hmm_h1 {
@@ -5164,7 +5191,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         let decayed = decay_prior(p);
-                        hap1_posts = Some(posts_from_priors(&decayed)?);
+                        hap1_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
                         p1_out = decayed;
                     }
                 } else {
@@ -5175,7 +5202,7 @@ impl crate::pipelines::ImputationPipeline {
                             .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
                             .unzip();
                         p1_out = HaplotypePriors::new(ids, probs);
-                        hap1_posts = Some(posts_from_donors(&donors_h1)?);
+                        hap1_posts = Some(posts_from_donors(&donors_h1, &mut posts_probs_buf)?);
                     } else {
                         return Err(ReagleError::vcf(format!(
                             "No subset priors or donors for haplotype: window={} sample={} hap={}",
@@ -5195,7 +5222,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         let decayed = decay_prior(p);
-                        hap2_posts = Some(posts_from_priors(&decayed)?);
+                        hap2_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
                         p2_out = decayed;
                     }
                 } else if use_hmm_h2 {
@@ -5213,7 +5240,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         let decayed = decay_prior(p);
-                        hap2_posts = Some(posts_from_priors(&decayed)?);
+                        hap2_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
                         p2_out = decayed;
                     }
                 } else {
@@ -5224,7 +5251,7 @@ impl crate::pipelines::ImputationPipeline {
                             .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
                             .unzip();
                         p2_out = HaplotypePriors::new(ids, probs);
-                        hap2_posts = Some(posts_from_donors(&donors_h2)?);
+                        hap2_posts = Some(posts_from_donors(&donors_h2, &mut posts_probs_buf)?);
                     } else {
                         return Err(ReagleError::vcf(format!(
                             "No subset priors or donors for haplotype: window={} sample={} hap={}",
@@ -5341,8 +5368,15 @@ impl crate::pipelines::ImputationPipeline {
                     .max(1);
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
-                for (haps, beams, query_alleles, query_allele_weight, _, peer_idx_by_hap, scratch) in
-                    batches.iter_mut()
+                for (
+                    haps,
+                    beams,
+                    query_alleles,
+                    query_allele_weight,
+                    _,
+                    peer_idx_by_hap,
+                    scratch,
+                ) in batches.iter_mut()
                 {
                     if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
                         let target_idx = target_m.as_usize();
@@ -5430,17 +5464,17 @@ impl crate::pipelines::ImputationPipeline {
                                             plan.n_ref_haps,
                                             peer_query,
                                         );
-                                        beam_uncertainty = 0.5 * (beam_uncertainty + peer_uncertainty);
+                                        beam_uncertainty =
+                                            0.5 * (beam_uncertainty + peer_uncertainty);
                                     }
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
-                                    let err_limit =
-                                        phase_query_orientation_error_limit(
-                                            geno_conf,
-                                            beam_uncertainty,
-                                        )
-                                        .max(1e-6);
+                                    let err_limit = phase_query_orientation_error_limit(
+                                        geno_conf,
+                                        beam_uncertainty,
+                                    )
+                                    .max(1e-6);
                                     cached_allele_weight =
                                         phase_orientation_weight(phase_conf, err_limit);
                                     if phase_best_orientation_error(phase_conf) > err_limit {
@@ -6452,84 +6486,83 @@ impl crate::pipelines::ImputationPipeline {
         let mut p2_buf: Vec<f32> = Vec::new();
         let mut allele_counts: Vec<f32> = Vec::new();
 
-        let mut update_multiallelic =
-            |stats: &mut ImputationQuality,
-             marker_idx: usize,
-             sample_idx: usize,
-             use_hard: bool| {
-                let n_alleles = ref_markers
-                    .marker(MarkerIdx::new(marker_idx as u32))
-                    .n_alleles()
-                    .max(1);
-                p1_buf.resize(n_alleles, 0.0);
-                p2_buf.resize(n_alleles, 0.0);
-                p1_buf.fill(0.0);
-                p2_buf.fill(0.0);
+        let mut update_multiallelic = |stats: &mut ImputationQuality,
+                                       marker_idx: usize,
+                                       sample_idx: usize,
+                                       use_hard: bool| {
+            let n_alleles = ref_markers
+                .marker(MarkerIdx::new(marker_idx as u32))
+                .n_alleles()
+                .max(1);
+            p1_buf.resize(n_alleles, 0.0);
+            p2_buf.resize(n_alleles, 0.0);
+            p1_buf.fill(0.0);
+            p2_buf.fill(0.0);
 
-                if use_hard {
-                    if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
-                        if (a1 as usize) < n_alleles {
-                            p1_buf[a1 as usize] = 1.0;
-                        }
-                        if (a2 as usize) < n_alleles {
-                            p2_buf[a2 as usize] = 1.0;
-                        }
-                        if let Some(stats) = stats.get_mut(marker_idx) {
-                            stats.add_sample_multiallelic(&p1_buf, &p2_buf);
-                            return;
-                        }
+            if use_hard {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    if (a1 as usize) < n_alleles {
+                        p1_buf[a1 as usize] = 1.0;
+                    }
+                    if (a2 as usize) < n_alleles {
+                        p2_buf[a2 as usize] = 1.0;
+                    }
+                    if let Some(stats) = stats.get_mut(marker_idx) {
+                        stats.add_sample_multiallelic(&p1_buf, &p2_buf);
+                        return;
                     }
                 }
+            }
 
-                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
-                    allele_counts.resize(n_alleles, 0.0);
-                    allele_counts.fill(0.0);
-                    let mut idx = 0usize;
-                    for j in 0..n_alleles {
-                        for i in 0..=j {
-                            let p = gp.get(idx).copied().unwrap_or(0.0).max(0.0);
-                            if i == j {
-                                allele_counts[i] += 2.0 * p;
-                            } else {
-                                allele_counts[i] += p;
-                                allele_counts[j] += p;
-                            }
-                            idx += 1;
+            if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                allele_counts.resize(n_alleles, 0.0);
+                allele_counts.fill(0.0);
+                let mut idx = 0usize;
+                for j in 0..n_alleles {
+                    for i in 0..=j {
+                        let p = gp.get(idx).copied().unwrap_or(0.0).max(0.0);
+                        if i == j {
+                            allele_counts[i] += 2.0 * p;
+                        } else {
+                            allele_counts[i] += p;
+                            allele_counts[j] += p;
                         }
+                        idx += 1;
                     }
+                }
+                for a in 0..n_alleles {
+                    let v = (allele_counts[a] * 0.5).clamp(0.0, 1.0);
+                    p1_buf[a] = v;
+                    p2_buf[a] = v;
+                }
+            } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                let local_m = marker_idx.saturating_sub(output_start);
+                if let Some(p1) = result
+                    .hap_posteriors
+                    .0
+                    .as_ref()
+                    .and_then(|p1| p1.get(local_m))
+                {
                     for a in 0..n_alleles {
-                        let v = (allele_counts[a] * 0.5).clamp(0.0, 1.0);
-                        p1_buf[a] = v;
-                        p2_buf[a] = v;
-                    }
-                } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                    let local_m = marker_idx.saturating_sub(output_start);
-                    if let Some(p1) = result
-                        .hap_posteriors
-                        .0
-                        .as_ref()
-                        .and_then(|p1| p1.get(local_m))
-                    {
-                        for a in 0..n_alleles {
-                            p1_buf[a] = p1.prob(a).clamp(0.0, 1.0);
-                        }
-                    }
-                    if let Some(p2) = result
-                        .hap_posteriors
-                        .1
-                        .as_ref()
-                        .and_then(|p2| p2.get(local_m))
-                    {
-                        for a in 0..n_alleles {
-                            p2_buf[a] = p2.prob(a).clamp(0.0, 1.0);
-                        }
+                        p1_buf[a] = p1.prob(a).clamp(0.0, 1.0);
                     }
                 }
+                if let Some(p2) = result
+                    .hap_posteriors
+                    .1
+                    .as_ref()
+                    .and_then(|p2| p2.get(local_m))
+                {
+                    for a in 0..n_alleles {
+                        p2_buf[a] = p2.prob(a).clamp(0.0, 1.0);
+                    }
+                }
+            }
 
-                if let Some(stats) = stats.get_mut(marker_idx) {
-                    stats.add_sample_multiallelic(&p1_buf, &p2_buf);
-                }
-            };
+            if let Some(stats) = stats.get_mut(marker_idx) {
+                stats.add_sample_multiallelic(&p1_buf, &p2_buf);
+            }
+        };
 
         if include_posteriors {
             for marker_idx in markers_to_process_start..output_end {

@@ -69,14 +69,8 @@ impl GeneticMap {
                 continue;
             }
 
-            let java_like = (
-                parts[2].parse::<f64>(),
-                parts[3].parse::<u32>(),
-            );
-            let rust_linear_like = (
-                parts[1].parse::<u32>(),
-                parts[3].parse::<f64>(),
-            );
+            let java_like = (parts[2].parse::<f64>(), parts[3].parse::<u32>());
+            let rust_linear_like = (parts[1].parse::<u32>(), parts[3].parse::<f64>());
 
             let (pos, gen_pos) = match (java_like, rust_linear_like) {
                 ((Ok(gen_pos), Ok(pos)), _) => (pos, gen_pos),
@@ -517,8 +511,7 @@ mod tests {
     #[test]
     fn test_interpolation_rust_linear_format() {
         let map_file = create_test_map_file_rust_linear();
-        let map =
-            GeneticMap::from_plink_file(map_file.path(), "chr1").expect("Failed to load map");
+        let map = GeneticMap::from_plink_file(map_file.path(), "chr1").expect("Failed to load map");
 
         assert!((map.gen_pos(1_000_000) - 0.0).abs() < 0.001);
         assert!((map.gen_pos(2_000_000) - 1.0).abs() < 0.001);

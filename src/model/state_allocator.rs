@@ -456,7 +456,8 @@ fn boundary_pool_sizes_from_scores(
     if num_windows < 2 {
         return out;
     }
-    let (neff_by_window, support_by_window) = window_effective_pool_stats(scores_by_hap, num_windows);
+    let (neff_by_window, support_by_window) =
+        window_effective_pool_stats(scores_by_hap, num_windows);
     let panel_pool = DonorPoolSize::new(n_pool);
 
     let mut b = 0usize;
@@ -748,9 +749,7 @@ pub fn allocate_lms_sparse(
             simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
         coarse_samples.push((mu, used, gain));
         if used <= total_budget
-            && (!found_feasible
-                || gain > best_gain
-                || (gain == best_gain && used > best_used))
+            && (!found_feasible || gain > best_gain || (gain == best_gain && used > best_used))
         {
             found_feasible = true;
             mu_best = mu;
@@ -969,10 +968,7 @@ pub fn allocate_lms_sparse(
 
         if gain > 0.0 && len > 0 && len <= remaining {
             let active = dp_scratch.active[..w].to_vec();
-            selected_states[polish_idx] = Some(AllocationState {
-                active,
-                len,
-            });
+            selected_states[polish_idx] = Some(AllocationState { active, len });
             let active = &selected_states[polish_idx]
                 .as_ref()
                 .expect("just inserted allocation state")

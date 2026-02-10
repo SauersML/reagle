@@ -1781,8 +1781,8 @@ fn test_ultra_dense_markers() {
         !non_genotyped_conf.is_empty(),
         "Expected non-genotyped GP confidences in ultra-dense marker test"
     );
-    let non_genotyped_mean_conf = non_genotyped_conf.iter().map(|&x| x as f64).sum::<f64>()
-        / non_genotyped_conf.len() as f64;
+    let non_genotyped_mean_conf =
+        non_genotyped_conf.iter().map(|&x| x as f64).sum::<f64>() / non_genotyped_conf.len() as f64;
     println!(
         "Ultra-dense test - Non-genotyped mean max(GP): {:.6}, count: {}",
         non_genotyped_mean_conf,

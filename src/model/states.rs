@@ -269,6 +269,28 @@ impl<Space> MosaicCursor<Space> {
         }));
     }
 
+    /// Advance cursor to `marker` without recording history.
+    #[inline]
+    pub fn advance_to_marker(&mut self, marker: usize, th: &ThreadedHaps<Space>) {
+        while let Some(Reverse(event)) = self.pending_switches.peek().copied() {
+            if event.marker > marker {
+                break;
+            }
+            self.pending_switches.pop();
+            if event.state_idx >= self.state_versions.len() {
+                continue;
+            }
+            if event.version != self.state_versions[event.state_idx] {
+                continue;
+            }
+            if marker < self.next_switch[event.state_idx] {
+                continue;
+            }
+            self.advance_state(event.state_idx, marker, th);
+            self.schedule_state_switch(event.state_idx, th);
+        }
+    }
+
     /// Phase A with history: Advance to marker, recording state switches.
     ///
     /// Same as `advance_to_marker` but pushes `StateSwitch` events onto the

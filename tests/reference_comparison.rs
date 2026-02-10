@@ -6711,8 +6711,7 @@ fn test_imputed_af_collapse_against_java() {
             "Found {} imputed markers with AF collapse (Java>=0.05, Rust<=0.01)",
             collapse.len()
         );
-        for (chrom, pos, ref_allele, alt_alleles, j_af, r_af, rust_swap) in
-            collapse.iter().take(10)
+        for (chrom, pos, ref_allele, alt_alleles, j_af, r_af, rust_swap) in collapse.iter().take(10)
         {
             println!(
                 "  pos={}:{} {}>{} java_af={:.4} rust_af={:.4} swap={}",
@@ -6726,8 +6725,7 @@ fn test_imputed_af_collapse_against_java() {
             );
         }
         println!("  Collapse diagnostics (first 10):");
-        for (chrom, pos, ref_allele, alt_alleles, j_af, r_af, rust_swap) in
-            collapse.iter().take(10)
+        for (chrom, pos, ref_allele, alt_alleles, j_af, r_af, rust_swap) in collapse.iter().take(10)
         {
             let idx = target_positions.binary_search(pos).unwrap_or_else(|i| i);
             let mut nearest = None;
@@ -6750,26 +6748,26 @@ fn test_imputed_af_collapse_against_java() {
             );
             let mut ref_af = ref_match
                 .map(|(rec, _)| {
-                let mut alt = 0usize;
-                let mut total = 0usize;
-                for g in &rec.genotypes {
-                    let alleles: Vec<&str> = g.gt.split(|c| c == '/' || c == '|').collect();
-                    for a in alleles {
-                        if a == "." {
-                            continue;
-                        }
-                        total += 1;
-                        if a != "0" {
-                            alt += 1;
+                    let mut alt = 0usize;
+                    let mut total = 0usize;
+                    for g in &rec.genotypes {
+                        let alleles: Vec<&str> = g.gt.split(|c| c == '/' || c == '|').collect();
+                        for a in alleles {
+                            if a == "." {
+                                continue;
+                            }
+                            total += 1;
+                            if a != "0" {
+                                alt += 1;
+                            }
                         }
                     }
-                }
-                if total > 0 {
-                    alt as f64 / total as f64
-                } else {
-                    0.0
-                }
-            })
+                    if total > 0 {
+                        alt as f64 / total as f64
+                    } else {
+                        0.0
+                    }
+                })
                 .unwrap_or(0.0);
             if let Some((_, ref_swap)) = ref_match {
                 if ref_swap {

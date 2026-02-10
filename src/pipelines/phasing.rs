@@ -379,6 +379,9 @@ const FAST_BEAM_FIX_CONF: f32 = 0.99;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const PHASE_RAM_FRACTION: f64 = 0.15;
 const PHASE_STATE_HARD_CAP: usize = 200;
+const PHASE_AUTO_PRESCAN_MULT: usize = 4;
+const PHASE_AUTO_PRESCAN_MIN: usize = 512;
+const PHASE_AUTO_PRESCAN_MAX: usize = 2048;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
@@ -4363,7 +4366,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             self.config.phase_states
         };
         per_window_cap = if self.config.phase_states == 0 {
-            per_window_cap.min(n_ref_haps).max(1)
+            let auto_target = self
+                .params
+                .n_states
+                .max(1)
+                .saturating_mul(PHASE_AUTO_PRESCAN_MULT)
+                .clamp(PHASE_AUTO_PRESCAN_MIN, PHASE_AUTO_PRESCAN_MAX)
+                .min(n_ref_haps.max(1));
+            per_window_cap.min(auto_target).max(1)
         } else {
             per_window_cap
                 .min(PHASE_STATE_HARD_CAP)
@@ -5134,15 +5144,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .wrapping_add(0xA5A5_5A5A_D00Du64);
 
                         // Use pre-built composite haplotypes from streaming PBWT
-                        let threaded_haps_full = threaded_haps_vec[s].clone();
+                        let threaded_haps_full = &threaded_haps_vec[s];
                         let n_states_full = threaded_haps_full.n_states();
-                        let mut threaded_haps = threaded_haps_full.clone();
+                        let mut threaded_haps = Cow::Borrowed(threaded_haps_full);
                         let mut n_states = n_states_full;
                         let mut selection_applied = false;
 
                         // Convert global prior paths to local paths for this iteration
                         let local_prior = prior_paths[s].as_ref().and_then(|gp| {
-                            global_to_local_paths(gp, &threaded_haps_full, n_markers)
+                            global_to_local_paths(gp, threaded_haps_full, n_markers)
                         });
 
                         // 2. Extract current alleles for H1 and H2
@@ -5172,55 +5182,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         // Collect EM statistics if requested (using original sequences)
                         // Only create HMM when needed to avoid unnecessary p_recomb.clone()
                         if n_states_full > final_states {
-                            let mut local_params = self.params.clone();
-                            local_params.p_mismatch = sample_p_err;
-                            let hmm_full =
-                                MosaicHmm::new(ref_view, &local_params, n_states_full, p_recomb);
-                            let mut fwd1 = Vec::new();
-                            let mut bwd1 = Vec::new();
-                            let mut fwd2 = Vec::new();
-                            let mut bwd2 = Vec::new();
-
-                            let plp = PlProvider {
-                                gt: target_gt,
-                                sample: s,
-                                subset_to_orig: None,
-                            };
-                            hmm_full.conditioned_forward_backward(
-                                &seq1,
-                                &seq2,
-                                &seq2,
-                                Some(sample_conf),
-                                Some(&plp),
-                                None,
-                                None,
-                                &threaded_haps_full,
-                                &mut fwd1,
-                                &mut bwd1,
-                            );
-                            hmm_full.conditioned_forward_backward(
-                                &seq2,
-                                &seq1,
-                                &seq1,
-                                Some(sample_conf),
-                                Some(&plp),
-                                None,
-                                None,
-                                &threaded_haps_full,
-                                &mut fwd2,
-                                &mut bwd2,
-                            );
-
-                            let probs1 =
-                                compute_state_posteriors(&fwd1, &bwd1, n_markers, n_states_full);
-                            let probs2 =
-                                compute_state_posteriors(&fwd2, &bwd2, n_markers, n_states_full);
-                            let top_selected = select_top_k_by_mass_two(
-                                &probs1,
-                                &probs2,
-                                n_states_full,
-                                final_states,
-                            );
                             let mut forced_counts: std::collections::HashMap<usize, u32> =
                                 std::collections::HashMap::new();
                             if let Some(prior) = local_prior.as_ref() {
@@ -5237,6 +5198,36 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 cb.cmp(&ca).then_with(|| a.cmp(&b))
                             });
 
+                            let mut can_reuse_prior_subset = false;
+                            if let Some(prior) = local_prior.as_ref() {
+                                if prior.path1.len() == n_markers && prior.path2.len() == n_markers {
+                                    let marker_pairs = n_markers.saturating_sub(1).max(1);
+                                    let mut switches1 = 0usize;
+                                    let mut switches2 = 0usize;
+                                    for m in 1..n_markers {
+                                        if prior.path1[m] != prior.path1[m - 1] {
+                                            switches1 += 1;
+                                        }
+                                        if prior.path2[m] != prior.path2[m - 1] {
+                                            switches2 += 1;
+                                        }
+                                    }
+                                    let switch_rate =
+                                        (switches1 + switches2) as f32 / (2 * marker_pairs) as f32;
+                                    let mean_conf = if sample_conf.is_empty() {
+                                        1.0
+                                    } else {
+                                        sample_conf.iter().copied().sum::<f32>()
+                                            / sample_conf.len() as f32
+                                    };
+                                    let unique_states = forced_counts.len();
+                                    can_reuse_prior_subset = unique_states > 0
+                                        && unique_states <= final_states
+                                        && switch_rate <= 0.12
+                                        && mean_conf >= 0.90;
+                                }
+                            }
+
                             let mut selected: Vec<usize> = Vec::new();
                             let mut selected_set: HashSet<usize> = HashSet::new();
                             let cap = final_states.max(1);
@@ -5247,20 +5238,77 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     }
                                 }
                             }
-                            for &state in &top_selected {
-                                if selected.len() >= cap {
-                                    break;
+                            if !can_reuse_prior_subset {
+                                let mut local_params = self.params.clone();
+                                local_params.p_mismatch = sample_p_err;
+                                let hmm_full =
+                                    MosaicHmm::new(ref_view, &local_params, n_states_full, p_recomb);
+                                let mut fwd1 = Vec::new();
+                                let mut bwd1 = Vec::new();
+                                let mut fwd2 = Vec::new();
+                                let mut bwd2 = Vec::new();
+
+                                let plp = PlProvider {
+                                    gt: target_gt,
+                                    sample: s,
+                                    subset_to_orig: None,
+                                };
+                                hmm_full.conditioned_forward_backward(
+                                    &seq1,
+                                    &seq2,
+                                    &seq2,
+                                    Some(sample_conf),
+                                    Some(&plp),
+                                    None,
+                                    None,
+                                    threaded_haps_full,
+                                    &mut fwd1,
+                                    &mut bwd1,
+                                );
+                                hmm_full.conditioned_forward_backward(
+                                    &seq2,
+                                    &seq1,
+                                    &seq1,
+                                    Some(sample_conf),
+                                    Some(&plp),
+                                    None,
+                                    None,
+                                    threaded_haps_full,
+                                    &mut fwd2,
+                                    &mut bwd2,
+                                );
+
+                                let probs1 =
+                                    compute_state_posteriors(&fwd1, &bwd1, n_markers, n_states_full);
+                                let probs2 =
+                                    compute_state_posteriors(&fwd2, &bwd2, n_markers, n_states_full);
+                                let top_selected = select_top_k_by_mass_two(
+                                    &probs1,
+                                    &probs2,
+                                    n_states_full,
+                                    final_states,
+                                );
+                                for &state in &top_selected {
+                                    if selected.len() >= cap {
+                                        break;
+                                    }
+                                    if selected_set.insert(state) {
+                                        selected.push(state);
+                                    }
                                 }
-                                if selected_set.insert(state) {
-                                    selected.push(state);
+                                if selected.is_empty() {
+                                    selected = top_selected;
                                 }
                             }
                             if selected.is_empty() {
-                                selected = top_selected;
+                                for idx in 0..cap.min(n_states_full) {
+                                    selected.push(idx);
+                                }
                             }
 
-                            threaded_haps = threaded_haps_full.subset_states(&selected);
-                            n_states = threaded_haps.n_states();
+                            let subset = threaded_haps_full.subset_states(&selected);
+                            n_states = subset.n_states();
+                            threaded_haps = Cow::Owned(subset);
                             selection_applied = true;
                         }
 
@@ -13073,8 +13121,14 @@ mod tests {
         );
 
         let hero_score = window_scores[0][hero_hap_idx];
-        let top = select_top_k(&window_scores[0], 15);
+        let top_k = 15usize;
+        let top = select_top_k(&window_scores[0], top_k);
         let in_top = top.iter().any(|(h, _)| *h == hero_hap_idx);
+        let kth_score = if top.len() == top_k {
+            top.last().map(|(_, s)| *s).unwrap_or(f32::NEG_INFINITY)
+        } else {
+            f32::NEG_INFINITY
+        };
         println!(
             "[prescan score test] top={:?}",
             top.iter()
@@ -13086,9 +13140,20 @@ mod tests {
             hero_hap_idx, hero_score, in_top
         );
         assert!(
-            in_top,
-            "Hero hap {} not in top-10 prescan scores for anchor window",
+            hero_score.is_finite() && hero_score > 0.0,
+            "Hero hap {} has non-positive/non-finite prescan score: {}",
+            hero_hap_idx,
+            hero_score
+        );
+        let tie_eps = 1e-6f32;
+        assert!(
+            in_top || hero_score + tie_eps >= kth_score,
+            "Hero hap {} score {:.6} is below top-{} threshold {:.6}",
             hero_hap_idx
+                ,
+            hero_score,
+            top_k,
+            kth_score
         );
     }
 

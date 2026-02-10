@@ -539,8 +539,7 @@ fn test_imputation_recomb_intensity_decoupled_from_phasing_estimate() {
         stderr
     );
     assert!(
-        stderr.contains("Imputation recomb_intensity:")
-            && stderr.contains("(source=config-ne)"),
+        stderr.contains("Imputation recomb_intensity:") && stderr.contains("(source=config-ne)"),
         "Expected imputation recombination intensity sourced from config-ne. stderr:\n{}",
         stderr
     );

@@ -753,14 +753,15 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
         let mut log_likelihood = 0.0f64;
 
-        let mut state_buf = vec![HapId::<HapSpace>::new(0u32); n_states];
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
         let mut ref_alleles_flat =
             AVec::<u8, ConstAlign<64>>::from_iter(64, std::iter::repeat(255u8).take(total_size));
+        let mut cursor = MosaicCursor::from_threaded(threaded_haps);
         for m in 0..n_markers {
-            threaded_haps.materialize_at(m, &mut state_buf);
+            cursor.advance_to_marker(m, threaded_haps);
+            let active = cursor.active_haps();
             for k in 0..n_states {
-                state_haps[k] = HapIdx::new(state_buf[k].as_u32());
+                state_haps[k] = HapIdx::new(active[k].as_u32());
             }
             let row_offset = m * n_states_padded;
             self.ref_gt.fill_batch(
@@ -931,9 +932,6 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             let row_offset = m * n_states_padded;
             let emissions_row = &mut emissions[..n_states];
             let ref_row = &ref_alleles_flat[row_offset..row_offset + n_states];
-            if kind != MarkerKind::Missing {
-                threaded_haps.materialize_at(m, &mut state_buf);
-            }
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             if m + PREFETCH_DISTANCE < n_markers {
                 let prefetch_ref = (m + PREFETCH_DISTANCE) * n_states_padded;
@@ -1034,7 +1032,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     partner,
                                     Some(&allele_probs),
                                     emissions_row,
-                                    &state_buf,
+                                    &[],
                                 );
                                 if !used_pattern {
                                     for k in 0..n_states {
@@ -1047,7 +1045,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     partner,
                                     None,
                                     emissions_row,
-                                    &state_buf,
+                                    &[],
                                 );
                                 if !used_pattern {
                                     fill_conf_emissions_fast(m, emissions_row, ref_row);
@@ -1059,7 +1057,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 partner,
                                 None,
                                 emissions_row,
-                                &state_buf,
+                                &[],
                             );
                             if !used_pattern {
                                 fill_conf_emissions_fast(m, emissions_row, ref_row);
@@ -1068,7 +1066,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     } else {
                         let partner = partner_alleles.get(m).copied().unwrap_or(255);
                         let used_pattern =
-                            try_fill_pattern_emissions(m, partner, None, emissions_row, &state_buf);
+                            try_fill_pattern_emissions(m, partner, None, emissions_row, &[]);
                         if !used_pattern {
                             fill_conf_emissions_fast(m, emissions_row, ref_row);
                         }
@@ -1183,7 +1181,6 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             let tile_start = tile_end.saturating_sub(TILE_SIZE).max(1);
             for m in (tile_start - 1..tile_end - 1).rev() {
                 let m_next = m + 1;
-                threaded_haps.materialize_at(m_next, &mut state_buf);
                 let next_row_offset = m_next * n_states_padded;
                 let ref_row = &ref_alleles_flat[next_row_offset..next_row_offset + n_states];
                 let emissions_row = &mut emissions[..n_states];
@@ -1276,7 +1273,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                         partner,
                                         Some(&allele_probs),
                                         emissions_row,
-                                        &state_buf,
+                                        &[],
                                     );
                                     if !used_pattern {
                                         for k in 0..n_states {
@@ -1289,7 +1286,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                         partner,
                                         None,
                                         emissions_row,
-                                        &state_buf,
+                                        &[],
                                     );
                                     if !used_pattern {
                                         fill_conf_emissions_fast(m_next, emissions_row, ref_row);
@@ -1301,7 +1298,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     partner,
                                     None,
                                     emissions_row,
-                                    &state_buf,
+                                    &[],
                                 );
                                 if !used_pattern {
                                     fill_conf_emissions_fast(m_next, emissions_row, ref_row);
@@ -1314,7 +1311,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 partner,
                                 None,
                                 emissions_row,
-                                &state_buf,
+                                &[],
                             );
                             if !used_pattern {
                                 fill_conf_emissions_fast(m_next, emissions_row, ref_row);
@@ -1405,14 +1402,15 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
         let n_states_padded = ((n_states + 63) / 64) * 64;
         let total_size = n_markers * n_states_padded;
-        let mut state_buf = vec![HapId::<HapSpace>::new(0u32); n_states];
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
         let mut ref_alleles_flat =
             AVec::<u8, ConstAlign<64>>::from_iter(64, std::iter::repeat(255u8).take(total_size));
+        let mut precompute_cursor = MosaicCursor::from_threaded(threaded_haps);
         for m in 0..n_markers {
-            threaded_haps.materialize_at(m, &mut state_buf);
+            precompute_cursor.advance_to_marker(m, threaded_haps);
+            let active = precompute_cursor.active_haps();
             for k in 0..n_states {
-                state_haps[k] = HapIdx::new(state_buf[k].as_u32());
+                state_haps[k] = HapIdx::new(active[k].as_u32());
             }
             let row_offset = m * n_states_padded;
             self.ref_gt.fill_batch(

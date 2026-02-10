@@ -272,7 +272,11 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     #[inline]
-    fn flush_top_k_choices(&self, best: std::collections::BinaryHeap<DonorChoice>, out: &mut Vec<u32>) {
+    fn flush_top_k_choices(
+        &self,
+        best: std::collections::BinaryHeap<DonorChoice>,
+        out: &mut Vec<u32>,
+    ) {
         let mut choices: Vec<DonorChoice> = best.into_vec();
         choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
         out.reserve(choices.len());
@@ -1168,24 +1172,20 @@ impl ReferencePbwt {
         scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         match self {
-            Self::U16(inner) => {
-                inner.update_beams_with_scratch_query(
-                    beams,
-                    query_alleles,
-                    query_bin_probs,
-                    n_alleles,
-                    scratch,
-                )
-            }
-            Self::U32(inner) => {
-                inner.update_beams_with_scratch_query(
-                    beams,
-                    query_alleles,
-                    query_bin_probs,
-                    n_alleles,
-                    scratch,
-                )
-            }
+            Self::U16(inner) => inner.update_beams_with_scratch_query(
+                beams,
+                query_alleles,
+                query_bin_probs,
+                n_alleles,
+                scratch,
+            ),
+            Self::U32(inner) => inner.update_beams_with_scratch_query(
+                beams,
+                query_alleles,
+                query_bin_probs,
+                n_alleles,
+                scratch,
+            ),
         }
     }
 
