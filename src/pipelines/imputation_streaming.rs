@@ -214,8 +214,9 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let evidence_strength = (weight_sum / (weight_sum + PRIOR_STRENGTH_MARKERS)).clamp(0.0, 1.0);
-    let min_error = (base * (1.0 - 0.5 * evidence_strength)).clamp(1e-6, base);
+    // Explicitly clamp the posterior error rate to be no lower than the base
+    // error rate to prevent 'AF collapse' on sparse data.
+    let min_error = base;
     posterior.clamp(min_error, 0.5)
 }
 
@@ -4623,7 +4624,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else if has_priors_h1 {
                     true
                 } else if no_info_h1 || insufficient_info_h1 {
-                    false
+                    true
                 } else {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
@@ -4633,7 +4634,7 @@ impl crate::pipelines::ImputationPipeline {
                 } else if has_priors_h2 {
                     true
                 } else if no_info_h2 || insufficient_info_h2 {
-                    false
+                    true
                 } else {
                     conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
@@ -6968,7 +6969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calibrated_emission_error_sharp_observations_lower_error() {
+    fn test_calibrated_emission_error_sharp_observations_clamped_to_base() {
         // 3 observed, informative markers: near-certain hard calls.
         let offsets = vec![0, 2, 4, 6];
         let probs = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
@@ -6978,13 +6979,9 @@ mod tests {
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
         assert!(
-            out < base,
-            "expected lower-than-base calibrated error, got {}",
-            out
-        );
-        assert!(
-            out >= 1e-6,
-            "expected calibrated error to respect lower clamp, got {}",
+            out >= base,
+            "expected calibrated error clamped to base {}, got {}",
+            base,
             out
         );
     }
