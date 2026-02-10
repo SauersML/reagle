@@ -4440,9 +4440,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
             per_window_cap.min(auto_target).max(1)
         } else {
-            per_window_cap
-                .min(n_ref_haps)
-                .max(1)
+            per_window_cap.min(n_ref_haps).max(1)
         };
         if self.config.phase_states == 0 {
             eprintln!(
@@ -10556,11 +10554,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // Use top unary states as first-haplotype seeds, then score all partners per seed.
     // For small sets, perform exhaustive pairwise scoring to handle uniform unary scores.
     let cand_k = ranked_states.len();
-    let n_seeds = if cand_k <= 256 {
-        cand_k
-    } else {
-        8.min(cand_k)
-    };
+    let n_seeds = if cand_k <= 256 { cand_k } else { 8.min(cand_k) };
 
     if scores.len() < cand_k {
         scores.resize(cand_k, 0.0);
@@ -10979,7 +10973,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
         } else {
             (p_keep, p_swap)
         };
-        let lr = if min_p < 1e-30 { 1e6_f32 } else { (max_p / min_p).min(1e6_f32) };
+        let lr = if min_p < 1e-30 {
+            1e6_f32
+        } else {
+            (max_p / min_p).min(1e6_f32)
+        };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));

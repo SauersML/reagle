@@ -21,6 +21,78 @@ pub struct ImputeHmmContext {
     pub hap_idx: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct MarkerIx(usize);
+
+impl MarkerIx {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct CheckpointIx(usize);
+
+impl CheckpointIx {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    fn as_usize(self) -> usize {
+        self.0
+    }
+
+    #[inline]
+    fn fwd_offset(self, active_states: usize) -> usize {
+        self.0 * active_states
+    }
+}
+
+struct CheckpointGrid {
+    markers: Vec<MarkerIx>,
+}
+
+impl CheckpointGrid {
+    #[inline]
+    fn len(&self) -> usize {
+        self.markers.len()
+    }
+
+    #[inline]
+    fn iter_forward(&self) -> impl Iterator<Item = (CheckpointIx, MarkerIx)> + '_ {
+        self.markers
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, m)| (CheckpointIx::new(i), m))
+    }
+
+    #[inline]
+    fn rev_indices(&self) -> impl Iterator<Item = CheckpointIx> {
+        (0..self.markers.len()).rev().map(CheckpointIx::new)
+    }
+
+    #[inline]
+    fn marker_at(&self, cp: CheckpointIx) -> MarkerIx {
+        self.markers[cp.as_usize()]
+    }
+
+    #[inline]
+    fn next_marker_after(&self, cp: CheckpointIx) -> Option<MarkerIx> {
+        self.markers.get(cp.as_usize() + 1).copied()
+    }
+}
+
 #[inline]
 fn validate_target_probs_nonempty(
     target_probs: &TargetAlleleProbs,
@@ -218,11 +290,6 @@ impl TargetAlleleProbs {
     }
 
     #[inline]
-    pub fn set_panel_priors(&mut self, priors: Arc<Vec<AllelePosteriors>>) {
-        self.panel_priors = Some(priors);
-    }
-
-    #[inline]
     pub fn min_untyped_prior_mix(&self) -> f32 {
         self.min_untyped_prior_mix
     }
@@ -235,7 +302,6 @@ pub struct ImputeWorkspace {
     pub emissions: Vec<f32>,
     pub fwd_history: Vec<f32>,
     pub fwd_checkpoints: Vec<f32>,
-    pub checkpoint_stride: usize,
     pub fwd_scales: Vec<f32>,
     pub weights: Vec<f32>,
     pub state_alleles: Vec<u8>,
@@ -341,6 +407,8 @@ impl<'a> NormalizedAlleleProbs<'a> {
     }
 }
 
+const SKIP_RETAIN_THRESHOLD: f32 = 0.005;
+
 impl ImputeWorkspace {
     pub fn new(n_states: usize, n_markers: usize) -> Self {
         Self {
@@ -349,7 +417,6 @@ impl ImputeWorkspace {
             emissions: vec![1.0; n_states],
             fwd_history: Vec::new(),
             fwd_checkpoints: Vec::new(),
-            checkpoint_stride: 1,
             fwd_scales: vec![1.0; n_markers],
             weights: vec![1.0; n_states],
             state_alleles: vec![255u8; n_states],
@@ -393,20 +460,23 @@ impl ImputeWorkspace {
         self.active_markers = n_markers;
     }
 
-    pub fn configure_checkpoints(&mut self, n_states: usize, n_markers: usize) -> usize {
-        // Keep checkpoint memory bounded while staying exact.
-        const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
-        let bytes_per_cp = n_states.max(1).saturating_mul(std::mem::size_of::<f32>());
-        let max_checkpoints = (MAX_CHECKPOINT_BYTES / bytes_per_cp).max(1);
-        let stride = (n_markers.max(1) + max_checkpoints - 1) / max_checkpoints;
-        let stride = stride.max(1);
-        let n_checkpoints = (n_markers + stride - 1) / stride + 1;
-        let want = n_checkpoints.saturating_mul(n_states.max(1));
+    pub fn ensure_typed_checkpoints(&mut self, n_states: usize, n_checkpoints: usize) {
+        let want = n_states.max(1).saturating_mul(n_checkpoints.max(1));
         if self.fwd_checkpoints.len() < want {
             self.fwd_checkpoints.resize(want, 0.0);
         }
-        self.checkpoint_stride = stride;
-        stride
+    }
+
+    #[inline]
+    fn store_checkpoint(&mut self, cp: CheckpointIx, n_states: usize) {
+        let off = cp.fwd_offset(n_states);
+        self.fwd_checkpoints[off..off + n_states].copy_from_slice(&self.fwd[..n_states]);
+    }
+
+    #[inline]
+    fn load_checkpoint(&mut self, cp: CheckpointIx, n_states: usize) {
+        let off = cp.fwd_offset(n_states);
+        self.fwd[..n_states].copy_from_slice(&self.fwd_checkpoints[off..off + n_states]);
     }
 
     pub fn ensure_block_history(&mut self, n_states: usize, block_len: usize) {
@@ -977,16 +1047,11 @@ fn apply_marker_prior_smoothing(
                     allele_probs,
                     &panel_probs,
                     floor_mix,
-                    adaptive_panel_mix
+                    adaptive_panel_mix,
                 );
             }
             AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
-                apply_adaptive_panel_blend(
-                    allele_probs,
-                    p,
-                    floor_mix,
-                    adaptive_panel_mix
-                );
+                apply_adaptive_panel_blend(allele_probs, p, floor_mix, adaptive_panel_mix);
             }
             _ => {}
         }
@@ -1012,7 +1077,6 @@ fn apply_marker_prior_smoothing(
         )
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
-
 }
 
 #[inline]
@@ -1076,6 +1140,83 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
         }
     }
     (max - min) <= 1e-6
+}
+
+#[inline]
+fn build_uniform_mask(target_probs: &TargetAlleleProbs, n_markers: usize) -> Vec<bool> {
+    (0..n_markers)
+        .map(|m| target_probs.is_uniform_marker(m))
+        .collect()
+}
+
+#[inline]
+fn build_skip_untyped_mask(
+    target_probs: &TargetAlleleProbs,
+    nearest_obs_lambda: &[f32],
+    uniform_mask: &[bool],
+    use_prior_smoothing: bool,
+) -> Vec<bool> {
+    let panel_priors = target_probs.panel_priors();
+    let Some(panel) = panel_priors else {
+        return vec![false; uniform_mask.len()];
+    };
+    (0..uniform_mask.len())
+        .map(|m| {
+            if !use_prior_smoothing || !uniform_mask[m] || target_probs.is_observed_marker(m) {
+                return false;
+            }
+            if m >= panel.len() {
+                return false;
+            }
+            let lambda = nearest_obs_lambda
+                .get(m)
+                .copied()
+                .unwrap_or(f32::INFINITY)
+                .max(0.0);
+            (-lambda).exp() < SKIP_RETAIN_THRESHOLD
+        })
+        .collect()
+}
+
+#[inline]
+fn panel_freq_posterior(
+    panel_priors: Option<&[AllelePosteriors]>,
+    marker_idx: usize,
+) -> AllelePosteriors {
+    panel_priors
+        .and_then(|p| p.get(marker_idx))
+        .cloned()
+        .unwrap_or(AllelePosteriors::Biallelic(0.0))
+}
+
+#[inline]
+fn build_checkpoint_markers(
+    uniform_mask: &[bool],
+    prior_marker_idx: Option<usize>,
+    n_markers: usize,
+) -> CheckpointGrid {
+    if n_markers == 0 {
+        return CheckpointGrid {
+            markers: Vec::new(),
+        };
+    }
+    let mut markers = Vec::with_capacity(n_markers.min(4096));
+    markers.push(MarkerIx::new(0));
+    for (m, &uniform) in uniform_mask.iter().enumerate().skip(1) {
+        if !uniform {
+            markers.push(MarkerIx::new(m));
+        }
+    }
+    if let Some(pm) = prior_marker_idx {
+        if pm < n_markers {
+            let pm = MarkerIx::new(pm);
+            match markers.binary_search(&pm) {
+                Ok(_) => {}
+                Err(ins) => markers.insert(ins, pm),
+            }
+        }
+    }
+    CheckpointGrid { markers }
 }
 
 #[inline]
@@ -1175,6 +1316,95 @@ fn transition_only_backward_update(
     }
     let n = bwd.len() as f32;
     (scale + shift_base * n).mul_add(bwd_sum, 0.0).max(1e-30)
+}
+
+#[inline]
+fn batched_transition_forward(
+    fwd: &mut [f32],
+    p_recomb: &[f32],
+    start: usize,
+    end: usize,
+    active_states: usize,
+    transition_haps: usize,
+) {
+    if active_states == 0 || start >= end {
+        return;
+    }
+    let k = active_states as f64;
+    let mut a = 1.0f64;
+    let mut b = 0.0f64;
+    let mut touched = false;
+    for m in start..end {
+        let recomb_rate = marker_recomb_rate(p_recomb, m);
+        if recomb_rate <= 0.0 {
+            continue;
+        }
+        touched = true;
+        let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+        let stay = stay as f64;
+        let shift = shift as f64;
+        a *= stay;
+        b = stay.mul_add(b, shift);
+    }
+    if !touched {
+        return;
+    }
+    b = ((1.0 - a) / k).max(0.0);
+    let a = a as f32;
+    let b = b as f32;
+    let mut sum = 0.0f32;
+    for v in fwd.iter_mut().take(active_states) {
+        *v = a.mul_add(*v, b);
+        sum += *v;
+    }
+    let sum = sum.max(1e-30);
+    if (sum - 1.0).abs() > 1e-4 {
+        let inv = 1.0 / sum;
+        for v in fwd.iter_mut().take(active_states) {
+            *v *= inv;
+        }
+    }
+}
+
+#[inline]
+fn batched_transition_backward(
+    bwd: &mut [f32],
+    bwd_sum: f32,
+    p_recomb: &[f32],
+    start: usize,
+    end: usize,
+    active_states: usize,
+    transition_haps: usize,
+) -> f32 {
+    if active_states == 0 || start >= end {
+        return bwd_sum;
+    }
+    let k = active_states as f64;
+    let mut a = 1.0f64;
+    let mut b_coeff = 0.0f64;
+    let mut touched = false;
+    for m in (start..end).rev() {
+        let recomb_rate = marker_recomb_rate(p_recomb, m);
+        if recomb_rate <= 0.0 {
+            continue;
+        }
+        touched = true;
+        let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+        let stay = stay as f64;
+        let shift = shift as f64;
+        a *= stay;
+        b_coeff = stay.mul_add(b_coeff, shift);
+    }
+    if !touched {
+        return bwd_sum;
+    }
+    b_coeff = ((1.0 - a) / k).max(0.0);
+    let a = a as f32;
+    let add = b_coeff as f32 * bwd_sum;
+    for v in bwd.iter_mut().take(active_states) {
+        *v = a.mul_add(*v, add);
+    }
+    bwd_sum
 }
 
 #[inline]
@@ -1461,7 +1691,6 @@ fn run_impute_hmm_impl(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
-    let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
@@ -1476,6 +1705,16 @@ fn run_impute_hmm_impl(
         // scaling is handled panel-aware inside the HMM kernels.
         ws.weights.fill(1.0);
     }
+    let uniform_mask = build_uniform_mask(target_probs, active_markers);
+    let skip_untyped_mask = build_skip_untyped_mask(
+        target_probs,
+        &ws.nearest_obs_lambda,
+        &uniform_mask,
+        use_prior_smoothing,
+    );
+    let panel_priors = target_probs.panel_priors();
+    let checkpoint_grid = build_checkpoint_markers(&uniform_mask, prior_marker_idx, active_markers);
+    ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -1498,7 +1737,19 @@ fn run_impute_hmm_impl(
             ws.fwd[..active_states].fill(uniform);
         }
 
-        for m in 0..active_markers {
+        let mut prev_marker = 0usize;
+        for (cp_idx, marker) in checkpoint_grid.iter_forward() {
+            let m = marker.as_usize();
+            if m > prev_marker {
+                batched_transition_forward(
+                    &mut ws.fwd[..active_states],
+                    p_recomb,
+                    prev_marker,
+                    m,
+                    active_states,
+                    transition_haps,
+                );
+            }
             let use_prior_weighting = m == 0 && state_priors.is_some();
             forward_update_impl(
                 ws,
@@ -1512,16 +1763,23 @@ fn run_impute_hmm_impl(
                 active_states,
                 transition_haps,
             );
-            if m % checkpoint_stride == 0 {
-                let cp = (m / checkpoint_stride) * active_states;
-                ws.fwd_checkpoints[cp..cp + active_states]
-                    .copy_from_slice(&ws.fwd[..active_states]);
-            }
+            ws.store_checkpoint(cp_idx, active_states);
             if prior_marker_idx == Some(m) {
                 let mut snapshot = ws.fwd[..active_states].to_vec();
                 normalize_probs(&mut snapshot);
                 forward_prior_state_post = Some(snapshot);
             }
+            prev_marker = m + 1;
+        }
+        if prev_marker < active_markers {
+            batched_transition_forward(
+                &mut ws.fwd[..active_states],
+                p_recomb,
+                prev_marker,
+                active_markers,
+                active_states,
+                transition_haps,
+            );
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1533,20 +1791,43 @@ fn run_impute_hmm_impl(
         ws.bwd.fill(1.0);
         let mut bwd_sum = active_states as f32;
         if active_markers > 0 {
-            let stride = checkpoint_stride.max(1);
-            let mut block_start = ((active_markers - 1) / stride) * stride;
-            loop {
-                let block_end = (block_start + stride).min(active_markers);
+            for cp_idx in checkpoint_grid.rev_indices() {
+                let block_start = checkpoint_grid.marker_at(cp_idx).as_usize();
+                let block_end = checkpoint_grid
+                    .next_marker_after(cp_idx)
+                    .map(MarkerIx::as_usize)
+                    .unwrap_or(active_markers);
                 let block_len = block_end.saturating_sub(block_start);
                 ws.ensure_block_history(active_states, block_len);
 
-                let cp = (block_start / stride) * active_states;
-                ws.fwd[..active_states]
-                    .copy_from_slice(&ws.fwd_checkpoints[cp..cp + active_states]);
+                ws.load_checkpoint(cp_idx, active_states);
                 ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
 
                 if block_start + 1 < block_end {
-                    for m in (block_start + 1)..block_end {
+                    let mut m = block_start + 1;
+                    while m < block_end {
+                        let replay_skip =
+                            is_final && prior_marker_idx != Some(m) && skip_untyped_mask[m];
+                        if replay_skip {
+                            let mut run_end = m + 1;
+                            while run_end < block_end
+                                && is_final
+                                && prior_marker_idx != Some(run_end)
+                                && skip_untyped_mask[run_end]
+                            {
+                                run_end += 1;
+                            }
+                            batched_transition_forward(
+                                &mut ws.fwd[..active_states],
+                                p_recomb,
+                                m,
+                                run_end,
+                                active_states,
+                                transition_haps,
+                            );
+                            m = run_end;
+                            continue;
+                        }
                         forward_update_impl(
                             ws,
                             m,
@@ -1562,10 +1843,32 @@ fn run_impute_hmm_impl(
                         let local_idx = (m - block_start) * active_states;
                         ws.fwd_history[local_idx..local_idx + active_states]
                             .copy_from_slice(&ws.fwd[..active_states]);
+                        m += 1;
                     }
                 }
 
+                let mut skipped_run_start: Option<usize> = None;
+                let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
+                    if is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev] {
+                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                        if skipped_run_start.is_none() {
+                            skipped_run_end = m_rev + 1;
+                        }
+                        skipped_run_start = Some(m_rev);
+                        continue;
+                    }
+                    if let Some(run_start) = skipped_run_start.take() {
+                        bwd_sum = batched_transition_backward(
+                            &mut ws.bwd[..active_states],
+                            bwd_sum,
+                            p_recomb,
+                            run_start,
+                            skipped_run_end,
+                            active_states,
+                            transition_haps,
+                        );
+                    }
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
@@ -1669,7 +1972,7 @@ fn run_impute_hmm_impl(
                                 if use_prior_smoothing {
                                     apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
-                                        target_probs.panel_priors(),
+                                        panel_priors,
                                         m_rev,
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
@@ -1721,7 +2024,7 @@ fn run_impute_hmm_impl(
                     //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
                     // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
                     // at marker t (sum of unnormalized alpha_t).
-                    if target_probs.is_uniform_marker(m_rev) {
+                    if uniform_mask[m_rev] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -1753,10 +2056,17 @@ fn run_impute_hmm_impl(
                         bwd_sum = new_sum.max(1e-30);
                     }
                 }
-                if block_start == 0 {
-                    break;
+                if let Some(run_start) = skipped_run_start.take() {
+                    bwd_sum = batched_transition_backward(
+                        &mut ws.bwd[..active_states],
+                        bwd_sum,
+                        p_recomb,
+                        run_start,
+                        skipped_run_end,
+                        active_states,
+                        transition_haps,
+                    );
                 }
-                block_start = block_start.saturating_sub(stride);
             }
         }
 
@@ -1791,7 +2101,6 @@ fn run_impute_hmm_seqcoded(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
-    let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
@@ -1804,6 +2113,16 @@ fn run_impute_hmm_seqcoded(
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
+    let uniform_mask = build_uniform_mask(target_probs, active_markers);
+    let skip_untyped_mask = build_skip_untyped_mask(
+        target_probs,
+        &ws.nearest_obs_lambda,
+        &uniform_mask,
+        use_prior_smoothing,
+    );
+    let panel_priors = target_probs.panel_priors();
+    let checkpoint_grid = build_checkpoint_markers(&uniform_mask, prior_marker_idx, active_markers);
+    ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -1827,7 +2146,19 @@ fn run_impute_hmm_seqcoded(
         }
 
         let mut last_hap_ptr: *const u16 = std::ptr::null();
-        for m in 0..active_markers {
+        let mut prev_marker = 0usize;
+        for (cp_idx, marker) in checkpoint_grid.iter_forward() {
+            let m = marker.as_usize();
+            if m > prev_marker {
+                batched_transition_forward(
+                    &mut ws.fwd[..active_states],
+                    p_recomb,
+                    prev_marker,
+                    m,
+                    active_states,
+                    transition_haps,
+                );
+            }
             let use_prior_weighting = m == 0 && state_priors.is_some();
             forward_update_seqcoded(
                 ws,
@@ -1842,16 +2173,23 @@ fn run_impute_hmm_seqcoded(
                 transition_haps,
                 &mut last_hap_ptr,
             );
-            if m % checkpoint_stride == 0 {
-                let cp = (m / checkpoint_stride) * active_states;
-                ws.fwd_checkpoints[cp..cp + active_states]
-                    .copy_from_slice(&ws.fwd[..active_states]);
-            }
+            ws.store_checkpoint(cp_idx, active_states);
             if prior_marker_idx == Some(m) {
                 let mut snapshot = ws.fwd[..active_states].to_vec();
                 normalize_probs(&mut snapshot);
                 forward_prior_state_post = Some(snapshot);
             }
+            prev_marker = m + 1;
+        }
+        if prev_marker < active_markers {
+            batched_transition_forward(
+                &mut ws.fwd[..active_states],
+                p_recomb,
+                prev_marker,
+                active_markers,
+                active_states,
+                transition_haps,
+            );
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -1863,22 +2201,45 @@ fn run_impute_hmm_seqcoded(
         ws.bwd.fill(1.0);
         let mut bwd_sum = active_states as f32;
         if active_markers > 0 {
-            let stride = checkpoint_stride.max(1);
-            let mut block_start = ((active_markers - 1) / stride) * stride;
             let mut last_hap_ptr: *const u16 = std::ptr::null();
-            loop {
-                let block_end = (block_start + stride).min(active_markers);
+            for cp_idx in checkpoint_grid.rev_indices() {
+                let block_start = checkpoint_grid.marker_at(cp_idx).as_usize();
+                let block_end = checkpoint_grid
+                    .next_marker_after(cp_idx)
+                    .map(MarkerIx::as_usize)
+                    .unwrap_or(active_markers);
                 let block_len = block_end.saturating_sub(block_start);
                 ws.ensure_block_history(active_states, block_len);
 
-                let cp = (block_start / stride) * active_states;
-                ws.fwd[..active_states]
-                    .copy_from_slice(&ws.fwd_checkpoints[cp..cp + active_states]);
+                ws.load_checkpoint(cp_idx, active_states);
                 ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
 
                 if block_start + 1 < block_end {
                     let mut last_hap_ptr_re: *const u16 = std::ptr::null();
-                    for m in (block_start + 1)..block_end {
+                    let mut m = block_start + 1;
+                    while m < block_end {
+                        let replay_skip =
+                            is_final && prior_marker_idx != Some(m) && skip_untyped_mask[m];
+                        if replay_skip {
+                            let mut run_end = m + 1;
+                            while run_end < block_end
+                                && is_final
+                                && prior_marker_idx != Some(run_end)
+                                && skip_untyped_mask[run_end]
+                            {
+                                run_end += 1;
+                            }
+                            batched_transition_forward(
+                                &mut ws.fwd[..active_states],
+                                p_recomb,
+                                m,
+                                run_end,
+                                active_states,
+                                transition_haps,
+                            );
+                            m = run_end;
+                            continue;
+                        }
                         forward_update_seqcoded(
                             ws,
                             m,
@@ -1895,10 +2256,32 @@ fn run_impute_hmm_seqcoded(
                         let local_idx = (m - block_start) * active_states;
                         ws.fwd_history[local_idx..local_idx + active_states]
                             .copy_from_slice(&ws.fwd[..active_states]);
+                        m += 1;
                     }
                 }
 
+                let mut skipped_run_start: Option<usize> = None;
+                let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
+                    if is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev] {
+                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                        if skipped_run_start.is_none() {
+                            skipped_run_end = m_rev + 1;
+                        }
+                        skipped_run_start = Some(m_rev);
+                        continue;
+                    }
+                    if let Some(run_start) = skipped_run_start.take() {
+                        bwd_sum = batched_transition_backward(
+                            &mut ws.bwd[..active_states],
+                            bwd_sum,
+                            p_recomb,
+                            run_start,
+                            skipped_run_end,
+                            active_states,
+                            transition_haps,
+                        );
+                    }
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
@@ -2001,7 +2384,7 @@ fn run_impute_hmm_seqcoded(
                                 if use_prior_smoothing {
                                     apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
-                                        target_probs.panel_priors(),
+                                        panel_priors,
                                         m_rev,
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
@@ -2048,7 +2431,7 @@ fn run_impute_hmm_seqcoded(
                         }
                     }
 
-                    if target_probs.is_uniform_marker(m_rev) {
+                    if uniform_mask[m_rev] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2083,10 +2466,17 @@ fn run_impute_hmm_seqcoded(
                         bwd_sum = new_sum.max(1e-30);
                     }
                 }
-                if block_start == 0 {
-                    break;
+                if let Some(run_start) = skipped_run_start.take() {
+                    bwd_sum = batched_transition_backward(
+                        &mut ws.bwd[..active_states],
+                        bwd_sum,
+                        p_recomb,
+                        run_start,
+                        skipped_run_end,
+                        active_states,
+                        transition_haps,
+                    );
                 }
-                block_start = block_start.saturating_sub(stride);
             }
         }
 
@@ -2121,7 +2511,6 @@ fn run_impute_hmm_dict(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
-    let checkpoint_stride = ws.configure_checkpoints(active_states, active_markers);
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
@@ -2134,6 +2523,16 @@ fn run_impute_hmm_dict(
     if active_states > 0 {
         ws.weights.fill(1.0);
     }
+    let uniform_mask = build_uniform_mask(target_probs, active_markers);
+    let skip_untyped_mask = build_skip_untyped_mask(
+        target_probs,
+        &ws.nearest_obs_lambda,
+        &uniform_mask,
+        use_prior_smoothing,
+    );
+    let panel_priors = target_probs.panel_priors();
+    let checkpoint_grid = build_checkpoint_markers(&uniform_mask, prior_marker_idx, active_markers);
+    ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -2156,7 +2555,19 @@ fn run_impute_hmm_dict(
         }
 
         let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
-        for m in 0..active_markers {
+        let mut prev_marker = 0usize;
+        for (cp_idx, marker) in checkpoint_grid.iter_forward() {
+            let m = marker.as_usize();
+            if m > prev_marker {
+                batched_transition_forward(
+                    &mut ws.fwd[..active_states],
+                    p_recomb,
+                    prev_marker,
+                    m,
+                    active_states,
+                    transition_haps,
+                );
+            }
             let use_prior_weighting = m == 0 && state_priors.is_some();
             forward_update_dict(
                 ws,
@@ -2171,16 +2582,23 @@ fn run_impute_hmm_dict(
                 transition_haps,
                 &mut last_dict_ptr,
             );
-            if m % checkpoint_stride == 0 {
-                let cp = (m / checkpoint_stride) * active_states;
-                ws.fwd_checkpoints[cp..cp + active_states]
-                    .copy_from_slice(&ws.fwd[..active_states]);
-            }
+            ws.store_checkpoint(cp_idx, active_states);
             if prior_marker_idx == Some(m) {
                 let mut snapshot = ws.fwd[..active_states].to_vec();
                 normalize_probs(&mut snapshot);
                 forward_prior_state_post = Some(snapshot);
             }
+            prev_marker = m + 1;
+        }
+        if prev_marker < active_markers {
+            batched_transition_forward(
+                &mut ws.fwd[..active_states],
+                p_recomb,
+                prev_marker,
+                active_markers,
+                active_states,
+                transition_haps,
+            );
         }
 
         let mut posteriors: Vec<AllelePosteriors> = Vec::new();
@@ -2192,22 +2610,45 @@ fn run_impute_hmm_dict(
         ws.bwd.fill(1.0);
         let mut bwd_sum = active_states as f32;
         if active_markers > 0 {
-            let stride = checkpoint_stride.max(1);
-            let mut block_start = ((active_markers - 1) / stride) * stride;
             let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
-            loop {
-                let block_end = (block_start + stride).min(active_markers);
+            for cp_idx in checkpoint_grid.rev_indices() {
+                let block_start = checkpoint_grid.marker_at(cp_idx).as_usize();
+                let block_end = checkpoint_grid
+                    .next_marker_after(cp_idx)
+                    .map(MarkerIx::as_usize)
+                    .unwrap_or(active_markers);
                 let block_len = block_end.saturating_sub(block_start);
                 ws.ensure_block_history(active_states, block_len);
 
-                let cp = (block_start / stride) * active_states;
-                ws.fwd[..active_states]
-                    .copy_from_slice(&ws.fwd_checkpoints[cp..cp + active_states]);
+                ws.load_checkpoint(cp_idx, active_states);
                 ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
 
                 if block_start + 1 < block_end {
                     let mut last_dict_ptr_re: *const DictionaryColumn = std::ptr::null();
-                    for m in (block_start + 1)..block_end {
+                    let mut m = block_start + 1;
+                    while m < block_end {
+                        let replay_skip =
+                            is_final && prior_marker_idx != Some(m) && skip_untyped_mask[m];
+                        if replay_skip {
+                            let mut run_end = m + 1;
+                            while run_end < block_end
+                                && is_final
+                                && prior_marker_idx != Some(run_end)
+                                && skip_untyped_mask[run_end]
+                            {
+                                run_end += 1;
+                            }
+                            batched_transition_forward(
+                                &mut ws.fwd[..active_states],
+                                p_recomb,
+                                m,
+                                run_end,
+                                active_states,
+                                transition_haps,
+                            );
+                            m = run_end;
+                            continue;
+                        }
                         forward_update_dict(
                             ws,
                             m,
@@ -2224,10 +2665,32 @@ fn run_impute_hmm_dict(
                         let local_idx = (m - block_start) * active_states;
                         ws.fwd_history[local_idx..local_idx + active_states]
                             .copy_from_slice(&ws.fwd[..active_states]);
+                        m += 1;
                     }
                 }
 
+                let mut skipped_run_start: Option<usize> = None;
+                let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
+                    if is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev] {
+                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                        if skipped_run_start.is_none() {
+                            skipped_run_end = m_rev + 1;
+                        }
+                        skipped_run_start = Some(m_rev);
+                        continue;
+                    }
+                    if let Some(run_start) = skipped_run_start.take() {
+                        bwd_sum = batched_transition_backward(
+                            &mut ws.bwd[..active_states],
+                            bwd_sum,
+                            p_recomb,
+                            run_start,
+                            skipped_run_end,
+                            active_states,
+                            transition_haps,
+                        );
+                    }
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                     let n_alleles = probs.len();
@@ -2331,7 +2794,7 @@ fn run_impute_hmm_dict(
                                 if use_prior_smoothing {
                                     apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
-                                        target_probs.panel_priors(),
+                                        panel_priors,
                                         m_rev,
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
@@ -2378,7 +2841,7 @@ fn run_impute_hmm_dict(
                         }
                     }
 
-                    if target_probs.is_uniform_marker(m_rev) {
+                    if uniform_mask[m_rev] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2413,10 +2876,17 @@ fn run_impute_hmm_dict(
                         bwd_sum = new_sum.max(1e-30);
                     }
                 }
-                if block_start == 0 {
-                    break;
+                if let Some(run_start) = skipped_run_start.take() {
+                    bwd_sum = batched_transition_backward(
+                        &mut ws.bwd[..active_states],
+                        bwd_sum,
+                        p_recomb,
+                        run_start,
+                        skipped_run_end,
+                        active_states,
+                        transition_haps,
+                    );
                 }
-                block_start = block_start.saturating_sub(stride);
             }
         }
 
