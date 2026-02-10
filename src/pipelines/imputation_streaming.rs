@@ -215,7 +215,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     let evidence_strength = (weight_sum / (weight_sum + PRIOR_STRENGTH_MARKERS)).clamp(0.0, 1.0);
-    let min_error = (base * (1.0 - 0.5 * evidence_strength)).clamp(1e-6, base);
+    let min_error = (base * (1.0 - 0.9 * evidence_strength)).clamp(1e-6, base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -6978,8 +6978,8 @@ mod tests {
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
         assert!(
-            out < base,
-            "expected lower-than-base calibrated error, got {}",
+            out < 0.009,
+            "expected significantly lower-than-base calibrated error (sharpening enabled), got {}",
             out
         );
         assert!(
