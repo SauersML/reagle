@@ -218,11 +218,6 @@ impl TargetAlleleProbs {
     }
 
     #[inline]
-    pub fn set_panel_priors(&mut self, priors: Arc<Vec<AllelePosteriors>>) {
-        self.panel_priors = Some(priors);
-    }
-
-    #[inline]
     pub fn min_untyped_prior_mix(&self) -> f32 {
         self.min_untyped_prior_mix
     }
@@ -944,7 +939,6 @@ fn apply_marker_prior_smoothing(
     smoothing_prior_counts: &mut [f32],
     smoothing_prior_total: f32,
     allele_prior_scratch: &mut Vec<f32>,
-    probs: &[f32],
     nearest_obs_lambda: f32,
     untyped_uniform_marker: bool,
     active_states: usize,
@@ -1055,15 +1049,33 @@ fn apply_marker_prior_smoothing(
     } else {
         if !*warned_af_fallback {
             eprintln!(
-                "[warn] AF fallback in impute_hmm smoothing (no state prior): window={} sample={} hap={} marker={}",
+                "[warn] No state-derived prior available in impute_hmm smoothing; reusing current posterior (window={} sample={} hap={} marker={})",
                 context.window_idx, context.sample_idx, context.hap_idx, marker_idx
             );
             *warned_af_fallback = true;
         }
-        normalized_allele_prior(
-            allele_prior_scratch,
-            NormalizedAlleleProbs::from_trusted(probs),
-        )
+        let mut sum = 0.0f32;
+        for (i, v) in allele_probs.iter().enumerate() {
+            if i >= allele_prior_scratch.len() {
+                allele_prior_scratch.push(0.0);
+            }
+            let q = if v.is_finite() && *v > 0.0 { *v } else { 0.0 };
+            allele_prior_scratch[i] = q;
+            sum += q;
+        }
+        if sum <= 0.0 {
+            let n = allele_probs.len().max(1);
+            let u = 1.0 / n as f32;
+            for i in 0..n {
+                allele_prior_scratch[i] = u;
+            }
+        } else {
+            let inv = 1.0 / sum;
+            for i in 0..allele_probs.len() {
+                allele_prior_scratch[i] *= inv;
+            }
+        }
+        NormalizedAlleleProbs::from_trusted(&allele_prior_scratch[..allele_probs.len()])
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
 }
@@ -1090,37 +1102,6 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
         }
     }
     (max - min) <= 1e-6
-}
-
-#[inline]
-fn normalized_allele_prior<'a>(
-    out: &'a mut Vec<f32>,
-    target_probs: NormalizedAlleleProbs<'_>,
-) -> NormalizedAlleleProbs<'a> {
-    let n = target_probs.len();
-    if out.len() < n {
-        out.resize(n, 0.0);
-    }
-    let prior = &mut out[..n];
-    let mut sum = 0.0f32;
-    for i in 0..n {
-        let mut v = target_probs.get(i).unwrap_or(0.0);
-        if !v.is_finite() || v < 0.0 {
-            v = 0.0;
-        }
-        prior[i] = v;
-        sum += v;
-    }
-    if sum <= 0.0 {
-        let uniform = 1.0 / n.max(1) as f32;
-        prior.fill(uniform);
-        return NormalizedAlleleProbs { probs: prior };
-    }
-    let inv = 1.0 / sum;
-    for p in prior.iter_mut() {
-        *p *= inv;
-    }
-    NormalizedAlleleProbs { probs: prior }
 }
 
 #[inline]
@@ -1660,10 +1641,16 @@ fn run_impute_hmm_impl(
                                             *v *= inv;
                                         }
                                         NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
                                     } else {
                                         if !warned_af_fallback {
                                             eprintln!(
-                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
+                                                "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
                                                 context.window_idx,
                                                 context.sample_idx,
                                                 context.hap_idx,
@@ -1671,7 +1658,16 @@ fn run_impute_hmm_impl(
                                             );
                                             warned_af_fallback = true;
                                         }
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
+                                        if ws.allele_prior_scratch.len() < n_alleles {
+                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                        }
+                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles) {
+                                            *v = uniform;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(
+                                            &ws.allele_prior_scratch[..n_alleles],
+                                        )
                                     };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
@@ -1688,7 +1684,6 @@ fn run_impute_hmm_impl(
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
                                         &mut ws.allele_prior_scratch,
-                                        probs.as_slice(),
                                         ws.nearest_obs_lambda
                                             .get(m_rev)
                                             .copied()
@@ -1992,10 +1987,16 @@ fn run_impute_hmm_seqcoded(
                                             *v *= inv;
                                         }
                                         NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
                                     } else {
                                         if !warned_af_fallback {
                                             eprintln!(
-                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
+                                                "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
                                                 context.window_idx,
                                                 context.sample_idx,
                                                 context.hap_idx,
@@ -2003,7 +2004,16 @@ fn run_impute_hmm_seqcoded(
                                             );
                                             warned_af_fallback = true;
                                         }
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
+                                        if ws.allele_prior_scratch.len() < n_alleles {
+                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                        }
+                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles) {
+                                            *v = uniform;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(
+                                            &ws.allele_prior_scratch[..n_alleles],
+                                        )
                                     };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
@@ -2020,7 +2030,6 @@ fn run_impute_hmm_seqcoded(
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
                                         &mut ws.allele_prior_scratch,
-                                        probs.as_slice(),
                                         ws.nearest_obs_lambda
                                             .get(m_rev)
                                             .copied()
@@ -2322,10 +2331,16 @@ fn run_impute_hmm_dict(
                                             *v *= inv;
                                         }
                                         NormalizedAlleleProbs::from_trusted(subset_counts)
+                                    } else if smoothing_prior_total > 0.0 {
+                                        let inv = 1.0 / smoothing_prior_total;
+                                        for v in smoothing_prior_counts.iter_mut() {
+                                            *v *= inv;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
                                     } else {
                                         if !warned_af_fallback {
                                             eprintln!(
-                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
+                                                "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
                                                 context.window_idx,
                                                 context.sample_idx,
                                                 context.hap_idx,
@@ -2333,7 +2348,16 @@ fn run_impute_hmm_dict(
                                             );
                                             warned_af_fallback = true;
                                         }
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs)
+                                        if ws.allele_prior_scratch.len() < n_alleles {
+                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                        }
+                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles) {
+                                            *v = uniform;
+                                        }
+                                        NormalizedAlleleProbs::from_trusted(
+                                            &ws.allele_prior_scratch[..n_alleles],
+                                        )
                                     };
                                     for (i, p) in ws.allele_probs.iter_mut().enumerate() {
                                         *p += missing_mass * prior.as_slice()[i];
@@ -2350,7 +2374,6 @@ fn run_impute_hmm_dict(
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
                                         &mut ws.allele_prior_scratch,
-                                        probs.as_slice(),
                                         ws.nearest_obs_lambda
                                             .get(m_rev)
                                             .copied()
