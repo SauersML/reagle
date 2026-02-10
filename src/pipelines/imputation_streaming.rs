@@ -3685,42 +3685,48 @@ impl crate::pipelines::ImputationPipeline {
             .count() as f32
             / n_ref_markers.max(1) as f32)
             .clamp(0.0, 1.0);
-        let err_floor = if genotyped_fraction < 0.01 {
-            // Keep a modest mismatch floor on sparse arrays to prevent overconfident
-            // emissions without washing out LD-driven signal at nearby untyped sites.
-            0.001f32
-        } else if genotyped_fraction < 0.02 {
-            0.0005f32
+        // Sparse-array rescue mode: prioritize typed-anchor consistency and force
+        // explicit HMM propagation rather than donor-only fallback heuristics.
+        let sparse_array_mode = genotyped_fraction <= 0.02;
+        let ultra_sparse_mode = genotyped_fraction <= 0.01;
+
+        let err_floor = if ultra_sparse_mode {
+            // Keep emissions sharp for chip-like arrays where typed anchors are the
+            // only reliable evidence; overly large mismatch floors over-smooth
+            // posteriors toward panel AF at untyped markers.
+            0.0001f32
+        } else if sparse_array_mode {
+            0.0002f32
         } else {
             self.params.p_mismatch
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
-        let smoothing_cluster_cm = if genotyped_fraction < 0.01 {
+        let smoothing_cluster_cm = if ultra_sparse_mode {
             let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.05f32 / frac).min(64.0);
+            let scale = (0.02f32 / frac).min(16.0);
             self.config.cluster.max(1e-6) * scale
-        } else if genotyped_fraction < 0.02 {
+        } else if sparse_array_mode {
             let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.01f32 / frac).min(8.0);
+            let scale = (0.01f32 / frac).min(4.0);
             self.config.cluster.max(1e-6) * scale
         } else {
             self.config.cluster.max(1e-6)
         };
-        let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
+        let min_untyped_prior_mix = if ultra_sparse_mode {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.2f32 * scale
-        } else if genotyped_fraction < 0.02 {
+            0.02f32 * scale
+        } else if sparse_array_mode {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.1f32 * scale
+            0.01f32 * scale
         } else {
             0.0f32
         };
         let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
         let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
         let min_untyped_prior_mix =
-            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
+            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.1);
         let overlap_size = 1000.min(output_end);
         let overlap_start = output_end.saturating_sub(overlap_size);
         let build_input_probs_pair = |hap1: HapIdx,
@@ -4618,7 +4624,9 @@ impl crate::pipelines::ImputationPipeline {
                 donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 let tiny_panel = plan.n_ref_haps <= 32;
-                let use_hmm_h1 = if tiny_panel {
+                let use_hmm_h1 = if sparse_array_mode {
+                    true
+                } else if tiny_panel {
                     true
                 } else if has_priors_h1 {
                     true
@@ -4628,7 +4636,9 @@ impl crate::pipelines::ImputationPipeline {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
                 };
-                let use_hmm_h2 = if tiny_panel {
+                let use_hmm_h2 = if sparse_array_mode {
+                    true
+                } else if tiny_panel {
                     true
                 } else if has_priors_h2 {
                     true
@@ -5088,7 +5098,7 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let ws = ws_opt.as_mut().unwrap();
                         let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
-                        if input_probs.has_untyped_markers() {
+                        if input_probs.has_untyped_markers() && !sparse_array_mode {
                             let panel =
                                 full_panel_posts.get_or_init(|| std::sync::Arc::new(build_full_panel_posts()));
                             input_probs.set_panel_priors(panel.clone());
