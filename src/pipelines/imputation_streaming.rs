@@ -3685,48 +3685,42 @@ impl crate::pipelines::ImputationPipeline {
             .count() as f32
             / n_ref_markers.max(1) as f32)
             .clamp(0.0, 1.0);
-        // Sparse-array rescue mode: prioritize typed-anchor consistency and force
-        // explicit HMM propagation rather than donor-only fallback heuristics.
-        let sparse_array_mode = genotyped_fraction <= 0.02;
-        let ultra_sparse_mode = genotyped_fraction <= 0.01;
-
-        let err_floor = if ultra_sparse_mode {
-            // Keep emissions sharp for chip-like arrays where typed anchors are the
-            // only reliable evidence; overly large mismatch floors over-smooth
-            // posteriors toward panel AF at untyped markers.
-            0.0001f32
-        } else if sparse_array_mode {
-            0.0002f32
+        let err_floor = if genotyped_fraction < 0.01 {
+            // Keep a modest mismatch floor on sparse arrays to prevent overconfident
+            // emissions without washing out LD-driven signal at nearby untyped sites.
+            0.001f32
+        } else if genotyped_fraction < 0.02 {
+            0.0005f32
         } else {
             self.params.p_mismatch
         };
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
-        let smoothing_cluster_cm = if ultra_sparse_mode {
+        let smoothing_cluster_cm = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.02f32 / frac).min(16.0);
+            let scale = (0.05f32 / frac).min(64.0);
             self.config.cluster.max(1e-6) * scale
-        } else if sparse_array_mode {
+        } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.01f32 / frac).min(4.0);
+            let scale = (0.01f32 / frac).min(8.0);
             self.config.cluster.max(1e-6) * scale
         } else {
             self.config.cluster.max(1e-6)
         };
-        let min_untyped_prior_mix = if ultra_sparse_mode {
+        let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.02f32 * scale
-        } else if sparse_array_mode {
+            0.2f32 * scale
+        } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.01f32 * scale
+            0.1f32 * scale
         } else {
             0.0f32
         };
         let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
         let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
         let min_untyped_prior_mix =
-            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.1);
+            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
         let overlap_size = 1000.min(output_end);
         let overlap_start = output_end.saturating_sub(overlap_size);
         let build_input_probs_pair = |hap1: HapIdx,
@@ -4537,55 +4531,7 @@ impl crate::pipelines::ImputationPipeline {
         let dbg_low_conf = AtomicUsize::new(0);
         let dbg_few_donors = AtomicUsize::new(0);
         let dbg_has_priors = AtomicUsize::new(0);
-        let dbg_fallback_ref_freq = AtomicUsize::new(0);
-        let build_full_panel_posts = || -> Vec<AllelePosteriors> {
-            let mut out: Vec<AllelePosteriors> = Vec::with_capacity(n_ref_markers);
-            for ref_m in 0..n_ref_markers {
-                let n_alleles = ref_markers
-                    .marker(MarkerIdx::new(ref_m as u32))
-                    .n_alleles()
-                    .max(1);
-                let col = &ref_columns[ref_m];
-                if n_alleles == 2 {
-                    let n_haps = col.n_haplotypes().max(1);
-                    let alt_count = col.alt_count();
-                    let alt_freq = (alt_count as f32 / n_haps as f32).clamp(1e-6, 1.0 - 1e-6);
-                    out.push(AllelePosteriors::Biallelic(alt_freq));
-                } else {
-                    let mut probs = vec![0.0f32; n_alleles];
-                    let n_haps = col.n_haplotypes();
-                    for h in 0..n_haps {
-                        let allele = col.get(HapIdx::new(h as u32));
-                        if allele == 255 {
-                            continue;
-                        }
-                        let idx = allele as usize;
-                        if idx < probs.len() {
-                            probs[idx] += 1.0;
-                        }
-                    }
-                    let mut sum = 0.0f32;
-                    for p in probs.iter() {
-                        sum += *p;
-                    }
-                    if sum <= 0.0 {
-                        let uniform = 1.0 / n_alleles as f32;
-                        for p in probs.iter_mut() {
-                            *p = uniform;
-                        }
-                    } else {
-                        let inv = 1.0 / sum;
-                        for p in probs.iter_mut() {
-                            *p *= inv;
-                        }
-                    }
-                    out.push(AllelePosteriors::Multiallelic(probs));
-                }
-            }
-            out
-        };
-        let full_panel_posts: std::sync::OnceLock<std::sync::Arc<Vec<AllelePosteriors>>> =
-            std::sync::OnceLock::new();
+        let dbg_fallback_selected_priors = AtomicUsize::new(0);
 
         let sample_results: Vec<ImputeResult> = sample_error_rates
             .par_iter_mut()
@@ -4624,9 +4570,7 @@ impl crate::pipelines::ImputationPipeline {
                 donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 let tiny_panel = plan.n_ref_haps <= 32;
-                let use_hmm_h1 = if sparse_array_mode {
-                    true
-                } else if tiny_panel {
+                let use_hmm_h1 = if tiny_panel {
                     true
                 } else if has_priors_h1 {
                     true
@@ -4636,9 +4580,7 @@ impl crate::pipelines::ImputationPipeline {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
                 };
-                let use_hmm_h2 = if sparse_array_mode {
-                    true
-                } else if tiny_panel {
+                let use_hmm_h2 = if tiny_panel {
                     true
                 } else if has_priors_h2 {
                     true
@@ -5098,11 +5040,6 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let ws = ws_opt.as_mut().unwrap();
                         let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
-                        if input_probs.has_untyped_markers() && !sparse_array_mode {
-                            let panel =
-                                full_panel_posts.get_or_init(|| std::sync::Arc::new(build_full_panel_posts()));
-                            input_probs.set_panel_priors(panel.clone());
-                        }
                         run_impute_hmm(
                             &state_haps,
                             ref_columns,
@@ -5172,11 +5109,29 @@ impl crate::pipelines::ImputationPipeline {
                 let mut p2_out = HaplotypePriors::empty();
 
                 if no_info_h1 && !has_priors_h1 && !use_hmm_h1 {
-                    let posts =
-                        full_panel_posts.get_or_init(|| std::sync::Arc::new(build_full_panel_posts()));
-                    hap1_posts = Some((**posts).clone());
-                    p1_out = HaplotypePriors::empty();
-                    dbg_fallback_ref_freq.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Very-uninformative fallback using prescan donor priors (window={} sample={} hap={})",
+                        window_idx,
+                        s,
+                        h1_idx.as_usize()
+                    );
+                    let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
+                    if total > 0 {
+                        let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h1
+                            .iter()
+                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
+                            .unzip();
+                        p1_out = HaplotypePriors::new(ids, probs);
+                        hap1_posts = Some(posts_from_donors(&donors_h1, &mut posts_probs_buf)?);
+                        dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        return Err(ReagleError::vcf(format!(
+                            "No prescan donors available for very-uninformative fallback: window={} sample={} hap={}",
+                            window_idx,
+                            s,
+                            h1_idx.as_usize()
+                        )));
+                    }
                 } else if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         let decayed = decay_prior(p);
@@ -5221,11 +5176,29 @@ impl crate::pipelines::ImputationPipeline {
                 }
 
                 if no_info_h2 && !has_priors_h2 && !use_hmm_h2 {
-                    let posts =
-                        full_panel_posts.get_or_init(|| std::sync::Arc::new(build_full_panel_posts()));
-                    hap2_posts = Some((**posts).clone());
-                    p2_out = HaplotypePriors::empty();
-                    dbg_fallback_ref_freq.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Very-uninformative fallback using prescan donor priors (window={} sample={} hap={})",
+                        window_idx,
+                        s,
+                        h2_idx.as_usize()
+                    );
+                    let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
+                    if total > 0 {
+                        let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h2
+                            .iter()
+                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c as f32 / total as f32))
+                            .unzip();
+                        p2_out = HaplotypePriors::new(ids, probs);
+                        hap2_posts = Some(posts_from_donors(&donors_h2, &mut posts_probs_buf)?);
+                        dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        return Err(ReagleError::vcf(format!(
+                            "No prescan donors available for very-uninformative fallback: window={} sample={} hap={}",
+                            window_idx,
+                            s,
+                            h2_idx.as_usize()
+                        )));
+                    }
                 } else if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         let decayed = decay_prior(p);
@@ -5310,7 +5283,7 @@ impl crate::pipelines::ImputationPipeline {
                 dbg_insufficient.load(Ordering::Relaxed),
                 dbg_low_conf.load(Ordering::Relaxed),
                 dbg_few_donors.load(Ordering::Relaxed),
-                dbg_fallback_ref_freq.load(Ordering::Relaxed)
+                dbg_fallback_selected_priors.load(Ordering::Relaxed)
             );
         }
 
