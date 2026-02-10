@@ -414,8 +414,15 @@ jobs:
           find metrics -name "reagle_metrics.json" | while read fname; do
              DIR=$(dirname "$fname")
              python3 scripts/plot_quality.py "$DIR"
+             python3 scripts/compare_metrics.py \
+               --reagle "$DIR/reagle_metrics.json" \
+               --beagle "$DIR/beagle_metrics.json" \
+               --label "$(basename "$DIR")" \
+               --output "$DIR/all_metrics_comparison.md"
              echo "" >> $GITHUB_STEP_SUMMARY
              cat "$DIR/summary.md" >> $GITHUB_STEP_SUMMARY
+             echo "" >> $GITHUB_STEP_SUMMARY
+             cat "$DIR/all_metrics_comparison.md" >> $GITHUB_STEP_SUMMARY
           done
           
       - name: Upload HTML Reports

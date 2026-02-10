@@ -965,6 +965,10 @@ fn apply_marker_prior_smoothing(
     } else {
         0.0
     };
+    // Scale panel completion by distance-based uncertainty. Near typed anchors
+    // (small lambda), panel pull should be weak; far from anchors it can rise.
+    let panel_uncertainty = (1.0 - (-nearest_obs_lambda.max(0.0)).exp()).clamp(0.0, 1.0);
+    let effective_missing_mass = missing_mass * panel_uncertainty;
     let floor_mix = min_prior_mix.clamp(0.0, 0.5);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -985,11 +989,11 @@ fn apply_marker_prior_smoothing(
                         }
                         normalize_probs(allele_probs);
                     }
-                    if missing_mass > 0.0 {
+                    if effective_missing_mass > 0.0 {
                         for i in 0..2 {
                             let panel_p = panel_probs[i];
                             if panel_p > allele_probs[i] {
-                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
+                                allele_probs[i] += effective_missing_mass * (panel_p - allele_probs[i]);
                             }
                         }
                         normalize_probs(allele_probs);
@@ -1017,11 +1021,11 @@ fn apply_marker_prior_smoothing(
                         }
                         normalize_probs(allele_probs);
                     }
-                    if missing_mass > 0.0 {
+                    if effective_missing_mass > 0.0 {
                         for (i, prob) in allele_probs.iter_mut().enumerate() {
                             let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                             if panel_p > *prob {
-                                *prob += missing_mass * (panel_p - *prob);
+                                *prob += effective_missing_mass * (panel_p - *prob);
                             }
                         }
                         normalize_probs(allele_probs);

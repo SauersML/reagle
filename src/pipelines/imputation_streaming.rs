@@ -3678,45 +3678,10 @@ impl crate::pipelines::ImputationPipeline {
 
         let target_samples = target_win.samples_arc();
         let target_pl_matrix = target_pl.unwrap_or(target_win);
-        let genotyped_fraction = (alignment
-            .ref_to_target
-            .iter()
-            .filter(|v| v.is_some())
-            .count() as f32
-            / n_ref_markers.max(1) as f32)
-            .clamp(0.0, 1.0);
-        let err_floor = if genotyped_fraction < 0.01 {
-            // Keep a modest mismatch floor on sparse arrays to prevent overconfident
-            // emissions without washing out LD-driven signal at nearby untyped sites.
-            0.001f32
-        } else if genotyped_fraction < 0.02 {
-            0.0005f32
-        } else {
-            self.params.p_mismatch
-        };
+        let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
-        let smoothing_cluster_cm = if genotyped_fraction < 0.01 {
-            let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.05f32 / frac).min(64.0);
-            self.config.cluster.max(1e-6) * scale
-        } else if genotyped_fraction < 0.02 {
-            let frac = genotyped_fraction.max(1e-6);
-            let scale = (0.01f32 / frac).min(8.0);
-            self.config.cluster.max(1e-6) * scale
-        } else {
-            self.config.cluster.max(1e-6)
-        };
-        let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
-            let frac = genotyped_fraction.max(1e-6);
-            let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.2f32 * scale
-        } else if genotyped_fraction < 0.02 {
-            let frac = genotyped_fraction.max(1e-6);
-            let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.1f32 * scale
-        } else {
-            0.0f32
-        };
+        let smoothing_cluster_cm = self.config.cluster.max(1e-6);
+        let min_untyped_prior_mix = 0.0f32;
         let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
         let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
         let min_untyped_prior_mix =

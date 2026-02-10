@@ -3385,6 +3385,37 @@ def stage_metrics():
     print(f"Test panel: {n_test} samples")
     print()
 
+    def _is_numeric_scalar(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _flatten_numeric_metrics(value, prefix=""):
+        out = {}
+        if isinstance(value, dict):
+            for key in sorted(value.keys()):
+                next_prefix = f"{prefix}.{key}" if prefix else str(key)
+                out.update(_flatten_numeric_metrics(value[key], next_prefix))
+        elif isinstance(value, list):
+            for idx, item in enumerate(value):
+                next_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+                out.update(_flatten_numeric_metrics(item, next_prefix))
+        elif _is_numeric_scalar(value):
+            val = float(value)
+            if math.isfinite(val):
+                out[prefix] = val
+        return out
+
+    def _fmt_metric_value(value):
+        rounded = round(value)
+        if abs(value - rounded) < 1e-12 and abs(rounded) >= 1000:
+            return f"{int(rounded):,}"
+        if abs(value) >= 1000:
+            return f"{value:,.3f}"
+        if abs(value) >= 1:
+            return f"{value:.6f}"
+        if value == 0:
+            return "0"
+        return f"{value:.6g}"
+
     for name, metrics in all_metrics.items():
         if metrics:
             print(f"{name.upper()}:")
@@ -3395,6 +3426,27 @@ def stage_metrics():
             print(f"  IQS: {iqs:.4f}" if iqs else "  IQS: N/A")
         else:
             print(f"{name.upper()}: FAILED/SKIPPED")
+
+    if all_metrics.get("reagle") and all_metrics.get("beagle"):
+        reagle_flat = _flatten_numeric_metrics(all_metrics["reagle"])
+        beagle_flat = _flatten_numeric_metrics(all_metrics["beagle"])
+        shared = sorted(set(reagle_flat.keys()) & set(beagle_flat.keys()))
+
+        print("\nREAGLE VS BEAGLE: ALL SHARED NUMERIC METRICS")
+        print(
+            f"  Shared metrics compared: {len(shared)} "
+            f"(reagle={len(reagle_flat)}, beagle={len(beagle_flat)})"
+        )
+        for key in shared:
+            reagle_val = reagle_flat[key]
+            beagle_val = beagle_flat[key]
+            delta = reagle_val - beagle_val
+            print(
+                f"  {key}: "
+                f"reagle={_fmt_metric_value(reagle_val)} "
+                f"beagle={_fmt_metric_value(beagle_val)} "
+                f"delta={_fmt_metric_value(delta)}"
+            )
 
     # Exit with appropriate code
     if not any(m for m in all_metrics.values()):

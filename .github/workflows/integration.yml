@@ -505,6 +505,16 @@ jobs:
         working-directory: .
         run: python3 tests/integration_test.py metrics
 
+      - name: Summarize all shared metrics (full chr22)
+        working-directory: .
+        run: |
+          python3 scripts/compare_metrics.py \
+            --reagle tests/data/reagle_metrics.json \
+            --beagle tests/data/beagle_metrics.json \
+            --label "integration-full-chr22" \
+            --output tests/data/all_metrics_comparison.md
+          cat tests/data/all_metrics_comparison.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install plotting dependencies
         run: python3 -m pip install --quiet matplotlib
 
@@ -520,6 +530,7 @@ jobs:
           path: |
             tests/data/*_metrics.txt
             tests/data/*_metrics.json
+            tests/data/all_metrics_comparison.md
 
       - name: Upload plots
         uses: actions/upload-artifact@v4
@@ -570,10 +581,23 @@ jobs:
         working-directory: .
         run: python3 tests/integration_test.py metrics
 
+      - name: Summarize all shared metrics (5% chr22)
+        working-directory: .
+        run: |
+          python3 scripts/compare_metrics.py \
+            --reagle tests/data/reagle_metrics.json \
+            --beagle tests/data/beagle_metrics.json \
+            --label "integration-chr22-5pct" \
+            --output tests/data/all_metrics_comparison.md
+          cat tests/data/all_metrics_comparison.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload metrics (5% chr22)
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: imputation-metrics-chr22-5pct
-          path: tests/data/*_metrics.txt
+          path: |
+            tests/data/*_metrics.txt
+            tests/data/*_metrics.json
+            tests/data/all_metrics_comparison.md
           retention-days: 30

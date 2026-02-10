@@ -4851,8 +4851,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 all_one.push(h);
                             }
                         }
-                        eprintln!("[prescan debug] all_zero_haps={:?}", all_zero);
-                        eprintln!("[prescan debug] all_one_haps={:?}", all_one);
+                        let all_zero_preview_len = all_zero.len().min(16);
+                        let all_one_preview_len = all_one.len().min(16);
+                        eprintln!(
+                            "[prescan debug] all_zero_haps_count={} preview={:?} omitted={}",
+                            all_zero.len(),
+                            &all_zero[..all_zero_preview_len],
+                            all_zero.len() - all_zero_preview_len
+                        );
+                        eprintln!(
+                            "[prescan debug] all_one_haps_count={} preview={:?} omitted={}",
+                            all_one.len(),
+                            &all_one[..all_one_preview_len],
+                            all_one.len() - all_one_preview_len
+                        );
                         let zero_in_candidates = all_zero
                             .iter()
                             .any(|&h| h < candidate_present.len() && candidate_present[h]);
