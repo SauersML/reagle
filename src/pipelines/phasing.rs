@@ -885,6 +885,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
 ) where
     TargetState: crate::data::storage::phase_state::PhaseState,
 {
+    const ANCHOR_RESCUE_WEIGHT: f32 = 0.35;
     let n_ref_haps = ref_columns.first().map(|c| c.n_haplotypes()).unwrap_or(0);
     if batch_haps.is_empty() || n_ref_haps == 0 {
         return;
@@ -1104,7 +1105,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 if allele_certainty <= f32::EPSILON {
                     continue;
                 }
-                for (rank, &d) in donors_buf.iter().enumerate() {
+                for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
                         continue;
@@ -1135,14 +1136,50 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if freq <= 0.0 {
                         continue;
                     }
-                    let rank_weight = 1.0 / (1.0 + 0.25 * rank as f32);
-                    let weight =
-                        allele_certainty * p_match * -(freq.max(min_freq)).ln() * rank_weight;
+                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
                     } else {
                         *w = weight;
+                    }
+                }
+                // For explicitly phased heterozygous scaffold sites, inject a small
+                // full-panel allele-consistency signal so true long-range donors are
+                // not dropped by PBWT donor subsampling ties.
+                let sample_idx = hap_idx / 2;
+                let hap1 = sample_idx * 2;
+                let hap2 = hap1 + 1;
+                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(orig_m, sample_idx))
+                    .unwrap_or(0);
+                if phased != 0 && is_het {
+                    let q = query_alleles[i].as_allele();
+                    if let Some(q_allele) = q {
+                        let freq = freqs
+                            .get(m)
+                            .and_then(|f| f.get(q_allele as usize))
+                            .copied()
+                            .unwrap_or(0.0)
+                            .max(min_freq);
+                        let rescue = ANCHOR_RESCUE_WEIGHT * allele_certainty * -(freq).ln();
+                        for idx in 0..n_ref_haps {
+                            if exclude_self && idx / 2 == hap_idx / 2 {
+                                continue;
+                            }
+                            if ref_alleles[idx] != q_allele {
+                                continue;
+                            }
+                            let w = &mut window_scores[i][idx];
+                            if w.is_finite() {
+                                *w += rescue;
+                            } else {
+                                *w = rescue;
+                            }
+                        }
                     }
                 }
             }
@@ -1352,7 +1389,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 if allele_certainty <= f32::EPSILON {
                     continue;
                 }
-                for (rank, &d) in donors_buf.iter().enumerate() {
+                for &d in donors_buf.iter() {
                     let idx = d as usize;
                     if idx >= n_ref_haps {
                         continue;
@@ -1383,14 +1420,47 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     if freq <= 0.0 {
                         continue;
                     }
-                    let rank_weight = 1.0 / (1.0 + 0.25 * rank as f32);
-                    let weight =
-                        allele_certainty * p_match * -(freq.max(min_freq)).ln() * rank_weight;
+                    let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
                     let w = &mut window_scores[i][idx];
                     if w.is_finite() {
                         *w += weight;
                     } else {
                         *w = weight;
+                    }
+                }
+                let sample_idx = hap_idx / 2;
+                let hap1 = sample_idx * 2;
+                let hap2 = hap1 + 1;
+                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
+                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let phased = phase_mask
+                    .and_then(|mask| mask.get(orig_m, sample_idx))
+                    .unwrap_or(0);
+                if phased != 0 && is_het {
+                    let q = query_alleles[i].as_allele();
+                    if let Some(q_allele) = q {
+                        let freq = freqs
+                            .get(m)
+                            .and_then(|f| f.get(q_allele as usize))
+                            .copied()
+                            .unwrap_or(0.0)
+                            .max(min_freq);
+                        let rescue = ANCHOR_RESCUE_WEIGHT * allele_certainty * -(freq).ln();
+                        for idx in 0..n_ref_haps {
+                            if exclude_self && idx / 2 == hap_idx / 2 {
+                                continue;
+                            }
+                            if ref_alleles[idx] != q_allele {
+                                continue;
+                            }
+                            let w = &mut window_scores[i][idx];
+                            if w.is_finite() {
+                                *w += rescue;
+                            } else {
+                                *w = rescue;
+                            }
+                        }
                     }
                 }
             }
@@ -6049,6 +6119,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     sample_p_no_err,
                                     sample_p_err,
                                     &mut rp,
+                                    None,
                                     &mut ws.scores,
                                     None,
                                 ) {
@@ -10336,6 +10407,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     p_no_err: f32,
     p_err: f32,
     ref_provider: &mut RefAlleleProvider<'_, AnyMarkerSpace, RefSpace>,
+    predecoded_ref_flat: Option<&[u8]>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
 ) -> Option<MosaicPaths> {
@@ -10360,24 +10432,45 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
     }
 
+    let sparse_markers: Vec<usize> = (0..n_markers)
+        .step_by(marker_stride)
+        .filter(|&m| {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            !(a1 == 255 && a2 == 255)
+        })
+        .collect();
+    if sparse_markers.is_empty() {
+        return None;
+    }
+    let mut sparse_ref_rows = vec![255u8; sparse_markers.len() * n_states];
+    for (row_i, &m) in sparse_markers.iter().enumerate() {
+        let dst = &mut sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
+        if let Some(flat) = predecoded_ref_flat {
+            let src_start = m * n_states;
+            let src_end = src_start + n_states;
+            if src_end <= flat.len() {
+                dst.copy_from_slice(&flat[src_start..src_end]);
+            } else {
+                ref_provider.fill_ref_alleles(m, dst);
+            }
+        } else {
+            ref_provider.fill_ref_alleles(m, dst);
+        }
+    }
+
     // Stage 1: O(M*K) unary compatibility to prefilter candidate states.
-    let mut ref_alleles = vec![255u8; n_states];
     let mut state_unary = vec![0.0f32; n_states];
-    let mut informative = 0usize;
-    for m in (0..n_markers).step_by(marker_stride) {
+    let informative = sparse_markers.len();
+    for (row_i, &m) in sparse_markers.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            continue;
-        }
-        informative += 1;
         let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
         let is_het = a1 != 255 && a2 != 255 && a1 != a2;
         let obs = if a1 != 255 { a1 } else { a2 };
-
-        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
+        let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
         for i in 0..n_states {
-            let r = ref_alleles[i];
+            let r = ref_row[i];
             let p = if is_het {
                 let e1 = emit_prob(r, a1, conf_m, p_no_err, p_err);
                 let e2 = emit_prob(r, a2, conf_m, p_no_err, p_err);
@@ -10413,19 +10506,15 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     let mut emit_a1 = vec![0.0f32; cand_k];
     let mut emit_a2 = vec![0.0f32; cand_k];
     let mut emit_obs = vec![0.0f32; cand_k];
-    for m in (0..n_markers).step_by(marker_stride) {
+    for (row_i, &m) in sparse_markers.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        if a1 == 255 && a2 == 255 {
-            continue;
-        }
         let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
         let is_het = a1 != 255 && a2 != 255 && a1 != a2;
         let obs = if a1 != 255 { a1 } else { a2 };
-
-        ref_provider.fill_ref_alleles(m, &mut ref_alleles);
+        let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
         for (ci, &state_idx) in ranked_states.iter().enumerate() {
-            let r = ref_alleles[state_idx];
+            let r = ref_row[state_idx];
             emit_a1[ci] = emit_prob(r, a1, conf_m, p_no_err, p_err);
             emit_a2[ci] = emit_prob(r, a2, conf_m, p_no_err, p_err);
             emit_obs[ci] = emit_prob(r, obs, conf_m, p_no_err, p_err);
@@ -10574,6 +10663,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         p_no_err,
         p_err,
         &mut ref_provider,
+        Some(shared_ref),
         &mut workspace.scores,
         None,
     );
@@ -13941,6 +14031,7 @@ mod tests {
             0.999,
             0.001,
             &mut ref_provider,
+            None,
             &mut scores,
             None,
         )
@@ -13996,6 +14087,7 @@ mod tests {
             0.999,
             0.001,
             &mut ref_provider,
+            None,
             &mut scores,
             None,
         );
