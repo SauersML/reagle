@@ -590,7 +590,7 @@ fn test_synthetic_slam_dunk() {
 
     for m in (1..n_markers).step_by(2) {
         let ds = dosages[m][0];
-        assert!(ds < 0.5, "Marker {} should be 0, got {}", m, ds);
+        assert!(ds < 0.1, "Marker {} should be 0, got {}", m, ds);
     }
 
     // DR2 validation for slam dunk test
@@ -684,13 +684,13 @@ fn test_synthetic_recombination() {
 
     // Marker 30 (in 0-region, should be 0)
     assert!(
-        dosages[30][0] < 0.5,
+        dosages[30][0] < 0.1,
         "Marker 30 should be 0, got {}",
         dosages[30][0]
     );
     // Marker 50 (in 1-region, should be 2 for diploid 1|1)
     assert!(
-        dosages[50][0] > 1.5,
+        dosages[50][0] > 1.9,
         "Marker 50 should be 2, got {}",
         dosages[50][0]
     );
@@ -897,13 +897,13 @@ fn test_simulated_chip_density() {
     let ds0 = dosages[50][0];
     let ds1 = dosages[50][1];
 
-    assert!(ds0 < 0.5, "Sample 0 at Marker 50 should be 0, got {}", ds0);
-    assert!(ds1 > 1.5, "Sample 1 at Marker 50 should be 2, got {}", ds1);
+    assert!(ds0 < 0.1, "Sample 0 at Marker 50 should be 0, got {}", ds0);
+    assert!(ds1 > 1.9, "Sample 1 at Marker 50 should be 2, got {}", ds1);
 
     let ds0 = dosages[150][0];
     let ds1 = dosages[150][1];
-    assert!(ds0 < 0.5, "Sample 0 at Marker 150 should be 0, got {}", ds0);
-    assert!(ds1 > 1.5, "Sample 1 at Marker 150 should be 2, got {}", ds1);
+    assert!(ds0 < 0.1, "Sample 0 at Marker 150 should be 0, got {}", ds0);
+    assert!(ds1 > 1.9, "Sample 1 at Marker 150 should be 2, got {}", ds1);
 
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
