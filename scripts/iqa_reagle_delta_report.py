@@ -555,11 +555,19 @@ def build_plot(
                 if delta is None:
                     continue
 
+                # Plot speed as fractional percent change (0..1) instead of raw seconds delta.
+                plot_x = delta
+                if key == "reagle_step_seconds":
+                    if base_val is None or cur_val is None or base_val <= 0:
+                        continue
+                    frac_change = abs((cur_val - base_val) / base_val)
+                    plot_x = min(max(frac_change, 0.0), 1.0)
+
                 y = j + ((run_pos % 9) - 4) * 0.045
                 color = "#16a34a" if emoji == "🟢" else ("#dc2626" if emoji == "🔴" else "#6b7280")
                 marker = "o" if run.get("status") == "completed" else "^"
-                ax.scatter(delta, y, s=42, color=color, alpha=0.85, marker=marker, edgecolors="none")
-                all_x.append(delta)
+                ax.scatter(plot_x, y, s=42, color=color, alpha=0.85, marker=marker, edgecolors="none")
+                all_x.append(plot_x)
                 plotted += 1
 
         ax.axvline(0.0, color="#111827", linewidth=1.0, alpha=0.6)
@@ -570,7 +578,7 @@ def build_plot(
         if len(short) > 40:
             short = short[:37] + "..."
         ax.set_title(f"{short}\n(points={plotted})", fontsize=10)
-        ax.set_xlabel("Delta vs base")
+        ax.set_xlabel("Delta vs base (speed shown as 0-1 fractional change)")
 
         if all_x:
             max_abs = max(abs(x) for x in all_x)

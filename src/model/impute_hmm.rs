@@ -21,6 +21,10 @@ pub struct ImputeHmmContext {
     pub hap_idx: usize,
 }
 
+// For distant untyped markers, HMM state posteriors contribute negligibly after
+// distance-based smoothing, so we can safely emit panel priors directly.
+const SKIP_RETAIN_THRESHOLD: f32 = 0.01;
+
 #[inline]
 fn validate_target_probs_nonempty(
     target_probs: &TargetAlleleProbs,
@@ -993,7 +997,8 @@ fn apply_marker_prior_smoothing(
                         for i in 0..2 {
                             let panel_p = panel_probs[i];
                             if panel_p > allele_probs[i] {
-                                allele_probs[i] += effective_missing_mass * (panel_p - allele_probs[i]);
+                                allele_probs[i] +=
+                                    effective_missing_mass * (panel_p - allele_probs[i]);
                             }
                         }
                         normalize_probs(allele_probs);
@@ -1174,6 +1179,35 @@ fn transition_only_backward_update(
     }
     let n = bwd.len() as f32;
     (scale + shift_base * n).mul_add(bwd_sum, 0.0).max(1e-30)
+}
+
+#[inline]
+fn should_skip_untyped_posterior(
+    target_probs: &TargetAlleleProbs,
+    nearest_obs_lambda: &[f32],
+    marker_idx: usize,
+    use_prior_smoothing: bool,
+) -> bool {
+    if !use_prior_smoothing || !target_probs.is_untyped_uniform_marker(marker_idx) {
+        return false;
+    }
+    let lambda = nearest_obs_lambda
+        .get(marker_idx)
+        .copied()
+        .unwrap_or(f32::INFINITY)
+        .max(0.0);
+    (-lambda).exp() < SKIP_RETAIN_THRESHOLD
+}
+
+#[inline]
+fn panel_freq_posterior(
+    panel_priors: Option<&[AllelePosteriors]>,
+    marker_idx: usize,
+) -> AllelePosteriors {
+    panel_priors
+        .and_then(|p| p.get(marker_idx))
+        .cloned()
+        .unwrap_or(AllelePosteriors::Biallelic(0.0))
 }
 
 #[inline]
@@ -1603,106 +1637,138 @@ fn run_impute_hmm_impl(
                     );
 
                     if is_final {
-                        // Compute posteriors using beta at time t (current ws.bwd), before updating
-                        // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
-                        ws.allele_probs.clear();
-                        if n_alleles > 0 {
-                            ws.allele_probs.resize(n_alleles, 0.0f32);
-                            let subset_counts = &mut ws.subset_counts[..n_alleles];
-                            let smoothing_prior_counts =
-                                &mut ws.smoothing_prior_counts[..n_alleles];
-                            subset_counts.fill(0.0);
-                            smoothing_prior_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
-                            let mut smoothing_prior_total = 0.0f32;
-                            let mut total = 0.0f32;
-                            let mut missing_mass = 0.0f32;
-                            for i in 0..active_states {
-                                let state_prob = fwd_slice[i] * ws.bwd[i];
-                                total += state_prob;
-                                let ref_allele = ref_alleles.get(i);
-                                if ref_allele == 255 {
-                                    missing_mass += state_prob;
-                                    continue;
-                                }
-                                let idx = ref_allele as usize;
-                                if idx < ws.allele_probs.len() {
-                                    ws.allele_probs[idx] += state_prob;
-                                    subset_counts[idx] += state_prob;
-                                    subset_total += state_prob;
-                                    let w = ws.weights[i].max(0.0);
-                                    if w > 0.0 {
-                                        smoothing_prior_counts[idx] += w;
-                                        smoothing_prior_total += w;
+                        if should_skip_untyped_posterior(
+                            target_probs,
+                            &ws.nearest_obs_lambda,
+                            m_rev,
+                            use_prior_smoothing,
+                        ) && prior_marker_idx != Some(m_rev)
+                        {
+                            posteriors[m_rev] =
+                                panel_freq_posterior(target_probs.panel_priors(), m_rev);
+                        } else {
+                            // Compute posteriors using beta at time t (current ws.bwd), before updating
+                            // beta for time t-1. This aligns alpha_t * beta_t for marker-level posteriors.
+                            ws.allele_probs.clear();
+                            if n_alleles > 0 {
+                                ws.allele_probs.resize(n_alleles, 0.0f32);
+                                let subset_counts = &mut ws.subset_counts[..n_alleles];
+                                let smoothing_prior_counts =
+                                    &mut ws.smoothing_prior_counts[..n_alleles];
+                                subset_counts.fill(0.0);
+                                smoothing_prior_counts.fill(0.0);
+                                let mut subset_total = 0.0f32;
+                                let mut smoothing_prior_total = 0.0f32;
+                                let mut total = 0.0f32;
+                                let mut missing_mass = 0.0f32;
+                                for i in 0..active_states {
+                                    let state_prob = fwd_slice[i] * ws.bwd[i];
+                                    total += state_prob;
+                                    let ref_allele = ref_alleles.get(i);
+                                    if ref_allele == 255 {
+                                        missing_mass += state_prob;
+                                        continue;
+                                    }
+                                    let idx = ref_allele as usize;
+                                    if idx < ws.allele_probs.len() {
+                                        ws.allele_probs[idx] += state_prob;
+                                        subset_counts[idx] += state_prob;
+                                        subset_total += state_prob;
+                                        let w = ws.weights[i].max(0.0);
+                                        if w > 0.0 {
+                                            smoothing_prior_counts[idx] += w;
+                                            smoothing_prior_total += w;
+                                        }
                                     }
                                 }
-                            }
-                            if total > 0.0 {
-                                if missing_mass > 0.0 {
-                                    let prior = if subset_total > 0.0 {
-                                        let inv = 1.0 / subset_total;
-                                        for v in subset_counts.iter_mut() {
-                                            *v *= inv;
+                                if total > 0.0 {
+                                    if missing_mass > 0.0 {
+                                        let prior = if subset_total > 0.0 {
+                                            let inv = 1.0 / subset_total;
+                                            for v in subset_counts.iter_mut() {
+                                                *v *= inv;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(subset_counts)
+                                        } else if smoothing_prior_total > 0.0 {
+                                            let inv = 1.0 / smoothing_prior_total;
+                                            for v in smoothing_prior_counts.iter_mut() {
+                                                *v *= inv;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(
+                                                smoothing_prior_counts,
+                                            )
+                                        } else {
+                                            if !warned_af_fallback {
+                                                eprintln!(
+                                                    "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
+                                                    context.window_idx,
+                                                    context.sample_idx,
+                                                    context.hap_idx,
+                                                    m_rev
+                                                );
+                                                warned_af_fallback = true;
+                                            }
+                                            if ws.allele_prior_scratch.len() < n_alleles {
+                                                ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                            }
+                                            let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                            for v in
+                                                ws.allele_prior_scratch.iter_mut().take(n_alleles)
+                                            {
+                                                *v = uniform;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(
+                                                &ws.allele_prior_scratch[..n_alleles],
+                                            )
+                                        };
+                                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                            *p += missing_mass * prior.as_slice()[i];
                                         }
-                                        NormalizedAlleleProbs::from_trusted(subset_counts)
-                                    } else if smoothing_prior_total > 0.0 {
-                                        let inv = 1.0 / smoothing_prior_total;
-                                        for v in smoothing_prior_counts.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
-                                    } else {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
-                                                context.window_idx,
-                                                context.sample_idx,
-                                                context.hap_idx,
-                                                m_rev
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        if ws.allele_prior_scratch.len() < n_alleles {
-                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
-                                        }
-                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
-                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles) {
-                                            *v = uniform;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(
-                                            &ws.allele_prior_scratch[..n_alleles],
-                                        )
-                                    };
-                                    for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                        *p += missing_mass * prior.as_slice()[i];
                                     }
-                                }
-                                for p in ws.allele_probs.iter_mut() {
-                                    *p /= total;
-                                }
-                                if use_prior_smoothing {
-                                    apply_marker_prior_smoothing(
-                                        &mut ws.allele_probs,
-                                        target_probs.panel_priors(),
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p /= total;
+                                    }
+                                    if use_prior_smoothing {
+                                        apply_marker_prior_smoothing(
+                                            &mut ws.allele_probs,
+                                            target_probs.panel_priors(),
+                                            m_rev,
+                                            smoothing_prior_counts,
+                                            smoothing_prior_total,
+                                            &mut ws.allele_prior_scratch,
+                                            ws.nearest_obs_lambda
+                                                .get(m_rev)
+                                                .copied()
+                                                .unwrap_or(f32::INFINITY),
+                                            target_probs.is_untyped_uniform_marker(m_rev),
+                                            active_states,
+                                            panel_haps,
+                                            target_probs.min_untyped_prior_mix(),
+                                            &mut warned_af_fallback,
+                                            context,
+                                        );
+                                    }
+                                } else {
+                                    return Err(ReagleError::vcf(format!(
+                                        "Posterior mass collapse in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
                                         m_rev,
-                                        smoothing_prior_counts,
-                                        smoothing_prior_total,
-                                        &mut ws.allele_prior_scratch,
-                                        ws.nearest_obs_lambda
-                                            .get(m_rev)
-                                            .copied()
-                                            .unwrap_or(f32::INFINITY),
-                                        target_probs.is_untyped_uniform_marker(m_rev),
-                                        active_states,
-                                        panel_haps,
-                                        target_probs.min_untyped_prior_mix(),
-                                        &mut warned_af_fallback,
-                                        context,
-                                    );
+                                        active_states
+                                    )));
+                                }
+                                if ws.allele_probs.len() == 2 {
+                                    posteriors[m_rev] =
+                                        AllelePosteriors::Biallelic(ws.allele_probs[1]);
+                                } else {
+                                    let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                    out.extend_from_slice(&ws.allele_probs);
+                                    posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                                 }
                             } else {
                                 return Err(ReagleError::vcf(format!(
-                                    "Posterior mass collapse in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                    "No allele space available in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
                                     context.window_idx,
                                     context.sample_idx,
                                     context.hap_idx,
@@ -1710,22 +1776,6 @@ fn run_impute_hmm_impl(
                                     active_states
                                 )));
                             }
-                            if ws.allele_probs.len() == 2 {
-                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                            } else {
-                                let mut out = Vec::with_capacity(ws.allele_probs.len());
-                                out.extend_from_slice(&ws.allele_probs);
-                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                            }
-                        } else {
-                            return Err(ReagleError::vcf(format!(
-                                "No allele space available in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
-                                context.window_idx,
-                                context.sample_idx,
-                                context.hap_idx,
-                                m_rev,
-                                active_states
-                            )));
                         }
                     }
 
@@ -1951,104 +2001,136 @@ fn run_impute_hmm_seqcoded(
                     }
 
                     if is_final {
-                        ws.allele_probs.clear();
-                        if n_alleles > 0 {
-                            ws.allele_probs.resize(n_alleles, 0.0f32);
-                            let subset_counts = &mut ws.subset_counts[..n_alleles];
-                            let smoothing_prior_counts =
-                                &mut ws.smoothing_prior_counts[..n_alleles];
-                            subset_counts.fill(0.0);
-                            smoothing_prior_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
-                            let mut smoothing_prior_total = 0.0f32;
-                            let mut total = 0.0f32;
-                            let mut missing_mass = 0.0f32;
-                            for i in 0..active_states {
-                                let state_prob = fwd_slice[i] * ws.bwd[i];
-                                total += state_prob;
-                                let ref_allele = seq_patterns.allele_for_state(i);
-                                if ref_allele == 255 {
-                                    missing_mass += state_prob;
-                                    continue;
-                                }
-                                let idx = ref_allele as usize;
-                                if idx < ws.allele_probs.len() {
-                                    ws.allele_probs[idx] += state_prob;
-                                    subset_counts[idx] += state_prob;
-                                    subset_total += state_prob;
-                                    let w = ws.weights[i].max(0.0);
-                                    if w > 0.0 {
-                                        smoothing_prior_counts[idx] += w;
-                                        smoothing_prior_total += w;
+                        if should_skip_untyped_posterior(
+                            target_probs,
+                            &ws.nearest_obs_lambda,
+                            m_rev,
+                            use_prior_smoothing,
+                        ) && prior_marker_idx != Some(m_rev)
+                        {
+                            posteriors[m_rev] =
+                                panel_freq_posterior(target_probs.panel_priors(), m_rev);
+                        } else {
+                            ws.allele_probs.clear();
+                            if n_alleles > 0 {
+                                ws.allele_probs.resize(n_alleles, 0.0f32);
+                                let subset_counts = &mut ws.subset_counts[..n_alleles];
+                                let smoothing_prior_counts =
+                                    &mut ws.smoothing_prior_counts[..n_alleles];
+                                subset_counts.fill(0.0);
+                                smoothing_prior_counts.fill(0.0);
+                                let mut subset_total = 0.0f32;
+                                let mut smoothing_prior_total = 0.0f32;
+                                let mut total = 0.0f32;
+                                let mut missing_mass = 0.0f32;
+                                for i in 0..active_states {
+                                    let state_prob = fwd_slice[i] * ws.bwd[i];
+                                    total += state_prob;
+                                    let ref_allele = seq_patterns.allele_for_state(i);
+                                    if ref_allele == 255 {
+                                        missing_mass += state_prob;
+                                        continue;
+                                    }
+                                    let idx = ref_allele as usize;
+                                    if idx < ws.allele_probs.len() {
+                                        ws.allele_probs[idx] += state_prob;
+                                        subset_counts[idx] += state_prob;
+                                        subset_total += state_prob;
+                                        let w = ws.weights[i].max(0.0);
+                                        if w > 0.0 {
+                                            smoothing_prior_counts[idx] += w;
+                                            smoothing_prior_total += w;
+                                        }
                                     }
                                 }
-                            }
-                            if total > 0.0 {
-                                if missing_mass > 0.0 {
-                                    let prior = if subset_total > 0.0 {
-                                        let inv = 1.0 / subset_total;
-                                        for v in subset_counts.iter_mut() {
-                                            *v *= inv;
+                                if total > 0.0 {
+                                    if missing_mass > 0.0 {
+                                        let prior = if subset_total > 0.0 {
+                                            let inv = 1.0 / subset_total;
+                                            for v in subset_counts.iter_mut() {
+                                                *v *= inv;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(subset_counts)
+                                        } else if smoothing_prior_total > 0.0 {
+                                            let inv = 1.0 / smoothing_prior_total;
+                                            for v in smoothing_prior_counts.iter_mut() {
+                                                *v *= inv;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(
+                                                smoothing_prior_counts,
+                                            )
+                                        } else {
+                                            if !warned_af_fallback {
+                                                eprintln!(
+                                                    "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
+                                                    context.window_idx,
+                                                    context.sample_idx,
+                                                    context.hap_idx,
+                                                    m_rev
+                                                );
+                                                warned_af_fallback = true;
+                                            }
+                                            if ws.allele_prior_scratch.len() < n_alleles {
+                                                ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                            }
+                                            let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                            for v in
+                                                ws.allele_prior_scratch.iter_mut().take(n_alleles)
+                                            {
+                                                *v = uniform;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(
+                                                &ws.allele_prior_scratch[..n_alleles],
+                                            )
+                                        };
+                                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                            *p += missing_mass * prior.as_slice()[i];
                                         }
-                                        NormalizedAlleleProbs::from_trusted(subset_counts)
-                                    } else if smoothing_prior_total > 0.0 {
-                                        let inv = 1.0 / smoothing_prior_total;
-                                        for v in smoothing_prior_counts.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
-                                    } else {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
-                                                context.window_idx,
-                                                context.sample_idx,
-                                                context.hap_idx,
-                                                m_rev
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        if ws.allele_prior_scratch.len() < n_alleles {
-                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
-                                        }
-                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
-                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles) {
-                                            *v = uniform;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(
-                                            &ws.allele_prior_scratch[..n_alleles],
-                                        )
-                                    };
-                                    for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                        *p += missing_mass * prior.as_slice()[i];
                                     }
-                                }
-                                for p in ws.allele_probs.iter_mut() {
-                                    *p /= total;
-                                }
-                                if use_prior_smoothing {
-                                    apply_marker_prior_smoothing(
-                                        &mut ws.allele_probs,
-                                        target_probs.panel_priors(),
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p /= total;
+                                    }
+                                    if use_prior_smoothing {
+                                        apply_marker_prior_smoothing(
+                                            &mut ws.allele_probs,
+                                            target_probs.panel_priors(),
+                                            m_rev,
+                                            smoothing_prior_counts,
+                                            smoothing_prior_total,
+                                            &mut ws.allele_prior_scratch,
+                                            ws.nearest_obs_lambda
+                                                .get(m_rev)
+                                                .copied()
+                                                .unwrap_or(f32::INFINITY),
+                                            target_probs.is_untyped_uniform_marker(m_rev),
+                                            active_states,
+                                            panel_haps,
+                                            target_probs.min_untyped_prior_mix(),
+                                            &mut warned_af_fallback,
+                                            context,
+                                        );
+                                    }
+                                } else {
+                                    return Err(ReagleError::vcf(format!(
+                                        "Posterior mass collapse in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
                                         m_rev,
-                                        smoothing_prior_counts,
-                                        smoothing_prior_total,
-                                        &mut ws.allele_prior_scratch,
-                                        ws.nearest_obs_lambda
-                                            .get(m_rev)
-                                            .copied()
-                                            .unwrap_or(f32::INFINITY),
-                                        target_probs.is_untyped_uniform_marker(m_rev),
-                                        active_states,
-                                        panel_haps,
-                                        target_probs.min_untyped_prior_mix(),
-                                        &mut warned_af_fallback,
-                                        context,
-                                    );
+                                        active_states
+                                    )));
+                                }
+                                if ws.allele_probs.len() == 2 {
+                                    posteriors[m_rev] =
+                                        AllelePosteriors::Biallelic(ws.allele_probs[1]);
+                                } else {
+                                    let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                    out.extend_from_slice(&ws.allele_probs);
+                                    posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                                 }
                             } else {
                                 return Err(ReagleError::vcf(format!(
-                                    "Posterior mass collapse in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
+                                    "No allele space available in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
                                     context.window_idx,
                                     context.sample_idx,
                                     context.hap_idx,
@@ -2056,22 +2138,6 @@ fn run_impute_hmm_seqcoded(
                                     active_states
                                 )));
                             }
-                            if ws.allele_probs.len() == 2 {
-                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                            } else {
-                                let mut out = Vec::with_capacity(ws.allele_probs.len());
-                                out.extend_from_slice(&ws.allele_probs);
-                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                            }
-                        } else {
-                            return Err(ReagleError::vcf(format!(
-                                "No allele space available in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
-                                context.window_idx,
-                                context.sample_idx,
-                                context.hap_idx,
-                                m_rev,
-                                active_states
-                            )));
                         }
                     }
 
@@ -2295,104 +2361,136 @@ fn run_impute_hmm_dict(
                     }
 
                     if is_final {
-                        ws.allele_probs.clear();
-                        if n_alleles > 0 {
-                            ws.allele_probs.resize(n_alleles, 0.0f32);
-                            let subset_counts = &mut ws.subset_counts[..n_alleles];
-                            let smoothing_prior_counts =
-                                &mut ws.smoothing_prior_counts[..n_alleles];
-                            subset_counts.fill(0.0);
-                            smoothing_prior_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
-                            let mut smoothing_prior_total = 0.0f32;
-                            let mut total = 0.0f32;
-                            let mut missing_mass = 0.0f32;
-                            for i in 0..active_states {
-                                let state_prob = fwd_slice[i] * ws.bwd[i];
-                                total += state_prob;
-                                let ref_allele = dict_patterns.allele_for_state(i);
-                                if ref_allele == 255 {
-                                    missing_mass += state_prob;
-                                    continue;
-                                }
-                                let idx = ref_allele as usize;
-                                if idx < ws.allele_probs.len() {
-                                    ws.allele_probs[idx] += state_prob;
-                                    subset_counts[idx] += state_prob;
-                                    subset_total += state_prob;
-                                    let w = ws.weights[i].max(0.0);
-                                    if w > 0.0 {
-                                        smoothing_prior_counts[idx] += w;
-                                        smoothing_prior_total += w;
+                        if should_skip_untyped_posterior(
+                            target_probs,
+                            &ws.nearest_obs_lambda,
+                            m_rev,
+                            use_prior_smoothing,
+                        ) && prior_marker_idx != Some(m_rev)
+                        {
+                            posteriors[m_rev] =
+                                panel_freq_posterior(target_probs.panel_priors(), m_rev);
+                        } else {
+                            ws.allele_probs.clear();
+                            if n_alleles > 0 {
+                                ws.allele_probs.resize(n_alleles, 0.0f32);
+                                let subset_counts = &mut ws.subset_counts[..n_alleles];
+                                let smoothing_prior_counts =
+                                    &mut ws.smoothing_prior_counts[..n_alleles];
+                                subset_counts.fill(0.0);
+                                smoothing_prior_counts.fill(0.0);
+                                let mut subset_total = 0.0f32;
+                                let mut smoothing_prior_total = 0.0f32;
+                                let mut total = 0.0f32;
+                                let mut missing_mass = 0.0f32;
+                                for i in 0..active_states {
+                                    let state_prob = fwd_slice[i] * ws.bwd[i];
+                                    total += state_prob;
+                                    let ref_allele = dict_patterns.allele_for_state(i);
+                                    if ref_allele == 255 {
+                                        missing_mass += state_prob;
+                                        continue;
+                                    }
+                                    let idx = ref_allele as usize;
+                                    if idx < ws.allele_probs.len() {
+                                        ws.allele_probs[idx] += state_prob;
+                                        subset_counts[idx] += state_prob;
+                                        subset_total += state_prob;
+                                        let w = ws.weights[i].max(0.0);
+                                        if w > 0.0 {
+                                            smoothing_prior_counts[idx] += w;
+                                            smoothing_prior_total += w;
+                                        }
                                     }
                                 }
-                            }
-                            if total > 0.0 {
-                                if missing_mass > 0.0 {
-                                    let prior = if subset_total > 0.0 {
-                                        let inv = 1.0 / subset_total;
-                                        for v in subset_counts.iter_mut() {
-                                            *v *= inv;
+                                if total > 0.0 {
+                                    if missing_mass > 0.0 {
+                                        let prior = if subset_total > 0.0 {
+                                            let inv = 1.0 / subset_total;
+                                            for v in subset_counts.iter_mut() {
+                                                *v *= inv;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(subset_counts)
+                                        } else if smoothing_prior_total > 0.0 {
+                                            let inv = 1.0 / smoothing_prior_total;
+                                            for v in smoothing_prior_counts.iter_mut() {
+                                                *v *= inv;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(
+                                                smoothing_prior_counts,
+                                            )
+                                        } else {
+                                            if !warned_af_fallback {
+                                                eprintln!(
+                                                    "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
+                                                    context.window_idx,
+                                                    context.sample_idx,
+                                                    context.hap_idx,
+                                                    m_rev
+                                                );
+                                                warned_af_fallback = true;
+                                            }
+                                            if ws.allele_prior_scratch.len() < n_alleles {
+                                                ws.allele_prior_scratch.resize(n_alleles, 0.0);
+                                            }
+                                            let uniform = 1.0f32 / n_alleles.max(1) as f32;
+                                            for v in
+                                                ws.allele_prior_scratch.iter_mut().take(n_alleles)
+                                            {
+                                                *v = uniform;
+                                            }
+                                            NormalizedAlleleProbs::from_trusted(
+                                                &ws.allele_prior_scratch[..n_alleles],
+                                            )
+                                        };
+                                        for (i, p) in ws.allele_probs.iter_mut().enumerate() {
+                                            *p += missing_mass * prior.as_slice()[i];
                                         }
-                                        NormalizedAlleleProbs::from_trusted(subset_counts)
-                                    } else if smoothing_prior_total > 0.0 {
-                                        let inv = 1.0 / smoothing_prior_total;
-                                        for v in smoothing_prior_counts.iter_mut() {
-                                            *v *= inv;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
-                                    } else {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] No state-derived prior in impute_hmm; using uniform fallback (window={} sample={} hap={} marker={})",
-                                                context.window_idx,
-                                                context.sample_idx,
-                                                context.hap_idx,
-                                                m_rev
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        if ws.allele_prior_scratch.len() < n_alleles {
-                                            ws.allele_prior_scratch.resize(n_alleles, 0.0);
-                                        }
-                                        let uniform = 1.0f32 / n_alleles.max(1) as f32;
-                                        for v in ws.allele_prior_scratch.iter_mut().take(n_alleles) {
-                                            *v = uniform;
-                                        }
-                                        NormalizedAlleleProbs::from_trusted(
-                                            &ws.allele_prior_scratch[..n_alleles],
-                                        )
-                                    };
-                                    for (i, p) in ws.allele_probs.iter_mut().enumerate() {
-                                        *p += missing_mass * prior.as_slice()[i];
                                     }
-                                }
-                                for p in ws.allele_probs.iter_mut() {
-                                    *p /= total;
-                                }
-                                if use_prior_smoothing {
-                                    apply_marker_prior_smoothing(
-                                        &mut ws.allele_probs,
-                                        target_probs.panel_priors(),
+                                    for p in ws.allele_probs.iter_mut() {
+                                        *p /= total;
+                                    }
+                                    if use_prior_smoothing {
+                                        apply_marker_prior_smoothing(
+                                            &mut ws.allele_probs,
+                                            target_probs.panel_priors(),
+                                            m_rev,
+                                            smoothing_prior_counts,
+                                            smoothing_prior_total,
+                                            &mut ws.allele_prior_scratch,
+                                            ws.nearest_obs_lambda
+                                                .get(m_rev)
+                                                .copied()
+                                                .unwrap_or(f32::INFINITY),
+                                            target_probs.is_untyped_uniform_marker(m_rev),
+                                            active_states,
+                                            panel_haps,
+                                            target_probs.min_untyped_prior_mix(),
+                                            &mut warned_af_fallback,
+                                            context,
+                                        );
+                                    }
+                                } else {
+                                    return Err(ReagleError::vcf(format!(
+                                        "Posterior mass collapse in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
                                         m_rev,
-                                        smoothing_prior_counts,
-                                        smoothing_prior_total,
-                                        &mut ws.allele_prior_scratch,
-                                        ws.nearest_obs_lambda
-                                            .get(m_rev)
-                                            .copied()
-                                            .unwrap_or(f32::INFINITY),
-                                        target_probs.is_untyped_uniform_marker(m_rev),
-                                        active_states,
-                                        panel_haps,
-                                        target_probs.min_untyped_prior_mix(),
-                                        &mut warned_af_fallback,
-                                        context,
-                                    );
+                                        active_states
+                                    )));
+                                }
+                                if ws.allele_probs.len() == 2 {
+                                    posteriors[m_rev] =
+                                        AllelePosteriors::Biallelic(ws.allele_probs[1]);
+                                } else {
+                                    let mut out = Vec::with_capacity(ws.allele_probs.len());
+                                    out.extend_from_slice(&ws.allele_probs);
+                                    posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
                                 }
                             } else {
                                 return Err(ReagleError::vcf(format!(
-                                    "Posterior mass collapse in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
+                                    "No allele space available in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
                                     context.window_idx,
                                     context.sample_idx,
                                     context.hap_idx,
@@ -2400,22 +2498,6 @@ fn run_impute_hmm_dict(
                                     active_states
                                 )));
                             }
-                            if ws.allele_probs.len() == 2 {
-                                posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
-                            } else {
-                                let mut out = Vec::with_capacity(ws.allele_probs.len());
-                                out.extend_from_slice(&ws.allele_probs);
-                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
-                            }
-                        } else {
-                            return Err(ReagleError::vcf(format!(
-                                "No allele space available in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
-                                context.window_idx,
-                                context.sample_idx,
-                                context.hap_idx,
-                                m_rev,
-                                active_states
-                            )));
                         }
                     }
 
