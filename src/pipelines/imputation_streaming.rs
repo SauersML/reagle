@@ -4477,7 +4477,6 @@ impl crate::pipelines::ImputationPipeline {
         struct ImputeResult {
             result: SampleImputationResult,
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
-            last_info_idx: Option<usize>,
         }
 
         let telemetry = self.telemetry.clone();
@@ -4501,10 +4500,10 @@ impl crate::pipelines::ImputationPipeline {
                 let priors_h1 = overlap_hap_priors.and_then(|p| p.get(h1_idx.as_usize()));
                 let priors_h2 = overlap_hap_priors.and_then(|p| p.get(h2_idx.as_usize()));
 
-                    let (mut input_probs_h1, mut input_probs_h2, last_info_h1, last_info_h2) =
+                let (mut input_probs_h1, mut input_probs_h2, _, _) =
                         build_input_probs_pair(h1_idx, h2_idx, s);
-                let handoff_capture_idx_h1 = last_info_h1.or(prior_marker_idx);
-                let handoff_capture_idx_h2 = last_info_h2.or(prior_marker_idx);
+                let handoff_capture_idx_h1 = prior_marker_idx;
+                let handoff_capture_idx_h2 = prior_marker_idx;
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
         let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
@@ -5071,12 +5070,6 @@ impl crate::pipelines::ImputationPipeline {
                         hap_posteriors: (hap1_posts, hap2_posts),
                     },
                     priors: Some((p1_out, p2_out)),
-                    last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    },
                 }
                 )
             })
@@ -5373,7 +5366,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut all_results = Vec::with_capacity(n_target_samples);
         let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
-        let mut handoff_marker_idx: Option<usize> = None;
+        let handoff_marker_idx: Option<usize> = prior_marker_idx;
 
         for mut item in sample_results {
             let sample_idx = item.result.sample_idx;
@@ -5411,12 +5404,6 @@ impl crate::pipelines::ImputationPipeline {
                     next_priors_vec[base + 1] = p2;
                 }
             }
-            if let Some(idx) = item.last_info_idx {
-                handoff_marker_idx = Some(match handoff_marker_idx {
-                    Some(prev) => prev.max(idx),
-                    None => idx,
-                });
-            }
         }
 
         all_results.sort_by_key(|result| result.sample_idx);
@@ -5438,7 +5425,6 @@ impl crate::pipelines::ImputationPipeline {
                 window_idx, output_markers
             ));
         }
-        let handoff_marker_idx = handoff_marker_idx.or(prior_marker_idx);
         let handoff_global_idx = handoff_marker_idx.map(|idx| idx + global_start);
         let handoff_gen_pos = handoff_marker_idx.and_then(|idx| gen_positions.get(idx).copied());
         Ok(Some(ImputationWindowResults {

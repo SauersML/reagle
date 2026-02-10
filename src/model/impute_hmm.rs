@@ -1994,7 +1994,7 @@ fn run_impute_hmm_impl(
                     let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
                     let off = local.fwd_offset(active_states);
                     let fwd_slice = &ws.fwd_history[off..off + active_states];
-                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
+                    if prior_marker_idx == Some(m_rev) {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -2188,7 +2188,7 @@ fn run_impute_hmm_impl(
         }
     }
 
-    if forward_prior_state_post.is_some() {
+    if final_prior_state_post.is_none() && forward_prior_state_post.is_some() {
         final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
@@ -2420,7 +2420,7 @@ fn run_impute_hmm_seqcoded(
                     let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
                     let off = local.fwd_offset(active_states);
                     let fwd_slice = &ws.fwd_history[off..off + active_states];
-                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
+                    if prior_marker_idx == Some(m_rev) {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -2603,7 +2603,7 @@ fn run_impute_hmm_seqcoded(
         }
     }
 
-    if forward_prior_state_post.is_some() {
+    if final_prior_state_post.is_none() && forward_prior_state_post.is_some() {
         final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
@@ -2835,7 +2835,7 @@ fn run_impute_hmm_dict(
                     let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
                     let off = local.fwd_offset(active_states);
                     let fwd_slice = &ws.fwd_history[off..off + active_states];
-                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
+                    if prior_marker_idx == Some(m_rev) {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -3018,7 +3018,7 @@ fn run_impute_hmm_dict(
         }
     }
 
-    if forward_prior_state_post.is_some() {
+    if final_prior_state_post.is_none() && forward_prior_state_post.is_some() {
         final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
