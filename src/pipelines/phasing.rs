@@ -9529,10 +9529,15 @@ fn sample_dynamic_mcmc(
     let mut candidates_buf: Vec<u32> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    const DATA_DRIVEN_INJECT_DIV: usize = 3;
     let mut collect_dynamic_neighbors =
         |path_ref: &[u32], query_hap: &[u8], target_states: usize, out: &mut Vec<u32>| {
             seen_buf.clear();
             candidates_buf.clear();
+            let inject_target = target_states
+                .checked_div(DATA_DRIVEN_INJECT_DIV)
+                .unwrap_or(0)
+                .max(1);
 
             for &m in &anchors_static {
                 let ref_hap = path_ref.get(m).copied().unwrap_or(0);
@@ -9557,6 +9562,21 @@ fn sample_dynamic_mcmc(
                         if seen_buf.insert(h) {
                             candidates_buf.push(h);
                         }
+                    }
+                }
+                // Inject target-driven neighbors so the state-space can recover
+                // from poor latent trajectories during burn-in/mixing.
+                let mut genotype_neighbors =
+                    phase_ibs.find_neighbors(hap1_idx, m, ibs2, inject_target);
+                for h in genotype_neighbors.drain(..) {
+                    if h == hap1_idx || h == hap1_idx + 1 {
+                        continue;
+                    }
+                    if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
+                        continue;
+                    }
+                    if seen_buf.insert(h) {
+                        candidates_buf.push(h);
                     }
                 }
             }
