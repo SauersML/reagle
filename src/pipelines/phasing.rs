@@ -71,9 +71,6 @@ use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, Pbwt
 use crate::model::hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
-use crate::model::phase_query::{
-    build_peer_indices, phase_best_orientation_error, phase_query_orientation_error_limit,
-};
 use crate::model::reference_pbwt::{
     PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
 };
@@ -1118,7 +1115,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight = anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight =
+                            anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -1388,7 +1386,8 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight = anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight =
+                            anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -9351,6 +9350,8 @@ fn sample_dynamic_mcmc(
     // from a random start.
     if let Some(paths) = initial_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
+            let mut pair_haps = [0u32; 2];
+            let mut pair_alleles = [255u8; 2];
             for m in 0..n_markers {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
@@ -9362,8 +9363,11 @@ fn sample_dynamic_mcmc(
                 let h2_idx = paths.path2[m] as usize;
 
                 if h1_idx < phase_ibs.n_haps() && h2_idx < phase_ibs.n_haps() {
-                    let ref1 = phase_ibs.allele(m, h1_idx as u32);
-                    let ref2 = phase_ibs.allele(m, h2_idx as u32);
+                    pair_haps[0] = h1_idx as u32;
+                    pair_haps[1] = h2_idx as u32;
+                    phase_ibs.fill_alleles_for_haps(m, &pair_haps, &mut pair_alleles);
+                    let ref1 = pair_alleles[0];
+                    let ref2 = pair_alleles[1];
 
                     let matches_orient1 = ref1 == a1 && ref2 == a2;
                     let matches_orient2 = ref1 == a2 && ref2 == a1;
@@ -9515,14 +9519,19 @@ fn sample_dynamic_mcmc(
                 let h2_best = neighbors[best_pair.1];
                 path1_ref.fill(h1_best);
                 path2_ref.fill(h2_best);
+                let mut pair_haps = [h1_best, h2_best];
+                let mut pair_alleles = [255u8; 2];
                 for m in 0..n_markers {
                     let a1 = seq1[m];
                     let a2 = seq2[m];
                     if a1 == 255 || a2 == 255 || a1 == a2 {
                         continue;
                     }
-                    let r1 = phase_ibs.allele(m, h1_best);
-                    let r2 = phase_ibs.allele(m, h2_best);
+                    pair_haps[0] = h1_best;
+                    pair_haps[1] = h2_best;
+                    phase_ibs.fill_alleles_for_haps(m, &pair_haps, &mut pair_alleles);
+                    let r1 = pair_alleles[0];
+                    let r2 = pair_alleles[1];
                     let m1 = r1 == a1 && r2 == a2;
                     let m2 = r1 == a2 && r2 == a1;
                     if m1 && !m2 {
@@ -9549,14 +9558,19 @@ fn sample_dynamic_mcmc(
             let h2_seed = neighbors[1];
             path1_ref.fill(h1_seed);
             path2_ref.fill(h2_seed);
+            let mut pair_haps = [h1_seed, h2_seed];
+            let mut pair_alleles = [255u8; 2];
             for m in 0..n_markers {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
                 if a1 == 255 || a2 == 255 || a1 == a2 {
                     continue;
                 }
-                let r1 = phase_ibs.allele(m, h1_seed);
-                let r2 = phase_ibs.allele(m, h2_seed);
+                pair_haps[0] = h1_seed;
+                pair_haps[1] = h2_seed;
+                phase_ibs.fill_alleles_for_haps(m, &pair_haps, &mut pair_alleles);
+                let r1 = pair_alleles[0];
+                let r2 = pair_alleles[1];
                 let m1 = r1 == a1 && r2 == a2;
                 let m2 = r1 == a2 && r2 == a1;
                 if m1 && !m2 {
@@ -9783,6 +9797,8 @@ fn sample_dynamic_mcmc(
 
     let mut candidates_buf: Vec<u32> = Vec::new();
     let mut scored_buf: Vec<(u32, f32)> = Vec::new();
+    let mut donor_scores_buf: Vec<f32> = Vec::new();
+    let mut donor_alleles_buf: Vec<u8> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut collect_dynamic_neighbors =
         |path_ref: &[u32],
@@ -9851,29 +9867,35 @@ fn sample_dynamic_mcmc(
             // haplotype sequence (query_hap), using cached confidence-weighted mismatch terms.
             scored_buf.clear();
             scored_buf.reserve(candidates_buf.len().saturating_sub(scored_buf.len()));
+            donor_scores_buf.clear();
+            donor_scores_buf.resize(candidates_buf.len(), 0.0);
+            donor_alleles_buf.clear();
+            donor_alleles_buf.resize(candidates_buf.len(), 255);
             let score_markers = if recipient_stability >= 0.95 && target_states <= n_states / 2 {
                 &score_markers_sparse
             } else {
                 &score_markers_static
             };
-            for &h in &candidates_buf {
-                let mut ll = 0.0f32;
-                for &m in score_markers {
-                    let obs = query_hap[m];
-                    if obs == 255 {
-                        continue;
-                    }
-                    let ref_al = phase_ibs.allele(m, h);
+            for &m in score_markers {
+                let obs = query_hap[m];
+                if obs == 255 {
+                    continue;
+                }
+                phase_ibs.fill_alleles_for_haps(m, &candidates_buf, &mut donor_alleles_buf);
+                for i in 0..candidates_buf.len() {
+                    let ref_al = donor_alleles_buf[i];
                     if ref_al == 255 {
                         continue;
                     }
-                    ll += if ref_al == obs {
+                    donor_scores_buf[i] += if ref_al == obs {
                         ll_match[m]
                     } else {
                         ll_mismatch[m]
                     };
                 }
-                scored_buf.push((h, ll));
+            }
+            for (i, &h) in candidates_buf.iter().enumerate() {
+                scored_buf.push((h, donor_scores_buf[i]));
             }
 
             let keep = target_states.min(scored_buf.len()).max(1);
@@ -10135,6 +10157,22 @@ fn sample_dynamic_mcmc(
         // Keep label orientation consistent across iterations to avoid H1/H2 drift.
         let mut keep_score = 0.0f32;
         let mut swap_score = 0.0f32;
+        let progress = if n_mcmc_steps > 1 {
+            step as f32 / (n_mcmc_steps - 1) as f32
+        } else {
+            1.0
+        };
+        let burnin_steps = (n_mcmc_steps / 2).max(1);
+        let burnin_ratio = if step < burnin_steps {
+            step as f32 / burnin_steps as f32
+        } else {
+            1.0
+        };
+        // Low inertia early for exploration; stronger later for stability.
+        let inertia_weight = (0.15 + 0.85 * progress)
+            * (0.4 + 0.6 * burnin_ratio)
+            * (0.25 + 0.75 * (1.0 - sample_uncertainty));
+        let anchor_weight = 1.0 + (1.0 - sample_uncertainty) * progress;
         for &m in &anchors_static {
             let w = phase_conf
                 .get(m)
@@ -10144,19 +10182,19 @@ fn sample_dynamic_mcmc(
                 .max(0.1);
             if prev_path1_ref.get(m).copied().unwrap_or(0) == path1_ref.get(m).copied().unwrap_or(0)
             {
-                keep_score += w;
+                keep_score += inertia_weight * w;
             }
             if prev_path2_ref.get(m).copied().unwrap_or(0) == path2_ref.get(m).copied().unwrap_or(0)
             {
-                keep_score += w;
+                keep_score += inertia_weight * w;
             }
             if prev_path1_ref.get(m).copied().unwrap_or(0) == path2_ref.get(m).copied().unwrap_or(0)
             {
-                swap_score += w;
+                swap_score += inertia_weight * w;
             }
             if prev_path2_ref.get(m).copied().unwrap_or(0) == path1_ref.get(m).copied().unwrap_or(0)
             {
-                swap_score += w;
+                swap_score += inertia_weight * w;
             }
             let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
             let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
@@ -10175,8 +10213,8 @@ fn sample_dynamic_mcmc(
                 if h1_alleles[m] == anchor_a2 {
                     anchor_swap += 1.0;
                 }
-                keep_score += 2.0 * anchor_keep;
-                swap_score += 2.0 * anchor_swap;
+                keep_score += anchor_weight * anchor_keep;
+                swap_score += anchor_weight * anchor_swap;
             }
         }
         if swap_score > keep_score {
