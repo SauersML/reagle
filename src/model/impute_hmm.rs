@@ -962,60 +962,33 @@ fn apply_marker_prior_smoothing(
     } else {
         0.0
     };
-    let floor_mix = min_prior_mix.clamp(0.0, 0.5);
+    let floor_mix = min_prior_mix.clamp(0.0, 0.9);
+    let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
+    // Only inject panel-frequency information when distance from typed anchors
+    // is sufficiently large. Near observed markers, let local LD dominate.
+    let adaptive_panel_mix = (missing_mass * (1.0 - retain)).clamp(0.0, 0.7);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
-            AllelePosteriors::Biallelic(p_alt) => {
-                if allele_probs.len() == 2 {
-                    let p_alt = p_alt.clamp(0.0, 1.0);
-                    let panel_probs = [1.0 - p_alt, p_alt];
-                    if floor_mix > 0.0 {
-                        // Panel prior acts as a one-sided floor: prevent allele
-                        // extinction on sparse windows without pulling confident
-                        // posteriors toward panel frequencies.
-                        for i in 0..2 {
-                            let floor = floor_mix * panel_probs[i];
-                            if allele_probs[i] < floor {
-                                allele_probs[i] = floor;
-                            }
-                        }
-                        normalize_probs(allele_probs);
-                    }
-                    if missing_mass > 0.0 {
-                        for i in 0..2 {
-                            let panel_p = panel_probs[i];
-                            if panel_p > allele_probs[i] {
-                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
-                            }
-                        }
-                        normalize_probs(allele_probs);
-                    }
-                }
+            AllelePosteriors::Biallelic(p_alt) if allele_probs.len() == 2 => {
+                let p_alt = p_alt.clamp(0.0, 1.0);
+                let panel_probs = [1.0 - p_alt, p_alt];
+                apply_adaptive_panel_blend(
+                    allele_probs,
+                    &panel_probs,
+                    floor_mix,
+                    adaptive_panel_mix
+                );
             }
-            AllelePosteriors::Multiallelic(p) => {
-                if p.len() == allele_probs.len() {
-                    if floor_mix > 0.0 {
-                        for (i, prob) in allele_probs.iter_mut().enumerate() {
-                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                            let floor = floor_mix * panel_p;
-                            if *prob < floor {
-                                *prob = floor;
-                            }
-                        }
-                        normalize_probs(allele_probs);
-                    }
-                    if missing_mass > 0.0 {
-                        for (i, prob) in allele_probs.iter_mut().enumerate() {
-                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                            if panel_p > *prob {
-                                *prob += missing_mass * (panel_p - *prob);
-                            }
-                        }
-                        normalize_probs(allele_probs);
-                    }
-                }
+            AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
+                apply_adaptive_panel_blend(
+                    allele_probs,
+                    p,
+                    floor_mix,
+                    adaptive_panel_mix
+                );
             }
+            _ => {}
         }
     }
 
@@ -1039,6 +1012,46 @@ fn apply_marker_prior_smoothing(
         )
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
+
+}
+
+#[inline]
+fn apply_adaptive_panel_blend(
+    allele_probs: &mut [f32],
+    panel_probs: &[f32],
+    floor_mix: f32,
+    adaptive_panel_mix: f32,
+) {
+    if allele_probs.len() != panel_probs.len() {
+        return;
+    }
+
+    if floor_mix > 0.0 {
+        // Keep a small non-zero panel floor only in deep untyped regions.
+        let scaled_floor = floor_mix.clamp(0.0, 0.6);
+        if scaled_floor > 0.0 {
+            for (i, prob) in allele_probs.iter_mut().enumerate() {
+                let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let floor = scaled_floor * panel_p;
+                if *prob < floor {
+                    *prob = floor;
+                }
+            }
+            normalize_probs(allele_probs);
+        }
+    }
+
+    if adaptive_panel_mix > 0.0 {
+        // Symmetric blend toward panel frequencies. This avoids one-sided ALT
+        // inflation and improves calibration for high-missingness windows.
+        let w = adaptive_panel_mix;
+        let one_minus_w = 1.0 - w;
+        for (i, prob) in allele_probs.iter_mut().enumerate() {
+            let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            *prob = one_minus_w * *prob + w * panel_p;
+        }
+        normalize_probs(allele_probs);
+    }
 }
 
 #[inline]

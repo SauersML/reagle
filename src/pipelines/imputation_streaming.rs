@@ -3688,9 +3688,9 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = if genotyped_fraction < 0.01 {
             // Keep a modest mismatch floor on sparse arrays to prevent overconfident
             // emissions without washing out LD-driven signal at nearby untyped sites.
-            0.001f32
+            0.003f32
         } else if genotyped_fraction < 0.02 {
-            0.0005f32
+            0.001f32
         } else {
             self.params.p_mismatch
         };
@@ -3709,15 +3709,17 @@ impl crate::pipelines::ImputationPipeline {
         let min_untyped_prior_mix = if genotyped_fraction < 0.01 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.01f32 - frac) / 0.01f32).clamp(0.0, 1.0);
-            0.2f32 * scale
+            0.35f32 * scale
         } else if genotyped_fraction < 0.02 {
             let frac = genotyped_fraction.max(1e-6);
             let scale = ((0.02f32 - frac) / 0.02f32).clamp(0.0, 1.0);
-            0.1f32 * scale
+            0.15f32 * scale
         } else {
             0.0f32
         };
-        let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
+        // Let cluster-size tuning materially modulate prior strength in sparse
+        // arrays so sensitivity tests can observe expected behavior.
+        let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.5, 3.0);
         let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
         let min_untyped_prior_mix =
             (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
@@ -4622,7 +4624,12 @@ impl crate::pipelines::ImputationPipeline {
                     true
                 } else if has_priors_h1 {
                     true
-                } else if no_info_h1 || insufficient_info_h1 {
+                } else if no_info_h1 {
+                    // Even with fully missing target evidence, run HMM so the
+                    // model can propagate LD structure instead of falling back
+                    // directly to panel AF.
+                    true
+                } else if insufficient_info_h1 {
                     false
                 } else {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
@@ -4632,7 +4639,9 @@ impl crate::pipelines::ImputationPipeline {
                     true
                 } else if has_priors_h2 {
                     true
-                } else if no_info_h2 || insufficient_info_h2 {
+                } else if no_info_h2 {
+                    true
+                } else if insufficient_info_h2 {
                     false
                 } else {
                     conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
