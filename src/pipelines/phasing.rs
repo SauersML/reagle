@@ -4440,9 +4440,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
             per_window_cap.min(auto_target).max(1)
         } else {
-            per_window_cap
-                .min(n_ref_haps)
-                .max(1)
+            per_window_cap.min(n_ref_haps).max(1)
         };
         if self.config.phase_states == 0 {
             eprintln!(
@@ -8351,6 +8349,8 @@ fn refresh_path_ref_from_states(path_ref: &mut [u32], path_idx: &[u32], neighbor
 fn compute_label_switch_transition_logs(
     p_recomb: &[f32],
     het_positions: &[usize],
+    empirical_switch_probs: Option<&[f32]>,
+    empirical_switch_obs: Option<&[f32]>,
 ) -> Vec<(f32, f32)> {
     let n_hets = het_positions.len();
     let mut out = vec![(0.0f32, 0.0f32); n_hets];
@@ -8368,7 +8368,7 @@ fn compute_label_switch_transition_logs(
     for i in 1..n_hets {
         let prev = het_positions[i - 1];
         let curr = het_positions[i];
-        let switch_p = if curr <= prev {
+        let recomb_switch_p = if curr <= prev {
             0.01f32
         } else {
             let start = (prev + 1).min(p_recomb.len());
@@ -8381,6 +8381,22 @@ fn compute_label_switch_transition_logs(
             let stay = log_stay.exp().clamp(0.0, 1.0);
             (1.0 - stay as f32).clamp(1e-6, 1.0 - 1e-6)
         };
+        let switch_p = if let Some(empirical) = empirical_switch_probs {
+            let p_emp = empirical.get(i).copied().unwrap_or(recomb_switch_p);
+            let obs = empirical_switch_obs
+                .and_then(|counts| counts.get(i).copied())
+                .unwrap_or(0.0)
+                .max(0.0);
+            // Strongly trust empirical latent orientation transitions when we have
+            // enough MCMC observations; fall back to recombination-derived prior
+            // in sparse or noisy regimes.
+            let trust_empirical = (obs / (obs + 20.0)).clamp(0.0, 0.6);
+            ((1.0 - trust_empirical) * recomb_switch_p + trust_empirical * p_emp)
+                .clamp(1e-6, 1.0 - 1e-6)
+        } else {
+            recomb_switch_p
+        };
+
         out[i] = ((1.0 - switch_p).ln(), switch_p.ln());
     }
     out
@@ -9448,6 +9464,8 @@ fn sample_dynamic_mcmc(
     }
     let mut swap_counts = vec![0f32; het_positions.len()];
     let mut swap_obs = vec![0f32; het_positions.len()];
+    let mut swap_transition_counts = vec![0f32; het_positions.len()];
+    let mut swap_transition_obs = vec![0f32; het_positions.len()];
 
     // Current set of neighbors (reused across markers within an MCMC step)
     let mut neighbors = initial_neighbors;
@@ -10219,6 +10237,8 @@ fn sample_dynamic_mcmc(
 
         // After first step, we have a valid path to use for latent state lookup
         // in subsequent iterations
+        let mut prev_idx = None;
+        let mut prev_swap = false;
         for &m in het_positions {
             let idx = het_index[m];
             if idx == usize::MAX {
@@ -10232,6 +10252,14 @@ fn sample_dynamic_mcmc(
             let swap = h1_alleles[m] != a1;
             swap_counts[idx] += if swap { 1.0 } else { 0.0 };
             swap_obs[idx] += 1.0;
+            if prev_idx.is_some() {
+                swap_transition_obs[idx] += 1.0;
+                if swap != prev_swap {
+                    swap_transition_counts[idx] += 1.0;
+                }
+            }
+            prev_idx = Some(idx);
+            prev_swap = swap;
         }
     }
 
@@ -10252,7 +10280,11 @@ fn sample_dynamic_mcmc(
         }
 
         let p_swap = if swap_obs[i] > 0.0 {
-            (swap_counts[i] + 0.5) / (swap_obs[i] + 1.0)
+            let raw = (swap_counts[i] + 0.5) / (swap_obs[i] + 1.0);
+            let support = (swap_obs[i] / (swap_obs[i] + 12.0)).clamp(0.0, 1.0);
+            // Temperature-shrink orientation posteriors toward 0.5 unless we have
+            // substantial repeated support across MCMC draws.
+            (0.5 + (raw - 0.5) * support * 0.85).clamp(1e-6, 1.0 - 1e-6)
         } else {
             0.5
         };
@@ -10273,7 +10305,20 @@ fn sample_dynamic_mcmc(
         swap_probs.push(p_swap.clamp(0.0, 1.0));
     }
     if !swap_probs.is_empty() {
-        let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
+        let mut swap_transition_probs = vec![0.01f32; swap_probs.len()];
+        for i in 1..swap_probs.len() {
+            let obs = swap_transition_obs[i];
+            if obs > 0.0 {
+                swap_transition_probs[i] =
+                    ((swap_transition_counts[i] + 0.5) / (obs + 1.0)).clamp(1e-6, 1.0 - 1e-6);
+            }
+        }
+        let transition_logs = compute_label_switch_transition_logs(
+            p_recomb,
+            het_positions,
+            Some(&swap_transition_probs),
+            Some(&swap_transition_obs),
+        );
         let mut dp0 = vec![f32::NEG_INFINITY; swap_probs.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; swap_probs.len()];
         let mut prev_state = vec![0u8; swap_probs.len()];
@@ -10964,7 +11009,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
         } else {
             (p_keep, p_swap)
         };
-        let lr = if min_p < 1e-30 { 1e6_f32 } else { (max_p / min_p).min(1e6_f32) };
+        let lr = if min_p < 1e-30 {
+            1e6_f32
+        } else {
+            (max_p / min_p).min(1e6_f32)
+        };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
@@ -10989,13 +11038,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let conf_m = conf[m].clamp(0.0, 1.0);
                 if a1_anchor != 255 {
-                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
                 if a2_anchor != 255 {
-                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
             }
@@ -11045,12 +11102,17 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
             swap_probs[i] = p_swap.clamp(0.0, 1.0);
             swap_probs_conf[i] = swap_probs[i];
-            swap_lr[i] = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
+            swap_lr[i] = if min_p < 1e-30 {
+                1e6
+            } else {
+                (max_p / min_p).min(1e6)
+            };
         }
     }
 
     if !het_positions.is_empty() {
-        let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
+        let transition_logs =
+            compute_label_switch_transition_logs(p_recomb, het_positions, None, None);
         let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
         let mut prev_state = vec![0u8; het_positions.len()];
