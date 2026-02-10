@@ -385,6 +385,9 @@ const PHASE_AUTO_PRESCAN_MAX: usize = 2048;
 const PHASE_STATE_BUDGET_SAFETY: f64 = 0.6;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const INVALID_ALLELE: u8 = 254;
+const REDUCTION_SPARSE_MAX_MARKERS: usize = 1024;
+const REDUCTION_SPARSE_HET_FRAC_NUM: usize = 3;
+const REDUCTION_SPARSE_HET_FRAC_DEN: usize = 4;
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
@@ -964,12 +967,15 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let best_orient_err = phase_best_orientation_error(phase_conf);
-                    if best_orient_err
-                        > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
-                    {
-                        cached_query_pair =
-                            [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
-                    } else if phase_conf < 0.5 {
+                    let orientation_guard =
+                        phase_query_orientation_error_limit(geno_conf, beam_uncertainty);
+                    let orientation_suspect = best_orient_err > orientation_guard;
+                    // Phased scaffold markers are explicit orientation constraints.
+                    // Keep an oriented query even when confidence is moderate.
+                    if orientation_suspect && phase_conf >= 0.5 {
+                        cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf.max(0.7));
+                    }
+                    if phase_conf < 0.5 {
                         cached_query_pair = [qa2, qa1];
                     } else {
                         cached_query_pair = [qa1, qa2];
@@ -1207,12 +1213,15 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         .sample_confidence_f32(marker_idx, sample_idx)
                         .clamp(0.0, 1.0);
                     let best_orient_err = phase_best_orientation_error(phase_conf);
-                    if best_orient_err
-                        > phase_query_orientation_error_limit(geno_conf, beam_uncertainty)
-                    {
-                        cached_query_pair =
-                            [PbwtQueryAllele::wildcard(), PbwtQueryAllele::wildcard()];
-                    } else if phase_conf < 0.5 {
+                    let orientation_guard =
+                        phase_query_orientation_error_limit(geno_conf, beam_uncertainty);
+                    let orientation_suspect = best_orient_err > orientation_guard;
+                    // Phased scaffold markers are explicit orientation constraints.
+                    // Keep an oriented query even when confidence is moderate.
+                    if orientation_suspect && phase_conf >= 0.5 {
+                        cached_query_probs = biallelic_haplotype_probs(a1, a2, phase_conf.max(0.7));
+                    }
+                    if phase_conf < 0.5 {
                         cached_query_pair = [qa2, qa1];
                     } else {
                         cached_query_pair = [qa1, qa2];
@@ -5287,14 +5296,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &mut bwd2,
                                 );
 
-                                let probs1 =
-                                    compute_state_posteriors(&fwd1, &bwd1, n_markers, n_states_full);
-                                let probs2 =
-                                    compute_state_posteriors(&fwd2, &bwd2, n_markers, n_states_full);
-                                let top_selected = select_top_k_by_mass_two(
-                                    &probs1,
-                                    &probs2,
+                                let sparse_markers =
+                                    select_reduction_sparse_markers(&seq1, &seq2, sample_conf);
+                                let top_selected = select_top_k_by_mass_two_sparse_fb(
+                                    &fwd1,
+                                    &bwd1,
+                                    &fwd2,
+                                    &bwd2,
                                     n_states_full,
+                                    &sparse_markers,
                                     final_states,
                                 );
                                 for &state in &top_selected {
@@ -7688,21 +7698,119 @@ fn compute_state_posteriors(
     probs
 }
 
-fn select_top_k_by_mass_two(
-    probs1: &[Vec<f32>],
-    probs2: &[Vec<f32>],
+fn select_reduction_sparse_markers(seq1: &[u8], seq2: &[u8], sample_conf: &[f32]) -> Vec<usize> {
+    let n_markers = seq1.len().min(seq2.len());
+    if n_markers == 0 {
+        return Vec::new();
+    }
+    let budget = REDUCTION_SPARSE_MAX_MARKERS.min(n_markers);
+    if n_markers <= budget {
+        return (0..n_markers).collect();
+    }
+
+    let mut het_markers: Vec<usize> = Vec::new();
+    let mut informative_markers: Vec<usize> = Vec::new();
+    for m in 0..n_markers {
+        let a1 = seq1[m];
+        let a2 = seq2[m];
+        if a1 == 255 || a2 == 255 {
+            continue;
+        }
+        informative_markers.push(m);
+        if a1 != a2 {
+            het_markers.push(m);
+        }
+    }
+
+    let mut selected: Vec<usize> = Vec::with_capacity(budget + 2);
+    selected.push(0);
+    selected.push(n_markers - 1);
+
+    let take_evenly = |src: &[usize], take: usize, dst: &mut Vec<usize>| {
+        if src.is_empty() || take == 0 {
+            return;
+        }
+        if src.len() <= take {
+            dst.extend_from_slice(src);
+            return;
+        }
+        for i in 0..take {
+            let idx = i * src.len() / take;
+            dst.push(src[idx]);
+        }
+    };
+
+    let het_quota = budget * REDUCTION_SPARSE_HET_FRAC_NUM / REDUCTION_SPARSE_HET_FRAC_DEN;
+    take_evenly(&het_markers, het_quota.min(het_markers.len()), &mut selected);
+
+    let remaining = budget.saturating_sub(selected.len());
+    if remaining > 0 {
+        if !informative_markers.is_empty() {
+            take_evenly(
+                &informative_markers,
+                remaining.min(informative_markers.len()),
+                &mut selected,
+            );
+        } else {
+            let stride = n_markers.div_ceil(remaining.max(1)).max(1);
+            let mut m = 0usize;
+            while m < n_markers && selected.len() < budget {
+                selected.push(m);
+                m = m.saturating_add(stride);
+            }
+        }
+    }
+
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.len() > budget {
+        let mut conf_ranked: Vec<(usize, f32)> = selected
+            .into_iter()
+            .map(|m| {
+                let c = sample_conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                let het_bonus = if a1 != 255 && a2 != 255 && a1 != a2 {
+                    0.25f32
+                } else {
+                    0.0
+                };
+                (m, c + het_bonus)
+            })
+            .collect();
+        conf_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        conf_ranked.truncate(budget);
+        let mut out: Vec<usize> = conf_ranked.into_iter().map(|(m, _)| m).collect();
+        out.sort_unstable();
+        out
+    } else {
+        selected
+    }
+}
+
+fn select_top_k_by_mass_two_sparse_fb(
+    fwd1: &[f32],
+    bwd1: &[f32],
+    fwd2: &[f32],
+    bwd2: &[f32],
     n_states: usize,
+    marker_indices: &[usize],
     k: usize,
 ) -> Vec<usize> {
     let mut mass = vec![0.0f32; n_states];
-    for row in probs1.iter() {
-        for (i, &p) in row.iter().enumerate().take(n_states) {
-            mass[i] += p;
+    for &m in marker_indices {
+        let row_start = m * n_states;
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        for i in 0..n_states {
+            sum1 += fwd1[row_start + i] * bwd1[row_start + i];
+            sum2 += fwd2[row_start + i] * bwd2[row_start + i];
         }
-    }
-    for row in probs2.iter() {
-        for (i, &p) in row.iter().enumerate().take(n_states) {
-            mass[i] += p;
+        let inv1 = if sum1 > 0.0 { 1.0 / sum1 } else { 0.0 };
+        let inv2 = if sum2 > 0.0 { 1.0 / sum2 } else { 0.0 };
+        for i in 0..n_states {
+            mass[i] += (fwd1[row_start + i] * bwd1[row_start + i]) * inv1;
+            mass[i] += (fwd2[row_start + i] * bwd2[row_start + i]) * inv2;
         }
     }
     let mut idx: Vec<usize> = (0..n_states).collect();
@@ -13130,14 +13238,8 @@ mod tests {
         );
 
         let hero_score = window_scores[0][hero_hap_idx];
-        let top_k = 15usize;
-        let top = select_top_k(&window_scores[0], top_k);
+        let top = select_top_k(&window_scores[0], 15);
         let in_top = top.iter().any(|(h, _)| *h == hero_hap_idx);
-        let kth_score = if top.len() == top_k {
-            top.last().map(|(_, s)| *s).unwrap_or(f32::NEG_INFINITY)
-        } else {
-            f32::NEG_INFINITY
-        };
         println!(
             "[prescan score test] top={:?}",
             top.iter()
@@ -13149,20 +13251,9 @@ mod tests {
             hero_hap_idx, hero_score, in_top
         );
         assert!(
-            hero_score.is_finite() && hero_score > 0.0,
-            "Hero hap {} has non-positive/non-finite prescan score: {}",
-            hero_hap_idx,
-            hero_score
-        );
-        let tie_eps = 1e-6f32;
-        assert!(
-            in_top || hero_score + tie_eps >= kth_score,
-            "Hero hap {} score {:.6} is below top-{} threshold {:.6}",
+            in_top,
+            "Hero hap {} not in top-10 prescan scores for anchor window",
             hero_hap_idx
-                ,
-            hero_score,
-            top_k,
-            kth_score
         );
     }
 
