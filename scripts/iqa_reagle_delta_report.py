@@ -154,18 +154,21 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
 
 
-def resolve_pr_number_for_run(repo: str, run: dict, pr_cache: dict[str, int | None]) -> int | None:
+def resolve_pr_for_run(
+    repo: str, run: dict, pr_cache: dict[str, tuple[int | None, str | None]]
+) -> tuple[int | None, str | None]:
     if run.get("event") != "pull_request":
-        return None
+        return None, None
 
     head_branch = run.get("head_branch") or run.get("headBranch")
     if not head_branch:
-        return None
+        return None, None
 
     if head_branch in pr_cache:
         return pr_cache[head_branch]
 
     pr_num: int | None = None
+    pr_state: str | None = None
     q1 = run_cmd_maybe(
         [
             "gh",
@@ -178,13 +181,20 @@ def resolve_pr_number_for_run(repo: str, run: dict, pr_cache: dict[str, int | No
             "--head",
             str(head_branch),
             "--json",
-            "number",
+            "number,state",
             "--jq",
-            ".[0].number",
+            ".[0]",
         ]
     )
-    if q1 and q1.isdigit():
-        pr_num = int(q1)
+    if q1:
+        obj1 = json.loads(q1)
+        if isinstance(obj1, dict):
+            num = obj1.get("number")
+            state = obj1.get("state")
+            if isinstance(num, int):
+                pr_num = num
+            if isinstance(state, str):
+                pr_state = state
     else:
         head_sha = run.get("head_sha") or run.get("headSha")
         if head_sha:
@@ -200,16 +210,23 @@ def resolve_pr_number_for_run(repo: str, run: dict, pr_cache: dict[str, int | No
                     "--search",
                     f"{head_sha} in:commits",
                     "--json",
-                    "number",
+                    "number,state",
                     "--jq",
-                    ".[0].number",
+                    ".[0]",
                 ]
             )
-            if q2 and q2.isdigit():
-                pr_num = int(q2)
+            if q2:
+                obj2 = json.loads(q2)
+                if isinstance(obj2, dict):
+                    num = obj2.get("number")
+                    state = obj2.get("state")
+                    if isinstance(num, int):
+                        pr_num = num
+                    if isinstance(state, str):
+                        pr_state = state
 
-    pr_cache[head_branch] = pr_num
-    return pr_num
+    pr_cache[head_branch] = (pr_num, pr_state)
+    return pr_num, pr_state
 
 
 def read_reagle_metrics_from_artifact(
@@ -636,8 +653,10 @@ def main() -> int:
 
     gh = GitHubClient(repo)
     base_run = resolve_base_run(gh, args.workflow, args.base_run)
-    pr_cache: dict[str, int | None] = {}
-    base_run["pr_number"] = resolve_pr_number_for_run(repo, base_run, pr_cache)
+    pr_cache: dict[str, tuple[int | None, str | None]] = {}
+    base_pr_num, base_pr_state = resolve_pr_for_run(repo, base_run, pr_cache)
+    base_run["pr_number"] = base_pr_num
+    base_run["pr_state"] = base_pr_state
     base_created = parse_iso_time(base_run["created_at"])
 
     workflow_id = find_workflow_id(gh, args.workflow)
@@ -676,7 +695,11 @@ def main() -> int:
 
     comparisons: list[dict] = []
     for idx, run in enumerate(subsequent, start=1):
-        run["pr_number"] = resolve_pr_number_for_run(repo, run, pr_cache)
+        run_pr_num, run_pr_state = resolve_pr_for_run(repo, run, pr_cache)
+        run["pr_number"] = run_pr_num
+        run["pr_state"] = run_pr_state
+        if run.get("event") == "pull_request" and run_pr_state != "OPEN":
+            continue
         pr_txt = f", pr=#{run.get('pr_number')}" if run.get("pr_number") is not None else ""
         print(
             f"[{idx}/{len(subsequent)}] run {run['id']} "
