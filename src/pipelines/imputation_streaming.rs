@@ -111,6 +111,27 @@ const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
 
+#[inline]
+fn compute_abyss_rank_cutoff(
+    n_ref_haps: usize,
+    per_window_cap_window: usize,
+    num_windows: usize,
+) -> usize {
+    if n_ref_haps == 0 {
+        return 1;
+    }
+    let base = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
+        .min(n_ref_haps)
+        .max(1);
+    let windows = num_windows.max(1);
+    let target_union = per_window_cap_window.min(n_ref_haps).max(1);
+    // Ensure that, in expectation, the union over windows can cover at least
+    // the configured per-window cap. This prevents single-window scans from
+    // collapsing to ABYSS_RANK_BASE candidates.
+    let min_per_window = target_union.div_ceil(windows).max(1);
+    base.max(min_per_window).min(n_ref_haps).max(1)
+}
+
 fn estimate_state_budget(available_bytes: u64, n_threads: usize, window_markers: usize) -> usize {
     if available_bytes == 0 || n_threads == 0 || window_markers == 0 {
         return 0;
@@ -1914,9 +1935,11 @@ fn build_imputation_plan(
                         );
                     }
 
-                    let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-                        .min(n_ref_haps)
-                        .max(1);
+                    let abyss_rank_cutoff = compute_abyss_rank_cutoff(
+                        n_ref_haps,
+                        per_window_cap_window,
+                        per_window_caps.len(),
+                    );
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
@@ -2095,9 +2118,11 @@ fn build_imputation_plan(
                         );
                     }
 
-                    let abyss_rank_cutoff = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-                        .min(n_ref_haps)
-                        .max(1);
+                    let abyss_rank_cutoff = compute_abyss_rank_cutoff(
+                        n_ref_haps,
+                        per_window_cap_window,
+                        per_window_caps.len(),
+                    );
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
@@ -2212,6 +2237,27 @@ fn build_imputation_plan(
                     .copied()
                     .min()
                     .unwrap_or(per_window_cap.max(1));
+                // Ensure abyss pruning does not collapse the active state set below the
+                // actual per-window HMM budget. In single-window scans, rank-hit based
+                // abyss selection can keep only a tiny top-k shell (e.g. 60 haplotypes),
+                // which severely underutilizes available memory budget and hurts
+                // imputation accuracy. We deterministically recover additional states
+                // from global scores up to the budgeted minimum.
+                let min_survivors = per_window_cap_min.min(n_ref_haps);
+                let mut survivors = n_ref_haps.saturating_sub(abyss_count);
+                if survivors < min_survivors {
+                    let ranked = select_top_k_allow_zero(&global_scores[i], n_ref_haps);
+                    for (h, _) in ranked {
+                        if survivors >= min_survivors {
+                            break;
+                        }
+                        if abyss[h] {
+                            abyss.set(h, false);
+                            abyss_count = abyss_count.saturating_sub(1);
+                            survivors += 1;
+                        }
+                    }
+                }
                 // When the per-window budget can hold the entire reference
                 // panel, the abyss serves no memory purpose — it only removes
                 // haplotypes from the HMM state space, biasing allele posteriors
@@ -6944,6 +6990,34 @@ mod tests {
             "expected calibrated emission error in valid probability range, got {}",
             out
         );
+    }
+
+    #[test]
+    fn test_compute_abyss_rank_cutoff_single_window_respects_budget() {
+        let n_ref_haps = 6546usize;
+        let per_window_cap = 2370usize;
+        let windows = 1usize;
+        let cutoff = compute_abyss_rank_cutoff(n_ref_haps, per_window_cap, windows);
+        assert_eq!(
+            cutoff, per_window_cap,
+            "single-window cutoff should match configured budget to avoid starvation"
+        );
+    }
+
+    #[test]
+    fn test_compute_abyss_rank_cutoff_multi_window_scales_with_union_target() {
+        let n_ref_haps = 6546usize;
+        let per_window_cap = 2370usize;
+        let windows = 4usize;
+        let cutoff = compute_abyss_rank_cutoff(n_ref_haps, per_window_cap, windows);
+        let expected_min = per_window_cap.div_ceil(windows);
+        assert!(
+            cutoff >= expected_min,
+            "cutoff {} should be >= {} to permit union coverage",
+            cutoff,
+            expected_min
+        );
+        assert!(cutoff <= n_ref_haps);
     }
 
     #[test]
