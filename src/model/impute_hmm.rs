@@ -35,6 +35,7 @@ impl MarkerIx {
     fn as_usize(self) -> usize {
         self.0
     }
+
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +51,28 @@ impl CheckpointIx {
     #[inline]
     fn as_usize(self) -> usize {
         self.0
+    }
+
+    #[inline]
+    fn fwd_offset(self, active_states: usize) -> usize {
+        self.0 * active_states
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct BlockLocalIx(usize);
+
+impl BlockLocalIx {
+    #[inline]
+    fn zero() -> Self {
+        Self(0)
+    }
+
+    #[inline]
+    fn from_marker(marker: MarkerIx, block_start: MarkerIx) -> Self {
+        assert!(marker.as_usize() >= block_start.as_usize());
+        Self(marker.as_usize() - block_start.as_usize())
     }
 
     #[inline]
@@ -88,8 +111,65 @@ impl CheckpointGrid {
     }
 
     #[inline]
-    fn next_marker_after(&self, cp: CheckpointIx) -> Option<MarkerIx> {
-        self.markers.get(cp.as_usize() + 1).copied()
+    fn next(&self, cp: CheckpointIx) -> Option<CheckpointIx> {
+        let next = cp.as_usize() + 1;
+        if next < self.markers.len() {
+            Some(CheckpointIx::new(next))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn block_view(&self, cp: CheckpointIx, n_markers: usize) -> BlockView {
+        let start = self.marker_at(cp);
+        let end = self
+            .next(cp)
+            .map(|ncp| self.marker_at(ncp))
+            .unwrap_or(MarkerIx::new(n_markers));
+        BlockView { start, end }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockView {
+    start: MarkerIx,
+    end: MarkerIx,
+}
+
+impl BlockView {
+    #[inline]
+    fn len(self) -> usize {
+        self.end.as_usize().saturating_sub(self.start.as_usize())
+    }
+
+    #[inline]
+    fn start_usize(self) -> usize {
+        self.start.as_usize()
+    }
+
+    #[inline]
+    fn end_usize(self) -> usize {
+        self.end.as_usize()
+    }
+}
+
+#[repr(transparent)]
+struct MarkerMask<T>(Vec<T>);
+
+impl<T> MarkerMask<T> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+}
+
+impl<T> std::ops::Index<MarkerIx> for MarkerMask<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, index: MarkerIx) -> &Self::Output {
+        &self.0[index.as_usize()]
     }
 }
 
@@ -484,6 +564,12 @@ impl ImputeWorkspace {
         if self.fwd_history.len() < want {
             self.fwd_history.resize(want, 0.0);
         }
+    }
+
+    #[inline]
+    fn store_fwd_history(&mut self, local: BlockLocalIx, n_states: usize) {
+        let off = local.fwd_offset(n_states);
+        self.fwd_history[off..off + n_states].copy_from_slice(&self.fwd[..n_states]);
     }
 
     #[inline]
@@ -1143,26 +1229,29 @@ fn is_uniform_probs(probs: &[f32]) -> bool {
 }
 
 #[inline]
-fn build_uniform_mask(target_probs: &TargetAlleleProbs, n_markers: usize) -> Vec<bool> {
-    (0..n_markers)
+fn build_uniform_mask(target_probs: &TargetAlleleProbs, n_markers: usize) -> MarkerMask<bool> {
+    MarkerMask(
+        (0..n_markers)
         .map(|m| target_probs.is_uniform_marker(m))
-        .collect()
+        .collect(),
+    )
 }
 
 #[inline]
 fn build_skip_untyped_mask(
     target_probs: &TargetAlleleProbs,
     nearest_obs_lambda: &[f32],
-    uniform_mask: &[bool],
+    uniform_mask: &MarkerMask<bool>,
     use_prior_smoothing: bool,
-) -> Vec<bool> {
+) -> MarkerMask<bool> {
     let panel_priors = target_probs.panel_priors();
     let Some(panel) = panel_priors else {
-        return vec![false; uniform_mask.len()];
+        return MarkerMask(vec![false; uniform_mask.len()]);
     };
-    (0..uniform_mask.len())
+    MarkerMask((0..uniform_mask.len())
         .map(|m| {
-            if !use_prior_smoothing || !uniform_mask[m] || target_probs.is_observed_marker(m) {
+            let mx = MarkerIx::new(m);
+            if !use_prior_smoothing || !uniform_mask[mx] || target_probs.is_observed_marker(m) {
                 return false;
             }
             if m >= panel.len() {
@@ -1175,23 +1264,33 @@ fn build_skip_untyped_mask(
                 .max(0.0);
             (-lambda).exp() < SKIP_RETAIN_THRESHOLD
         })
-        .collect()
+        .collect())
 }
 
 #[inline]
-fn panel_freq_posterior(
+fn write_panel_freq_posterior(
+    dst: &mut AllelePosteriors,
     panel_priors: Option<&[AllelePosteriors]>,
     marker_idx: usize,
-) -> AllelePosteriors {
-    panel_priors
-        .and_then(|p| p.get(marker_idx))
-        .cloned()
-        .unwrap_or(AllelePosteriors::Biallelic(0.0))
+) {
+    let Some(src) = panel_priors.and_then(|p| p.get(marker_idx)) else {
+        *dst = AllelePosteriors::Biallelic(0.0);
+        return;
+    };
+    match src {
+        AllelePosteriors::Biallelic(p_alt) => {
+            *dst = AllelePosteriors::Biallelic(*p_alt);
+        }
+        AllelePosteriors::Multiallelic(probs) => {
+            // Arc clone is O(1) and avoids reallocating the PMF.
+            *dst = AllelePosteriors::Multiallelic(std::sync::Arc::clone(probs));
+        }
+    }
 }
 
 #[inline]
 fn build_checkpoint_markers(
-    uniform_mask: &[bool],
+    uniform_mask: &MarkerMask<bool>,
     prior_marker_idx: Option<usize>,
     n_markers: usize,
 ) -> CheckpointGrid {
@@ -1202,7 +1301,8 @@ fn build_checkpoint_markers(
     }
     let mut markers = Vec::with_capacity(n_markers.min(4096));
     markers.push(MarkerIx::new(0));
-    for (m, &uniform) in uniform_mask.iter().enumerate().skip(1) {
+    for m in 1..uniform_mask.len() {
+        let uniform = uniform_mask[MarkerIx::new(m)];
         if !uniform {
             markers.push(MarkerIx::new(m));
         }
@@ -1330,7 +1430,6 @@ fn batched_transition_forward(
     if active_states == 0 || start >= end {
         return;
     }
-    let k = active_states as f64;
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
@@ -1349,7 +1448,12 @@ fn batched_transition_forward(
     if !touched {
         return;
     }
-    b = ((1.0 - a) / k).max(0.0);
+    // Keep the true composed additive coefficient from the recurrence:
+    //   x' = stay * x + shift
+    // composed over markers as:
+    //   a <- a * stay
+    //   b <- stay * b + shift
+    // Do not replace with (1-a)/k shortcut.
     let a = a as f32;
     let b = b as f32;
     let mut sum = 0.0f32;
@@ -1379,7 +1483,6 @@ fn batched_transition_backward(
     if active_states == 0 || start >= end {
         return bwd_sum;
     }
-    let k = active_states as f64;
     let mut a = 1.0f64;
     let mut b_coeff = 0.0f64;
     let mut touched = false;
@@ -1398,7 +1501,12 @@ fn batched_transition_backward(
     if !touched {
         return bwd_sum;
     }
-    b_coeff = ((1.0 - a) / k).max(0.0);
+    // Keep the true composed additive coefficient from the recurrence:
+    //   x' = stay * x + shift
+    // composed over markers as:
+    //   a <- a * stay
+    //   b <- stay * b + shift
+    // Do not replace with (1-a)/k shortcut.
     let a = a as f32;
     let add = b_coeff as f32 * bwd_sum;
     for v in bwd.iter_mut().take(active_states) {
@@ -1792,28 +1900,29 @@ fn run_impute_hmm_impl(
         let mut bwd_sum = active_states as f32;
         if active_markers > 0 {
             for cp_idx in checkpoint_grid.rev_indices() {
-                let block_start = checkpoint_grid.marker_at(cp_idx).as_usize();
-                let block_end = checkpoint_grid
-                    .next_marker_after(cp_idx)
-                    .map(MarkerIx::as_usize)
-                    .unwrap_or(active_markers);
-                let block_len = block_end.saturating_sub(block_start);
+                let block = checkpoint_grid.block_view(cp_idx, active_markers);
+                let block_start_ix = block.start;
+                let block_start = block.start_usize();
+                let block_end = block.end_usize();
+                let block_len = block.len();
                 ws.ensure_block_history(active_states, block_len);
 
                 ws.load_checkpoint(cp_idx, active_states);
-                ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
+                ws.store_fwd_history(BlockLocalIx::zero(), active_states);
 
                 if block_start + 1 < block_end {
                     let mut m = block_start + 1;
                     while m < block_end {
                         let replay_skip =
-                            is_final && prior_marker_idx != Some(m) && skip_untyped_mask[m];
+                            is_final
+                                && prior_marker_idx != Some(m)
+                                && skip_untyped_mask[MarkerIx::new(m)];
                         if replay_skip {
                             let mut run_end = m + 1;
                             while run_end < block_end
                                 && is_final
                                 && prior_marker_idx != Some(run_end)
-                                && skip_untyped_mask[run_end]
+                                && skip_untyped_mask[MarkerIx::new(run_end)]
                             {
                                 run_end += 1;
                             }
@@ -1840,9 +1949,8 @@ fn run_impute_hmm_impl(
                             active_states,
                             transition_haps,
                         );
-                        let local_idx = (m - block_start) * active_states;
-                        ws.fwd_history[local_idx..local_idx + active_states]
-                            .copy_from_slice(&ws.fwd[..active_states]);
+                        let local = BlockLocalIx::from_marker(MarkerIx::new(m), block_start_ix);
+                        ws.store_fwd_history(local, active_states);
                         m += 1;
                     }
                 }
@@ -1850,8 +1958,11 @@ fn run_impute_hmm_impl(
                 let mut skipped_run_start: Option<usize> = None;
                 let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
-                    if is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev] {
-                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                    if is_final
+                        && prior_marker_idx != Some(m_rev)
+                        && skip_untyped_mask[MarkerIx::new(m_rev)]
+                    {
+                        write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                         if skipped_run_start.is_none() {
                             skipped_run_end = m_rev + 1;
                         }
@@ -1880,8 +1991,9 @@ fn run_impute_hmm_impl(
                         ws.ensure_smoothing_prior_counts(n_alleles);
                     }
 
-                    let start = (m_rev - block_start) * active_states;
-                    let fwd_slice = &ws.fwd_history[start..start + active_states];
+                    let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
+                    let off = local.fwd_offset(active_states);
+                    let fwd_slice = &ws.fwd_history[off..off + active_states];
                     if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
@@ -2005,7 +2117,8 @@ fn run_impute_hmm_impl(
                             } else {
                                 let mut out = Vec::with_capacity(ws.allele_probs.len());
                                 out.extend_from_slice(&ws.allele_probs);
-                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                                posteriors[m_rev] =
+                                    AllelePosteriors::Multiallelic(std::sync::Arc::from(out));
                             }
                         } else {
                             return Err(ReagleError::vcf(format!(
@@ -2024,7 +2137,7 @@ fn run_impute_hmm_impl(
                     //   beta_{t-1}(i) = ( (1-r) * b_t(i) * beta_t(i) + (r/N) * S_t ) / c_t
                     // where S_t = sum_j b_t(j) * beta_t(j) and c_t is the forward scale
                     // at marker t (sum of unnormalized alpha_t).
-                    if uniform_mask[m_rev] {
+                    if uniform_mask[MarkerIx::new(m_rev)] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2203,29 +2316,30 @@ fn run_impute_hmm_seqcoded(
         if active_markers > 0 {
             let mut last_hap_ptr: *const u16 = std::ptr::null();
             for cp_idx in checkpoint_grid.rev_indices() {
-                let block_start = checkpoint_grid.marker_at(cp_idx).as_usize();
-                let block_end = checkpoint_grid
-                    .next_marker_after(cp_idx)
-                    .map(MarkerIx::as_usize)
-                    .unwrap_or(active_markers);
-                let block_len = block_end.saturating_sub(block_start);
+                let block = checkpoint_grid.block_view(cp_idx, active_markers);
+                let block_start_ix = block.start;
+                let block_start = block.start_usize();
+                let block_end = block.end_usize();
+                let block_len = block.len();
                 ws.ensure_block_history(active_states, block_len);
 
                 ws.load_checkpoint(cp_idx, active_states);
-                ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
+                ws.store_fwd_history(BlockLocalIx::zero(), active_states);
 
                 if block_start + 1 < block_end {
                     let mut last_hap_ptr_re: *const u16 = std::ptr::null();
                     let mut m = block_start + 1;
                     while m < block_end {
                         let replay_skip =
-                            is_final && prior_marker_idx != Some(m) && skip_untyped_mask[m];
+                            is_final
+                                && prior_marker_idx != Some(m)
+                                && skip_untyped_mask[MarkerIx::new(m)];
                         if replay_skip {
                             let mut run_end = m + 1;
                             while run_end < block_end
                                 && is_final
                                 && prior_marker_idx != Some(run_end)
-                                && skip_untyped_mask[run_end]
+                                && skip_untyped_mask[MarkerIx::new(run_end)]
                             {
                                 run_end += 1;
                             }
@@ -2253,9 +2367,8 @@ fn run_impute_hmm_seqcoded(
                             transition_haps,
                             &mut last_hap_ptr_re,
                         );
-                        let local_idx = (m - block_start) * active_states;
-                        ws.fwd_history[local_idx..local_idx + active_states]
-                            .copy_from_slice(&ws.fwd[..active_states]);
+                        let local = BlockLocalIx::from_marker(MarkerIx::new(m), block_start_ix);
+                        ws.store_fwd_history(local, active_states);
                         m += 1;
                     }
                 }
@@ -2263,8 +2376,11 @@ fn run_impute_hmm_seqcoded(
                 let mut skipped_run_start: Option<usize> = None;
                 let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
-                    if is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev] {
-                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                    if is_final
+                        && prior_marker_idx != Some(m_rev)
+                        && skip_untyped_mask[MarkerIx::new(m_rev)]
+                    {
+                        write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                         if skipped_run_start.is_none() {
                             skipped_run_end = m_rev + 1;
                         }
@@ -2301,8 +2417,9 @@ fn run_impute_hmm_seqcoded(
                         &mut ws.state_patterns,
                     );
 
-                    let start = (m_rev - block_start) * active_states;
-                    let fwd_slice = &ws.fwd_history[start..start + active_states];
+                    let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
+                    let off = local.fwd_offset(active_states);
+                    let fwd_slice = &ws.fwd_history[off..off + active_states];
                     if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
@@ -2417,7 +2534,8 @@ fn run_impute_hmm_seqcoded(
                             } else {
                                 let mut out = Vec::with_capacity(ws.allele_probs.len());
                                 out.extend_from_slice(&ws.allele_probs);
-                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                                posteriors[m_rev] =
+                                    AllelePosteriors::Multiallelic(std::sync::Arc::from(out));
                             }
                         } else {
                             return Err(ReagleError::vcf(format!(
@@ -2431,7 +2549,7 @@ fn run_impute_hmm_seqcoded(
                         }
                     }
 
-                    if uniform_mask[m_rev] {
+                    if uniform_mask[MarkerIx::new(m_rev)] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,
@@ -2612,29 +2730,30 @@ fn run_impute_hmm_dict(
         if active_markers > 0 {
             let mut last_dict_ptr: *const DictionaryColumn = std::ptr::null();
             for cp_idx in checkpoint_grid.rev_indices() {
-                let block_start = checkpoint_grid.marker_at(cp_idx).as_usize();
-                let block_end = checkpoint_grid
-                    .next_marker_after(cp_idx)
-                    .map(MarkerIx::as_usize)
-                    .unwrap_or(active_markers);
-                let block_len = block_end.saturating_sub(block_start);
+                let block = checkpoint_grid.block_view(cp_idx, active_markers);
+                let block_start_ix = block.start;
+                let block_start = block.start_usize();
+                let block_end = block.end_usize();
+                let block_len = block.len();
                 ws.ensure_block_history(active_states, block_len);
 
                 ws.load_checkpoint(cp_idx, active_states);
-                ws.fwd_history[..active_states].copy_from_slice(&ws.fwd[..active_states]);
+                ws.store_fwd_history(BlockLocalIx::zero(), active_states);
 
                 if block_start + 1 < block_end {
                     let mut last_dict_ptr_re: *const DictionaryColumn = std::ptr::null();
                     let mut m = block_start + 1;
                     while m < block_end {
                         let replay_skip =
-                            is_final && prior_marker_idx != Some(m) && skip_untyped_mask[m];
+                            is_final
+                                && prior_marker_idx != Some(m)
+                                && skip_untyped_mask[MarkerIx::new(m)];
                         if replay_skip {
                             let mut run_end = m + 1;
                             while run_end < block_end
                                 && is_final
                                 && prior_marker_idx != Some(run_end)
-                                && skip_untyped_mask[run_end]
+                                && skip_untyped_mask[MarkerIx::new(run_end)]
                             {
                                 run_end += 1;
                             }
@@ -2662,9 +2781,8 @@ fn run_impute_hmm_dict(
                             transition_haps,
                             &mut last_dict_ptr_re,
                         );
-                        let local_idx = (m - block_start) * active_states;
-                        ws.fwd_history[local_idx..local_idx + active_states]
-                            .copy_from_slice(&ws.fwd[..active_states]);
+                        let local = BlockLocalIx::from_marker(MarkerIx::new(m), block_start_ix);
+                        ws.store_fwd_history(local, active_states);
                         m += 1;
                     }
                 }
@@ -2672,8 +2790,11 @@ fn run_impute_hmm_dict(
                 let mut skipped_run_start: Option<usize> = None;
                 let mut skipped_run_end = 0usize;
                 for m_rev in (block_start..block_end).rev() {
-                    if is_final && prior_marker_idx != Some(m_rev) && skip_untyped_mask[m_rev] {
-                        posteriors[m_rev] = panel_freq_posterior(panel_priors, m_rev);
+                    if is_final
+                        && prior_marker_idx != Some(m_rev)
+                        && skip_untyped_mask[MarkerIx::new(m_rev)]
+                    {
+                        write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                         if skipped_run_start.is_none() {
                             skipped_run_end = m_rev + 1;
                         }
@@ -2711,8 +2832,9 @@ fn run_impute_hmm_dict(
                         &mut ws.dict_pattern_alleles,
                     );
 
-                    let start = (m_rev - block_start) * active_states;
-                    let fwd_slice = &ws.fwd_history[start..start + active_states];
+                    let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
+                    let off = local.fwd_offset(active_states);
+                    let fwd_slice = &ws.fwd_history[off..off + active_states];
                     if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
@@ -2827,7 +2949,8 @@ fn run_impute_hmm_dict(
                             } else {
                                 let mut out = Vec::with_capacity(ws.allele_probs.len());
                                 out.extend_from_slice(&ws.allele_probs);
-                                posteriors[m_rev] = AllelePosteriors::Multiallelic(out);
+                                posteriors[m_rev] =
+                                    AllelePosteriors::Multiallelic(std::sync::Arc::from(out));
                             }
                         } else {
                             return Err(ReagleError::vcf(format!(
@@ -2841,7 +2964,7 @@ fn run_impute_hmm_dict(
                         }
                     }
 
-                    if uniform_mask[m_rev] {
+                    if uniform_mask[MarkerIx::new(m_rev)] {
                         bwd_sum = transition_only_backward_update(
                             &mut ws.bwd[..active_states],
                             recomb_rate,

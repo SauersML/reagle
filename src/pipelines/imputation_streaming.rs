@@ -4646,7 +4646,9 @@ impl crate::pipelines::ImputationPipeline {
                                 probs_buf.get(1).copied().unwrap_or(0.0),
                             ));
                         } else {
-                            out.push(AllelePosteriors::Multiallelic(probs_buf.clone()));
+                            out.push(AllelePosteriors::Multiallelic(
+                                std::sync::Arc::<[f32]>::from(probs_buf.clone()),
+                            ));
                         }
                     }
                     Ok(out)
@@ -4702,7 +4704,9 @@ impl crate::pipelines::ImputationPipeline {
                                 probs_buf.get(1).copied().unwrap_or(0.0),
                             ));
                         } else {
-                            out.push(AllelePosteriors::Multiallelic(probs_buf.clone()));
+                            out.push(AllelePosteriors::Multiallelic(
+                                std::sync::Arc::<[f32]>::from(probs_buf.clone()),
+                            ));
                         }
                     }
                     Ok(out)
@@ -5735,7 +5739,7 @@ impl crate::pipelines::ImputationPipeline {
                     AllelePosteriors::Biallelic(0.0),
                 )
             } else {
-                let zeros = vec![0.0f32; n_alleles];
+                let zeros = std::sync::Arc::<[f32]>::from(vec![0.0f32; n_alleles]);
                 (
                     AllelePosteriors::Multiallelic(zeros.clone()),
                     AllelePosteriors::Multiallelic(zeros),
@@ -6798,7 +6802,7 @@ impl crate::pipelines::ImputationPipeline {
                             AllelePosteriors::Biallelic(0.0),
                         )
                     } else {
-                        let zeros = vec![0.0f32; n_alleles];
+                        let zeros = std::sync::Arc::<[f32]>::from(vec![0.0f32; n_alleles]);
                         (
                             AllelePosteriors::Multiallelic(zeros.clone()),
                             AllelePosteriors::Multiallelic(zeros),

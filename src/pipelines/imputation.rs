@@ -31,7 +31,7 @@ pub enum AllelePosteriors {
     /// Biallelic site: just store P(ALT)
     Biallelic(f32),
     /// Multiallelic site: full PMF where index i = P(allele i)
-    Multiallelic(Vec<f32>),
+    Multiallelic(Arc<[f32]>),
 }
 
 impl AllelePosteriors {
