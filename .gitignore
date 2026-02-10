@@ -47,3 +47,4 @@ scripts/microarray_profile/
 tests/data/
 # Local agent instructions
 AGENTS.md
+*.png
