@@ -1904,7 +1904,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 }
                 self.hap2_use_combined[m] = false;
                 self.hap2_allele[m] = a2;
-                self.hap2_hard_match[m] = self.anchor_drop_prob == 0.0;
+                self.hap2_hard_match[m] = false;
                 let a1 = self.anchor_hap1.get(m).copied().unwrap_or(255);
                 if a1 != 255 {
                     self.hap2_partner_allele[m] = a1;
@@ -1966,7 +1966,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 }
                 self.hap1_use_combined[m] = false;
                 self.hap1_allele[m] = a1;
-                self.hap1_hard_match[m] = self.anchor_drop_prob == 0.0;
+                self.hap1_hard_match[m] = false;
                 let a2 = self.anchor_hap2.get(m).copied().unwrap_or(255);
                 if a2 != 255 {
                     self.hap1_partner_allele[m] = a2;
@@ -9987,14 +9987,7 @@ fn sample_dynamic_mcmc(
             if a1 == 255 || a2 == 255 || a1 == a2 {
                 fixed_allele[m] = 255; // No constraint (hom/missing)
             } else if is_anchor {
-                if anchor_a2 != 255 {
-                    fixed_allele[m] = anchor_a2;
-                } else if anchor_a1 != 255 {
-                    // H1 is anchored, so H2 must be the opposite allele
-                    fixed_allele[m] = if anchor_a1 == a1 { a2 } else { a1 };
-                } else {
-                    fixed_allele[m] = 255;
-                }
+                fixed_allele[m] = anchor_a2;
             } else {
                 fixed_allele[m] = h2_alleles[m];
             }
@@ -10105,14 +10098,7 @@ fn sample_dynamic_mcmc(
             if a1 == 255 || a2 == 255 || a1 == a2 {
                 fixed_allele[m] = 255;
             } else if is_anchor {
-                if anchor_a1 != 255 {
-                    fixed_allele[m] = anchor_a1;
-                } else if anchor_a2 != 255 {
-                    // H2 is anchored, so H1 must be the opposite allele
-                    fixed_allele[m] = if anchor_a2 == a1 { a2 } else { a1 };
-                } else {
-                    fixed_allele[m] = 255;
-                }
+                fixed_allele[m] = anchor_a1;
             } else {
                 fixed_allele[m] = h1_alleles[m];
             }
