@@ -947,8 +947,6 @@ fn apply_marker_prior_smoothing(
     probs: &[f32],
     nearest_obs_lambda: f32,
     untyped_uniform_marker: bool,
-    active_states: usize,
-    panel_haps: usize,
     min_prior_mix: f32,
     warned_af_fallback: &mut bool,
     context: ImputeHmmContext,
@@ -957,11 +955,6 @@ fn apply_marker_prior_smoothing(
         return;
     }
 
-    let missing_mass = if panel_haps > 0 && active_states < panel_haps {
-        ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
     let floor_mix = min_prior_mix.clamp(0.0, 0.5);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -982,15 +975,6 @@ fn apply_marker_prior_smoothing(
                         }
                         normalize_probs(allele_probs);
                     }
-                    if missing_mass > 0.0 {
-                        for i in 0..2 {
-                            let panel_p = panel_probs[i];
-                            if panel_p > allele_probs[i] {
-                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
-                            }
-                        }
-                        normalize_probs(allele_probs);
-                    }
                 }
             }
             AllelePosteriors::Multiallelic(p) => {
@@ -1001,15 +985,6 @@ fn apply_marker_prior_smoothing(
                             let floor = floor_mix * panel_p;
                             if *prob < floor {
                                 *prob = floor;
-                            }
-                        }
-                        normalize_probs(allele_probs);
-                    }
-                    if missing_mass > 0.0 {
-                        for (i, prob) in allele_probs.iter_mut().enumerate() {
-                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                            if panel_p > *prob {
-                                *prob += missing_mass * (panel_p - *prob);
                             }
                         }
                         normalize_probs(allele_probs);
@@ -1667,8 +1642,6 @@ fn run_impute_hmm_impl(
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        active_states,
-                                        panel_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
@@ -1999,8 +1972,6 @@ fn run_impute_hmm_seqcoded(
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        active_states,
-                                        panel_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
@@ -2329,8 +2300,6 @@ fn run_impute_hmm_dict(
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        active_states,
-                                        panel_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
