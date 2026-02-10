@@ -5634,6 +5634,31 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         let n_samples = sample_phases.len();
         let n_hi_freq = hi_freq_to_orig.len();
+        let sample_has_unresolved_stage1_het: Vec<bool> = sample_phases
+            .iter()
+            .map(|sp| {
+                hi_freq_to_orig.iter().any(|&m| {
+                    if !sp.is_unphased(m) {
+                        return false;
+                    }
+                    let a1 = sp.allele1(m);
+                    let a2 = sp.allele2(m);
+                    a1 != 255 && a2 != 255 && a1 != a2
+                })
+            })
+            .collect();
+        let active_sample_indices: Vec<usize> = (0..n_samples)
+            .filter(|&s| {
+                let frozen = frozen_samples
+                    .and_then(|frozen| frozen.get(s))
+                    .copied()
+                    .unwrap_or(false);
+                !frozen && sample_has_unresolved_stage1_het[s]
+            })
+            .collect();
+        if active_sample_indices.is_empty() {
+            return Ok((0, 0, vec![false; n_samples]));
+        }
         let timing = Arc::new(Stage1Timing::default());
         let timing_start = Instant::now();
         const LOG_EVERY_NS: u64 = 60_000_000_000;
@@ -5766,19 +5791,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             }
             let collect_cohort_stats = cohort_stats_out.is_some();
             let sample_iter = || {
-                sample_phases.par_iter().enumerate().map(|(s, sp)| {
-                    if frozen_samples
-                        .and_then(|frozen| frozen.get(s))
-                        .copied()
-                        .unwrap_or(false)
-                    {
-                        return Stage1PhaseDecision {
-                            orientation: Stage1OrientationUpdate::NoChange,
-                            het_updates: Vec::new(),
-                            paths: None,
-                            cohort_stats: None,
-                        };
-                    }
+                active_sample_indices.par_iter().map(|&s| {
+                    let sp = &sample_phases[s];
                     THREAD_WORKSPACE.with(|ws| {
                         let mut workspace = ws.borrow_mut();
                         if workspace.is_none() {
@@ -5790,29 +5804,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         let n_hi_freq = hi_freq_to_orig.len();
                         let mut threaded_haps = Cow::Borrowed(&threaded_haps_vec[s]);
-
-                        // Fast path: if this sample has no unresolved heterozygotes in Stage 1,
-                        // skip all HMM/MCMC work for this iteration.
-                        let mut has_unresolved_het = false;
-                        for &m in hi_freq_to_orig {
-                            if !sp.is_unphased(m) {
-                                continue;
-                            }
-                            let a1 = sp.allele1(m);
-                            let a2 = sp.allele2(m);
-                            if a1 != 255 && a2 != 255 && a1 != a2 {
-                                has_unresolved_het = true;
-                                break;
-                            }
-                        }
-                        if !has_unresolved_het {
-                            return Stage1PhaseDecision {
-                                orientation: Stage1OrientationUpdate::NoChange,
-                                het_updates: Vec::new(),
-                                paths: None,
-                                cohort_stats: None,
-                            };
-                        }
 
                         let t0 = Instant::now();
                         // Extract alleles/confidence for SUBSET of markers using reused buffers
