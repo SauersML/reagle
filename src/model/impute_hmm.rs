@@ -946,10 +946,31 @@ fn apply_marker_prior_smoothing(
     allele_prior_scratch: &mut Vec<f32>,
     probs: &[f32],
     nearest_obs_lambda: f32,
+    untyped_uniform_marker: bool,
+    active_states: usize,
+    panel_haps: usize,
     min_prior_mix: f32,
     warned_af_fallback: &mut bool,
     context: ImputeHmmContext,
 ) {
+    if !untyped_uniform_marker {
+        return;
+    }
+
+    // Scale missing mass mixing by the uncertainty of the local HMM posterior.
+    // If the local HMM is confident (max_prob ~ 1.0), we trust it and do not
+    // dilute with the global prior. If it is uncertain, we mix in the global
+    // prior to regularize. This fixes "fuzzy dosages" in perfect-match scenarios
+    // while retaining robustness for ambiguous regions.
+    let max_prob = allele_probs.iter().copied().fold(0.0f32, f32::max);
+    let uncertainty = (1.0 - max_prob).clamp(0.0, 1.0);
+
+    let missing_mass = if panel_haps > 0 && active_states < panel_haps {
+        let base_mass = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
+        base_mass * uncertainty
+    } else {
+        0.0
+    };
     let floor_mix = min_prior_mix.clamp(0.0, 0.5);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -970,6 +991,24 @@ fn apply_marker_prior_smoothing(
                         }
                         normalize_probs(allele_probs);
                     }
+                    if missing_mass > 0.0 {
+                        for i in 0..2 {
+                            let panel_p = panel_probs[i];
+                            if panel_p > allele_probs[i] {
+                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
+                            }
+                        }
+                        normalize_probs(allele_probs);
+                    }
+                    if missing_mass > 0.0 {
+                        for i in 0..2 {
+                            let panel_p = panel_probs[i];
+                            if panel_p > allele_probs[i] {
+                                allele_probs[i] += missing_mass * (panel_p - allele_probs[i]);
+                            }
+                        }
+                        normalize_probs(allele_probs);
+                    }
                 }
             }
             AllelePosteriors::Multiallelic(p) => {
@@ -980,6 +1019,24 @@ fn apply_marker_prior_smoothing(
                             let floor = floor_mix * panel_p;
                             if *prob < floor {
                                 *prob = floor;
+                            }
+                        }
+                        normalize_probs(allele_probs);
+                    }
+                    if missing_mass > 0.0 {
+                        for (i, prob) in allele_probs.iter_mut().enumerate() {
+                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            if panel_p > *prob {
+                                *prob += missing_mass * (panel_p - *prob);
+                            }
+                        }
+                        normalize_probs(allele_probs);
+                    }
+                    if missing_mass > 0.0 {
+                        for (i, prob) in allele_probs.iter_mut().enumerate() {
+                            let panel_p = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            if panel_p > *prob {
+                                *prob += missing_mass * (panel_p - *prob);
                             }
                         }
                         normalize_probs(allele_probs);
@@ -1623,7 +1680,7 @@ fn run_impute_hmm_impl(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if use_prior_smoothing && target_probs.is_untyped_uniform_marker(m_rev) {
+                                if use_prior_smoothing {
                                     apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
                                         target_probs.panel_priors(),
@@ -1636,6 +1693,9 @@ fn run_impute_hmm_impl(
                                             .get(m_rev)
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
@@ -1952,7 +2012,7 @@ fn run_impute_hmm_seqcoded(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if use_prior_smoothing && target_probs.is_untyped_uniform_marker(m_rev) {
+                                if use_prior_smoothing {
                                     apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
                                         target_probs.panel_priors(),
@@ -1965,6 +2025,9 @@ fn run_impute_hmm_seqcoded(
                                             .get(m_rev)
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
@@ -2279,7 +2342,7 @@ fn run_impute_hmm_dict(
                                 for p in ws.allele_probs.iter_mut() {
                                     *p /= total;
                                 }
-                                if use_prior_smoothing && target_probs.is_untyped_uniform_marker(m_rev) {
+                                if use_prior_smoothing {
                                     apply_marker_prior_smoothing(
                                         &mut ws.allele_probs,
                                         target_probs.panel_priors(),
@@ -2292,6 +2355,9 @@ fn run_impute_hmm_dict(
                                             .get(m_rev)
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
+                                        target_probs.is_untyped_uniform_marker(m_rev),
+                                        active_states,
+                                        panel_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
