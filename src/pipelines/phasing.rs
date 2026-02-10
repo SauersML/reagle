@@ -4440,9 +4440,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 .min(n_ref_haps.max(1));
             per_window_cap.min(auto_target).max(1)
         } else {
-            per_window_cap
-                .min(n_ref_haps)
-                .max(1)
+            per_window_cap.min(n_ref_haps).max(1)
         };
         if self.config.phase_states == 0 {
             eprintln!(
@@ -5688,10 +5686,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             // 2. Build bidirectional PBWT on high-frequency markers only
             let use_dynamic_mcmc = self.config.dynamic_mcmc;
-            eprintln!(
-                "[stage1 mode] dynamic_mcmc={} n_hi_freq={} samples={}",
-                use_dynamic_mcmc, n_hi_freq, n_samples
-            );
+            let stage1_debug = self.config.profile;
+            if stage1_debug {
+                eprintln!(
+                    "[stage1 mode] dynamic_mcmc={} n_hi_freq={} samples={}",
+                    use_dynamic_mcmc, n_hi_freq, n_samples
+                );
+            }
             let phase_ibs = if use_dynamic_mcmc {
                 if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
                     Some(self.build_bidirectional_pbwt_subset_with_ref(
@@ -5727,9 +5728,43 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 bb.set_dynamic_mcmc(self.config.dynamic_mcmc, k);
                 bb.reset_dyn_neighbors();
             }
-            let sample_phase_stability: Vec<f32> = sample_phases
+            #[derive(Clone, Copy)]
+            struct Stage1SamplePrep {
+                has_unresolved_het: bool,
+                phase_stability: f32,
+            }
+            let sample_prep: Vec<Stage1SamplePrep> = sample_phases
                 .iter()
-                .map(|sp| stage1_sample_phase_stability(sp, hi_freq_to_orig))
+                .map(|sp| {
+                    let mut phased_hets = 0usize;
+                    let mut unresolved_hets = 0usize;
+                    for &m in hi_freq_to_orig {
+                        let a1 = sp.allele1(m);
+                        let a2 = sp.allele2(m);
+                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                            continue;
+                        }
+                        if sp.is_unphased(m) {
+                            unresolved_hets += 1;
+                        } else {
+                            phased_hets += 1;
+                        }
+                    }
+                    let denom = (phased_hets + unresolved_hets) as f32;
+                    let phase_stability = if denom > 0.0 {
+                        phased_hets as f32 / denom
+                    } else {
+                        1.0
+                    };
+                    Stage1SamplePrep {
+                        has_unresolved_het: unresolved_hets > 0,
+                        phase_stability,
+                    }
+                })
+                .collect();
+            let sample_phase_stability: Vec<f32> = sample_prep
+                .iter()
+                .map(|prep| prep.phase_stability)
                 .collect();
             let emission_conf_scales = Arc::new(build_marker_emission_conf_scales(
                 target_gt,
@@ -5737,7 +5772,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 hi_freq_to_orig,
                 self.params.p_mismatch,
             ));
-            if !emission_conf_scales.is_empty() {
+            if stage1_debug && !emission_conf_scales.is_empty() {
                 let mut sum_scale = 0.0f32;
                 let mut min_scale = 1.0f32;
                 for &scale in emission_conf_scales.iter() {
@@ -5781,19 +5816,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                         // Fast path: if this sample has no unresolved heterozygotes in Stage 1,
                         // skip all HMM/MCMC work for this iteration.
-                        let mut has_unresolved_het = false;
-                        for &m in hi_freq_to_orig {
-                            if !sp.is_unphased(m) {
-                                continue;
-                            }
-                            let a1 = sp.allele1(m);
-                            let a2 = sp.allele2(m);
-                            if a1 != 255 && a2 != 255 && a1 != a2 {
-                                has_unresolved_het = true;
-                                break;
-                            }
-                        }
-                        if !has_unresolved_het {
+                        if !sample_prep[s].has_unresolved_het {
                             return Stage1PhaseDecision {
                                 orientation: Stage1OrientationUpdate::NoChange,
                                 het_updates: Vec::new(),
@@ -6040,7 +6063,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let t_anchor = t_anchor_start.elapsed();
 
                         let n_states = threaded_haps.as_ref().n_states();
-                        if s == 0 && n_hi_freq <= 600 {
+                        if stage1_debug && s == 0 && n_hi_freq <= 600 {
                             let mut state_ids = vec![CombinedHapId::from(0u32); n_states];
                             threaded_haps.as_ref().materialize_at(0, &mut state_ids);
                             let has_200 = state_ids.iter().any(|id| id.as_u32() == 200);
@@ -6143,7 +6166,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                             .map(|id: &CombinedHapId| id.as_u32())
                                             .collect(),
                                     });
-                                    if s == 0 && n_hi_freq <= 600 {
+                                    if stage1_debug && s == 0 && n_hi_freq <= 600 {
                                         let p1 = prior_local
                                             .as_ref()
                                             .and_then(|p| p.path1.first().copied())
@@ -6162,7 +6185,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             // Do not inject per-marker phase anchors into dynamic MCMC.
                             // In unanchored/symmetric regimes this can create circular
                             // self-conditioning against the current phase assignment.
-                            if s == 0 && n_hi_freq <= 600 {
+                            if stage1_debug && s == 0 && n_hi_freq <= 600 {
                                 let p1 = prior_local
                                     .as_ref()
                                     .and_then(|p| p.path1.first().copied())
@@ -8046,21 +8069,6 @@ fn build_marker_emission_conf_scales(
         .into_iter()
         .map(|err| ((0.5 - err) / denom).clamp(EMIT_PROFILE_MIN_CONF_SCALE, 1.0))
         .collect()
-}
-
-fn stage1_sample_phase_stability(sp: &SamplePhase, hi_freq_to_orig: &[usize]) -> f32 {
-    let mut sum = 0.0f32;
-    let mut count = 0usize;
-    for &m in hi_freq_to_orig {
-        let a1 = sp.allele1(m);
-        let a2 = sp.allele2(m);
-        if a1 == 255 || a2 == 255 || a1 == a2 {
-            continue;
-        }
-        sum += sp.phase_confidence(m).clamp(0.0, 1.0);
-        count += 1;
-    }
-    if count == 0 { 0.5 } else { sum / count as f32 }
 }
 
 #[inline]
@@ -10964,7 +10972,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
         } else {
             (p_keep, p_swap)
         };
-        let lr = if min_p < 1e-30 { 1e6_f32 } else { (max_p / min_p).min(1e6_f32) };
+        let lr = if min_p < 1e-30 {
+            1e6_f32
+        } else {
+            (max_p / min_p).min(1e6_f32)
+        };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
         swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
@@ -10989,13 +11001,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 }
                 let conf_m = conf[m].clamp(0.0, 1.0);
                 if a1_anchor != 255 {
-                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s1, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s2, a1_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
                 if a2_anchor != 255 {
-                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err).max(1e-30).ln();
+                    score_direct += emit_prob(s2, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
+                    score_flip += emit_prob(s1, a2_anchor, conf_m, p_no_err, p_err)
+                        .max(1e-30)
+                        .ln();
                     evidence += 1;
                 }
             }
@@ -11045,7 +11065,11 @@ fn sample_swap_bits_mosaic<RefSpace>(
             };
             swap_probs[i] = p_swap.clamp(0.0, 1.0);
             swap_probs_conf[i] = swap_probs[i];
-            swap_lr[i] = if min_p < 1e-30 { 1e6 } else { (max_p / min_p).min(1e6) };
+            swap_lr[i] = if min_p < 1e-30 {
+                1e6
+            } else {
+                (max_p / min_p).min(1e6)
+            };
         }
     }
 
