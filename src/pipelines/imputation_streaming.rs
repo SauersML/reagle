@@ -214,8 +214,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let evidence_strength = (weight_sum / (weight_sum + PRIOR_STRENGTH_MARKERS)).clamp(0.0, 1.0);
-    let min_error = (base * (1.0 - 0.5 * evidence_strength)).clamp(1e-6, base);
+    let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -6916,7 +6915,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calibrated_emission_error_sharp_observations_lower_error() {
+    fn test_calibrated_emission_error_sharp_observations_clamped_to_base() {
         // 3 observed, informative markers: near-certain hard calls.
         let offsets = vec![0, 2, 4, 6];
         let probs = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
@@ -6925,14 +6924,19 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
+        // Sharpening is allowed down to 10% of base or 1e-6.
+        let limit = base * 0.1;
         assert!(
-            out < base,
-            "expected lower-than-base calibrated error, got {}",
+            out >= limit,
+            "expected calibrated error clamped to limit {}, got {}",
+            limit,
             out
         );
+        // With sharp observations, it should be below base.
         assert!(
-            out >= 1e-6,
-            "expected calibrated error to respect lower clamp, got {}",
+            out < base,
+            "expected calibrated error to sharpen below base {}, got {}",
+            base,
             out
         );
     }

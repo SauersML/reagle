@@ -10546,7 +10546,13 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         return None;
     }
 
-    let target_k = n_states.min((n_states / 3).max(48).min(128));
+    // For small panels or fully heterozygous targets, unary scores may be
+    // uniform or noisy. Ensure we scan a sufficient number of candidates.
+    let target_k = if n_states <= 256 {
+        n_states
+    } else {
+        n_states.min((n_states / 3).max(64).min(256))
+    };
     let mut ranked_states: Vec<usize> = (0..n_states).collect();
     ranked_states.sort_by(|&a, &b| {
         let sa = state_unary[a] + state_bonus[a];
@@ -10557,8 +10563,14 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
 
     // Stage 2: Greedy beam pair scoring over reduced candidate set.
     // Use top unary states as first-haplotype seeds, then score all partners per seed.
-    const BEAM_SEEDS: usize = 8;
+    // For small sets, perform exhaustive pairwise scoring to handle uniform unary scores.
     let cand_k = ranked_states.len();
+    let n_seeds = if cand_k <= 256 {
+        cand_k
+    } else {
+        8.min(cand_k)
+    };
+
     if scores.len() < cand_k {
         scores.resize(cand_k, 0.0);
     }
@@ -10569,7 +10581,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             .partial_cmp(&state_unary[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    seed_states.truncate(BEAM_SEEDS.min(cand_k));
+    seed_states.truncate(n_seeds);
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best_pair = (ranked_states[0], ranked_states[1]);

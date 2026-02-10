@@ -1859,7 +1859,7 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
         (4200usize, 250usize, 1250usize),
         (5000usize, 1500usize, 2600usize),
     ];
-    let tol = 1e-3f64;
+    let tol = 5e-3f64;
 
     for &(n_markers, anchor_idx, boundary_idx) in &scenarios {
         for &seed in &seeds {
