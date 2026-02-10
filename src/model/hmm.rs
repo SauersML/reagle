@@ -754,8 +754,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let mut log_likelihood = 0.0f64;
 
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
-        let mut ref_alleles_row =
-            AVec::<u8, ConstAlign<64>>::from_iter(64, std::iter::repeat(255u8).take(n_states_padded));
+        let mut ref_alleles_row = AVec::<u8, ConstAlign<64>>::from_iter(
+            64,
+            std::iter::repeat(255u8).take(n_states_padded),
+        );
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
         let mut cursor_history: Vec<StateSwitch<HapSpace>> = Vec::new();
         let inv_n_states = 1.0 / n_states as f32;
