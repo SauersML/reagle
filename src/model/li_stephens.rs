@@ -7,6 +7,11 @@
 pub fn subset_linear_exact_k(recomb_rate: f32, k_subset: f32, n_total: usize) -> (f32, f32) {
     let r = recomb_rate.clamp(0.0, 1.0);
     let n = n_total.max(1) as f32;
+    // exact_k preserves caller-provided subset size (no clamping to [1, n]),
+    // but still rejects nonphysical values to avoid NaN/invalid transitions.
+    if !k_subset.is_finite() || k_subset <= 0.0 {
+        return (0.0, 0.0);
+    }
     let k = k_subset;
     let switch_full = r / n;
     let z = ((1.0 - r) + k * switch_full).max(1e-30);
@@ -39,6 +44,8 @@ pub fn normalized_switch_scale_shift(
     min_sum: f32,
 ) -> (f32, f32) {
     let n = n_states.max(1) as f32;
+    // Clamp to a valid probability range to keep affine transition updates
+    // numerically physical even if upstream noise pushes p_switch slightly out of range.
     let r = p_switch.clamp(0.0, 1.0);
     let shift = r / n;
     let scale = (1.0 - r) / sum.max(min_sum);

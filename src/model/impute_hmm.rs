@@ -878,6 +878,8 @@ fn refresh_ref_alleles<'a, C: RefColumnLike + ?Sized>(
     dict_pattern_alleles: &mut Vec<u8>,
 ) -> RefAlleles<'a> {
     col.fill_ref_alleles(state_haps, state_alleles, dict_pattern_alleles);
+    // Invariant: RefAlleles always views state_alleles (never dict_pattern_alleles),
+    // so callers may repurpose dict_pattern_alleles after this returns.
     RefAlleles {
         slice: state_alleles,
     }
@@ -1517,7 +1519,7 @@ fn subset_transition_params(
         return (0.0, 0.0);
     }
     // Preserve historical imputation behavior: use exact active subset size
-    // (no clamping) when conditioning transitions to tracked states.
+    // (no clamping of k). Recombination is still clamped in li_stephens.
     subset_linear_exact_k(recomb_rate, active_states as f32, n_ref_haps)
 }
 
@@ -2037,12 +2039,15 @@ fn forward_update_dict(
 struct PreparedGroups {
     key: usize,
     n_groups: usize,
+    direct_alleles_ptr: *const u8,
+    direct_alleles_len: usize,
 }
 
 trait ImputeKernel {
     type MarkerCtx;
     const LABEL: &'static str;
     const CLAMP_AFFINE_GROUP_MASS: bool;
+    const MAX_NON_MISSING_ALLELES: usize;
 
     fn reset_forward(&mut self);
     fn reset_backward(&mut self);
@@ -2072,6 +2077,10 @@ trait ImputeKernel {
 
     fn marker_key(ctx: &Self::MarkerCtx) -> usize;
     fn marker_group_count(ctx: &Self::MarkerCtx) -> usize;
+    fn group_alleles<'a>(
+        ctx: &Self::MarkerCtx,
+        dict_pattern_alleles: &'a [u8],
+    ) -> &'a [u8];
 }
 
 #[derive(Default)]
@@ -2122,6 +2131,8 @@ impl DenseKernel {
         PreparedGroups {
             key: m.wrapping_add(1),
             n_groups,
+            direct_alleles_ptr: std::ptr::null(),
+            direct_alleles_len: 0,
         }
     }
 }
@@ -2130,6 +2141,7 @@ impl ImputeKernel for DenseKernel {
     type MarkerCtx = PreparedGroups;
     const LABEL: &'static str = "dense/sparse";
     const CLAMP_AFFINE_GROUP_MASS: bool = true;
+    const MAX_NON_MISSING_ALLELES: usize = 255;
 
     #[inline]
     fn reset_forward(&mut self) {}
@@ -2184,6 +2196,14 @@ impl ImputeKernel for DenseKernel {
     #[inline]
     fn marker_group_count(ctx: &Self::MarkerCtx) -> usize {
         ctx.n_groups
+    }
+
+    #[inline]
+    fn group_alleles<'a>(
+        ctx: &Self::MarkerCtx,
+        dict_pattern_alleles: &'a [u8],
+    ) -> &'a [u8] {
+        &dict_pattern_alleles[..ctx.n_groups]
     }
 }
 
@@ -2268,15 +2288,11 @@ impl PatternSource for SeqcodedSource {
         refresh_seq_patterns(col, stamp, state_haps, &mut ws.state_patterns);
         let seq_alleles = col.seq_alleles();
         let n_patterns = seq_alleles.len();
-        if ws.dict_pattern_alleles.len() < n_patterns {
-            ws.dict_pattern_alleles.resize(n_patterns, 255);
-        }
-        if n_patterns > 0 {
-            ws.dict_pattern_alleles[..n_patterns].copy_from_slice(seq_alleles);
-        }
         PreparedGroups {
             key,
             n_groups: n_patterns,
+            direct_alleles_ptr: seq_alleles.as_ptr(),
+            direct_alleles_len: n_patterns,
         }
     }
 }
@@ -2341,6 +2357,8 @@ impl PatternSource for DictionarySource {
         PreparedGroups {
             key,
             n_groups: n_patterns,
+            direct_alleles_ptr: std::ptr::null(),
+            direct_alleles_len: 0,
         }
     }
 }
@@ -2365,6 +2383,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
     type MarkerCtx = PreparedGroups;
     const LABEL: &'static str = S::LABEL;
     const CLAMP_AFFINE_GROUP_MASS: bool = false;
+    const MAX_NON_MISSING_ALLELES: usize = 255;
 
     #[inline]
     fn reset_forward(&mut self) {
@@ -2414,12 +2433,12 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
         active_states: usize,
     ) -> Self::MarkerCtx {
         assert!(active_states <= state_haps.len());
-        assert!(n_alleles <= 256);
+        assert!(n_alleles <= Self::MAX_NON_MISSING_ALLELES);
         S::prepare_patterns(
             &mut self.backward_stamp,
             ws,
             m,
-            state_haps,
+            &state_haps[..active_states],
             ref_columns,
         )
     }
@@ -2432,6 +2451,19 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
     #[inline]
     fn marker_group_count(ctx: &Self::MarkerCtx) -> usize {
         ctx.n_groups
+    }
+
+    #[inline]
+    fn group_alleles<'a>(
+        ctx: &Self::MarkerCtx,
+        dict_pattern_alleles: &'a [u8],
+    ) -> &'a [u8] {
+        if ctx.direct_alleles_ptr.is_null() {
+            &dict_pattern_alleles[..ctx.n_groups]
+        } else {
+            // SeqCoded context points directly at stable per-marker pattern alleles.
+            unsafe { std::slice::from_raw_parts(ctx.direct_alleles_ptr, ctx.direct_alleles_len) }
+        }
     }
 }
 
@@ -2467,6 +2499,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
+    assert!(active_states <= state_haps.len());
     let active_markers = ws.active_markers();
     if active_states > 0 {
         ws.weights[..active_states].fill(1.0);
@@ -2606,6 +2639,18 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
 
                         let probs = target_probs.probs_for_marker_normalized(m);
                         let n_alleles = probs.len();
+                        if n_alleles > K::MAX_NON_MISSING_ALLELES {
+                            return Err(ReagleError::vcf(format!(
+                                "Marker allele count exceeds {} kernel capacity in imputation HMM ({}): window={} sample={} hap={} marker={} n_alleles={}",
+                                K::MAX_NON_MISSING_ALLELES,
+                                K::LABEL,
+                                context.window_idx,
+                                context.sample_idx,
+                                context.hap_idx,
+                                m,
+                                n_alleles
+                            )));
+                        }
                         if prior_marker_idx == Some(m) {
                             ws.ensure_state_posterior_scratch(active_states);
                         }
@@ -2674,7 +2719,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let mut smoothing_prior_total = 0.0f32;
                                 let mut total = 0.0f32;
                                 let mut missing_mass = 0.0f32;
-                                let group_alleles = &ws.dict_pattern_alleles[..n_groups];
+                                let group_alleles =
+                                    K::group_alleles(&prepared, &ws.dict_pattern_alleles);
                                 for pid in 0..n_groups {
                                     let stats = GroupSufficientStats::from_arrays(
                                         pid,
@@ -2759,6 +2805,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             context,
                                         );
                                     }
+                                    write_posterior_from_probs(&mut posteriors[m], &ws.allele_probs);
                                 } else {
                                     if !warned_af_fallback {
                                         eprintln!(
@@ -2774,7 +2821,6 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     }
                                     write_panel_freq_posterior(&mut posteriors[m], panel_priors, m);
                                 }
-                                write_posterior_from_probs(&mut posteriors[m], &ws.allele_probs);
                             } else {
                                 return Err(ReagleError::vcf(format!(
                                     "No allele space available in imputation HMM ({}): window={} sample={} hap={} marker={} active_states={}",
@@ -2803,6 +2849,18 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 let probs = target_probs.probs_for_marker_normalized(m_rev);
                 let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                 let n_alleles = probs.len();
+                if n_alleles > K::MAX_NON_MISSING_ALLELES {
+                    return Err(ReagleError::vcf(format!(
+                        "Marker allele count exceeds {} kernel capacity in imputation HMM ({}): window={} sample={} hap={} marker={} n_alleles={}",
+                        K::MAX_NON_MISSING_ALLELES,
+                        K::LABEL,
+                        context.window_idx,
+                        context.sample_idx,
+                        context.hap_idx,
+                        m_rev,
+                        n_alleles
+                    )));
+                }
                 if prior_marker_idx == Some(m_rev) {
                     ws.ensure_state_posterior_scratch(active_states);
                 }
@@ -2819,8 +2877,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     n_alleles,
                     active_states,
                 );
-                let n_groups = K::marker_group_count(&prepared);
-                let group_alleles = &ws.dict_pattern_alleles[..n_groups];
+                let group_alleles = K::group_alleles(&prepared, &ws.dict_pattern_alleles);
 
                 if is_final
                     && prior_marker_idx != Some(m_rev)
@@ -2925,6 +2982,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         context,
                                     );
                                 }
+                                write_posterior_from_probs(&mut posteriors[m_rev], &ws.allele_probs);
                             } else {
                                 if !warned_af_fallback {
                                     eprintln!(
@@ -2940,7 +2998,6 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 }
                                 write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                             }
-                            write_posterior_from_probs(&mut posteriors[m_rev], &ws.allele_probs);
                         } else {
                             return Err(ReagleError::vcf(format!(
                                 "No allele space available in imputation HMM ({}): window={} sample={} hap={} marker={} active_states={}",
@@ -2964,7 +3021,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     );
                 } else {
                     fill_pattern_emissions(
-                        &ws.dict_pattern_alleles[..n_groups],
+                        group_alleles,
                         probs,
                         current_error,
                         &mut ws.emission_by_allele,

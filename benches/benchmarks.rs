@@ -517,13 +517,22 @@ fn bench_phase_ibs_operations(c: &mut Criterion) {
     let n_markers = 500;
 
     // Build PBWT from random-ish allele data
-    let alleles: Vec<Vec<u8>> = (0..n_markers)
-        .map(|m| (0..n_haps).map(|h| ((m * 7 + h * 13) % 2) as u8).collect())
+    let alleles_flat: Vec<u8> = (0..n_markers)
+        .map(|m| {
+            (0..n_haps)
+                .map(|h| ((m * 7 + h * 13) % 2) as u8)
+                .collect::<Vec<u8>>()
+        })
+        .flatten()
         .collect();
 
     let subset_to_global: Vec<usize> = (0..n_markers).collect();
-    let pbwt =
-        BidirectionalPhaseIbs::build_for_subset(alleles, n_haps, n_markers, &subset_to_global);
+    let pbwt = BidirectionalPhaseIbs::build_for_subset_flat(
+        alleles_flat,
+        n_haps,
+        n_markers,
+        &subset_to_global,
+    );
 
     group.throughput(Throughput::Elements(100)); // 100 lookups
 
