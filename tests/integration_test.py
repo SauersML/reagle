@@ -421,7 +421,9 @@ def ensure_plink_genetic_map(ref_vcf, map_path, chrom="22"):
     with open(map_path, "w") as f:
         for pos in positions:
             cm = pos / 1_000_000.0
-            f.write(f"{map_chr}\t.\t{cm:.6f}\t{pos}\n")
+            # Use chrom_label (matching the VCF, e.g. "chr22") rather than
+            # the bare number (e.g. "22") so Beagle can look up its map.
+            f.write(f"{chrom_label}\t.\t{cm:.6f}\t{pos}\n")
 
     return map_path
 
