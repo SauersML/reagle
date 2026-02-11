@@ -2102,7 +2102,6 @@ fn run_impute_hmm_impl(
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
-    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
     let current_error = error_rate;
 
@@ -2146,11 +2145,6 @@ fn run_impute_hmm_impl(
                 transition_haps,
             );
             ws.store_checkpoint(cp_idx, active_states);
-            if prior_marker_idx == Some(m) {
-                let mut snapshot = ws.fwd[..active_states].to_vec();
-                normalize_probs(&mut snapshot);
-                forward_prior_state_post = Some(snapshot);
-            }
             prev_marker = m + 1;
         }
         if prev_marker < active_markers {
@@ -2234,7 +2228,7 @@ fn run_impute_hmm_impl(
                         }
                         let a_bwd_m = ws.bwd_affine_a[m - block_start] as f32;
                         let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
-                        if prior_marker_idx == Some(m) && forward_prior_state_post.is_none() {
+                        if prior_marker_idx == Some(m) {
                             let gamma = &mut ws.state_posterior_scratch[..active_states];
                             let mut sum = 0.0f32;
                             for i in 0..active_states {
@@ -2455,7 +2449,7 @@ fn run_impute_hmm_impl(
                         ws.ensure_smoothing_prior_counts(n_alleles);
                     }
                     let fwd_slice = &ws.fwd[..active_states];
-                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
+                    if prior_marker_idx == Some(m_rev) {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -2652,10 +2646,6 @@ fn run_impute_hmm_impl(
             final_posteriors = posteriors;
         }
     }
-
-    if forward_prior_state_post.is_some() {
-        final_prior_state_post = forward_prior_state_post;
-    }
     Ok((final_posteriors, final_prior_state_post))
 }
 
@@ -2704,7 +2694,6 @@ fn run_impute_hmm_seqcoded(
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
-    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
     let current_error = error_rate;
 
@@ -2750,11 +2739,6 @@ fn run_impute_hmm_seqcoded(
                 &mut last_hap_ptr,
             );
             ws.store_checkpoint(cp_idx, active_states);
-            if prior_marker_idx == Some(m) {
-                let mut snapshot = ws.fwd[..active_states].to_vec();
-                normalize_probs(&mut snapshot);
-                forward_prior_state_post = Some(snapshot);
-            }
             prev_marker = m + 1;
         }
         if prev_marker < active_markers {
@@ -2862,7 +2846,7 @@ fn run_impute_hmm_seqcoded(
                         let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
                         let forward_affine = ForwardAffine::from_f64(a_fwd, b_fwd);
                         let backward_affine = BackwardAffine::new(a_bwd_m, b_bwd_m, bwd_sum_right);
-                        if prior_marker_idx == Some(m) && forward_prior_state_post.is_none() {
+                        if prior_marker_idx == Some(m) {
                             let gamma = &mut ws.state_posterior_scratch[..active_states];
                             let mut sum = 0.0f32;
                             for i in 0..active_states {
@@ -3042,7 +3026,7 @@ fn run_impute_hmm_seqcoded(
                     write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                 } else {
                     let fwd_slice = &ws.fwd[..active_states];
-                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
+                    if prior_marker_idx == Some(m_rev) {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -3218,10 +3202,6 @@ fn run_impute_hmm_seqcoded(
             final_posteriors = posteriors;
         }
     }
-
-    if forward_prior_state_post.is_some() {
-        final_prior_state_post = forward_prior_state_post;
-    }
     Ok((final_posteriors, final_prior_state_post))
 }
 
@@ -3270,7 +3250,6 @@ fn run_impute_hmm_dict(
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
-    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
     let current_error = error_rate;
     let final_pass = 0usize;
@@ -3315,11 +3294,6 @@ fn run_impute_hmm_dict(
                 &mut last_dict_ptr,
             );
             ws.store_checkpoint(cp_idx, active_states);
-            if prior_marker_idx == Some(m) {
-                let mut snapshot = ws.fwd[..active_states].to_vec();
-                normalize_probs(&mut snapshot);
-                forward_prior_state_post = Some(snapshot);
-            }
             prev_marker = m + 1;
         }
         if prev_marker < active_markers {
@@ -3427,7 +3401,7 @@ fn run_impute_hmm_dict(
                         let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
                         let forward_affine = ForwardAffine::from_f64(a_fwd, b_fwd);
                         let backward_affine = BackwardAffine::new(a_bwd_m, b_bwd_m, bwd_sum_right);
-                        if prior_marker_idx == Some(m) && forward_prior_state_post.is_none() {
+                        if prior_marker_idx == Some(m) {
                             let gamma = &mut ws.state_posterior_scratch[..active_states];
                             let mut sum = 0.0f32;
                             for i in 0..active_states {
@@ -3608,7 +3582,7 @@ fn run_impute_hmm_dict(
                     write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                 } else {
                     let fwd_slice = &ws.fwd[..active_states];
-                    if prior_marker_idx == Some(m_rev) && forward_prior_state_post.is_none() {
+                    if prior_marker_idx == Some(m_rev) {
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
@@ -3783,10 +3757,6 @@ fn run_impute_hmm_dict(
         if is_final {
             final_posteriors = posteriors;
         }
-    }
-
-    if forward_prior_state_post.is_some() {
-        final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
 }
