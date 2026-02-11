@@ -5633,7 +5633,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         sp.set_phase_confidence(m, p_orient);
                     }
 
-
                     let lr_threshold = self.params.lr_threshold;
                     for (m, lr) in het_lr_values {
                         if lr >= lr_threshold {
