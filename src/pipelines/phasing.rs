@@ -10962,32 +10962,21 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let ref1 = ref_row[p1];
             let ref2 = ref_row[p2];
 
-            let mut orient = if ref1 == a1 && ref2 == a2 {
-                Some(0u8)
-            } else if ref1 == a2 && ref2 == a1 {
-                Some(1u8)
-            } else {
-                None
-            };
-
-            if orient.is_none() {
-                let c = conf[m].clamp(0.0, 1.0);
-                let keep = emit_prob(ref1, a1, c, p_no_err, p_err)
-                    * emit_prob(ref2, a2, c, p_no_err, p_err);
-                let swap = emit_prob(ref1, a2, c, p_no_err, p_err)
-                    * emit_prob(ref2, a1, c, p_no_err, p_err);
-                orient = Some(if swap > keep { 1 } else { 0 });
+            let c = conf[m].clamp(0.0, 1.0);
+            let keep =
+                emit_prob(ref1, a1, c, p_no_err, p_err) * emit_prob(ref2, a2, c, p_no_err, p_err);
+            let swap =
+                emit_prob(ref1, a2, c, p_no_err, p_err) * emit_prob(ref2, a1, c, p_no_err, p_err);
+            let denom = (keep + swap).max(1e-30);
+            let mut p_swap_sample = (swap / denom).clamp(0.0, 1.0);
+            if sample_flip {
+                p_swap_sample = 1.0 - p_swap_sample;
             }
 
-            if let Some(mut bit) = orient {
-                if sample_flip {
-                    bit ^= 1;
-                }
-                if bit == 1 {
-                    swap_counts[i] += 1.0;
-                }
-                obs_counts[i] += 1.0;
-            }
+            // Rao-Blackwellized orientation evidence: each sample contributes
+            // posterior swap mass instead of a hard 0/1 vote.
+            swap_counts[i] += p_swap_sample;
+            obs_counts[i] += 1.0;
         }
     }
 
