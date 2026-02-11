@@ -300,6 +300,7 @@ fn test_ser_switching_all0_all1_reference_dense_map() {
     config.nthreads = Some(1);
     config.ne = 10000.0;
     config.err = Some(0.0001);
+    config.mcmc_lr_samples = 100;
 
     let mut pipeline = PhasingPipeline::new(config, None);
     pipeline.run().expect("Pipeline run failed");

@@ -10611,7 +10611,10 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     seed_states.truncate(n_seeds);
 
     let mut best_score = f32::NEG_INFINITY;
-    let mut best_pair = (ranked_states[0], ranked_states[1]);
+    let mut best_pairs = Vec::with_capacity(1);
+    // Initialize with fallback in case all scores are -Inf
+    best_pairs.push((ranked_states[0], ranked_states[1]));
+
     for &si in seed_states.iter() {
         scores[..cand_k].fill(0.0);
         let bonus_i = state_bonus[si];
@@ -10657,9 +10660,36 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
                 continue;
             }
             let s = scores[cj] + bonus_i + state_bonus[sj];
-            if s > best_score {
+            if s > best_score + 1e-4 {
                 best_score = s;
-                best_pair = (si, sj);
+                best_pairs.clear();
+                best_pairs.push((si, sj));
+            } else if (s - best_score).abs() < 1e-4 {
+                best_pairs.push((si, sj));
+            }
+        }
+    }
+
+    if best_pairs.len() > 1 {
+        // Check for phase conflict among top candidates.
+        // If multiple best pairs imply different haplotypes at heterozygous sites,
+        // we have symmetric evidence and should return None to let the HMM handle ambiguity.
+        let first_pair = best_pairs[0];
+        for &(si, _) in &best_pairs[1..] {
+            for (row_i, &m) in sparse_markers.iter().enumerate() {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
+                }
+
+                let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
+                let a_p1 = ref_row[first_pair.0];
+                let a_si = ref_row[si];
+
+                if a_p1 != 255 && a_si != 255 && a_p1 != a_si {
+                    return None;
+                }
             }
         }
     }
@@ -10667,6 +10697,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
+    let best_pair = best_pairs[0];
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
@@ -10888,7 +10919,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         chain.step();
     }
 
-    let lr_samples = lr_samples_param.max(12).min(32);
+    let lr_samples = lr_samples_param.max(12).min(256);
     let mut swap_counts = vec![0.0f32; het_positions.len()];
     let mut obs_counts = vec![0.0f32; het_positions.len()];
 
@@ -10906,8 +10937,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     for _ in 0..lr_samples {
         chain.step();
 
-        let mut sample_flip = false;
-        if !anchor_indices.is_empty() {
+        let sample_flip = if !anchor_indices.is_empty() {
             let mut direct = 0.0f32;
             let mut flipped = 0.0f32;
             let mut evidence = 0usize;
@@ -10937,8 +10967,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     evidence += 1;
                 }
             }
-            sample_flip = evidence > 0 && flipped > direct;
-        }
+            evidence > 0 && flipped > direct
+        } else {
+            // No anchors to orient phase; mix globally to prevent confident lock-in
+            // on arbitrary label orientation.
+            chain.rng.random_bool(0.5)
+        };
 
         for (i, &m) in het_positions.iter().enumerate() {
             let a1 = seq1[m];
@@ -13261,20 +13295,14 @@ mod tests {
             None,
             &mut scores,
             None,
-        )
-        .unwrap();
+        );
 
         // Best pair should be (0, 1) or (1, 0) - Score 3.
         // Or (2, 3) / (3, 2).
+        // BUT they are symmetric and ambiguous.
+        // The algorithm should now detect ambiguity and return None.
 
-        println!("Selected pair: ({}, {})", paths.path1[0], paths.path2[0]);
-
-        assert!(
-            (paths.path1[0] == 1 && paths.path2[0] == 0)
-                || (paths.path1[0] == 0 && paths.path2[0] == 1)
-                || (paths.path1[0] == 3 && paths.path2[0] == 2)
-                || (paths.path1[0] == 2 && paths.path2[0] == 3)
-        );
+        assert!(paths.is_none(), "Expected ambiguity to result in None");
     }
 
     #[test]
