@@ -5257,16 +5257,12 @@ impl crate::pipelines::ImputationPipeline {
 
         let output_markers = output_end.saturating_sub(output_start);
         let mut sm_alt_probs_by_hap: Vec<Option<Vec<f32>>> = vec![None; n_target_haps];
-        let sm_haps: Vec<usize> = sm_needed
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| {
-                if f.load(Ordering::Relaxed) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
+        // Bold accuracy mode: compute SM donor traces for all target haplotypes,
+        // not only missing/fallback cases. We then blend these local PBWT donor
+        // signals with HMM posteriors downstream to rescue rare/private variants
+        // when the global HMM diffuses probability mass.
+        let sm_haps: Vec<usize> = (0..n_target_haps)
+            .filter(|&i| sm_needed[i].load(Ordering::Relaxed) || output_markers > 0)
             .collect();
         if !sm_haps.is_empty() && output_markers > 0 {
             let mut pbwt = ReferencePbwt::new(plan.n_ref_haps);
@@ -6260,8 +6256,30 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         0.0
                     };
-                let d1 = hap_dosage(&result.hap_posteriors.0, &result.hap_alt_probs.0);
-                let d2 = hap_dosage(&result.hap_posteriors.1, &result.hap_alt_probs.1);
+                let mut d1 = hap_dosage(&result.hap_posteriors.0, &result.hap_alt_probs.0);
+                let mut d2 = hap_dosage(&result.hap_posteriors.1, &result.hap_alt_probs.1);
+                // Blend robust local PBWT donor signal into HMM dosages. This helps
+                // prevent over-diffuse posteriors from crushing rare/private alleles.
+                if let Some(sm1) = result
+                    .hap_alt_probs
+                    .0
+                    .as_ref()
+                    .and_then(|p| p.get(local_m).copied())
+                {
+                    if (sm1 - 0.5).abs() >= 0.25 {
+                        d1 = (0.55 * d1 + 0.45 * sm1).clamp(0.0, 1.0);
+                    }
+                }
+                if let Some(sm2) = result
+                    .hap_alt_probs
+                    .1
+                    .as_ref()
+                    .and_then(|p| p.get(local_m).copied())
+                {
+                    if (sm2 - 0.5).abs() >= 0.25 {
+                        d2 = (0.55 * d2 + 0.45 * sm2).clamp(0.0, 1.0);
+                    }
+                }
                 d1 + d2
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
@@ -6327,8 +6345,28 @@ impl crate::pipelines::ImputationPipeline {
                             .and_then(|p2| p2.get(local_m).copied())
                     });
                 if n_alleles <= 2 {
-                    let p1_alt = p1_alt.unwrap_or(0.0);
-                    let p2_alt = p2_alt.unwrap_or(0.0);
+                    let mut p1_alt = p1_alt.unwrap_or(0.0);
+                    let mut p2_alt = p2_alt.unwrap_or(0.0);
+                    if let Some(sm1) = result
+                        .hap_alt_probs
+                        .0
+                        .as_ref()
+                        .and_then(|p| p.get(local_m).copied())
+                    {
+                        if (sm1 - 0.5).abs() >= 0.25 {
+                            p1_alt = (0.55 * p1_alt + 0.45 * sm1).clamp(0.0, 1.0);
+                        }
+                    }
+                    if let Some(sm2) = result
+                        .hap_alt_probs
+                        .1
+                        .as_ref()
+                        .and_then(|p| p.get(local_m).copied())
+                    {
+                        if (sm2 - 0.5).abs() >= 0.25 {
+                            p2_alt = (0.55 * p2_alt + 0.45 * sm2).clamp(0.0, 1.0);
+                        }
+                    }
                     let gp00 = (1.0 - p1_alt) * (1.0 - p2_alt);
                     let gp01 = p1_alt * (1.0 - p2_alt) + (1.0 - p1_alt) * p2_alt;
                     let gp11 = p1_alt * p2_alt;
