@@ -6159,7 +6159,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             });
                             if prior_local.is_none() {
                                 let mut rp = RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
-                                if let Some(local_best) = find_best_constant_pair_with_buffer(
+                                let (local_best_opt, _) = find_best_constant_pair_with_buffer(
                                     n_hi_freq,
                                     n_states,
                                     &seq1,
@@ -6171,7 +6171,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     None,
                                     &mut ws.scores,
                                     None,
-                                ) {
+                                );
+                                if let Some(local_best) = local_best_opt {
                                     let global_best =
                                         local_to_global_paths(&local_best, threaded_haps.as_ref(), n_hi_freq);
                                     prior_local = Some(MosaicPaths {
@@ -10501,9 +10502,9 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     predecoded_ref_flat: Option<&[u8]>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
-) -> Option<MosaicPaths> {
+) -> (Option<MosaicPaths>, bool) {
     if n_states < 2 {
-        return None;
+        return (None, false);
     }
     // Bound compute on long windows by evaluating a sparse marker grid.
     const MAX_EVAL_MARKERS: usize = 2000;
@@ -10532,7 +10533,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         })
         .collect();
     if sparse_markers.is_empty() {
-        return None;
+        return (None, false);
     }
     let mut sparse_ref_rows = vec![255u8; sparse_markers.len() * n_states];
     for (row_i, &m) in sparse_markers.iter().enumerate() {
@@ -10574,7 +10575,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     }
 
     if informative == 0 {
-        return None;
+        return (None, false);
     }
 
     // For small panels or fully heterozygous targets, unary scores may be
@@ -10670,7 +10671,93 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
-    Some(MosaicPaths { path1, path2 })
+    let mut is_ambiguous = false;
+    let mut collision_count = 0usize;
+    // Heuristic: check if the second best pair is very close to the best pair.
+    // Scores are log-likelihoods. If difference is small, evidence is ambiguous.
+    const AMBIGUITY_TOLERANCE: f32 = 0.01;
+    let best_score_thresh = best_score - AMBIGUITY_TOLERANCE;
+
+    // Re-scan to find near-optimal pairs
+    for &si in seed_states.iter() {
+        scores[..cand_k].fill(0.0);
+        let bonus_i = state_bonus[si];
+
+        for (row_i, &m) in sparse_markers.iter().enumerate() {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+            let obs = if a1 != 255 { a1 } else { a2 };
+            let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
+            let r_seed = ref_row[si];
+
+            if is_het {
+                let seed_a1 = emit_prob(r_seed, a1, conf_m, p_no_err, p_err);
+                let seed_a2 = emit_prob(r_seed, a2, conf_m, p_no_err, p_err);
+                for (cj, &sj) in ranked_states.iter().enumerate() {
+                    if sj == si {
+                        continue;
+                    }
+                    let rj = ref_row[sj];
+                    let e1j = emit_prob(rj, a1, conf_m, p_no_err, p_err);
+                    let e2j = emit_prob(rj, a2, conf_m, p_no_err, p_err);
+                    let prob = 0.5 * (seed_a1 * e2j + seed_a2 * e1j);
+                    scores[cj] += prob.max(1e-30).ln();
+                }
+            } else {
+                let seed_obs = emit_prob(r_seed, obs, conf_m, p_no_err, p_err);
+                for (cj, &sj) in ranked_states.iter().enumerate() {
+                    if sj == si {
+                        continue;
+                    }
+                    let rj = ref_row[sj];
+                    let obs_j = emit_prob(rj, obs, conf_m, p_no_err, p_err);
+                    let prob = seed_obs * obs_j;
+                    scores[cj] += prob.max(1e-30).ln();
+                }
+            }
+        }
+
+        for (cj, &sj) in ranked_states.iter().enumerate() {
+            if sj == si {
+                continue;
+            }
+            let s = scores[cj] + bonus_i + state_bonus[sj];
+            if s >= best_score_thresh {
+                // Check if this pair implies a different phase than the best pair
+                // Sample a few hets to check phase consistency
+                let mut consistent = 0usize;
+                let mut inconsistent = 0usize;
+                for (row_i, &m) in sparse_markers.iter().enumerate().take(20) {
+                    let a1 = seq1[m];
+                    let a2 = seq2[m];
+                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                        continue;
+                    }
+                    let best_r1 = sparse_ref_rows[row_i * n_states + best_pair.0];
+                    let cand_r1 = sparse_ref_rows[row_i * n_states + si];
+
+                    let best_phase = if best_r1 == a1 { 0 } else { 1 };
+                    let cand_phase = if cand_r1 == a1 { 0 } else { 1 };
+                    if best_phase == cand_phase {
+                        consistent += 1;
+                    } else {
+                        inconsistent += 1;
+                    }
+                }
+                if inconsistent > 0 && inconsistent >= consistent {
+                    collision_count += 1;
+                }
+            }
+        }
+    }
+
+    if collision_count > 0 {
+        is_ambiguous = true;
+    }
+
+    (Some(MosaicPaths { path1, path2 }), is_ambiguous)
 }
 
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
@@ -10785,7 +10872,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
 
-    let heuristic_paths = find_best_constant_pair_with_buffer(
+    let (heuristic_paths, _) = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
         seq1,
@@ -10888,7 +10975,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         chain.step();
     }
 
-    let lr_samples = lr_samples_param.max(12).min(32);
+    let lr_samples = lr_samples_param.max(12).min(200);
     let mut swap_counts = vec![0.0f32; het_positions.len()];
     let mut obs_counts = vec![0.0f32; het_positions.len()];
 
@@ -13249,7 +13336,7 @@ mod tests {
         let conf = vec![1.0; n_markers];
 
         let mut scores = Vec::new();
-        let paths = find_best_constant_pair_with_buffer(
+        let (paths, _) = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
@@ -13261,8 +13348,8 @@ mod tests {
             None,
             &mut scores,
             None,
-        )
-        .unwrap();
+        );
+        let paths = paths.unwrap();
 
         // Best pair should be (0, 1) or (1, 0) - Score 3.
         // Or (2, 3) / (3, 2).
@@ -13305,7 +13392,7 @@ mod tests {
         let conf = vec![1.0f32; n_markers];
         let mut scores = Vec::new();
 
-        let paths = find_best_constant_pair_with_buffer(
+        let (paths, is_ambiguous) = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
@@ -13322,6 +13409,9 @@ mod tests {
             paths.is_some(),
             "long-window heuristic should not be disabled"
         );
+        // Hero/Distractor setup is perfectly ambiguous with distractors when only looking at 0/1 matches
+        // because distractors can also be phase-consistent.
+        assert!(is_ambiguous, "Expected ambiguity with hero/distractor setup");
     }
 
     #[test]
