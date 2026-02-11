@@ -219,6 +219,65 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
 }
 
 #[inline]
+fn select_refinement_marker(input_probs: &TargetAlleleProbs) -> Option<usize> {
+    let n = input_probs.n_markers();
+    if n == 0 {
+        return None;
+    }
+    let center = n / 2;
+    let mut best_non_uniform: Option<(usize, usize)> = None;
+    let mut best_observed: Option<(usize, usize)> = None;
+    for m in 0..n {
+        if !input_probs.is_observed_marker(m) {
+            continue;
+        }
+        let dist = m.abs_diff(center);
+        match best_observed {
+            Some((best_dist, _)) if dist >= best_dist => {}
+            _ => best_observed = Some((dist, m)),
+        }
+        if input_probs.is_uniform_marker(m) {
+            continue;
+        }
+        match best_non_uniform {
+            Some((best_dist, _)) if dist >= best_dist => {}
+            _ => best_non_uniform = Some((dist, m)),
+        }
+    }
+    best_non_uniform
+        .map(|(_, m)| m)
+        .or_else(|| best_observed.map(|(_, m)| m))
+}
+
+#[inline]
+fn dense_priors_from_state_posterior(
+    state_haps: &[RefHapId],
+    posterior: &[f32],
+    out: &mut Vec<f32>,
+) -> Option<()> {
+    if posterior.is_empty() || posterior.len() != state_haps.len() {
+        return None;
+    }
+    out.clear();
+    out.resize(state_haps.len(), 0.0);
+    let mut sum = 0.0f32;
+    for (idx, &p) in posterior.iter().enumerate() {
+        if p.is_finite() && p > 0.0 {
+            out[idx] = p;
+            sum += p;
+        }
+    }
+    if sum <= 0.0 {
+        return None;
+    }
+    let inv = 1.0 / sum;
+    for v in out.iter_mut() {
+        *v *= inv;
+    }
+    Some(())
+}
+
+#[inline]
 fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> usize {
     if n_ref_haps == 0 {
         return 1;
@@ -5001,14 +5060,19 @@ impl crate::pipelines::ImputationPipeline {
                         None
                     };
 
-                    let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
+                    let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
                         }
                         let ws = ws_opt.as_mut().unwrap();
                         let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
-                        run_impute_hmm(
+                        let context = ImputeHmmContext {
+                            window_idx,
+                            sample_idx: s,
+                            hap_idx: hap_idx.as_usize(),
+                        };
+                        let (mut posteriors, mut state_post) = run_impute_hmm(
                             &state_haps,
                             ref_columns,
                             input_probs,
@@ -5017,14 +5081,48 @@ impl crate::pipelines::ImputationPipeline {
                             prior_marker_idx,
                             state_priors_slice.take(),
                             &ref_allele_freqs,
-                            ImputeHmmContext {
-                                window_idx,
-                                sample_idx: s,
-                                hap_idx: hap_idx.as_usize(),
-                            },
+                            context,
                             smoothing_cluster_cm,
                             ws,
-                        )
+                        )?;
+
+                        // Second-pass posterior refinement: condition the same window on
+                        // a central typed-marker posterior to reduce long-range drift and
+                        // improve dosage calibration on sparse targets.
+                        let refinement_marker = select_refinement_marker(input_probs);
+                        if let (Some(m_refine), Some(first_post)) =
+                            (refinement_marker, state_post.as_ref())
+                        {
+                            let mut refined_priors = Vec::new();
+                            if dense_priors_from_state_posterior(
+                                &state_haps,
+                                first_post,
+                                &mut refined_priors,
+                            )
+                            .is_some()
+                            {
+                                let refined_error_rate = (effective_error_rate * 0.85)
+                                    .max(1e-6)
+                                    .min(0.5);
+                                let (refined_posteriors, refined_state_post) = run_impute_hmm(
+                                    &state_haps,
+                                    ref_columns,
+                                    input_probs,
+                                    &p_recomb,
+                                    refined_error_rate,
+                                    Some(m_refine),
+                                    Some(refined_priors.as_slice()),
+                                    &ref_allele_freqs,
+                                    context,
+                                    smoothing_cluster_cm,
+                                    ws,
+                                )?;
+                                posteriors = refined_posteriors;
+                                state_post = refined_state_post;
+                            }
+                        }
+
+                        Ok((posteriors, state_post))
                     })?;
 
                     let mut next_priors = HaplotypePriors::empty();
