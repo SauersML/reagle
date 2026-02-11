@@ -10626,28 +10626,29 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             let r_seed = ref_row[si];
 
             if is_het {
-                let seed_a1 = emit_prob(r_seed, a1, conf_m, p_no_err, p_err);
-                let seed_a2 = emit_prob(r_seed, a2, conf_m, p_no_err, p_err);
                 for (cj, &sj) in ranked_states.iter().enumerate() {
                     if sj == si {
                         continue;
                     }
                     let rj = ref_row[sj];
-                    let e1j = emit_prob(rj, a1, conf_m, p_no_err, p_err);
-                    let e2j = emit_prob(rj, a2, conf_m, p_no_err, p_err);
-                    let prob = 0.5 * (seed_a1 * e2j + seed_a2 * e1j);
-                    scores[cj] += prob.max(1e-30).ln();
+                    if r_seed != 255 && rj != 255 {
+                        let match1 = (r_seed == a1 && rj == a2) || (r_seed == a2 && rj == a1);
+                        if match1 {
+                            scores[cj] += 1.0;
+                        }
+                    }
                 }
             } else {
-                let seed_obs = emit_prob(r_seed, obs, conf_m, p_no_err, p_err);
                 for (cj, &sj) in ranked_states.iter().enumerate() {
                     if sj == si {
                         continue;
                     }
                     let rj = ref_row[sj];
-                    let obs_j = emit_prob(rj, obs, conf_m, p_no_err, p_err);
-                    let prob = seed_obs * obs_j;
-                    scores[cj] += prob.max(1e-30).ln();
+                    if r_seed != 255 && rj != 255 {
+                        if r_seed == obs && rj == obs {
+                            scores[cj] += 1.0;
+                        }
+                    }
                 }
             }
         }
