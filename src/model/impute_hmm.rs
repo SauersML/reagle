@@ -1179,9 +1179,27 @@ fn smooth_allele_posteriors_subset(
     let max_effective = allele_probs.len().max(1) as f32;
     let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
-    // Pseudo-count mass should track information decay only. Extra gain
-    // over-regularizes sparse arrays and can collapse rare-allele posteriors.
-    let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
+    // Entropy-aware confidence gating: when posterior entropy is much lower
+    // than the local-prior entropy, the state subset is likely overconfident.
+    // Increase smoothing in that regime to reduce sparse-subset collapse.
+    let mut post_entropy = 0.0f32;
+    let mut prior_entropy = 0.0f32;
+    for (&post, &prior) in allele_probs.iter().zip(subset_prior_probs.iter()) {
+        let p = post.clamp(0.0, 1.0);
+        let q = prior.clamp(0.0, 1.0);
+        if p > 0.0 {
+            post_entropy -= p * p.ln();
+        }
+        if q > 0.0 {
+            prior_entropy -= q * q.ln();
+        }
+    }
+    let entropy_gap = (prior_entropy - post_entropy).max(0.0);
+    let max_entropy = (allele_probs.len().max(2) as f32).ln().max(1e-6);
+    let confidence_boost = (entropy_gap / max_entropy).clamp(0.0, 1.0);
+
+    let base_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
+    let prior_mass = base_mass * (1.0 + 1.75 * confidence_boost);
     if prior_mass <= 0.0 {
         return;
     }
@@ -1220,13 +1238,11 @@ fn apply_marker_prior_smoothing(
     //
     // PBWT selection is highly effective, so we assume the "missing" mass is much
     // less than the random-selection baseline of (1 - active/total).
-    // We use a power law (ratio^4) to strongly penalize very sparse subsets (e.g. 1% of panel)
-    // while virtually eliminating the penalty for dense subsets (e.g. 50% of panel).
-    // This fixes dosage bias in "slam dunk" tests (ratio ~0.5 -> penalty ~0.06)
-    // while maintaining calibration in large-panel imputation (ratio ~0.95 -> penalty ~0.8).
+    // We use a power law to penalize sparse subsets while keeping dense subsets
+    // mostly untouched.
     let missing_mass = if panel_haps > 0 && active_states < panel_haps {
         let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        raw_ratio.powi(4)
+        raw_ratio.powi(3)
     } else {
         0.0
     };
@@ -1234,7 +1250,14 @@ fn apply_marker_prior_smoothing(
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
     // Only inject panel-frequency information when distance from typed anchors
     // is sufficiently large. Near observed markers, let local LD dominate.
-    let adaptive_panel_mix = (missing_mass * (1.0 - retain)).clamp(0.0, 0.7);
+    let active_ratio = if panel_haps > 0 {
+        (active_states as f32 / panel_haps as f32).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let sparsity_boost = (1.0 - active_ratio).powi(2);
+    let adaptive_panel_mix =
+        (missing_mass * (1.0 - retain) * (1.0 + 1.5 * sparsity_boost)).clamp(0.0, 0.85);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1304,9 +1327,32 @@ fn apply_adaptive_panel_blend(
     }
 
     if adaptive_panel_mix > 0.0 {
+        // Jensen-Shannon disagreement between local subset posterior and
+        // panel prior controls how strongly to apply panel blending.
+        let mut m_entropy = 0.0f32;
+        let mut p_entropy = 0.0f32;
+        let mut q_entropy = 0.0f32;
+        for (i, &p_raw) in allele_probs.iter().enumerate() {
+            let p = p_raw.clamp(0.0, 1.0);
+            let q = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let m = 0.5 * (p + q);
+            if p > 0.0 {
+                p_entropy -= p * p.ln();
+            }
+            if q > 0.0 {
+                q_entropy -= q * q.ln();
+            }
+            if m > 0.0 {
+                m_entropy -= m * m.ln();
+            }
+        }
+        let js_div = (m_entropy - 0.5 * (p_entropy + q_entropy)).max(0.0);
+        let max_js = (2.0f32).ln();
+        let disagreement = (js_div / max_js).clamp(0.0, 1.0);
+
         // Symmetric blend toward panel frequencies. This avoids one-sided ALT
         // inflation and improves calibration for high-missingness windows.
-        let w = adaptive_panel_mix;
+        let w = (adaptive_panel_mix * (1.0 + 1.25 * disagreement)).clamp(0.0, 0.9);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
