@@ -518,6 +518,20 @@ def collect_run_metrics(
         except Exception as exc:
             print(f"WARN: Failed reading artifact '{name}' from run {run['id']}: {exc}")
             out[name] = None
+
+    # Fallback: if all target artifacts were missing, try extracting from logs.
+    if all(v is None for v in out.values()):
+        log_metrics = extract_metrics_from_logs(gh, run, cache_dir)
+        if log_metrics:
+            for name in target_artifact_names:
+                if name in log_metrics:
+                    out[name] = log_metrics[name]
+                else:
+                    # Match by any available log-extracted key (single-job runs).
+                    for lk, lv in log_metrics.items():
+                        if out.get(name) is None:
+                            out[name] = lv
+                            break
     return out
 
 
