@@ -52,6 +52,33 @@ use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
 
+#[inline]
+fn keep_top_k_donors_by_weight(donors: &mut Vec<(RefHapId, u32)>, k: usize) {
+    if donors.len() <= k {
+        donors.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        return;
+    }
+    let split = k.max(1).min(donors.len());
+    let (top, _, _) = donors.select_nth_unstable_by(split - 1, |a, b| b.1.cmp(&a.1));
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    donors.truncate(split);
+}
+
+#[inline]
+fn keep_top_k_haps_by_prob(weighted: &mut Vec<(RefHapId, f32)>, k: usize) {
+    if weighted.len() <= k {
+        weighted
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        return;
+    }
+    let split = k.max(1).min(weighted.len());
+    let (top, _, _) = weighted.select_nth_unstable_by(split - 1, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    weighted.truncate(split);
+}
+
 fn push_unique(dst: &mut Vec<String>, value: String) {
     if !dst.iter().any(|v| v == &value) {
         dst.push(value);
@@ -4523,6 +4550,7 @@ impl crate::pipelines::ImputationPipeline {
         let no_info_h2 = sm_total_info[h2_idx.as_usize()] <= 0.0;
                 let has_priors_h1 = priors_h1.map(|p| !p.is_empty()).unwrap_or(false);
                 let has_priors_h2 = priors_h2.map(|p| !p.is_empty()).unwrap_or(false);
+                let max_fast_donors = per_window_cap_local.saturating_mul(2).max(64);
                 let mut donors_h1: Vec<(RefHapId, u32)> = sm_donor_counts[h1_idx.as_usize()]
                     .iter()
                     .map(|(h, c)| (*h, *c))
@@ -4531,8 +4559,8 @@ impl crate::pipelines::ImputationPipeline {
                     .iter()
                     .map(|(h, c)| (*h, *c))
                     .collect();
-                donors_h1.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                donors_h2.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                keep_top_k_donors_by_weight(&mut donors_h1, max_fast_donors);
+                keep_top_k_donors_by_weight(&mut donors_h2, max_fast_donors);
                 let tiny_panel = plan.n_ref_haps <= 32;
                 let use_hmm_h1 = if tiny_panel {
                     true
@@ -4741,9 +4769,7 @@ impl crate::pipelines::ImputationPipeline {
                             .zip(p.probs().iter())
                             .map(|(id, prob)| (RefHapId::new(id.0), *prob))
                             .collect();
-                        weighted.sort_by(|a, b| {
-                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        keep_top_k_haps_by_prob(&mut weighted, k.saturating_mul(2).max(64));
                         prior_haps.extend(weighted.into_iter().map(|(hap, _)| hap));
                     }
 
