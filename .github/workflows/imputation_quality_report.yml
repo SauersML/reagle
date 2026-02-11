@@ -292,6 +292,32 @@ jobs:
       - name: Run Quality Assessment
         run: python3 scripts/quality_assessment.py --person "${{ matrix.person }}" --file "${{ matrix.file_path }}"
 
+      - name: Save input-specific prep cache
+        if: always() && steps.cache-prep-input.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target.vcf.gz
+            target.vcf.gz.csi
+            target.vcf.gz.tbi
+            reagle_ref.vcf.gz
+            reagle_ref.vcf.gz.csi
+            reagle_ref.vcf.gz.tbi
+          key: prep-input-v1-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.file_path, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}-${{ steps.cg-release.outputs.tag }}
+
+      - name: Save person-specific prep cache
+        if: always() && steps.cache-prep-person.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            truth.vcf.gz
+            truth.vcf.gz.csi
+            truth.vcf.gz.tbi
+            ref_beagle.vcf.gz
+            ref_beagle.vcf.gz.csi
+            ref_beagle.vcf.gz.tbi
+          key: prep-person-v1-${{ runner.os }}-${{ matrix.person }}-${{ hashFiles(matrix.truth_glob, 'scripts/prepare_data.py', 'scripts/quality_assessment.py') }}
+
       - name: Validate prep artifacts
         run: |
           set -euo pipefail
