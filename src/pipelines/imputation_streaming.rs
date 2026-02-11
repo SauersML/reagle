@@ -1090,6 +1090,7 @@ struct PrescanCacheMeta {
     n_ref_haps: usize,
     per_window_caps: Vec<usize>,
     window_handoff: Vec<(f64, f64)>,
+    window_starts: Vec<usize>,
 }
 
 struct PrescanCacheGuard {
@@ -1113,6 +1114,7 @@ enum ReferenceData {
         n_ref_haps: usize,
         per_window_caps: Vec<usize>,
         window_handoff: Vec<(f64, f64)>,
+        window_starts: Vec<usize>,
     },
     OnDisk {
         cache_meta: PrescanCacheMeta,
@@ -1121,6 +1123,13 @@ enum ReferenceData {
 }
 
 impl ReferenceData {
+    fn window_starts(&self) -> &[usize] {
+        match self {
+            Self::InMemory { window_starts, .. } => window_starts.as_slice(),
+            Self::OnDisk { cache_meta, .. } => cache_meta.window_starts.as_slice(),
+        }
+    }
+
     fn n_ref_haps(&self) -> usize {
         match self {
             Self::InMemory { n_ref_haps, .. } => *n_ref_haps,
@@ -1284,6 +1293,7 @@ fn prepare_reference_data(
     let mut n_ref_haps = 0usize;
     let mut per_window_caps: Vec<usize> = Vec::new();
     let mut window_handoff: Vec<(f64, f64)> = Vec::new();
+    let mut window_starts: Vec<usize> = Vec::new();
     let mut windows: Vec<RefWindow> = Vec::new();
     let mut packed_columns: Vec<Vec<PackedRefColumn>> = Vec::new();
     let mut total_bytes: u64 = 0;
@@ -1341,6 +1351,7 @@ fn prepare_reference_data(
             let start_gen = gen_maps.gen_pos_by_name(start_chrom, start_marker.pos);
             let end_gen = gen_maps.gen_pos_by_name(end_chrom, end_marker.pos);
             window_handoff.push((start_gen, end_gen));
+            window_starts.push(ref_window.global_start);
 
             if use_in_memory {
                 let packed = pack_ref_columns(&ref_window.markers, &ref_window.ref_columns)?;
@@ -1404,6 +1415,7 @@ fn prepare_reference_data(
             n_ref_haps,
             per_window_caps,
             window_handoff,
+            window_starts,
         })
     } else {
         let path = cache_path
@@ -1417,6 +1429,7 @@ fn prepare_reference_data(
             n_ref_haps,
             per_window_caps,
             window_handoff,
+            window_starts,
         };
         let guard = PrescanCacheGuard { path };
         Ok(ReferenceData::OnDisk {
@@ -2683,6 +2696,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut window_idx = 0usize;
         let mut sample_error_rates =
             vec![self.params.p_mismatch.clamp(1e-6, 0.5); n_target_samples];
+        let window_starts = ref_data.window_starts().to_vec();
 
         match &mut ref_data {
             ReferenceData::InMemory { windows, .. } => {
@@ -2903,6 +2917,22 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
+                        {
+                            let next_start = window_starts.get(window_idx + 1).copied();
+                            if let Some(next) = next_start {
+                                if next > ref_window.global_start {
+                                    Some(next - ref_window.global_start - 1)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                if ref_window.output_end > 0 {
+                                    Some(ref_window.output_end.saturating_sub(1))
+                                } else {
+                                    None
+                                }
+                            }
+                        },
                         // Use phase confidence from the phased target haplotypes. If the
                         // input was unphased, the phasing pipeline provides calibrated
                         // phase confidence for heterozygotes, which we should leverage
@@ -3211,6 +3241,22 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
+                        {
+                            let next_start = window_starts.get(window_idx + 1).copied();
+                            if let Some(next) = next_start {
+                                if next > ref_window.global_start {
+                                    Some(next - ref_window.global_start - 1)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                if ref_window.output_end > 0 {
+                                    Some(ref_window.output_end.saturating_sub(1))
+                                } else {
+                                    None
+                                }
+                            }
+                        },
                         // Use phase confidence from the phased target haplotypes. If the
                         // input was unphased, the phasing pipeline provides calibrated
                         // phase confidence for heterozygotes, which we should leverage
@@ -3362,6 +3408,7 @@ impl crate::pipelines::ImputationPipeline {
         global_start: usize,
         output_start: usize,
         output_end: usize,
+        prior_marker_idx: Option<usize>,
         phase_conf_valid: bool,
         sample_error_rates: &mut [f32],
     ) -> Result<Option<ImputationWindowResults>> {
@@ -4468,12 +4515,6 @@ impl crate::pipelines::ImputationPipeline {
                 std::cell::RefCell::new(None);
         }
 
-        let prior_marker_idx = if output_end > 0 {
-            Some(output_end.saturating_sub(1))
-        } else {
-            None
-        };
-
         struct ImputeResult {
             result: SampleImputationResult,
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
@@ -4878,7 +4919,7 @@ impl crate::pipelines::ImputationPipeline {
                         )));
                     }
 
-                    let mut state_priors_slice: Option<&[f32]> = if let Some(p) = priors {
+                    let state_priors_slice: Option<&[f32]> = if let Some(p) = priors {
                         if p.is_empty() {
                             if !warned_no_priors {
                                 warn!(
@@ -4958,7 +4999,7 @@ impl crate::pipelines::ImputationPipeline {
                             &p_recomb,
                             effective_error_rate,
                             prior_marker_idx,
-                            state_priors_slice.take(),
+                            state_priors_slice,
                             &ref_allele_freqs,
                             ImputeHmmContext {
                                 window_idx,
@@ -4966,6 +5007,7 @@ impl crate::pipelines::ImputationPipeline {
                                 hap_idx: hap_idx.as_usize(),
                             },
                             smoothing_cluster_cm,
+                            if state_priors_slice.is_some() { Some(0.0) } else { None },
                             ws,
                         )
                     })?;

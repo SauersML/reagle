@@ -978,6 +978,7 @@ fn compute_nearest_observed_lambda(
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
+    prior_obs_dist: Option<f32>,
 ) {
     const BASE_CLUSTER_CM: f32 = 0.005;
     let n = target_probs.n_markers();
@@ -996,12 +997,15 @@ fn compute_nearest_observed_lambda(
         return;
     }
 
-    let mut dist = f32::INFINITY;
+    let mut dist = prior_obs_dist.unwrap_or(f32::INFINITY);
     for m in 0..n {
+        if m > 0 || prior_obs_dist.is_some() {
+            if dist.is_finite() {
+                dist += recomb_lambda_from_p(marker_recomb_rate(p_recomb, m));
+            }
+        }
         if target_probs.is_observed_marker(m) {
             dist = 0.0;
-        } else if m > 0 && dist.is_finite() {
-            dist += recomb_lambda_from_p(marker_recomb_rate(p_recomb, m));
         }
         ws.nearest_obs_fwd[m] = dist;
     }
@@ -1790,6 +1794,7 @@ fn run_impute_hmm_impl(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    prior_obs_dist: Option<f32>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "dense/sparse")?;
@@ -1804,7 +1809,13 @@ fn run_impute_hmm_impl(
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
+        compute_nearest_observed_lambda(
+            ws,
+            target_probs,
+            p_recomb,
+            smoothing_cluster_cm,
+            prior_obs_dist,
+        );
     } else {
         ws.nearest_obs_lambda.clear();
     }
@@ -1994,22 +2005,6 @@ fn run_impute_hmm_impl(
                     let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
                     let off = local.fwd_offset(active_states);
                     let fwd_slice = &ws.fwd_history[off..off + active_states];
-                    if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
-                        let mut sum = 0.0f32;
-                        for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
-                            }
-                            final_prior_state_post = Some(gamma.to_vec());
-                        }
-                    }
                     // Always refresh ref alleles for posterior calculation, even if emissions are uniform.
                     let ref_alleles = refresh_ref_alleles(
                         &ref_columns[m_rev],
@@ -2188,7 +2183,7 @@ fn run_impute_hmm_impl(
         }
     }
 
-    if final_prior_state_post.is_none() && forward_prior_state_post.is_some() {
+    if final_prior_state_post.is_none() {
         final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
@@ -2205,6 +2200,7 @@ fn run_impute_hmm_seqcoded(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    prior_obs_dist: Option<f32>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "seqcoded")?;
@@ -2219,7 +2215,13 @@ fn run_impute_hmm_seqcoded(
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
+        compute_nearest_observed_lambda(
+            ws,
+            target_probs,
+            p_recomb,
+            smoothing_cluster_cm,
+            prior_obs_dist,
+        );
     } else {
         ws.nearest_obs_lambda.clear();
     }
@@ -2420,22 +2422,6 @@ fn run_impute_hmm_seqcoded(
                     let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
                     let off = local.fwd_offset(active_states);
                     let fwd_slice = &ws.fwd_history[off..off + active_states];
-                    if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
-                        let mut sum = 0.0f32;
-                        for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
-                            }
-                            final_prior_state_post = Some(gamma.to_vec());
-                        }
-                    }
 
                     if is_final {
                         ws.allele_probs.clear();
@@ -2603,7 +2589,7 @@ fn run_impute_hmm_seqcoded(
         }
     }
 
-    if final_prior_state_post.is_none() && forward_prior_state_post.is_some() {
+    if final_prior_state_post.is_none() {
         final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
@@ -2620,6 +2606,7 @@ fn run_impute_hmm_dict(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    prior_obs_dist: Option<f32>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, "dictionary")?;
@@ -2634,7 +2621,13 @@ fn run_impute_hmm_dict(
     // Compute distance-based shrinkage only when untyped markers exist.
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
+        compute_nearest_observed_lambda(
+            ws,
+            target_probs,
+            p_recomb,
+            smoothing_cluster_cm,
+            prior_obs_dist,
+        );
     } else {
         ws.nearest_obs_lambda.clear();
     }
@@ -2835,22 +2828,6 @@ fn run_impute_hmm_dict(
                     let local = BlockLocalIx::from_marker(MarkerIx::new(m_rev), block_start_ix);
                     let off = local.fwd_offset(active_states);
                     let fwd_slice = &ws.fwd_history[off..off + active_states];
-                    if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
-                        let mut sum = 0.0f32;
-                        for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
-                            }
-                            final_prior_state_post = Some(gamma.to_vec());
-                        }
-                    }
 
                     if is_final {
                         ws.allele_probs.clear();
@@ -3018,7 +2995,7 @@ fn run_impute_hmm_dict(
         }
     }
 
-    if final_prior_state_post.is_none() && forward_prior_state_post.is_some() {
+    if final_prior_state_post.is_none() {
         final_prior_state_post = forward_prior_state_post;
     }
     Ok((final_posteriors, final_prior_state_post))
@@ -3038,6 +3015,7 @@ pub fn run_impute_hmm(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    prior_obs_dist: Option<f32>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_reference_marker_count(ref_columns.len(), target_probs, context, "dispatch")?;
@@ -3069,6 +3047,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            prior_obs_dist,
             ws,
         );
     }
@@ -3088,6 +3067,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            prior_obs_dist,
             ws,
         );
     }
@@ -3107,6 +3087,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            prior_obs_dist,
             ws,
         );
     }
@@ -3126,6 +3107,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            prior_obs_dist,
             ws,
         );
     }
@@ -3141,6 +3123,7 @@ pub fn run_impute_hmm(
         ref_allele_freqs,
         context,
         smoothing_cluster_cm,
+        prior_obs_dist,
         ws,
     )
 }
