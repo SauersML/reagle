@@ -10670,30 +10670,6 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
     }
 
-    if best_pairs.len() > 1 {
-        // Check for phase conflict among top candidates.
-        // If multiple best pairs imply different haplotypes at heterozygous sites,
-        // we have symmetric evidence and should return None to let the HMM handle ambiguity.
-        let first_pair = best_pairs[0];
-        for &(si, _) in &best_pairs[1..] {
-            for (row_i, &m) in sparse_markers.iter().enumerate() {
-                let a1 = seq1[m];
-                let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
-                    continue;
-                }
-
-                let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
-                let a_p1 = ref_row[first_pair.0];
-                let a_si = ref_row[si];
-
-                if a_p1 != 255 && a_si != 255 && a_p1 != a_si {
-                    return None;
-                }
-            }
-        }
-    }
-
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
@@ -13300,9 +13276,10 @@ mod tests {
         // Best pair should be (0, 1) or (1, 0) - Score 3.
         // Or (2, 3) / (3, 2).
         // BUT they are symmetric and ambiguous.
-        // The algorithm should now detect ambiguity and return None.
+        // The algorithm previously returned None, but this destroys structure.
+        // We now pick one arbitrarily.
 
-        assert!(paths.is_none(), "Expected ambiguity to result in None");
+        assert!(paths.is_some(), "Expected ambiguity to be resolved arbitrarily, not None");
     }
 
     #[test]
