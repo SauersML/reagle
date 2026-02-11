@@ -11074,7 +11074,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let new_paths = MosaicPaths {
+    let mut new_paths = MosaicPaths {
         path1: chain.path1.clone(),
         path2: chain.path2.clone(),
     };
@@ -11116,7 +11116,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
         };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
-        swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
+        // Confidence is the probability of the chosen phase (always >= 0.5)
+        let conf = if p_swap > 0.5 { p_swap } else { 1.0 - p_swap };
+        swap_probs_conf.push(conf.clamp(0.0, 1.0));
     }
 
     // Removed redundant and unstable overwrite loop (using single sample "new_paths").
@@ -11204,6 +11206,46 @@ fn sample_swap_bits_mosaic<RefSpace>(
     workspace.path2 = buffers.path2;
     workspace.fwd_block = buffers.fwd_block;
     workspace.combined_checkpoint_data = combined_checkpoints.into_buffer();
+
+    // Ensure returned paths are consistent with the swap decision.
+    // If swap_bits says "Swap" (1), the caller will flip the genotype (seq1 <-> seq2).
+    // We must ensure path1 corresponds to the incoming seq1 (old seq2).
+    // If path1 currently corresponds to old seq1, we must swap path1/path2.
+    // This aligns the HMM initialization for the next iteration with the updated genotype.
+    if !workspace.ref_alleles_flat.is_empty() {
+        let n_states_usize = n_states.get();
+        for m in 0..n_markers {
+            let target_swap = swap_bits[m] == 1;
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            if a1 == 255 || a2 == 255 || a1 == a2 {
+                continue;
+            }
+
+            let p1 = new_paths.path1[m] as usize;
+            if p1 >= n_states_usize {
+                continue;
+            }
+
+            let offset = m * n_states_usize;
+            if offset + p1 >= workspace.ref_alleles_flat.len() {
+                continue;
+            }
+            let r1 = workspace.ref_alleles_flat[offset + p1];
+
+            // If r1 matches a2 (seq2), current path1 is aligned with seq2 (Swap).
+            // If r1 matches a1 (seq1), current path1 is aligned with seq1 (Keep).
+            // If r1 matches neither, we assume Keep (no swap needed if ambiguous).
+            let current_is_swap = r1 == a2;
+
+            if current_is_swap != target_swap {
+                let p1_val = new_paths.path1[m];
+                let p2_val = new_paths.path2[m];
+                new_paths.path1[m] = p2_val;
+                new_paths.path2[m] = p1_val;
+            }
+        }
+    }
 
     (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths)
 }
@@ -12540,8 +12582,10 @@ mod tests {
         th.push_new(CombinedHapId::new(0));
         th.push_new(CombinedHapId::new(1));
 
-        let seq1: Vec<u8> = vec![0; n_markers];
-        let seq2: Vec<u8> = vec![1; n_markers];
+        // Setup sequence to match hero pattern (0, 1, 0, 1...) to test stability.
+        // If seq1 matches hero, we expect no state switches (stay in State 0).
+        let seq1: Vec<u8> = hero_pattern.clone();
+        let seq2: Vec<u8> = hero_pattern.iter().map(|&a| 1 - a).collect();
         let conf: Vec<f32> = vec![1.0; n_markers];
         let mut anchor_h1 = vec![255u8; n_markers];
         let mut anchor_h2 = vec![255u8; n_markers];
