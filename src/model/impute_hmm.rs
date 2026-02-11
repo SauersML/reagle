@@ -1851,6 +1851,17 @@ fn run_impute_hmm_impl(
                 ws.fwd[len..active_states].fill(0.0);
             }
             normalize_probs(&mut ws.fwd[..active_states]);
+            if let Some(r) = p_recomb.get(0).copied() {
+                if r > 0.0 {
+                    transition_only_forward_update(
+                        &mut ws.fwd[..active_states],
+                        1.0,
+                        r,
+                        transition_haps,
+                    );
+                }
+            }
+            eprintln!("[DEBUG] win={} prior_first={:.3} target_probs_0={:?}", context.window_idx, ws.fwd[0], target_probs.probs_for_marker(0));
         } else {
             let uniform = 1.0 / active_states.max(1) as f32;
             ws.fwd[..active_states].fill(uniform);
@@ -2255,6 +2266,17 @@ fn run_impute_hmm_seqcoded(
                 ws.fwd[len..active_states].fill(0.0);
             }
             normalize_probs(&mut ws.fwd[..active_states]);
+            if let Some(r) = p_recomb.get(0).copied() {
+                if r > 0.0 {
+                    transition_only_forward_update(
+                        &mut ws.fwd[..active_states],
+                        1.0,
+                        r,
+                        transition_haps,
+                    );
+                }
+            }
+            eprintln!("[DEBUG] win={} prior_first={:.3} target_probs_0={:?}", context.window_idx, ws.fwd[0], target_probs.probs_for_marker(0));
         } else {
             let uniform = 1.0 / active_states.max(1) as f32;
             ws.fwd[..active_states].fill(uniform);
@@ -2660,6 +2682,17 @@ fn run_impute_hmm_dict(
                 ws.fwd[len..active_states].fill(0.0);
             }
             normalize_probs(&mut ws.fwd[..active_states]);
+            if let Some(r) = p_recomb.get(0).copied() {
+                if r > 0.0 {
+                    transition_only_forward_update(
+                        &mut ws.fwd[..active_states],
+                        1.0,
+                        r,
+                        transition_haps,
+                    );
+                }
+            }
+            eprintln!("[DEBUG] win={} prior_first={:.3} target_probs_0={:?}", context.window_idx, ws.fwd[0], target_probs.probs_for_marker(0));
         } else {
             let uniform = 1.0 / active_states.max(1) as f32;
             ws.fwd[..active_states].fill(uniform);
