@@ -4305,20 +4305,8 @@ impl crate::pipelines::ImputationPipeline {
                 true,
             );
             (
-                TargetAlleleProbs::new(
-                    offsets1,
-                    probs1,
-                    observed1,
-                    None,
-                    min_untyped_prior_mix1,
-                ),
-                TargetAlleleProbs::new(
-                    offsets2,
-                    probs2,
-                    observed2,
-                    None,
-                    min_untyped_prior_mix2,
-                ),
+                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1),
+                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2),
                 last_info1,
                 last_info2,
             )
