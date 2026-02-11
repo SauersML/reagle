@@ -506,7 +506,7 @@ fn bench_pbwt_update(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark BidirectionalPhaseIbs position lookups and best_match_span
+/// Benchmark BidirectionalPhaseIbs lightweight accessors.
 fn bench_phase_ibs_operations(c: &mut Criterion) {
     use reagle::model::phase_ibs::BidirectionalPhaseIbs;
 
@@ -515,25 +515,26 @@ fn bench_phase_ibs_operations(c: &mut Criterion) {
 
     let n_haps = 2000;
     let n_markers = 500;
-
-    // Build PBWT from random-ish allele data
-    let alleles: Vec<Vec<u8>> = (0..n_markers)
-        .map(|m| (0..n_haps).map(|h| ((m * 7 + h * 13) % 2) as u8).collect())
+    let alleles_flat: Vec<u8> = (0..n_markers)
+        .flat_map(|m| (0..n_haps).map(move |h| ((m * 7 + h * 13) % 2) as u8))
         .collect();
 
     let subset_to_global: Vec<usize> = (0..n_markers).collect();
-    let pbwt =
-        BidirectionalPhaseIbs::build_for_subset(alleles, n_haps, n_markers, &subset_to_global);
+    let pbwt = BidirectionalPhaseIbs::build_for_subset_flat(
+        alleles_flat,
+        n_haps,
+        n_markers,
+        &subset_to_global,
+    );
 
-    group.throughput(Throughput::Elements(100)); // 100 lookups
-
-    group.bench_function("best_match_span_100", |b| {
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("n_haps_1000", |b| {
         b.iter(|| {
-            let mut total_span = 0usize;
-            for hap in 0..100u32 {
-                total_span += pbwt.best_match_span(hap, n_markers / 2);
+            let mut total = 0usize;
+            for _ in 0..1000 {
+                total += pbwt.n_haps();
             }
-            black_box(total_span)
+            black_box(total)
         })
     });
 
