@@ -10888,7 +10888,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         chain.step();
     }
 
-    let lr_samples = lr_samples_param.max(12).min(32);
+    let lr_samples = lr_samples_param.max(12).min(200);
     let mut swap_counts = vec![0.0f32; het_positions.len()];
     let mut obs_counts = vec![0.0f32; het_positions.len()];
 

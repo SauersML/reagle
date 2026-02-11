@@ -161,12 +161,18 @@ fn run_rust_phasing_with_window_toml(
     pipeline.run_auto()
 }
 
-/// Run Rust phasing pipeline (defaults).
-fn run_rust_phasing_default(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
+/// Run Rust phasing pipeline with explicit phase states.
+fn run_rust_phasing_with_states(
+    gt_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    states: usize,
+) -> reagle::Result<()> {
     let mut config = Config::default();
     config.target = gt_path.to_path_buf();
     config.out = out_prefix.to_path_buf();
     config.seed = seed;
+    config.phase_states = states;
     let mut pipeline = reagle::PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
@@ -2338,11 +2344,11 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
     let seeds = [12345, 23456, 34567];
     for (run_idx, seed) in seeds.iter().copied().enumerate() {
         let out_low = work_dir.path().join(format!("out_low_{}", run_idx));
-        run_rust_phasing_default(&target_vcf, &out_low, seed)
+        run_rust_phasing_with_states(&target_vcf, &out_low, seed, 64)
             .expect("Rust phasing failed (low states)");
 
         let out_high = work_dir.path().join(format!("out_high_{}", run_idx));
-        run_rust_phasing_default(&target_vcf, &out_high, seed)
+        run_rust_phasing_with_states(&target_vcf, &out_high, seed, 256)
             .expect("Rust phasing failed (high states)");
 
         let records_low = parse_vcf(&work_dir.path().join(format!("out_low_{}.vcf.gz", run_idx)));
