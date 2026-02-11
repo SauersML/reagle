@@ -1,17 +1,3 @@
-"""
-Jules Optimizer Loop - Continuous improvement cycle for Rust code.
-
-This script runs within the 'jules_loop.yml' workflow.
-It analyzes the build log from the current run (or a provided log file),
-decides on improvements, sends a request to the Jules API, applies the patch,
-and pushes the changes.
-
-REGRESSION PROTECTION:
-- If the Rust build was PASSING before Jules' changes, we verify it still passes
-  after applying the patch. If the build now fails (regression), we abort.
-- If the Rust build was already FAILING, we allow commits even if still failing,
-  as any progress is better than no progress.
-"""
 import os
 import sys
 import json
@@ -24,14 +10,42 @@ JULES_API_URL = "https://jules.googleapis.com"
 MAX_RETRIES = 2
 RETRY_DELAY = 60
 
+PROMPT_TEXT = """
+The goal is to have the best and most accurate imputation (and phasing) out of any tool, while being extraordinarily fast (and no OOM).
+This project is for genotype phasing and imputation. We care most about accuracy, then very fast speed, with the constraint that it must not run out of memory with ~15 GB.
+We care about real-world usage above any test. The goal of the project should be to maximize universal future wellbeing above any one particular present task.
+This should guide our decision-making. This happens through taking proper long-term solutions. How?
+Well, better phasing and imputation leads to downstream better, e.g., predictive power for disease prediction, disease associations, science, etc., which improve lives tangibly.
+This means we must always do what is best for real-world accuracy and performance.
 
-def strip_ansi(text):
+RULES:
+- Always make a real improvement and finish in one PR.
+- Use the provided build log as a signal. If there are compile errors or failing tests, you might diagnose root cause and fix the implementation.
+- If everything passes, improve performance, memory, correctness, and add or strengthen tests.
+- Never weaken, delete, or #[ignore] tests to make them pass. Failing tests are valuable information.
+- Only change a test if the test itself is genuinely wrong (not just failing).
+- Commit progress if code compiles, even with failing tests.
+- Correctness matters: this code affects real health outcomes via polygenic scores.
+- No hacks. Do the proper fix.
+- Avoid small, unimpactful changes such as knob tuning or tweaking.
+
+SCOPE:
+- DO NOT modify rust-toolchain.toml if it exists.
+- Focus ONLY on src/*.rs files and Cargo.toml.
+- Run cargo check --all-targets and cargo test to validate changes.
+- You are encouraged to proactively search official Rust documentation when needed.
+
+OUTPUT:
+- Produce a patch that meaningfully improves the project.
+""".strip()
+
+def strip_ansi(text: str) -> str:
     """Removes ANSI escape codes from text."""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', text)
+    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    return ansi_escape.sub("", text)
 
 
-def run_command(cmd, check=False):
+def run_command(cmd, check: bool = False):
     """Run a shell command and return stdout, stderr, return code."""
     if isinstance(cmd, list):
         print(f"Running: {' '.join(cmd)}")
@@ -45,14 +59,12 @@ def run_command(cmd, check=False):
         print(result.stdout)
         print(result.stderr)
         sys.exit(result.returncode)
+
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
-def filter_noise(logs):
-    """
-    Remove noisy lines that don't help with debugging.
-    These are mostly downloading/compiling dependency messages.
-    """
+def filter_noise(logs: str) -> str:
+    """Remove noisy lines that don't help with debugging."""
     noise_patterns = [
         "Downloading crates ...",
         "Downloaded ",
@@ -69,29 +81,27 @@ def filter_noise(logs):
         "Fresh ",
     ]
 
-    filtered_lines = []
-    for line in logs.split('\n'):
-        is_noise = any(pattern in line for pattern in noise_patterns)
-        if not is_noise:
-            filtered_lines.append(line)
-
-    return '\n'.join(filtered_lines)
+    out = []
+    for line in logs.split("\n"):
+        if any(pat in line for pat in noise_patterns):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def get_run_info():
     """
     Retrieves status and logs.
-    First checks for local environment variables provided by the workflow.
+    Expects LOCAL_LOG_FILE and LOCAL_BUILD_STATUS to be set by workflow.
     """
     print("\n--- Getting Run Info ---")
-
     local_log_file = os.environ.get("LOCAL_LOG_FILE")
     local_status = os.environ.get("LOCAL_BUILD_STATUS")
 
     if local_log_file and local_status:
         print(f"Using local log file: {local_log_file} with status: {local_status}")
         try:
-            with open(local_log_file, 'r') as f:
+            with open(local_log_file, "r") as f:
                 raw_logs = f.read()
 
             logs = filter_noise(strip_ansi(raw_logs))
@@ -110,37 +120,41 @@ def get_run_info():
     return "unknown", "No logs available."
 
 
-def verify_rust_build():
-    """
-    Run the Rust build and return True if it passes, False otherwise.
-    """
+def verify_rust_build() -> bool:
+    """Run cargo check + cargo test. Return True if both pass."""
     print("\n--- Verifying Rust Build ---")
 
-    # Run cargo check first (faster), then cargo test
-    stdout, stderr, code = run_command("cargo check --all-targets")
-
-    if code == 0:
-        print("Cargo check passed. Running tests...")
-        stdout, stderr, code = run_command("cargo test")
-
-        if code == 0:
-            print("Rust build and tests passed.")
-            return True
-        else:
-            print("Rust tests failed.")
-            print(f"stderr: {stderr[:2000]}" if stderr else "")
-            return False
-    else:
+    _, stderr, code = run_command("cargo check --all-targets")
+    if code != 0:
         print("Rust build failed.")
-        print(f"stderr: {stderr[:2000]}" if stderr else "")
+        if stderr:
+            print(f"stderr: {stderr[:2000]}")
         return False
 
+    print("Cargo check passed. Running tests...")
+    _, stderr, code = run_command("cargo test")
+    if code != 0:
+        print("Rust tests failed.")
+        if stderr:
+            print(f"stderr: {stderr[:2000]}")
+        return False
 
-def call_jules(prompt, attempt=1):
-    """
-    Interacts with Jules API to get a plan and changeset.
-    Returns the changeset or None if Jules couldn't produce one.
-    """
+    print("Rust build and tests passed.")
+    return True
+
+
+def build_prompt(conclusion: str, logs: str) -> str:
+    context = (
+        "RUN CONTEXT:\n"
+        f"- build_status: {conclusion}\n\n"
+        "BUILD LOG (filtered):\n\n"
+        f"{logs}\n"
+    )
+    return context + "\n\n" + PROMPT_TEXT
+
+
+def call_jules(prompt: str, attempt: int = 1):
+    """Create a Jules session, poll activities, and return a ChangeSet (or PR_CREATED/None)."""
     api_key = os.environ.get("JULES_API_KEY")
     repo = os.environ.get("GITHUB_REPOSITORY")
 
@@ -154,9 +168,9 @@ def call_jules(prompt, attempt=1):
         "prompt": prompt,
         "sourceContext": {
             "source": f"sources/github/{repo}",
-            "githubRepoContext": {"startingBranch": "main"}
+            "githubRepoContext": {"startingBranch": "main"},
         },
-        "automationMode": "AUTO_CREATE_PR"
+        "automationMode": "AUTO_CREATE_PR",
     }
 
     print("Sending payload to Jules API:")
@@ -167,7 +181,7 @@ def call_jules(prompt, attempt=1):
             f"{JULES_API_URL}/v1alpha/sessions",
             headers={"X-Goog-Api-Key": api_key},
             json=payload,
-            timeout=60
+            timeout=60,
         )
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
@@ -181,7 +195,7 @@ def call_jules(prompt, attempt=1):
     session_name = session["name"]
     print(f"Session created: {session_name}")
 
-    max_polls = 180  # 30 minutes of polling
+    max_polls = 180
     seen_ids = set()
 
     for i in range(max_polls):
@@ -192,7 +206,7 @@ def call_jules(prompt, attempt=1):
             r = requests.get(
                 f"{JULES_API_URL}/v1alpha/{session_name}/activities",
                 headers={"X-Goog-Api-Key": api_key},
-                timeout=30
+                timeout=30,
             )
         except requests.exceptions.RequestException as e:
             print(f"Polling error: {e}")
@@ -217,10 +231,11 @@ def call_jules(prompt, attempt=1):
             print(f"\n--- New Activity ({originator}) ---")
 
             if "planGenerated" in act:
-                print("Plan Generated:")
                 steps = act["planGenerated"].get("plan", {}).get("steps", [])
-                for step in steps:
-                    print(f"  {step.get('index', '?')}. {step.get('title', '')}")
+                if steps:
+                    print("Plan Generated:")
+                    for step in steps:
+                        print(f"  {step.get('index', '?')}. {step.get('title', '')}")
 
             if "progressUpdated" in act:
                 prog = act["progressUpdated"]
@@ -258,75 +273,11 @@ def call_jules(prompt, attempt=1):
 
 def main():
     conclusion, logs = get_run_info()
+    prompt = build_prompt(conclusion, logs)
 
-    # Common restrictions for all prompts
-    version_restriction = (
-        "\n\nNOTE:\n"
-        "- You are encouraged to proactively search the web for Rust documentation.\n"
-        "- DO NOT modify 'rust-toolchain.toml' if it exists - the Rust version may be pinned.\n"
-        "- Focus ONLY on src/*.rs files and Cargo.toml for improvements.\n"
-        "- This is genotype phasing/imputation to Rust.\n"
-        "- Always try to improve something--commit and finish. No further instruction will be given.\n"
-        "- Run 'cargo check' and 'cargo test' to verify your changes compile.\n"
-    )
-
-    # Detect if it was a test failure vs build failure by checking logs
-    build_passed_tests_failed = (
-        conclusion == "failure" and "Cargo check passed" in logs
-    )
-
-    # Core philosophy that applies to all prompts
-    philosophy = (
-        "\n\nPHILOSOPHY:\n"
-        "- Tests are INFORMATION, not goals. Never aim for 'green CI'. Failing tests are valuable.\n"
-        "- New tests that FAIL are more useful than passing tests - they reveal bugs.\n"
-        "- Never weaken, delete, or #[ignore] tests to make them pass. That destroys information.\n"
-        "- Only fix a test if the test itself is genuinely wrong (not just failing).\n"
-        "- Commit and push frequently if code compiles, even with failing tests.\n"
-        "- Correctness matters: this code affects real health outcomes via polygenic scores.\n"
-        "- No 'for now' thinking. Do the proper fix, not a hack.\n"
-    )
-
-    if conclusion == "success":
-        prompt = (
-            "The Rust build and tests passed. Find something to improve:\n"
-            "- Make code faster or more memory efficient\n"
-            "- Create difficult tests that might fail (exposing bugs is valuable!)\n"
-            "- Strengthen test assertions until they fail\n"
-            "- Find logical/mathematical flaws by referencing Java/\n"
-            "- Track down factors hurting phasing/imputation accuracy\n"
-            "- Fix bugs or implement missing functionality\n"
-            "- Benchmark and optimize hot paths\n\n"
-            "This is a port of BEAGLE (genotype phasing/imputation) from Java to Rust. "
-            "Feel free to tackle complex tasks. Push to main frequently if code compiles."
-            + philosophy
-            + version_restriction
-        )
-    elif build_passed_tests_failed:
-        prompt = (
-            f"The Rust code compiles but some tests failed.\n"
-            f"Logs:\n\n{logs}\n\n"
-            "Investigate the root cause. Tests are information telling you something is wrong. "
-            "Options:\n"
-            "- Fix the implementation bug that the test exposed (reference Java/ for correct behavior)\n"
-            "- If investigating reveals a deeper issue, create a NEW failing test that exposes it better\n"
-            "- Improve speed/memory while investigating\n"
-            "- Strengthen other test assertions to find more bugs\n\n"
-            "This is a port of BEAGLE (genotype phasing/imputation) from Java to Rust. "
-            "Commit progress even if tests still fail - progress is good."
-            + philosophy
-            + version_restriction
-        )
-    else:
-        prompt = (
-            f"The code needs some work.\n"
-            f"Logs:\n\n{logs}\n\n"
-            "This is genotype phasing/imputation in Rust. "
-            + philosophy
-            + version_restriction
-        )
-
-    print(f"\nPrompting Jules with:\n{prompt}\n")
+    print("\nPrompting Jules with:\n")
+    print(prompt)
+    print("\n")
 
     changeset = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -361,7 +312,7 @@ def main():
     run_command("git fetch origin main")
     run_command("git checkout -B main origin/main")
 
-    out, err, code = run_command("git apply jules.patch")
+    _, err, code = run_command("git apply jules.patch")
     if code != 0:
         print(f"Failed to apply patch: {err}")
         print("Patch may be malformed.")
@@ -372,7 +323,6 @@ def main():
 
     run_command("git add .")
     _, _, code = run_command("git diff --cached --quiet")
-
     if code == 0:
         print("\nNo changes to commit after applying patch.")
         sys.exit(0)
@@ -381,16 +331,13 @@ def main():
 
     if was_passing_before:
         print("\n--- Regression Check (build was passing before) ---")
-        build_passes_now = verify_rust_build()
-
-        if not build_passes_now:
-            print("\n REGRESSION DETECTED: Build was passing, but Jules' changes broke it!")
+        if not verify_rust_build():
+            print("\nREGRESSION DETECTED: Build was passing, but Jules' changes broke it!")
             print("Reverting changes and aborting commit.")
             run_command("git checkout -- .")
             run_command("git clean -fd")
             sys.exit(0)
-        else:
-            print("Regression check passed: build still works.")
+        print("Regression check passed: build still works.")
     else:
         print("\n--- Skipping regression check (build was already failing) ---")
         print("Jules' changes will be committed even if build still fails.")
@@ -399,18 +346,17 @@ def main():
     print("\n--- Committing and Creating PR ---")
     print(f"Commit message: {msg}")
 
-    # Create a unique branch name
     import datetime
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     branch_name = f"jules/{timestamp}"
 
     run_command(f"git checkout -b {branch_name}", check=True)
-    run_command(['git', 'commit', '-m', msg], check=True)
+    run_command(["git", "commit", "-m", msg], check=True)
 
     print(f"Pushing changes to branch {branch_name}...")
     run_command(f"git push origin {branch_name}", check=True)
 
-    # Create PR via GitHub CLI (more reliable than API)
     print("\n--- Creating Pull Request ---")
     github_token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -423,59 +369,56 @@ def main():
         print("WARNING: GITHUB_REPOSITORY not set, cannot create PR.")
         sys.exit(0)
 
-    print(f"Repository: {repo}")
-    print(f"Branch: {branch_name}")
-
-    # Try gh CLI first (most reliable)
     pr_title = msg[:200] if len(msg) > 200 else msg
     pr_body = f"Automated improvement by Jules.\n\n**Summary:**\n{msg}"
 
-    # Set GH_TOKEN for gh CLI
     os.environ["GH_TOKEN"] = github_token
 
     gh_cmd = [
-        "gh", "pr", "create",
-        "--title", pr_title,
-        "--body", pr_body,
-        "--base", "main",
-        "--head", branch_name
+        "gh",
+        "pr",
+        "create",
+        "--title",
+        pr_title,
+        "--body",
+        pr_body,
+        "--base",
+        "main",
+        "--head",
+        branch_name,
     ]
 
     stdout, stderr, code = run_command(gh_cmd)
     if code == 0:
         print(f"PR created successfully via gh CLI: {stdout}")
-    else:
-        print(f"gh CLI failed (code {code}): {stderr}")
-        print("Falling back to GitHub API...")
+        print("Done. PR creation attempted.")
+        return
 
-        # Fallback to GitHub API
-        pr_payload = {
-            "title": pr_title,
-            "head": branch_name,
-            "base": "main",
-            "body": pr_body
-        }
+    print(f"gh CLI failed (code {code}): {stderr}")
+    print("Falling back to GitHub API...")
 
-        try:
-            pr_resp = requests.post(
-                f"https://api.github.com/repos/{repo}/pulls",
-                headers={
-                    "Authorization": f"token {github_token}",
-                    "Accept": "application/vnd.github.v3+json"
-                },
-                json=pr_payload,
-                timeout=30
-            )
+    pr_payload = {"title": pr_title, "head": branch_name, "base": "main", "body": pr_body}
 
-            print(f"API Response Status: {pr_resp.status_code}")
-            if pr_resp.status_code == 201:
-                pr_url = pr_resp.json().get("html_url")
-                print(f"PR created successfully: {pr_url}")
-            else:
-                print(f"Failed to create PR: {pr_resp.status_code}")
-                print(f"Response: {pr_resp.text}")
-        except requests.exceptions.RequestException as e:
-            print(f"Error creating PR: {e}")
+    try:
+        pr_resp = requests.post(
+            f"https://api.github.com/repos/{repo}/pulls",
+            headers={
+                "Authorization": f"token {github_token}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+            json=pr_payload,
+            timeout=30,
+        )
+
+        print(f"API Response Status: {pr_resp.status_code}")
+        if pr_resp.status_code == 201:
+            pr_url = pr_resp.json().get("html_url")
+            print(f"PR created successfully: {pr_url}")
+        else:
+            print(f"Failed to create PR: {pr_resp.status_code}")
+            print(f"Response: {pr_resp.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error creating PR: {e}")
 
     print("Done. PR creation attempted.")
 
