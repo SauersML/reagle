@@ -870,7 +870,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 idx = 0;
             }
             phases.reverse();
-            let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
+            let p_swapped = self.compute_swap_posteriors_smoothed(
+                &logsum_swapped,
+                &logsum_unswapped,
+                &condensed.call_sites,
+            );
+            let posterior_decisions =
+                self.decode_posterior_phase_path(&p_swapped, &condensed.call_sites);
+            if posterior_decisions.len() == phases.len() {
+                phases = posterior_decisions;
+            }
             let has_input_anchor = sample_phase.has_input_phase_anchor();
             for (i, phase_swapped) in phases.iter().enumerate() {
                 let call = &condensed.call_sites[i];
@@ -1934,4 +1943,147 @@ fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> 
         }
     }
     out
+}
+
+impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
+    fn compute_swap_posteriors_smoothed(
+        &self,
+        logsum_swapped: &[f64],
+        logsum_unswapped: &[f64],
+        call_sites: &[CallSite],
+    ) -> Vec<f32> {
+        let base = compute_swap_posteriors(logsum_swapped, logsum_unswapped);
+        if base.is_empty() {
+            return base;
+        }
+
+        let n = base.len();
+        let mut emit_unswapped = vec![0.0f64; n];
+        let mut emit_swapped = vec![0.0f64; n];
+        for i in 0..n {
+            let p = base[i].clamp(1e-6, 1.0 - 1e-6) as f64;
+            emit_swapped[i] = p.ln();
+            emit_unswapped[i] = (1.0 - p).ln();
+            if let Some(cs) = call_sites.get(i)
+                && cs.fixed
+                && cs.flip_cost > 0
+            {
+                // Preserve hard/soft external anchors: fixed phase input should
+                // dominate unless sequencing evidence is overwhelming.
+                emit_swapped[i] -= (cs.flip_cost as f64) / 1_000_000.0;
+            }
+        }
+
+        let mut trans_same = vec![0.0f64; n.saturating_sub(1)];
+        let mut trans_flip = vec![0.0f64; n.saturating_sub(1)];
+        for i in 1..n {
+            let d = call_sites
+                .get(i)
+                .map(|c| c.dist_morgans.max(0.0))
+                .unwrap_or(0.0);
+            let p_flip = self.orientation_flip_prob(d);
+            trans_flip[i - 1] = p_flip.ln();
+            trans_same[i - 1] = (1.0 - p_flip).ln();
+        }
+
+        let mut alpha_u = vec![f64::NEG_INFINITY; n];
+        let mut alpha_s = vec![f64::NEG_INFINITY; n];
+        alpha_u[0] = (-0.5f64.ln()) + emit_unswapped[0];
+        alpha_s[0] = (-0.5f64.ln()) + emit_swapped[0];
+        for i in 1..n {
+            alpha_u[i] = logaddexp(
+                alpha_u[i - 1] + trans_same[i - 1],
+                alpha_s[i - 1] + trans_flip[i - 1],
+            ) + emit_unswapped[i];
+            alpha_s[i] = logaddexp(
+                alpha_s[i - 1] + trans_same[i - 1],
+                alpha_u[i - 1] + trans_flip[i - 1],
+            ) + emit_swapped[i];
+        }
+
+        let mut beta_u = vec![0.0f64; n];
+        let mut beta_s = vec![0.0f64; n];
+        for i in (0..n.saturating_sub(1)).rev() {
+            beta_u[i] = logaddexp(
+                trans_same[i] + emit_unswapped[i + 1] + beta_u[i + 1],
+                trans_flip[i] + emit_swapped[i + 1] + beta_s[i + 1],
+            );
+            beta_s[i] = logaddexp(
+                trans_same[i] + emit_swapped[i + 1] + beta_s[i + 1],
+                trans_flip[i] + emit_unswapped[i + 1] + beta_u[i + 1],
+            );
+        }
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let lu = alpha_u[i] + beta_u[i];
+            let ls = alpha_s[i] + beta_s[i];
+            let z = logaddexp(lu, ls);
+            if !z.is_finite() {
+                out.push(base[i]);
+            } else {
+                out.push(((ls - z).exp() as f32).clamp(0.0, 1.0));
+            }
+        }
+        out
+    }
+
+    fn decode_posterior_phase_path(&self, p_swapped: &[f32], call_sites: &[CallSite]) -> Vec<bool> {
+        if p_swapped.is_empty() {
+            return Vec::new();
+        }
+        let n = p_swapped.len();
+        let mut v_u = vec![f64::NEG_INFINITY; n];
+        let mut v_s = vec![f64::NEG_INFINITY; n];
+        let mut ptr_u = vec![false; n];
+        let mut ptr_s = vec![false; n];
+        let p0 = p_swapped[0].clamp(1e-6, 1.0 - 1e-6) as f64;
+        v_u[0] = (-0.5f64.ln()) + (1.0 - p0).ln();
+        v_s[0] = (-0.5f64.ln()) + p0.ln();
+        for i in 1..n {
+            let p = p_swapped[i].clamp(1e-6, 1.0 - 1e-6) as f64;
+            let emit_u = (1.0 - p).ln();
+            let emit_s = p.ln();
+            let d = call_sites
+                .get(i)
+                .map(|c| c.dist_morgans.max(0.0))
+                .unwrap_or(0.0);
+            let p_flip = self.orientation_flip_prob(d);
+            let log_same = (1.0 - p_flip).ln();
+            let log_flip = p_flip.ln();
+
+            let uu = v_u[i - 1] + log_same;
+            let su = v_s[i - 1] + log_flip;
+            if uu >= su {
+                v_u[i] = uu + emit_u;
+                ptr_u[i] = false;
+            } else {
+                v_u[i] = su + emit_u;
+                ptr_u[i] = true;
+            }
+            let ss = v_s[i - 1] + log_same;
+            let us = v_u[i - 1] + log_flip;
+            if ss >= us {
+                v_s[i] = ss + emit_s;
+                ptr_s[i] = true;
+            } else {
+                v_s[i] = us + emit_s;
+                ptr_s[i] = false;
+            }
+        }
+        let mut out = vec![false; n];
+        out[n - 1] = v_s[n - 1] > v_u[n - 1];
+        for i in (1..n).rev() {
+            out[i - 1] = if out[i] { ptr_s[i] } else { ptr_u[i] };
+        }
+        out
+    }
+
+    #[inline]
+    fn orientation_flip_prob(&self, dist_morgans: f32) -> f64 {
+        let d = dist_morgans.max(0.0) as f64;
+        let rho = self.costs.recomb_intensity.max(1e-12);
+        let p = (rho * d) / (1.0 + rho * d);
+        p.clamp(1e-6, 0.35)
+    }
 }

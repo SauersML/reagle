@@ -5623,8 +5623,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         sp.swap_alleles(m);
                     }
 
+                    let has_anchor = sp.has_input_phase_anchor();
+                    let mut lr_map: HashMap<usize, f32> =
+                        HashMap::with_capacity(het_lr_values.len());
+                    for (m, lr) in het_lr_values.iter().copied() {
+                        lr_map.insert(m, lr);
+                    }
                     for (m, p_orient) in het_phase_values {
-                        sp.set_phase_confidence(m, p_orient);
+                        let lr = lr_map.get(&m).copied().unwrap_or(1.0);
+                        let conf = calibrate_phase_confidence(p_orient, has_anchor, lr);
+                        sp.set_phase_confidence(m, conf);
                     }
 
                     let lr_threshold = self.params.lr_threshold;
@@ -6656,12 +6664,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             for Stage1HetUpdate {
                 marker: HiFreqMarkerIdx(hi_freq_idx),
+                lr: PhaseLogOdds(lr),
                 confidence: PhaseConfidence(p_orient),
-                ..
             } in &decision.het_updates
             {
                 let m = hi_freq_to_orig[*hi_freq_idx];
-                sp.set_phase_confidence(m, *p_orient);
+                let conf = calibrate_phase_confidence(*p_orient, sp.has_input_phase_anchor(), *lr);
+                sp.set_phase_confidence(m, conf);
             }
 
             if let Some(paths) = decision.paths {
@@ -11876,6 +11885,24 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     }
 }
 
+#[inline]
+fn calibrate_phase_confidence(p_orient: f32, has_anchor: bool, lr: f32) -> f32 {
+    let p = p_orient.clamp(0.0, 1.0);
+    let centered = (p - 0.5).abs();
+    let lr_safe = lr.max(1.0);
+    let strength = if has_anchor {
+        // Anchored input can preserve high confidence where supported.
+        0.40 + 0.60 * ((lr_safe - 1.0) / (lr_safe + 1.0)).clamp(0.0, 1.0)
+    } else {
+        // For de-novo phase (no anchor), keep probabilities conservative.
+        // This avoids overconfident posteriors under globally symmetric evidence.
+        let _ = lr_safe;
+        0.18
+    };
+    let conf = 0.5 + centered * strength;
+    conf.clamp(0.5, 0.995)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13370,5 +13397,17 @@ mod tests {
             .fold(f32::NEG_INFINITY, f32::max);
         assert!(min_p.is_finite() && max_p.is_finite());
         assert!(max_p > min_p);
+    }
+
+    #[test]
+    fn test_calibrate_phase_confidence_unanchored_shrinks_extremes() {
+        let conf = calibrate_phase_confidence(0.99, false, 1.0);
+        assert!(conf <= 0.6, "expected shrinkage, got {}", conf);
+    }
+
+    #[test]
+    fn test_calibrate_phase_confidence_anchored_preserves_signal() {
+        let conf = calibrate_phase_confidence(0.99, true, 50.0);
+        assert!(conf > 0.75, "expected strong confidence, got {}", conf);
     }
 }
