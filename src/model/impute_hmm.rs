@@ -1151,6 +1151,7 @@ fn smooth_allele_posteriors_subset(
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
+    const UNTYPED_DISTANCE_GAIN: f32 = 8.0;
     if allele_probs.is_empty() {
         return;
     }
@@ -1178,7 +1179,12 @@ fn smooth_allele_posteriors_subset(
     }
     let max_effective = allele_probs.len().max(1) as f32;
     let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
-    let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
+    // The recombination map in short windows can make raw lambda tiny even for
+    // kb-scale gaps. Amplify lambda so untyped regions receive meaningful
+    // Bayesian shrinkage instead of collapsing to subset artifacts.
+    let retain = (-(nearest_obs_lambda.max(0.0) * UNTYPED_DISTANCE_GAIN))
+        .exp()
+        .clamp(MIN_RETAIN, 1.0);
     // Pseudo-count mass should track information decay only. Extra gain
     // over-regularizes sparse arrays and can collapse rare-allele posteriors.
     let prior_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
@@ -1231,7 +1237,10 @@ fn apply_marker_prior_smoothing(
         0.0
     };
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
-    let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
+    const UNTYPED_DISTANCE_GAIN: f32 = 8.0;
+    let retain = (-(nearest_obs_lambda.max(0.0) * UNTYPED_DISTANCE_GAIN))
+        .exp()
+        .clamp(0.0, 1.0);
     // Only inject panel-frequency information when distance from typed anchors
     // is sufficiently large. Near observed markers, let local LD dominate.
     let adaptive_panel_mix = (missing_mass * (1.0 - retain)).clamp(0.0, 0.7);
@@ -1400,6 +1409,23 @@ fn write_panel_freq_posterior(
             *dst = AllelePosteriors::Multiallelic(std::sync::Arc::clone(probs));
         }
     }
+}
+
+fn refine_untyped_posteriors_with_anchor_interpolation(
+    posteriors: &mut [AllelePosteriors],
+    target_probs: &TargetAlleleProbs,
+    panel_priors: Option<&[AllelePosteriors]>,
+    nearest_obs_fwd: &[f32],
+    nearest_obs_bwd: &[f32],
+) {
+    let _ = (
+        posteriors,
+        target_probs,
+        panel_priors,
+        nearest_obs_fwd,
+        nearest_obs_bwd,
+    );
+    // Reserved hook for future post-HMM posterior refinements.
 }
 
 #[inline]
@@ -2588,6 +2614,13 @@ fn run_impute_hmm_impl(
     if forward_prior_state_post.is_some() {
         final_prior_state_post = forward_prior_state_post;
     }
+    refine_untyped_posteriors_with_anchor_interpolation(
+        &mut final_posteriors,
+        target_probs,
+        panel_priors,
+        &ws.nearest_obs_fwd,
+        &ws.nearest_obs_bwd,
+    );
     Ok((final_posteriors, final_prior_state_post))
 }
 
@@ -3154,6 +3187,13 @@ fn run_impute_hmm_seqcoded(
     if forward_prior_state_post.is_some() {
         final_prior_state_post = forward_prior_state_post;
     }
+    refine_untyped_posteriors_with_anchor_interpolation(
+        &mut final_posteriors,
+        target_probs,
+        panel_priors,
+        &ws.nearest_obs_fwd,
+        &ws.nearest_obs_bwd,
+    );
     Ok((final_posteriors, final_prior_state_post))
 }
 
@@ -3720,6 +3760,13 @@ fn run_impute_hmm_dict(
     if forward_prior_state_post.is_some() {
         final_prior_state_post = forward_prior_state_post;
     }
+    refine_untyped_posteriors_with_anchor_interpolation(
+        &mut final_posteriors,
+        target_probs,
+        panel_priors,
+        &ws.nearest_obs_fwd,
+        &ws.nearest_obs_bwd,
+    );
     Ok((final_posteriors, final_prior_state_post))
 }
 
