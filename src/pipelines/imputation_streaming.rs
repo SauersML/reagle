@@ -4536,23 +4536,21 @@ impl crate::pipelines::ImputationPipeline {
                 let tiny_panel = plan.n_ref_haps <= 32;
                 let use_hmm_h1 = if tiny_panel {
                     true
-                } else if has_priors_h1 {
-                    true
                 } else if no_info_h1 || insufficient_info_h1 {
                     true
                 } else {
                     conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h1.len() < SM_MATCH_MIN_DONORS
+                        || (has_priors_h1 && conf_ratio_h1 > (SM_MATCH_LOW_CONF_FRAC * 0.25))
                 };
                 let use_hmm_h2 = if tiny_panel {
-                    true
-                } else if has_priors_h2 {
                     true
                 } else if no_info_h2 || insufficient_info_h2 {
                     true
                 } else {
                     conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
                         || donors_h2.len() < SM_MATCH_MIN_DONORS
+                        || (has_priors_h2 && conf_ratio_h2 > (SM_MATCH_LOW_CONF_FRAC * 0.25))
                 };
 
                 let track_hmm = |use_hmm: bool,
@@ -4711,6 +4709,58 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     Ok(out)
                 };
+                let blend_priors_with_donors =
+                    |priors: &HaplotypePriors,
+                     donors: &[(RefHapId, u32)],
+                     prior_weight: f32|
+                     -> HaplotypePriors {
+                        let prior_weight = prior_weight.clamp(0.0, 1.0);
+                        let donor_weight = (1.0 - prior_weight).max(0.0);
+                        let mut weights: std::collections::HashMap<u32, f32> =
+                            std::collections::HashMap::new();
+
+                        for (id, p) in priors.ids().iter().zip(priors.probs().iter()) {
+                            let w = (*p).max(0.0) * prior_weight;
+                            if w > 0.0 {
+                                *weights.entry(id.0).or_insert(0.0) += w;
+                            }
+                        }
+
+                        let donor_total: u32 = donors.iter().map(|(_, c)| *c).sum();
+                        if donor_total > 0 && donor_weight > 0.0 {
+                            let inv = donor_weight / donor_total as f32;
+                            for (hap, count) in donors.iter() {
+                                let w = *count as f32 * inv;
+                                if w > 0.0 {
+                                    *weights.entry(hap.as_u32()).or_insert(0.0) += w;
+                                }
+                            }
+                        }
+
+                        if weights.is_empty() {
+                            return priors.clone();
+                        }
+
+                        let mut ids: Vec<GlobalHapId> = Vec::with_capacity(weights.len());
+                        let mut probs: Vec<f32> = Vec::with_capacity(weights.len());
+                        let mut sum = 0.0f32;
+                        for (id, w) in weights.into_iter() {
+                            if w.is_finite() && w > 0.0 {
+                                ids.push(GlobalHapId(id));
+                                probs.push(w);
+                                sum += w;
+                            }
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0 / sum;
+                            for p in probs.iter_mut() {
+                                *p *= inv;
+                            }
+                            HaplotypePriors::new(ids, probs)
+                        } else {
+                            priors.clone()
+                        }
+                    };
 
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
@@ -5121,8 +5171,9 @@ impl crate::pipelines::ImputationPipeline {
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         let decayed = decay_prior(p);
-                        hap1_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
-                        p1_out = decayed;
+                        let blended = blend_priors_with_donors(&decayed, &donors_h1, 0.25);
+                        hap1_posts = Some(posts_from_priors(&blended, &mut posts_probs_buf)?);
+                        p1_out = blended;
                     }
                 } else {
                     let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
@@ -5188,8 +5239,9 @@ impl crate::pipelines::ImputationPipeline {
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         let decayed = decay_prior(p);
-                        hap2_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
-                        p2_out = decayed;
+                        let blended = blend_priors_with_donors(&decayed, &donors_h2, 0.25);
+                        hap2_posts = Some(posts_from_priors(&blended, &mut posts_probs_buf)?);
+                        p2_out = blended;
                     }
                 } else {
                     let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
