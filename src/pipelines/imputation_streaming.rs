@@ -4,7 +4,8 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -659,33 +660,68 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<(usize, f32)> = scores
-        .iter()
-        .enumerate()
-        .filter(|&(_, &s)| s.is_finite() && s > 0.0)
-        .map(|(i, &s)| (i, s))
-        .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    if ranked.len() > k {
-        ranked.truncate(k);
-    }
-    ranked
+    select_top_k_heap(scores, k, true)
 }
 
 fn select_top_k_allow_zero(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<(usize, f32)> = scores
-        .iter()
-        .enumerate()
-        .filter(|&(_, &s)| s.is_finite())
-        .map(|(i, &s)| (i, s))
+    select_top_k_heap(scores, k, false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RankedScore {
+    idx: usize,
+    score: f32,
+}
+
+impl Eq for RankedScore {}
+
+impl Ord for RankedScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // All callers filter to finite scores, so this ordering is total.
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+impl PartialOrd for RankedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn select_top_k_heap(scores: &[f32], k: usize, require_positive: bool) -> Vec<(usize, f32)> {
+    let mut heap: BinaryHeap<Reverse<RankedScore>> = BinaryHeap::with_capacity(k.saturating_add(1));
+    for (idx, &score) in scores.iter().enumerate() {
+        if !score.is_finite() || (require_positive && score <= 0.0) {
+            continue;
+        }
+
+        let candidate = RankedScore { idx, score };
+        if heap.len() < k {
+            heap.push(Reverse(candidate));
+            continue;
+        }
+
+        let keep = heap
+            .peek()
+            .map(|lowest| candidate > lowest.0)
+            .unwrap_or(true);
+        if keep {
+            heap.pop();
+            heap.push(Reverse(candidate));
+        }
+    }
+
+    let mut ranked: Vec<(usize, f32)> = heap
+        .into_iter()
+        .map(|Reverse(r)| (r.idx, r.score))
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    if ranked.len() > k {
-        ranked.truncate(k);
-    }
     ranked
 }
 
