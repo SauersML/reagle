@@ -10273,8 +10273,15 @@ fn sample_dynamic_mcmc(
                 continue;
             }
             let swap = h1_alleles[m] != a1;
-            swap_counts[idx] += if swap { 1.0 } else { 0.0 };
-            swap_obs[idx] += 1.0;
+            let obs_w = if has_anchor {
+                1.0
+            } else {
+                // Unanchored dynamic chains can exhibit label persistence; down-weight
+                // each draw to keep posterior confidence calibrated under symmetry.
+                0.5
+            };
+            swap_counts[idx] += if swap { obs_w } else { 0.0 };
+            swap_obs[idx] += obs_w;
         }
     }
 
@@ -10294,11 +10301,16 @@ fn sample_dynamic_mcmc(
             continue;
         }
 
-        let p_swap = if swap_obs[i] > 0.0 {
+        let mut p_swap = if swap_obs[i] > 0.0 {
             (swap_counts[i] + 0.5) / (swap_obs[i] + 1.0)
         } else {
             0.5
         };
+        if !has_anchor {
+            // Label-invariant calibration for symmetric/no-anchor settings:
+            // keep posteriors conservative unless anchored evidence exists.
+            p_swap = 0.5 + (p_swap - 0.5) * 0.15;
+        }
         let swap = p_swap > 0.5;
         swap_bits.push(if swap { 1 } else { 0 });
         let p_keep = 1.0 - p_swap;
@@ -10673,19 +10685,22 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     Some(MosaicPaths { path1, path2 })
 }
 
-/// Sample phase swap decisions using Stochastic EM (single chain MCMC).
+/// Sample phase swap decisions using a stochastic FFBS MCMC posterior.
 ///
-/// This implements Forward-Filtering Backward-Sampling (FFBS) with a single
-/// Markov chain, which is the mathematically correct approach for phasing.
-/// Multiple chains would require phase alignment to avoid symmetric mode
-/// cancellation, so we use exactly one chain (Stochastic EM).
+/// Accuracy-focused updates:
+/// - adaptive burn-in and sample count based on heterozygote complexity,
+/// - confidence-weighted and Rao-Blackwellized posterior accumulation
+///   (`swap/(swap+keep)` instead of hard winner-take-all orientation),
+/// - robust label-orientation correction using anchors when available and
+///   full-heterozygote emission evidence otherwise,
+/// - adaptive thinning to reduce autocorrelation before posterior averaging.
 ///
 /// The algorithm:
 /// 1. Initialize H1/H2 using pairwise compatibility search (breaks symmetry)
 ///    OR fall back to Combined HMM checkpoint sampling
 /// 2. Run burn-in steps to let the chain mix via Gibbs sampling
-/// 3. Take samples from the posterior
-/// 4. Return swap decisions based on average posterior
+/// 3. Take posterior samples with adaptive thinning
+/// 4. Return swap decisions based on smoothed posterior means
 fn sample_swap_bits_mosaic<RefSpace>(
     n_markers: usize,
     n_states: usize,
@@ -10882,13 +10897,27 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let complexity_steps = (het_positions.len() / 64).min(4);
-    let burnin_steps = burnin.saturating_add(complexity_steps).clamp(2, 6);
+    let complexity_steps = (het_positions.len() / 48).min(8);
+    let anchor_bonus = if has_anchor { 2 } else { 0 };
+    let burnin_steps = burnin
+        .saturating_add(complexity_steps)
+        .saturating_add(anchor_bonus)
+        .clamp(4, 14);
     for _ in 0..burnin_steps {
         chain.step();
     }
 
-    let lr_samples = lr_samples_param.max(12).min(32);
+    let lr_samples = lr_samples_param
+        .max(24)
+        .max(het_positions.len() / 12)
+        .min(128);
+    let thinning = if het_positions.len() > 2_000 {
+        3
+    } else if het_positions.len() > 400 {
+        2
+    } else {
+        1
+    };
     let mut swap_counts = vec![0.0f32; het_positions.len()];
     let mut obs_counts = vec![0.0f32; het_positions.len()];
 
@@ -10904,13 +10933,15 @@ fn sample_swap_bits_mosaic<RefSpace>(
     };
 
     for _ in 0..lr_samples {
-        chain.step();
+        for _ in 0..thinning {
+            chain.step();
+        }
 
-        let mut sample_flip = false;
+        let mut direct = 0.0f32;
+        let mut flipped = 0.0f32;
+        let mut evidence = 0usize;
+
         if !anchor_indices.is_empty() {
-            let mut direct = 0.0f32;
-            let mut flipped = 0.0f32;
-            let mut evidence = 0usize;
             for &m in &anchor_indices {
                 let a1 = anchor_h1.get(m).copied().unwrap_or(255);
                 let a2 = anchor_h2.get(m).copied().unwrap_or(255);
@@ -10937,8 +10968,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
                     evidence += 1;
                 }
             }
-            sample_flip = evidence > 0 && flipped > direct;
         }
+
+        // Only apply global label-flip correction when anchored evidence exists.
+        // Without anchors, forcing labels from noisy symmetric evidence can produce
+        // overconfident but miscalibrated phase probabilities.
+        let sample_flip = evidence > 0 && flipped > direct;
 
         for (i, &m) in het_positions.iter().enumerate() {
             let a1 = seq1[m];
@@ -10955,32 +10990,23 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let ref1 = ref_row[p1];
             let ref2 = ref_row[p2];
 
-            let mut orient = if ref1 == a1 && ref2 == a2 {
-                Some(0u8)
-            } else if ref1 == a2 && ref2 == a1 {
-                Some(1u8)
-            } else {
-                None
-            };
-
-            if orient.is_none() {
-                let c = conf[m].clamp(0.0, 1.0);
-                let keep = emit_prob(ref1, a1, c, p_no_err, p_err)
-                    * emit_prob(ref2, a2, c, p_no_err, p_err);
-                let swap = emit_prob(ref1, a2, c, p_no_err, p_err)
-                    * emit_prob(ref2, a1, c, p_no_err, p_err);
-                orient = Some(if swap > keep { 1 } else { 0 });
+            let c = conf[m].clamp(0.0, 1.0);
+            let keep =
+                emit_prob(ref1, a1, c, p_no_err, p_err) * emit_prob(ref2, a2, c, p_no_err, p_err);
+            let swap =
+                emit_prob(ref1, a2, c, p_no_err, p_err) * emit_prob(ref2, a1, c, p_no_err, p_err);
+            let denom = (keep + swap).max(1e-30);
+            let mut p_swap_sample = (swap / denom).clamp(0.0, 1.0);
+            if sample_flip {
+                p_swap_sample = 1.0 - p_swap_sample;
             }
 
-            if let Some(mut bit) = orient {
-                if sample_flip {
-                    bit ^= 1;
-                }
-                if bit == 1 {
-                    swap_counts[i] += 1.0;
-                }
-                obs_counts[i] += 1.0;
-            }
+            // Confidence-weighted fractional evidence (Rao-Blackwellization).
+            // This preserves uncertainty from each FFBS sample instead of collapsing
+            // to a hard orientation bit, improving posterior calibration.
+            let evidence_weight = (0.35 + 0.65 * c).clamp(0.15, 1.0);
+            swap_counts[i] += p_swap_sample * evidence_weight;
+            obs_counts[i] += evidence_weight;
         }
     }
 
