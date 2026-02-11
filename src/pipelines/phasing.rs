@@ -11007,7 +11007,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let new_paths = MosaicPaths {
+    let mut new_paths = MosaicPaths {
         path1: chain.path1.clone(),
         path2: chain.path2.clone(),
     };
@@ -11152,22 +11152,55 @@ fn sample_swap_bits_mosaic<RefSpace>(
     workspace.fwd_block = buffers.fwd_block;
     workspace.combined_checkpoint_data = combined_checkpoints.into_buffer();
 
-    // Ensure returned paths are consistent with the swap decision.
-    // If swap_bits says "Swap" (1), the caller will flip the genotype (seq1 <-> seq2).
-    // We must ensure path1 corresponds to the incoming seq1 (old seq2).
-    // If path1 currently corresponds to old seq1, we must swap path1/path2.
-    // This aligns the HMM initialization for the next iteration with the updated genotype.
-    // new_paths corresponds to (use_seq1, use_seq2).
-    // If flipped_input is true, new_path1 emits use_seq1 (seq2).
-    // If swap_bits implies final_swap=1 (H1 gets seq2), then new_path1 matches.
-    // If swap_bits implies final_swap=0 (H1 gets seq1), then new_path1 (matching seq2) is wrong?
-    // Wait. If final_swap=0, it means p_swap_final < 0.5 => p_swap_hmm > 0.5 (if flipped).
-    // => HMM swapped.
-    // => HMM path1 matches use_seq2 (seq1).
-    // => new_path1 matches seq1.
-    // => Consistent with final_swap=0.
-    // So new_paths are implicitly consistent with the chosen orientation logic.
-    // No manual path permutation required.
+    // Consistency check: Ensure the returned HMM paths (which serve as the prior for the next
+    // iteration) are consistent with the genotype update decision encoded in `swap_bits`.
+    //
+    // `swap_bits[i] == 1` means the caller will swap `seq1` and `seq2` at marker `m`.
+    // We must ensure that `new_paths.path1[m]` corresponds to the allele that will end up in Haplotype 1.
+    //
+    // Without this check, stochastic variation in the chain (e.g. the last sample differing
+    // from the average posterior) can create a "phantom switch" where the genotype is updated
+    // to (A, B) but the prior for the next step believes it is (B, A), destabilizing the HMM.
+    let ref_flat = &workspace.ref_alleles_flat;
+    if !ref_flat.is_empty() {
+        for (i, &m) in het_positions.iter().enumerate() {
+            let swap = swap_bits[i] == 1;
+            // The allele that will reside in H1 after the caller applies `swap_bits`.
+            let target_h1_allele = if swap { seq2[m] } else { seq1[m] };
+            let target_h2_allele = if swap { seq1[m] } else { seq2[m] };
+
+            // If homozygous or missing, orientation is irrelevant.
+            if target_h1_allele == 255
+                || target_h2_allele == 255
+                || target_h1_allele == target_h2_allele
+            {
+                continue;
+            }
+
+            let p1_idx = new_paths.path1[m] as usize;
+            if p1_idx >= n_states_usize {
+                continue;
+            }
+
+            let offset = m * n_states_usize + p1_idx;
+            if offset >= ref_flat.len() {
+                continue;
+            }
+
+            let ref_a1 = ref_flat[offset];
+            if ref_a1 == 255 {
+                continue;
+            }
+
+            // If the path1 state emits an allele inconsistent with the target H1 allele,
+            // we assume it must belong to H2 (since it's a het), so we swap paths to align.
+            if ref_a1 != target_h1_allele {
+                let tmp = new_paths.path1[m];
+                new_paths.path1[m] = new_paths.path2[m];
+                new_paths.path2[m] = tmp;
+            }
+        }
+    }
 
     (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths)
 }
