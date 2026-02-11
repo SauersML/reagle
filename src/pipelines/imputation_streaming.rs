@@ -241,6 +241,7 @@ struct ImputationPlan {
     core_states: Vec<Vec<RefHapId>>, // per target hap (derived)
     window_intervals: Vec<Vec<HapIntervals>>, // per target hap (sparse)
     abyss_mask: Vec<BitVec<u64, Lsb0>>, // per target hap
+    fallback_ranked_haps: Vec<Vec<RefHapId>>, // per target hap (global score rank)
     per_window_cap: usize,
     per_window_caps: Vec<usize>, // per window (global, same for all target haps)
     full_panel: bool,
@@ -1503,6 +1504,7 @@ fn build_imputation_plan(
         core_states: vec![Vec::new(); n_target_haps],
         window_intervals: vec![Vec::new(); n_target_haps],
         abyss_mask: vec![BitVec::new(); n_target_haps],
+        fallback_ranked_haps: vec![Vec::new(); n_target_haps],
         per_window_cap: per_window_cap.max(1),
         per_window_caps: Vec::new(),
         full_panel: false,
@@ -1561,6 +1563,10 @@ fn build_imputation_plan(
         plan.full_panel = true;
         for _ in 0..n_target_haps {
             plan.stats.update(n_ref_haps, 0, 0);
+        }
+        for hap_idx in 0..n_target_haps {
+            plan.fallback_ranked_haps[hap_idx] =
+                (0..n_ref_haps).map(|h| RefHapId::new(h as u32)).collect();
         }
         eprintln!(
             "Pre-scan summary: skipped full panel in {:.1}s",
@@ -2317,11 +2323,17 @@ fn build_imputation_plan(
                 };
                 let core_len = core.len();
                 let intervals_len = intervals.len();
+                let fallback_ranked_haps: Vec<RefHapId> =
+                    select_top_k_allow_zero(&global_scores[i], n_ref_haps)
+                        .into_iter()
+                        .map(|(h, _)| RefHapId::new(h as u32))
+                        .collect();
                 Ok((
                     hap_idx,
                     abyss,
                     intervals,
                     core,
+                    fallback_ranked_haps,
                     core_len,
                     intervals_len,
                     abyss_count,
@@ -2329,11 +2341,21 @@ fn build_imputation_plan(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        for (hap_idx, abyss, intervals, core, core_len, intervals_len, abyss_count) in batch_results
+        for (
+            hap_idx,
+            abyss,
+            intervals,
+            core,
+            fallback_ranked_haps,
+            core_len,
+            intervals_len,
+            abyss_count,
+        ) in batch_results
         {
             plan.abyss_mask[hap_idx] = abyss;
             plan.window_intervals[hap_idx] = intervals;
             plan.core_states[hap_idx] = core;
+            plan.fallback_ranked_haps[hap_idx] = fallback_ranked_haps;
             plan.stats.update(
                 core_len,
                 intervals_len.saturating_sub(core_len),
@@ -4875,9 +4897,20 @@ impl crate::pipelines::ImputationPipeline {
                     }
 
                     if out.len() < k {
+                        let fallback_ranked = plan
+                            .fallback_ranked_haps
+                            .get(hap_idx.as_usize())
+                            .map(|v| v.as_slice())
+                            .unwrap_or(empty_haps);
+                        let remaining = k - out.len();
+                        fill_from(&mut out, &mut seen, fallback_ranked, remaining, k);
+                    }
+
+                    if out.len() < k {
                         // Deterministically complete the state set from the
                         // reference panel. This prevents silent under-filled
                         // state spaces when mixed sources do not cover `k`.
+                        // This is now a final guard after score-ranked fallback.
                         let abyss = if use_abyss {
                             plan.abyss_mask.get(hap_idx.as_usize())
                         } else {
