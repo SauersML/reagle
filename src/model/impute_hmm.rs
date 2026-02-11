@@ -10,6 +10,7 @@ use crate::data::storage::{
 };
 use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
+use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -460,6 +461,7 @@ pub struct ImputeWorkspace {
     pub emissions: Vec<f32>,
     pub fwd_checkpoints: Vec<f32>,
     pub fwd_scales: Vec<f32>,
+    pub weights: Vec<f32>,
     pub state_alleles: Vec<u8>,
     pub state_patterns: Vec<u16>,
     pub pattern_emissions: Vec<f32>,
@@ -579,6 +581,7 @@ impl ImputeWorkspace {
             emissions: vec![1.0; n_states],
             fwd_checkpoints: Vec::new(),
             fwd_scales: vec![1.0; n_markers],
+            weights: vec![1.0; n_states],
             state_alleles: vec![255u8; n_states],
             state_patterns: vec![0u16; n_states],
             pattern_emissions: Vec::new(),
@@ -608,6 +611,10 @@ impl ImputeWorkspace {
             self.fwd.resize(n_states, 0.0);
             self.bwd.resize(n_states, 1.0);
             self.emissions.resize(n_states, 1.0);
+            self.weights.resize(n_states, 1.0);
+        }
+        if self.weights.len() < n_states {
+            self.weights.resize(n_states, 1.0);
         }
         if self.state_alleles.len() < n_states {
             self.state_alleles.resize(n_states, 255);
@@ -1506,38 +1513,6 @@ fn transition_only_forward_update(
 }
 
 #[inline]
-fn forward_update_unweighted_emission(
-    fwd: &mut [f32],
-    emissions: &[f32],
-    fwd_sum: f32,
-    recomb_rate: f32,
-    transition_haps: usize,
-) -> f32 {
-    if fwd.is_empty() {
-        return 0.0;
-    }
-    let mut new_sum = 0.0f32;
-    if recomb_rate <= 0.0 {
-        for i in 0..fwd.len() {
-            let v = fwd[i] * emissions[i];
-            fwd[i] = v;
-            new_sum += v;
-        }
-        return new_sum.max(1e-30);
-    }
-    let denom = fwd_sum.max(1e-30);
-    let (stay_gap, shift) = subset_transition_params(recomb_rate, fwd.len(), transition_haps);
-    let scale = stay_gap / denom;
-    for i in 0..fwd.len() {
-        let transitioned = scale.mul_add(fwd[i], shift);
-        let v = transitioned * emissions[i];
-        fwd[i] = v;
-        new_sum += v;
-    }
-    new_sum.max(1e-30)
-}
-
-#[inline]
 fn transition_only_backward_update(
     bwd: &mut [f32],
     recomb_rate: f32,
@@ -1669,9 +1644,11 @@ fn fill_bwd_affine_coeffs(
     }
     let right = block_end - 1;
     let mut a = 1.0f64;
-    let mut b = 0.0f64;
+    let mut c = 0.0f64;
+    let mut s = 1.0f64; // sum-factor: sum(b_m) / sum(b_right)
     a_out[right - block_start] = a;
-    b_out[right - block_start] = b;
+    b_out[right - block_start] = c;
+    let k = active_states as f64;
     for m in (block_start + 1..right).rev() {
         let recomb_rate = marker_recomb_rate(p_recomb, m + 1);
         if recomb_rate > 0.0 {
@@ -1679,11 +1656,15 @@ fn fill_bwd_affine_coeffs(
                 subset_transition_params(recomb_rate, active_states, transition_haps);
             let stay = stay as f64;
             let shift = shift as f64;
-            a *= stay;
-            b = stay.mul_add(b, shift);
+            let a_new = stay * a;
+            let c_new = stay.mul_add(c, shift * s);
+            let s_new = (stay + shift * k) * s;
+            a = a_new;
+            c = c_new;
+            s = s_new;
         }
         a_out[m - block_start] = a;
-        b_out[m - block_start] = b;
+        b_out[m - block_start] = c;
     }
 }
 
@@ -1847,14 +1828,22 @@ fn forward_update_impl<C: RefColumnLike>(
             &mut ws.emission_by_allele,
             &mut ws.emissions[..active_states],
         );
-
-        forward_update_unweighted_emission(
-            &mut ws.fwd[..active_states],
-            &ws.emissions[..active_states],
-            1.0,
-            recomb_rate,
-            transition_haps,
-        )
+        if recomb_rate > 0.0 {
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                1.0,
+                recomb_rate,
+                transition_haps,
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
+                active_states,
+            )
+        } else {
+            for i in 0..active_states {
+                ws.fwd[i] *= ws.emissions[i];
+            }
+            ws.fwd[..active_states].iter().sum::<f32>().max(1e-30)
+        }
     };
 
     if next_sum <= 0.0 {
@@ -1907,14 +1896,22 @@ fn forward_update_seqcoded(
             let pid = seq_patterns.state_patterns[i] as usize;
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
-
-        forward_update_unweighted_emission(
-            &mut ws.fwd[..active_states],
-            &ws.emissions[..active_states],
-            1.0,
-            recomb_rate,
-            transition_haps,
-        )
+        if recomb_rate > 0.0 {
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                1.0,
+                recomb_rate,
+                transition_haps,
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
+                active_states,
+            )
+        } else {
+            for i in 0..active_states {
+                ws.fwd[i] *= ws.emissions[i];
+            }
+            ws.fwd[..active_states].iter().sum::<f32>().max(1e-30)
+        }
     };
 
     if next_sum <= 0.0 {
@@ -1972,14 +1969,22 @@ fn forward_update_dict(
             let pid = dict_patterns.state_patterns[i] as usize;
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
-
-        forward_update_unweighted_emission(
-            &mut ws.fwd[..active_states],
-            &ws.emissions[..active_states],
-            1.0,
-            recomb_rate,
-            transition_haps,
-        )
+        if recomb_rate > 0.0 {
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                1.0,
+                recomb_rate,
+                transition_haps,
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
+                active_states,
+            )
+        } else {
+            for i in 0..active_states {
+                ws.fwd[i] *= ws.emissions[i];
+            }
+            ws.fwd[..active_states].iter().sum::<f32>().max(1e-30)
+        }
     };
 
     if next_sum <= 0.0 {
@@ -2014,6 +2019,9 @@ fn run_impute_hmm_impl(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    if active_states > 0 {
+        ws.weights[..active_states].fill(1.0);
+    }
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
@@ -2252,6 +2260,11 @@ fn run_impute_hmm_impl(
                                     );
                                     let state_prob =
                                         affine_group_mass(forward_affine, backward_affine, stats);
+                                    let state_prob = if state_prob.is_finite() {
+                                        state_prob.max(0.0)
+                                    } else {
+                                        0.0
+                                    };
                                     ws.allele_probs[idx] += state_prob;
                                     subset_counts[idx] += state_prob;
                                     subset_total += state_prob;
@@ -2264,6 +2277,12 @@ fn run_impute_hmm_impl(
                                     backward_affine,
                                     missing_stats,
                                 );
+                                let missing_mass = if missing_mass.is_finite() {
+                                    missing_mass.max(0.0)
+                                } else {
+                                    0.0
+                                };
+                                total += missing_mass;
                                 if total > 0.0 {
                                     if missing_mass > 0.0 {
                                         let prior = if subset_total > 0.0 {
@@ -2317,14 +2336,18 @@ fn run_impute_hmm_impl(
                                         );
                                     }
                                 } else {
-                                    return Err(ReagleError::vcf(format!(
-                                        "Posterior mass collapse in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
-                                        context.window_idx,
-                                        context.sample_idx,
-                                        context.hap_idx,
-                                        m,
-                                        active_states
-                                    )));
+                                    if !warned_af_fallback {
+                                        eprintln!(
+                                            "[warn] posterior-mass fallback in impute_hmm (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                            context.window_idx,
+                                            context.sample_idx,
+                                            context.hap_idx,
+                                            m,
+                                            active_states
+                                        );
+                                        warned_af_fallback = true;
+                                    }
+                                    write_panel_freq_posterior(&mut posteriors[m], panel_priors, m);
                                 }
                                 if ws.allele_probs.len() == 2 {
                                     posteriors[m] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -2477,14 +2500,22 @@ fn run_impute_hmm_impl(
                                     );
                                 }
                             } else {
-                                return Err(ReagleError::vcf(format!(
-                                    "Posterior mass collapse in imputation HMM (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
-                                    context.window_idx,
-                                    context.sample_idx,
-                                    context.hap_idx,
+                                if !warned_af_fallback {
+                                    eprintln!(
+                                        "[warn] posterior-mass fallback in impute_hmm (dense/sparse): window={} sample={} hap={} marker={} active_states={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
+                                        m_rev,
+                                        active_states
+                                    );
+                                    warned_af_fallback = true;
+                                }
+                                write_panel_freq_posterior(
+                                    &mut posteriors[m_rev],
+                                    panel_priors,
                                     m_rev,
-                                    active_states
-                                )));
+                                );
                             }
                             if ws.allele_probs.len() == 2 {
                                 posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -2580,6 +2611,9 @@ fn run_impute_hmm_seqcoded(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    if active_states > 0 {
+        ws.weights[..active_states].fill(1.0);
+    }
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
@@ -2870,14 +2904,18 @@ fn run_impute_hmm_seqcoded(
                                         );
                                     }
                                 } else {
-                                    return Err(ReagleError::vcf(format!(
-                                        "Posterior mass collapse in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
-                                        context.window_idx,
-                                        context.sample_idx,
-                                        context.hap_idx,
-                                        m,
-                                        active_states
-                                    )));
+                                    if !warned_af_fallback {
+                                        eprintln!(
+                                            "[warn] posterior-mass fallback in impute_hmm (seqcoded): window={} sample={} hap={} marker={} active_states={}",
+                                            context.window_idx,
+                                            context.sample_idx,
+                                            context.hap_idx,
+                                            m,
+                                            active_states
+                                        );
+                                        warned_af_fallback = true;
+                                    }
+                                    write_panel_freq_posterior(&mut posteriors[m], panel_priors, m);
                                 }
                                 if ws.allele_probs.len() == 2 {
                                     posteriors[m] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -3033,14 +3071,22 @@ fn run_impute_hmm_seqcoded(
                                     );
                                 }
                             } else {
-                                return Err(ReagleError::vcf(format!(
-                                    "Posterior mass collapse in imputation HMM (seqcoded): window={} sample={} hap={} marker={} active_states={}",
-                                    context.window_idx,
-                                    context.sample_idx,
-                                    context.hap_idx,
+                                if !warned_af_fallback {
+                                    eprintln!(
+                                        "[warn] posterior-mass fallback in impute_hmm (seqcoded): window={} sample={} hap={} marker={} active_states={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
+                                        m_rev,
+                                        active_states
+                                    );
+                                    warned_af_fallback = true;
+                                }
+                                write_panel_freq_posterior(
+                                    &mut posteriors[m_rev],
+                                    panel_priors,
                                     m_rev,
-                                    active_states
-                                )));
+                                );
                             }
                             if ws.allele_probs.len() == 2 {
                                 posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -3131,6 +3177,9 @@ fn run_impute_hmm_dict(
     ws.resize(n_states, n_markers);
     let active_states = ws.active_states();
     let active_markers = ws.active_markers();
+    if active_states > 0 {
+        ws.weights[..active_states].fill(1.0);
+    }
     let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
     let transition_haps = panel_haps;
     // Compute distance-based shrinkage only when untyped markers exist.
@@ -3421,14 +3470,18 @@ fn run_impute_hmm_dict(
                                         );
                                     }
                                 } else {
-                                    return Err(ReagleError::vcf(format!(
-                                        "Posterior mass collapse in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
-                                        context.window_idx,
-                                        context.sample_idx,
-                                        context.hap_idx,
-                                        m,
-                                        active_states
-                                    )));
+                                    if !warned_af_fallback {
+                                        eprintln!(
+                                            "[warn] posterior-mass fallback in impute_hmm (dictionary): window={} sample={} hap={} marker={} active_states={}",
+                                            context.window_idx,
+                                            context.sample_idx,
+                                            context.hap_idx,
+                                            m,
+                                            active_states
+                                        );
+                                        warned_af_fallback = true;
+                                    }
+                                    write_panel_freq_posterior(&mut posteriors[m], panel_priors, m);
                                 }
                                 if ws.allele_probs.len() == 2 {
                                     posteriors[m] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
@@ -3584,14 +3637,22 @@ fn run_impute_hmm_dict(
                                     );
                                 }
                             } else {
-                                return Err(ReagleError::vcf(format!(
-                                    "Posterior mass collapse in imputation HMM (dictionary): window={} sample={} hap={} marker={} active_states={}",
-                                    context.window_idx,
-                                    context.sample_idx,
-                                    context.hap_idx,
+                                if !warned_af_fallback {
+                                    eprintln!(
+                                        "[warn] posterior-mass fallback in impute_hmm (dictionary): window={} sample={} hap={} marker={} active_states={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
+                                        m_rev,
+                                        active_states
+                                    );
+                                    warned_af_fallback = true;
+                                }
+                                write_panel_freq_posterior(
+                                    &mut posteriors[m_rev],
+                                    panel_priors,
                                     m_rev,
-                                    active_states
-                                )));
+                                );
                             }
                             if ws.allele_probs.len() == 2 {
                                 posteriors[m_rev] = AllelePosteriors::Biallelic(ws.allele_probs[1]);
