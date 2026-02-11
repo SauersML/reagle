@@ -5623,9 +5623,16 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         sp.swap_alleles(m);
                     }
 
+                    // WARNING: Do NOT add a calibrate_phase_confidence() shrinkage
+                    // step here. PR #756 tried shrinking unanchored phase confidence
+                    // to strength=0.18 (compressing all values to [0.50, 0.59]),
+                    // which destroyed the phase signal imputation depends on.
+                    // Result: concordance -0.000181, R² -0.000191, HOMALT -0.001461.
+                    // Phase confidence should be passed through as-is from the HMM.
                     for (m, p_orient) in het_phase_values {
                         sp.set_phase_confidence(m, p_orient);
                     }
+
 
                     let lr_threshold = self.params.lr_threshold;
                     for (m, lr) in het_lr_values {

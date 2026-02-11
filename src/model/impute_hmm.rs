@@ -1233,6 +1233,13 @@ fn apply_marker_prior_smoothing(
     warned_af_fallback: &mut bool,
     context: ImputeHmmContext,
 ) {
+    // WARNING: Do NOT extend this function to non-uniform untyped markers.
+    // PR #745 tried removing this guard and applying mild smoothing (0.25x mix,
+    // cap 0.2) to all untyped markers, plus adding an anti-collapse regularizer
+    // (35% panel blend) and 4x epsilon inflation for sparse windows. The triple
+    // stacking caused Hellinger +0.002166 with zero R² gain — same over-
+    // regularization failure mode as PR #746. Keep this guard: only uniform
+    // untyped markers need panel-frequency smoothing.
     if !untyped_uniform_marker {
         return;
     }

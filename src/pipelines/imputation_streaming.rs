@@ -265,6 +265,12 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     posterior.clamp(min_error, 0.5)
 }
 
+// WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
+// base=0.08 with cluster/err factors clamped to [0.5, 10.0] (up to 100x
+// combined), which pushed min_untyped_prior_mix to the 0.5 cap — replacing
+// half the posterior with panel frequencies. Result: R² -0.000726, HOMALT
+// -0.000730. The cubic ramp + mild factors below (clamped to [0.8, 1.6])
+// are intentionally conservative: local LD should dominate when data exists.
 #[inline]
 fn adaptive_untyped_prior_mix(
     observed_ratio: f32,
