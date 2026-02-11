@@ -6159,7 +6159,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             });
                             if prior_local.is_none() {
                                 let mut rp = RefAlleleProvider::new(subset_view, threaded_haps.as_ref());
-                                if let Some(local_best) = find_best_constant_pair_with_buffer(
+                                if let (Some(local_best), _) = find_best_constant_pair_with_buffer(
                                     n_hi_freq,
                                     n_states,
                                     &seq1,
@@ -10501,9 +10501,9 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     predecoded_ref_flat: Option<&[u8]>,
     scores: &mut Vec<f32>,
     hint: Option<&MosaicPaths>,
-) -> Option<MosaicPaths> {
+) -> (Option<MosaicPaths>, bool) {
     if n_states < 2 {
-        return None;
+        return (None, false);
     }
     // Bound compute on long windows by evaluating a sparse marker grid.
     const MAX_EVAL_MARKERS: usize = 2000;
@@ -10532,7 +10532,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         })
         .collect();
     if sparse_markers.is_empty() {
-        return None;
+        return (None, false);
     }
     let mut sparse_ref_rows = vec![255u8; sparse_markers.len() * n_states];
     for (row_i, &m) in sparse_markers.iter().enumerate() {
@@ -10574,7 +10574,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     }
 
     if informative == 0 {
-        return None;
+        return (None, false);
     }
 
     // For small panels or fully heterozygous targets, unary scores may be
@@ -10670,6 +10670,36 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         }
     }
 
+    let mut is_ambiguous = false;
+    if best_pairs.len() > 1 {
+        // Check for phase conflict among top candidates.
+        // If multiple best pairs imply different haplotypes at heterozygous sites,
+        // we have symmetric evidence. We still return the first pair to provide
+        // a coherent start, but flag it as ambiguous.
+        let first_pair = best_pairs[0];
+        for &(si, _) in &best_pairs[1..] {
+            for (row_i, &m) in sparse_markers.iter().enumerate() {
+                let a1 = seq1[m];
+                let a2 = seq2[m];
+                if a1 == 255 || a2 == 255 || a1 == a2 {
+                    continue;
+                }
+
+                let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
+                let a_p1 = ref_row[first_pair.0];
+                let a_si = ref_row[si];
+
+                if a_p1 != 255 && a_si != 255 && a_p1 != a_si {
+                    is_ambiguous = true;
+                    break;
+                }
+            }
+            if is_ambiguous {
+                break;
+            }
+        }
+    }
+
     // If best score is too low (worse than random), maybe don't use it?
     // But random initialization is also bad. This is likely the "least bad" start.
     // So we return it.
@@ -10677,7 +10707,7 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
     let path1 = vec![best_pair.0 as u32; n_markers];
     let path2 = vec![best_pair.1 as u32; n_markers];
 
-    Some(MosaicPaths { path1, path2 })
+    (Some(MosaicPaths { path1, path2 }), is_ambiguous)
 }
 
 /// Sample phase swap decisions using Stochastic EM (single chain MCMC).
@@ -10792,7 +10822,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
 
-    let heuristic_paths = find_best_constant_pair_with_buffer(
+    let (heuristic_paths, is_ambiguous) = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
         seq1,
@@ -11014,7 +11044,17 @@ fn sample_swap_bits_mosaic<RefSpace>(
             continue;
         }
 
-        let p_swap = (swap_counts[i] + 0.5) / (obs_counts[i] + 1.0);
+        // If we detected ambiguity in initialization and have no anchor evidence,
+        // we force low confidence (0.5) to avoid confident locking into an arbitrary mode.
+        // This preserves the "random choice" for phasing (point estimate) while correctly
+        // reporting high uncertainty for Brier scores.
+        let force_ambiguous = is_ambiguous && obs_counts[i] > 0.0 && !has_anchor;
+
+        let p_swap = if force_ambiguous {
+            0.5
+        } else {
+            (swap_counts[i] + 0.5) / (obs_counts[i] + 1.0)
+        };
         let p_keep = 1.0 - p_swap;
         let chosen_swap = p_swap > 0.5;
         swap_bits.push(chosen_swap as u8);
@@ -13277,7 +13317,9 @@ mod tests {
         // The algorithm previously returned None, but this destroys structure.
         // We now pick one arbitrarily.
 
+        let (paths, is_ambiguous) = paths;
         assert!(paths.is_some(), "Expected ambiguity to be resolved arbitrarily, not None");
+        assert!(is_ambiguous, "Expected ambiguity flag to be true");
     }
 
     #[test]
@@ -13308,7 +13350,7 @@ mod tests {
         let conf = vec![1.0f32; n_markers];
         let mut scores = Vec::new();
 
-        let paths = find_best_constant_pair_with_buffer(
+        let (paths, is_ambiguous) = find_best_constant_pair_with_buffer(
             n_markers,
             n_states,
             &seq1,
@@ -13324,6 +13366,10 @@ mod tests {
         assert!(
             paths.is_some(),
             "long-window heuristic should not be disabled"
+        );
+        assert!(
+            !is_ambiguous,
+            "Expected hero/distractor setup to be unambiguous"
         );
     }
 
