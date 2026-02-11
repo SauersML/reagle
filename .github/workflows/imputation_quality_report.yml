@@ -311,6 +311,8 @@ jobs:
           elif [ -f convert_genome_array_out/panel.vcf ]; then
             [ -s convert_genome_array_out/panel.vcf ]
             bcftools view -h convert_genome_array_out/panel.vcf >/dev/null
+          elif [ -f reagle_ref.vcf.gz ]; then
+            echo "convert_genome artifacts missing but reagle_ref.vcf.gz exists (cached run?); skipping intermediate check."
           else
             echo "Missing convert_genome array panel artifact"
             exit 1

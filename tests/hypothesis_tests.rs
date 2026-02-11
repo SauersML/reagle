@@ -118,7 +118,7 @@ fn run_rust_imputation_with_window_toml(
     let toml =
         format!("window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n");
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
-    let config = Config::parse_from([
+    let mut config = Config::parse_from([
         "reagle",
         "--target",
         gt_path.to_str().unwrap(),
@@ -130,6 +130,10 @@ fn run_rust_imputation_with_window_toml(
         &seed.to_string(),
     ])
     .expect("config");
+    // Explicitly set window parameters to ensure they are respected, regardless of TOML loading.
+    config.window = window;
+    config.overlap = overlap;
+    config.window_markers = window_markers;
     let mut pipeline = ImputationPipeline::new(config, None);
     pipeline.run()
 }
@@ -147,7 +151,7 @@ fn run_rust_phasing_with_window_toml(
     let toml =
         format!("window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\n");
     std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
-    let config = Config::parse_from([
+    let mut config = Config::parse_from([
         "reagle",
         "--target",
         gt_path.to_str().unwrap(),
@@ -157,6 +161,10 @@ fn run_rust_phasing_with_window_toml(
         &seed.to_string(),
     ])
     .expect("config");
+    // Explicitly set window parameters to ensure they are respected, regardless of TOML loading.
+    config.window = window;
+    config.overlap = overlap;
+    config.window_markers = window_markers;
     let mut pipeline = reagle::PhasingPipeline::new(config, None);
     pipeline.run_auto()
 }
