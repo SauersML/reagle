@@ -2342,7 +2342,7 @@ fn test_phase_state_capacity_should_not_change_output_on_simple_ld() {
 
     let mut total_mismatches = 0usize;
     let mut worst_mismatches = 0usize;
-    let seeds = [12345];
+    let seeds = [12345, 23456, 34567];
     for (run_idx, seed) in seeds.iter().copied().enumerate() {
         let out_low = work_dir.path().join(format!("out_low_{}", run_idx));
         run_rust_phasing_with_states(&target_vcf, &out_low, seed, 64)

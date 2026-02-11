@@ -468,7 +468,6 @@ pub struct ImputeWorkspace {
     pub allele_probs: Vec<f32>,
     subset_counts: Vec<f32>,
     smoothing_prior_counts: Vec<f32>,
-    state_posterior_scratch: Vec<f32>,
     allele_prior_scratch: Vec<f32>,
     dict_pattern_alleles: Vec<u8>,
     emission_by_allele: Vec<f32>,
@@ -588,7 +587,6 @@ impl ImputeWorkspace {
             allele_probs: Vec::new(),
             subset_counts: Vec::new(),
             smoothing_prior_counts: Vec::new(),
-            state_posterior_scratch: Vec::new(),
             allele_prior_scratch: Vec::new(),
             dict_pattern_alleles: Vec::new(),
             emission_by_allele: Vec::new(),
@@ -681,13 +679,6 @@ impl ImputeWorkspace {
     #[inline]
     pub fn active_markers(&self) -> usize {
         self.active_markers
-    }
-
-    #[inline]
-    fn ensure_state_posterior_scratch(&mut self, n_states: usize) {
-        if self.state_posterior_scratch.len() < n_states {
-            self.state_posterior_scratch.resize(n_states, 0.0);
-        }
     }
 
     #[inline]
@@ -1763,10 +1754,6 @@ impl ForwardAffine {
         }
     }
 
-    #[inline]
-    fn apply(self, x: f32) -> f32 {
-        self.a.mul_add(x, self.b)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1784,10 +1771,6 @@ impl BackwardAffine {
         }
     }
 
-    #[inline]
-    fn apply(self, x: f32) -> f32 {
-        self.a.mul_add(x, self.add)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2094,7 +2077,7 @@ fn run_impute_hmm_impl(
     ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
-    let mut final_prior_state_post: Option<Vec<f32>> = None;
+    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
     let current_error = error_rate;
 
@@ -2137,6 +2120,9 @@ fn run_impute_hmm_impl(
                 active_states,
                 transition_haps,
             );
+            if is_final && prior_marker_idx == Some(m) {
+                forward_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+            }
             ws.store_checkpoint(cp_idx, active_states);
             prev_marker = m + 1;
         }
@@ -2212,33 +2198,12 @@ fn run_impute_hmm_impl(
                         }
                         let probs = target_probs.probs_for_marker_normalized(m);
                         let n_alleles = probs.len();
-                        if prior_marker_idx == Some(m) {
-                            ws.ensure_state_posterior_scratch(active_states);
-                        }
                         if is_final && n_alleles > 0 {
                             ws.ensure_subset_counts(n_alleles);
                             ws.ensure_smoothing_prior_counts(n_alleles);
                         }
                         let a_bwd_m = ws.bwd_affine_a[m - block_start] as f32;
                         let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
-                        if prior_marker_idx == Some(m) {
-                            let gamma = &mut ws.state_posterior_scratch[..active_states];
-                            let mut sum = 0.0f32;
-                            for i in 0..active_states {
-                                let fwd_i = (a_fwd as f32).mul_add(ws.fwd[i], b_fwd as f32);
-                                let bwd_i = a_bwd_m.mul_add(ws.bwd[i], b_bwd_m * bwd_sum_right);
-                                let g = (fwd_i * bwd_i).max(0.0);
-                                gamma[i] = g;
-                                sum += g;
-                            }
-                            if sum > 0.0 {
-                                let inv = 1.0f32 / sum;
-                                for g in gamma.iter_mut() {
-                                    *g *= inv;
-                                }
-                                final_prior_state_post = Some(gamma.to_vec());
-                            }
-                        }
                         if is_final {
                             ws.allele_probs.clear();
                             if n_alleles > 0 {
@@ -2434,30 +2399,11 @@ fn run_impute_hmm_impl(
                 } else {
                     let probs = target_probs.probs_for_marker_normalized(m_rev);
                     let n_alleles = probs.len();
-                    if prior_marker_idx == Some(m_rev) {
-                        ws.ensure_state_posterior_scratch(active_states);
-                    }
                     if is_final && n_alleles > 0 {
                         ws.ensure_subset_counts(n_alleles);
                         ws.ensure_smoothing_prior_counts(n_alleles);
                     }
                     let fwd_slice = &ws.fwd[..active_states];
-                    if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
-                        let mut sum = 0.0f32;
-                        for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
-                            }
-                            final_prior_state_post = Some(gamma.to_vec());
-                        }
-                    }
                     let ref_alleles = refresh_ref_alleles(
                         &ref_columns[m_rev],
                         state_haps,
@@ -2640,7 +2586,7 @@ fn run_impute_hmm_impl(
         }
     }
 
-    Ok((final_posteriors, final_prior_state_post))
+    Ok((final_posteriors, forward_prior_state_post))
 }
 
 fn run_impute_hmm_seqcoded(
@@ -2687,7 +2633,7 @@ fn run_impute_hmm_seqcoded(
     ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
-    let mut final_prior_state_post: Option<Vec<f32>> = None;
+    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
     let current_error = error_rate;
 
@@ -2732,6 +2678,9 @@ fn run_impute_hmm_seqcoded(
                 transition_haps,
                 &mut last_hap_ptr,
             );
+            if is_final && prior_marker_idx == Some(m) {
+                forward_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+            }
             ws.store_checkpoint(cp_idx, active_states);
             prev_marker = m + 1;
         }
@@ -2805,9 +2754,6 @@ fn run_impute_hmm_seqcoded(
                         }
                         let probs = target_probs.probs_for_marker_normalized(m);
                         let n_alleles = probs.len();
-                        if prior_marker_idx == Some(m) {
-                            ws.ensure_state_posterior_scratch(active_states);
-                        }
                         if is_final && n_alleles > 0 {
                             ws.ensure_subset_counts(n_alleles);
                             ws.ensure_smoothing_prior_counts(n_alleles);
@@ -2840,24 +2786,6 @@ fn run_impute_hmm_seqcoded(
                         let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
                         let forward_affine = ForwardAffine::from_f64(a_fwd, b_fwd);
                         let backward_affine = BackwardAffine::new(a_bwd_m, b_bwd_m, bwd_sum_right);
-                        if prior_marker_idx == Some(m) {
-                            let gamma = &mut ws.state_posterior_scratch[..active_states];
-                            let mut sum = 0.0f32;
-                            for i in 0..active_states {
-                                let fwd_i = forward_affine.apply(ws.fwd[i]);
-                                let bwd_i = backward_affine.apply(ws.bwd[i]);
-                                let g = (fwd_i * bwd_i).max(0.0);
-                                gamma[i] = g;
-                                sum += g;
-                            }
-                            if sum > 0.0 {
-                                let inv = 1.0f32 / sum;
-                                for g in gamma.iter_mut() {
-                                    *g *= inv;
-                                }
-                                final_prior_state_post = Some(gamma.to_vec());
-                            }
-                        }
                         if is_final {
                             ws.allele_probs.clear();
                             if n_alleles > 0 {
@@ -2998,9 +2926,6 @@ fn run_impute_hmm_seqcoded(
                 let probs = target_probs.probs_for_marker_normalized(m_rev);
                 let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                 let n_alleles = probs.len();
-                if prior_marker_idx == Some(m_rev) {
-                    ws.ensure_state_posterior_scratch(active_states);
-                }
                 if is_final && n_alleles > 0 {
                     ws.ensure_subset_counts(n_alleles);
                     ws.ensure_smoothing_prior_counts(n_alleles);
@@ -3020,23 +2945,6 @@ fn run_impute_hmm_seqcoded(
                     write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                 } else {
                     let fwd_slice = &ws.fwd[..active_states];
-                    if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
-                        let mut sum = 0.0f32;
-                        for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
-                            }
-                            final_prior_state_post = Some(gamma.to_vec());
-                        }
-                    }
-
                     if is_final {
                         ws.allele_probs.clear();
                         if n_alleles > 0 {
@@ -3197,7 +3105,7 @@ fn run_impute_hmm_seqcoded(
         }
     }
 
-    Ok((final_posteriors, final_prior_state_post))
+    Ok((final_posteriors, forward_prior_state_post))
 }
 
 fn run_impute_hmm_dict(
@@ -3244,7 +3152,7 @@ fn run_impute_hmm_dict(
     ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
-    let mut final_prior_state_post: Option<Vec<f32>> = None;
+    let mut forward_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
     let current_error = error_rate;
     let final_pass = 0usize;
@@ -3288,6 +3196,9 @@ fn run_impute_hmm_dict(
                 transition_haps,
                 &mut last_dict_ptr,
             );
+            if is_final && prior_marker_idx == Some(m) {
+                forward_prior_state_post = Some(ws.fwd[..active_states].to_vec());
+            }
             ws.store_checkpoint(cp_idx, active_states);
             prev_marker = m + 1;
         }
@@ -3361,9 +3272,6 @@ fn run_impute_hmm_dict(
                         }
                         let probs = target_probs.probs_for_marker_normalized(m);
                         let n_alleles = probs.len();
-                        if prior_marker_idx == Some(m) {
-                            ws.ensure_state_posterior_scratch(active_states);
-                        }
                         if is_final && n_alleles > 0 {
                             ws.ensure_subset_counts(n_alleles);
                             ws.ensure_smoothing_prior_counts(n_alleles);
@@ -3396,24 +3304,6 @@ fn run_impute_hmm_dict(
                         let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
                         let forward_affine = ForwardAffine::from_f64(a_fwd, b_fwd);
                         let backward_affine = BackwardAffine::new(a_bwd_m, b_bwd_m, bwd_sum_right);
-                        if prior_marker_idx == Some(m) {
-                            let gamma = &mut ws.state_posterior_scratch[..active_states];
-                            let mut sum = 0.0f32;
-                            for i in 0..active_states {
-                                let fwd_i = forward_affine.apply(ws.fwd[i]);
-                                let bwd_i = backward_affine.apply(ws.bwd[i]);
-                                let g = (fwd_i * bwd_i).max(0.0);
-                                gamma[i] = g;
-                                sum += g;
-                            }
-                            if sum > 0.0 {
-                                let inv = 1.0f32 / sum;
-                                for g in gamma.iter_mut() {
-                                    *g *= inv;
-                                }
-                                final_prior_state_post = Some(gamma.to_vec());
-                            }
-                        }
                         if is_final {
                             ws.allele_probs.clear();
                             if n_alleles > 0 {
@@ -3555,9 +3445,6 @@ fn run_impute_hmm_dict(
                 let probs = target_probs.probs_for_marker_normalized(m_rev);
                 let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                 let n_alleles = probs.len();
-                if prior_marker_idx == Some(m_rev) {
-                    ws.ensure_state_posterior_scratch(active_states);
-                }
                 if is_final && n_alleles > 0 {
                     ws.ensure_subset_counts(n_alleles);
                     ws.ensure_smoothing_prior_counts(n_alleles);
@@ -3577,23 +3464,6 @@ fn run_impute_hmm_dict(
                     write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
                 } else {
                     let fwd_slice = &ws.fwd[..active_states];
-                    if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
-                        let mut sum = 0.0f32;
-                        for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
-                            }
-                            final_prior_state_post = Some(gamma.to_vec());
-                        }
-                    }
-
                     if is_final {
                         ws.allele_probs.clear();
                         if n_alleles > 0 {
@@ -3754,7 +3624,7 @@ fn run_impute_hmm_dict(
         }
     }
 
-    Ok((final_posteriors, final_prior_state_post))
+    Ok((final_posteriors, forward_prior_state_post))
 }
 
 /// Run forward-backward HMM and emit allele posteriors.
