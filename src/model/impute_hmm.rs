@@ -1178,6 +1178,11 @@ fn smooth_allele_posteriors_subset(
     }
     let max_effective = allele_probs.len().max(1) as f32;
     let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
+    // WARNING: Do NOT multiply nearest_obs_lambda by a gain factor here
+    // (e.g. `* 8.0`). Amplifying lambda causes exp(-lambda*8) to decay to
+    // near-zero even for short gaps, replacing posteriors with population
+    // frequencies and destroying local LD signal. Tested in PR #746:
+    // Hellinger +0.0037 (worst of all PRs), HET accuracy -0.0025.
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
     // Pseudo-count mass should track information decay only. Extra gain
     // over-regularizes sparse arrays and can collapse rare-allele posteriors.
@@ -2581,6 +2586,16 @@ fn run_impute_hmm_impl(
         }
 
         if is_final {
+            // WARNING: Do NOT add a post-HMM posterior interpolation pass here
+            // (e.g. LD-bridge that overwrites untyped marker posteriors with
+            // distance-weighted averages of typed anchor posteriors). The HMM
+            // forward-backward posteriors already encode full LD structure
+            // through the state space; replacing them with naive anchor
+            // interpolation destroys this signal. Deep-untyped regions get
+            // bridge_strength approaching 0.95, overwriting nearly the entire
+            // posterior. Panel-prior mixing up to 35% further dilutes toward
+            // population frequencies. Tested in PR #741: R² -0.008,
+            // SEN -0.0013 — second worst accuracy regression observed.
             final_posteriors = posteriors;
         }
     }

@@ -5053,6 +5053,13 @@ impl crate::pipelines::ImputationPipeline {
                         None
                     };
 
+                    // WARNING: Do NOT add a second-pass HMM re-run here that feeds
+                    // first-pass posteriors back as priors. This creates circular
+                    // self-reinforcement: errors in pass 1 get amplified in pass 2,
+                    // causing posterior collapse on rare alleles. Tightening the
+                    // emission error for the second pass makes it worse by increasing
+                    // confidence in wrong states. Tested in PR #755: R² -0.009,
+                    // SEN -0.0018 — catastrophic accuracy regression.
                     let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
@@ -5309,6 +5316,12 @@ impl crate::pipelines::ImputationPipeline {
 
         let output_markers = output_end.saturating_sub(output_start);
         let mut sm_alt_probs_by_hap: Vec<Option<Vec<f32>>> = vec![None; n_target_haps];
+        // WARNING: Do NOT expand sm_haps to all target haplotypes (e.g. by
+        // adding `|| output_markers > 0`). Computing SM donor traces for every
+        // haplotype wastes ~97s per run and the downstream PBWT blending it
+        // enables (see dosage warning below) harms accuracy. Only haplotypes
+        // that actually need the SM fallback path should be included.
+        // Tested in PR #758: R² -0.0012, +97s slower.
         let sm_haps: Vec<usize> = sm_needed
             .iter()
             .enumerate()
@@ -6312,6 +6325,13 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         0.0
                     };
+                // WARNING: Do NOT blend PBWT donor alt-probs into these
+                // dosages (e.g. `0.55 * HMM + 0.45 * PBWT`). The PBWT donor
+                // trace is a heuristic match signal, not a calibrated posterior.
+                // A 45% weight injects massive wrong signal when the best PBWT
+                // donor carries the wrong allele (common at low-MAF sites),
+                // corrupting dosage calibration. Tested in PR #758: R² -0.0012,
+                // Hellinger +0.001, +97s slower.
                 let d1 = hap_dosage(&result.hap_posteriors.0, &result.hap_alt_probs.0);
                 let d2 = hap_dosage(&result.hap_posteriors.1, &result.hap_alt_probs.1);
                 d1 + d2
