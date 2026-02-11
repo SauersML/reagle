@@ -8435,6 +8435,131 @@ fn compute_label_switch_transition_logs(
     out
 }
 
+#[inline]
+fn logsumexp2(a: f32, b: f32) -> f32 {
+    let m = a.max(b);
+    if !m.is_finite() {
+        return m;
+    }
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+/// Decode orientation states across heterozygotes with a two-state HMM.
+///
+/// Returns `(map_states, posterior_p_swap, lr_for_map_state)`.
+fn decode_orientation_hmm(
+    raw_swap_probs: &[f32],
+    transition_logs: &[(f32, f32)],
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    if raw_swap_probs.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+
+    let n = raw_swap_probs.len();
+    let mut emit0 = vec![0.0f32; n];
+    let mut emit1 = vec![0.0f32; n];
+    for (i, &p1_raw) in raw_swap_probs.iter().enumerate() {
+        let p1 = p1_raw.clamp(1e-6, 1.0 - 1e-6);
+        emit1[i] = p1.ln();
+        emit0[i] = (1.0 - p1).clamp(1e-6, 1.0 - 1e-6).ln();
+    }
+
+    // Viterbi path for globally consistent MAP orientation.
+    let mut dp0 = vec![f32::NEG_INFINITY; n];
+    let mut dp1 = vec![f32::NEG_INFINITY; n];
+    let mut back = vec![0u8; n];
+    dp0[0] = emit0[0];
+    dp1[0] = emit1[0];
+    for i in 1..n {
+        let (stay, sw) = transition_logs
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| ((1.0 - 0.01f32).ln(), 0.01f32.ln()));
+
+        let from0_to0 = dp0[i - 1] + stay;
+        let from1_to0 = dp1[i - 1] + sw;
+        if from0_to0 >= from1_to0 {
+            dp0[i] = from0_to0 + emit0[i];
+            back[i] = 0;
+        } else {
+            dp0[i] = from1_to0 + emit0[i];
+            back[i] = 1;
+        }
+
+        let from0_to1 = dp0[i - 1] + sw;
+        let from1_to1 = dp1[i - 1] + stay;
+        if from0_to1 >= from1_to1 {
+            dp1[i] = from0_to1 + emit1[i];
+        } else {
+            dp1[i] = from1_to1 + emit1[i];
+            back[i] |= 2;
+        }
+    }
+
+    let mut states = vec![0u8; n];
+    let mut state = if dp1[n - 1] > dp0[n - 1] { 1 } else { 0 };
+    for i in (0..n).rev() {
+        states[i] = state;
+        if i == 0 {
+            break;
+        }
+        let prev = back[i];
+        state = if state == 0 {
+            prev & 1
+        } else if (prev & 2) != 0 {
+            1
+        } else {
+            0
+        };
+    }
+
+    // Forward-backward posteriors provide calibrated confidence masses.
+    let mut alpha0 = vec![f32::NEG_INFINITY; n];
+    let mut alpha1 = vec![f32::NEG_INFINITY; n];
+    alpha0[0] = emit0[0];
+    alpha1[0] = emit1[0];
+    for i in 1..n {
+        let (stay, sw) = transition_logs
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| ((1.0 - 0.01f32).ln(), 0.01f32.ln()));
+        alpha0[i] = emit0[i] + logsumexp2(alpha0[i - 1] + stay, alpha1[i - 1] + sw);
+        alpha1[i] = emit1[i] + logsumexp2(alpha1[i - 1] + stay, alpha0[i - 1] + sw);
+    }
+
+    let mut beta0 = vec![0.0f32; n];
+    let mut beta1 = vec![0.0f32; n];
+    for i in (0..n.saturating_sub(1)).rev() {
+        let (stay, sw) = transition_logs
+            .get(i + 1)
+            .copied()
+            .unwrap_or_else(|| ((1.0 - 0.01f32).ln(), 0.01f32.ln()));
+        beta0[i] = logsumexp2(
+            stay + emit0[i + 1] + beta0[i + 1],
+            sw + emit1[i + 1] + beta1[i + 1],
+        );
+        beta1[i] = logsumexp2(
+            stay + emit1[i + 1] + beta1[i + 1],
+            sw + emit0[i + 1] + beta0[i + 1],
+        );
+    }
+
+    let mut posterior_p_swap = vec![0.5f32; n];
+    let mut lr = vec![1.0f32; n];
+    for i in 0..n {
+        let z = logsumexp2(alpha0[i] + beta0[i], alpha1[i] + beta1[i]);
+        let log_p1 = alpha1[i] + beta1[i] - z;
+        let p1 = log_p1.exp().clamp(1e-6, 1.0 - 1e-6);
+        posterior_p_swap[i] = p1;
+
+        let p_chosen = if states[i] == 1 { p1 } else { 1.0 - p1 };
+        let p_other = 1.0 - p_chosen;
+        lr[i] = (p_chosen / p_other.max(1e-6)).clamp(1.0, 1e6);
+    }
+
+    (states, posterior_p_swap, lr)
+}
+
 fn build_fwd_checkpoints<RefSpace>(
     checkpoints: &mut FwdCheckpoints,
     n_markers: usize,
@@ -10321,63 +10446,15 @@ fn sample_dynamic_mcmc(
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
     }
-    if !swap_probs.is_empty() {
+    let swap_probs_conf = if !swap_probs.is_empty() {
         let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
-        let mut dp0 = vec![f32::NEG_INFINITY; swap_probs.len()];
-        let mut dp1 = vec![f32::NEG_INFINITY; swap_probs.len()];
-        let mut prev_state = vec![0u8; swap_probs.len()];
-        for i in 0..swap_probs.len() {
-            let p1 = swap_probs[i].clamp(1e-6, 1.0 - 1e-6);
-            let p0 = (1.0 - p1).clamp(1e-6, 1.0 - 1e-6);
-            let e0 = p0.ln();
-            let e1 = p1.ln();
-            if i == 0 {
-                dp0[i] = e0;
-                dp1[i] = e1;
-                continue;
-            }
-            let (stay, sw) = transition_logs
-                .get(i)
-                .copied()
-                .unwrap_or_else(|| ((1.0 - 0.01f32).ln(), 0.01f32.ln()));
-            let from0_to0 = dp0[i - 1] + stay;
-            let from1_to0 = dp1[i - 1] + sw;
-            if from0_to0 >= from1_to0 {
-                dp0[i] = from0_to0 + e0;
-                prev_state[i] = 0;
-            } else {
-                dp0[i] = from1_to0 + e0;
-                prev_state[i] = 1;
-            }
-            let from0_to1 = dp0[i - 1] + sw;
-            let from1_to1 = dp1[i - 1] + stay;
-            if from0_to1 >= from1_to1 {
-                dp1[i] = from0_to1 + e1;
-            } else {
-                dp1[i] = from1_to1 + e1;
-                prev_state[i] |= 2;
-            }
-        }
-        let mut state = if dp1[swap_probs.len() - 1] > dp0[swap_probs.len() - 1] {
-            1u8
-        } else {
-            0u8
-        };
-        for i in (0..swap_probs.len()).rev() {
-            swap_bits[i] = state;
-            if i == 0 {
-                break;
-            }
-            let prev = prev_state[i];
-            if state == 0 {
-                state = prev & 1;
-            } else {
-                state = if (prev & 2) != 0 { 1 } else { 0 };
-            }
-        }
-    }
-
-    let swap_probs_conf = swap_probs.clone();
+        let (decoded_bits, posterior_probs, _) =
+            decode_orientation_hmm(&swap_probs, &transition_logs);
+        swap_bits = decoded_bits;
+        posterior_probs
+    } else {
+        swap_probs.clone()
+    };
     {
         let mut path1_switches = 0usize;
         let mut path2_switches = 0usize;
@@ -11025,62 +11102,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     if !het_positions.is_empty() {
         let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
-        let mut dp0 = vec![f32::NEG_INFINITY; het_positions.len()];
-        let mut dp1 = vec![f32::NEG_INFINITY; het_positions.len()];
-        let mut prev_state = vec![0u8; het_positions.len()];
-
-        for i in 0..het_positions.len() {
-            let p_swap = swap_probs[i].clamp(1e-6, 1.0 - 1e-6);
-            let p_keep = (1.0 - p_swap).clamp(1e-6, 1.0 - 1e-6);
-            let emit0 = p_keep.ln();
-            let emit1 = p_swap.ln();
-
-            if i == 0 {
-                dp0[i] = emit0;
-                dp1[i] = emit1;
-            } else {
-                let (stay, sw) = transition_logs
-                    .get(i)
-                    .copied()
-                    .unwrap_or_else(|| ((1.0 - 0.01f32).ln(), 0.01f32.ln()));
-                let from0_to0 = dp0[i - 1] + stay;
-                let from1_to0 = dp1[i - 1] + sw;
-                if from0_to0 >= from1_to0 {
-                    dp0[i] = from0_to0 + emit0;
-                    prev_state[i] = 0;
-                } else {
-                    dp0[i] = from1_to0 + emit0;
-                    prev_state[i] = 1;
-                }
-
-                let from0_to1 = dp0[i - 1] + sw;
-                let from1_to1 = dp1[i - 1] + stay;
-                if from0_to1 >= from1_to1 {
-                    dp1[i] = from0_to1 + emit1;
-                } else {
-                    dp1[i] = from1_to1 + emit1;
-                    prev_state[i] |= 2;
-                }
-            }
-        }
-
-        let mut state = if dp1[het_positions.len() - 1] > dp0[het_positions.len() - 1] {
-            1u8
-        } else {
-            0u8
-        };
-        for idx in (0..het_positions.len()).rev() {
-            swap_bits[idx] = state;
-            if idx == 0 {
-                break;
-            }
-            let prev = prev_state[idx];
-            if state == 0 {
-                state = prev & 1;
-            } else {
-                state = if (prev & 2) != 0 { 1 } else { 0 };
-            }
-        }
+        let (decoded_bits, posterior_probs, _) =
+            decode_orientation_hmm(&swap_probs, &transition_logs);
+        swap_bits = decoded_bits;
+        swap_probs_conf = posterior_probs;
     }
 
     workspace.fwd = buffers.fwd.into_avec();
@@ -13365,5 +13390,35 @@ mod tests {
             .fold(f32::NEG_INFINITY, f32::max);
         assert!(min_p.is_finite() && max_p.is_finite());
         assert!(max_p > min_p);
+    }
+
+    #[test]
+    fn test_decode_orientation_hmm_smooths_singleton_flip() {
+        let raw = vec![0.01, 0.02, 0.99, 0.03, 0.02];
+        let mut trans = vec![(0.0f32, 0.0f32); raw.len()];
+        for t in trans.iter_mut().skip(1) {
+            *t = ((1.0 - 1e-4f32).ln(), (1e-4f32).ln());
+        }
+
+        let (states, posterior, lr) = decode_orientation_hmm(&raw, &trans);
+        assert_eq!(states.len(), raw.len());
+        assert!(states.iter().all(|&s| s == 0));
+        assert_eq!(posterior.len(), raw.len());
+        assert_eq!(lr.len(), raw.len());
+        assert!(lr.iter().all(|v| v.is_finite() && *v >= 1.0));
+    }
+
+    #[test]
+    fn test_decode_orientation_hmm_tracks_real_block_switch() {
+        let raw = vec![0.02, 0.01, 0.03, 0.96, 0.98, 0.95];
+        let mut trans = vec![(0.0f32, 0.0f32); raw.len()];
+        for t in trans.iter_mut().skip(1) {
+            *t = ((1.0 - 0.02f32).ln(), (0.02f32).ln());
+        }
+
+        let (states, posterior, _) = decode_orientation_hmm(&raw, &trans);
+        assert_eq!(&states[..3], &[0, 0, 0]);
+        assert_eq!(&states[3..], &[1, 1, 1]);
+        assert!(posterior[0] < 0.5 && posterior[5] > 0.5);
     }
 }
