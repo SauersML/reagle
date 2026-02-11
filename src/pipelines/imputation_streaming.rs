@@ -38,9 +38,7 @@ use crate::model::impute_hmm::{
 };
 use crate::model::parameters::ModelParams;
 use crate::model::phase_query::{
-    build_peer_indices, pbwt_beam_uncertainty, phase_best_orientation_error,
-    phase_orientation_weight, phase_query_orientation_error_limit,
-    uncertain_orientation_wildcard_info_weight,
+    build_peer_indices, decide_phase_query_orientation, pbwt_beam_uncertainty,
 };
 use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
@@ -4330,19 +4328,16 @@ impl crate::pipelines::ImputationPipeline {
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
-                                    let err_limit = phase_query_orientation_error_limit(
+                                    let orientation = decide_phase_query_orientation(
+                                        phase_conf,
                                         geno_conf,
                                         beam_uncertainty,
-                                    )
-                                    .max(1e-6);
-                                    let orientation_weight =
-                                        phase_orientation_weight(phase_conf, err_limit);
-                                    cached_allele_weight = orientation_weight;
-                                    if phase_best_orientation_error(phase_conf) > err_limit {
+                                    );
+                                    cached_allele_weight = orientation.allele_weight;
+                                    cached_wildcard_weight = orientation.wildcard_info_weight;
+                                    if orientation.use_wildcard {
                                         cached_query_pair = [255, 255];
-                                        cached_wildcard_weight =
-                                            uncertain_orientation_wildcard_info_weight();
-                                    } else if phase_conf < 0.5 {
+                                    } else if orientation.flip_orientation {
                                         cached_query_pair = [mapped2, mapped1];
                                     } else {
                                         cached_query_pair = [mapped1, mapped2];
@@ -5418,18 +5413,16 @@ impl crate::pipelines::ImputationPipeline {
                                     let geno_conf = target_win
                                         .sample_confidence_f32(target_marker, sample_idx)
                                         .clamp(0.0, 1.0);
-                                    let err_limit = phase_query_orientation_error_limit(
+                                    let orientation = decide_phase_query_orientation(
+                                        phase_conf,
                                         geno_conf,
                                         beam_uncertainty,
-                                    )
-                                    .max(1e-6);
-                                    cached_allele_weight =
-                                        phase_orientation_weight(phase_conf, err_limit);
-                                    if phase_best_orientation_error(phase_conf) > err_limit {
+                                    );
+                                    cached_allele_weight = orientation.allele_weight;
+                                    cached_wildcard_weight = orientation.wildcard_info_weight;
+                                    if orientation.use_wildcard {
                                         cached_query_pair = [255, 255];
-                                        cached_wildcard_weight =
-                                            uncertain_orientation_wildcard_info_weight();
-                                    } else if phase_conf < 0.5 {
+                                    } else if orientation.flip_orientation {
                                         cached_query_pair = [mapped2, mapped1];
                                     } else {
                                         cached_query_pair = [mapped1, mapped2];
