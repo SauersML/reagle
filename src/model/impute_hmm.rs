@@ -1403,6 +1403,160 @@ fn write_panel_freq_posterior(
 }
 
 #[inline]
+fn posterior_to_probs(posterior: &AllelePosteriors, out: &mut Vec<f32>) {
+    out.clear();
+    match posterior {
+        AllelePosteriors::Biallelic(p_alt) => {
+            let p_alt = p_alt.clamp(0.0, 1.0);
+            out.push(1.0 - p_alt);
+            out.push(p_alt);
+        }
+        AllelePosteriors::Multiallelic(p) => {
+            out.extend(p.iter().copied().map(|v| v.max(0.0)));
+            normalize_probs(out);
+        }
+    }
+}
+
+#[inline]
+fn probs_to_posterior(probs: &[f32]) -> AllelePosteriors {
+    if probs.len() == 2 {
+        AllelePosteriors::Biallelic(probs[1].clamp(0.0, 1.0))
+    } else {
+        AllelePosteriors::Multiallelic(std::sync::Arc::from(probs.to_vec()))
+    }
+}
+
+fn apply_ld_bridge_interpolation(
+    posteriors: &mut [AllelePosteriors],
+    target_probs: &TargetAlleleProbs,
+    p_recomb: &[f32],
+    panel_priors: Option<&[AllelePosteriors]>,
+) {
+    let n_markers = posteriors.len();
+    if n_markers == 0 {
+        return;
+    }
+
+    let mut left_obs: Vec<Option<usize>> = vec![None; n_markers];
+    let mut right_obs: Vec<Option<usize>> = vec![None; n_markers];
+    let mut left_lambda: Vec<f32> = vec![f32::INFINITY; n_markers];
+    let mut right_lambda: Vec<f32> = vec![f32::INFINITY; n_markers];
+
+    let mut prev_obs: Option<usize> = None;
+    let mut lam = f32::INFINITY;
+    for m in 0..n_markers {
+        if target_probs.is_observed_marker(m) {
+            prev_obs = Some(m);
+            lam = 0.0;
+        } else if m > 0 && lam.is_finite() {
+            lam += recomb_lambda_from_p(marker_recomb_rate(p_recomb, m));
+        }
+        left_obs[m] = prev_obs;
+        left_lambda[m] = lam;
+    }
+
+    let mut next_obs: Option<usize> = None;
+    lam = f32::INFINITY;
+    for m_rev in (0..n_markers).rev() {
+        if target_probs.is_observed_marker(m_rev) {
+            next_obs = Some(m_rev);
+            lam = 0.0;
+        } else if m_rev + 1 < n_markers && lam.is_finite() {
+            lam += recomb_lambda_from_p(marker_recomb_rate(p_recomb, m_rev + 1));
+        }
+        right_obs[m_rev] = next_obs;
+        right_lambda[m_rev] = lam;
+    }
+
+    let mut cur_probs = Vec::<f32>::new();
+    let mut left_probs = Vec::<f32>::new();
+    let mut right_probs = Vec::<f32>::new();
+    let mut blend_probs = Vec::<f32>::new();
+
+    for m in 0..n_markers {
+        if !target_probs.is_untyped_uniform_marker(m) {
+            continue;
+        }
+
+        posterior_to_probs(&posteriors[m], &mut cur_probs);
+        if cur_probs.is_empty() {
+            continue;
+        }
+
+        blend_probs.clear();
+        blend_probs.resize(cur_probs.len(), 0.0);
+
+        let mut anchor_weight_sum = 0.0f32;
+        if let Some(left_idx) = left_obs[m] {
+            posterior_to_probs(&posteriors[left_idx], &mut left_probs);
+            if left_probs.len() == cur_probs.len() {
+                let w = (-left_lambda[m].max(0.0)).exp();
+                if w > 0.0 {
+                    for (dst, src) in blend_probs.iter_mut().zip(left_probs.iter()) {
+                        *dst += w * *src;
+                    }
+                    anchor_weight_sum += w;
+                }
+            }
+        }
+        if let Some(right_idx) = right_obs[m] {
+            posterior_to_probs(&posteriors[right_idx], &mut right_probs);
+            if right_probs.len() == cur_probs.len() {
+                let w = (-right_lambda[m].max(0.0)).exp();
+                if w > 0.0 {
+                    for (dst, src) in blend_probs.iter_mut().zip(right_probs.iter()) {
+                        *dst += w * *src;
+                    }
+                    anchor_weight_sum += w;
+                }
+            }
+        }
+
+        if anchor_weight_sum > 0.0 {
+            let inv = 1.0 / anchor_weight_sum;
+            for p in blend_probs.iter_mut() {
+                *p *= inv;
+            }
+            let total_lambda = left_lambda[m].min(50.0) + right_lambda[m].min(50.0);
+            // Strong interpolation deep inside untyped stretches, weaker near anchors.
+            let bridge_strength = (1.0 - (-total_lambda).exp()).clamp(0.0, 0.95);
+            let keep = 1.0 - bridge_strength;
+            for i in 0..cur_probs.len() {
+                cur_probs[i] = keep * cur_probs[i] + bridge_strength * blend_probs[i];
+            }
+        }
+
+        if let Some(panel) = panel_priors.and_then(|p| p.get(m)) {
+            let panel_mix =
+                (1.0 - (-left_lambda[m].min(right_lambda[m]).max(0.0)).exp()).clamp(0.0, 0.35);
+            if panel_mix > 0.0 {
+                match panel {
+                    AllelePosteriors::Biallelic(p_alt) if cur_probs.len() == 2 => {
+                        let panel_probs = [1.0 - p_alt.clamp(0.0, 1.0), p_alt.clamp(0.0, 1.0)];
+                        let keep = 1.0 - panel_mix;
+                        cur_probs[0] = keep * cur_probs[0] + panel_mix * panel_probs[0];
+                        cur_probs[1] = keep * cur_probs[1] + panel_mix * panel_probs[1];
+                    }
+                    AllelePosteriors::Multiallelic(panel_vec)
+                        if panel_vec.len() == cur_probs.len() =>
+                    {
+                        let keep = 1.0 - panel_mix;
+                        for (c, p) in cur_probs.iter_mut().zip(panel_vec.iter()) {
+                            *c = keep * *c + panel_mix * p.max(0.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        normalize_probs(&mut cur_probs);
+        posteriors[m] = probs_to_posterior(&cur_probs);
+    }
+}
+
+#[inline]
 fn build_checkpoint_markers(
     uniform_mask: &MarkerMask<bool>,
     prior_marker_idx: Option<usize>,
@@ -2581,6 +2735,7 @@ fn run_impute_hmm_impl(
         }
 
         if is_final {
+            apply_ld_bridge_interpolation(&mut posteriors, target_probs, p_recomb, panel_priors);
             final_posteriors = posteriors;
         }
     }
@@ -3147,6 +3302,7 @@ fn run_impute_hmm_seqcoded(
         }
 
         if is_final {
+            apply_ld_bridge_interpolation(&mut posteriors, target_probs, p_recomb, panel_priors);
             final_posteriors = posteriors;
         }
     }
@@ -3713,6 +3869,7 @@ fn run_impute_hmm_dict(
         }
 
         if is_final {
+            apply_ld_bridge_interpolation(&mut posteriors, target_probs, p_recomb, panel_priors);
             final_posteriors = posteriors;
         }
     }
