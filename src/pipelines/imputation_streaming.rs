@@ -4615,12 +4615,6 @@ impl crate::pipelines::ImputationPipeline {
             None
         };
 
-        // Total recombination mass across the window for Li-Stephens decay.
-        // When the HMM is skipped (no informative markers), the handoff prior
-        // must still decay toward uniform via recombination. Without this, a
-        // prior from a distant typed marker stays locked indefinitely.
-        let window_total_p_recomb: f32 = p_recomb.iter().sum();
-
         struct ImputeResult {
             result: SampleImputationResult,
             priors: Option<(HaplotypePriors, HaplotypePriors)>,
@@ -4750,56 +4744,6 @@ impl crate::pipelines::ImputationPipeline {
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
                 let mut posts_probs_buf: Vec<f32> = Vec::new();
-                let posts_from_priors =
-                    |priors: &HaplotypePriors, probs_buf: &mut Vec<f32>| -> Result<Vec<AllelePosteriors>> {
-                    let mut out: Vec<AllelePosteriors> =
-                        Vec::with_capacity(output_end.saturating_sub(output_start));
-                    for ref_m in output_start..output_end {
-                        let n_alleles = ref_markers
-                            .marker(MarkerIdx::new(ref_m as u32))
-                            .n_alleles()
-                            .max(1);
-                        probs_buf.clear();
-                        probs_buf.resize(n_alleles, 0.0);
-                        for (id, p) in priors.ids().iter().zip(priors.probs().iter()) {
-                            let hap = HapIdx::new(id.0);
-                            let allele = ref_columns
-                                .get(ref_m)
-                                .map(|c| c.get(hap))
-                                .unwrap_or(255);
-                            if allele == 255 {
-                                continue;
-                            }
-                            let idx = allele as usize;
-                            if idx < probs_buf.len() {
-                                probs_buf[idx] += *p;
-                            }
-                        }
-                        let sum: f32 = probs_buf.iter().sum();
-                        if sum <= 0.0 {
-                            return Err(ReagleError::vcf(format!(
-                                "Subset prior collapsed while building allele posteriors: window={} sample={} marker={} source=handoff_priors",
-                                window_idx, s, ref_m
-                            )));
-                        }
-                        if sum > 0.0 {
-                            let inv = 1.0 / sum;
-                            for v in probs_buf.iter_mut() {
-                                *v *= inv;
-                            }
-                        }
-                        if n_alleles == 2 {
-                            out.push(AllelePosteriors::Biallelic(
-                                probs_buf.get(1).copied().unwrap_or(0.0),
-                            ));
-                        } else {
-                            out.push(AllelePosteriors::Multiallelic(
-                                std::sync::Arc::<[f32]>::from(probs_buf.clone()),
-                            ));
-                        }
-                    }
-                    Ok(out)
-                };
                 let posts_from_donors =
                     |donors: &[(RefHapId, u32)], probs_buf: &mut Vec<f32>| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
@@ -5120,6 +5064,129 @@ impl crate::pipelines::ImputationPipeline {
                         let probs = vec![uniform_weight; state_haps.len()];
                         Ok((out, HaplotypePriors::new(ids, probs)))
                     };
+                let exact_transition_only_from_priors =
+                    |hap_idx: HapIdx,
+                     priors: &HaplotypePriors,
+                     capture_idx: Option<usize>,
+                     probs_buf: &mut Vec<f32>|
+                     -> Result<(Vec<AllelePosteriors>, HaplotypePriors)> {
+                        if priors.is_empty() {
+                            return Err(ReagleError::vcf(format!(
+                                "Cannot run transition-only propagation with empty priors: window={} sample={} hap={}",
+                                window_idx,
+                                s,
+                                hap_idx.as_usize()
+                            )));
+                        }
+
+                        let k = priors.ids().len();
+                        let n_ref_haps = ref_allele_freqs.n_ref_haps().max(1) as f32;
+                        let mut state_probs = priors.probs().to_vec();
+                        let mut state_sum = 0.0f32;
+                        for v in &mut state_probs {
+                            if !v.is_finite() || *v < 0.0 {
+                                *v = 0.0;
+                            }
+                            state_sum += *v;
+                        }
+                        if state_sum <= 0.0 {
+                            return Err(ReagleError::vcf(format!(
+                                "Transition-only propagation got zero prior mass: window={} sample={} hap={} states={}",
+                                window_idx,
+                                s,
+                                hap_idx.as_usize(),
+                                k
+                            )));
+                        }
+                        let inv0 = 1.0 / state_sum;
+                        for v in &mut state_probs {
+                            *v *= inv0;
+                        }
+                        state_sum = 1.0;
+
+                        let mut captured_probs: Option<Vec<f32>> = None;
+                        let mut out: Vec<AllelePosteriors> =
+                            Vec::with_capacity(output_end.saturating_sub(output_start));
+
+                        for ref_m in 0..output_end {
+                            let recomb_rate = p_recomb.get(ref_m).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            if recomb_rate > 0.0 && !state_probs.is_empty() {
+                                let switch_full = recomb_rate / n_ref_haps;
+                                let z = ((1.0 - recomb_rate) + (k as f32) * switch_full).max(1e-30);
+                                let stay_gap = (1.0 - recomb_rate) / z;
+                                let shift = switch_full / z;
+                                let scale = stay_gap / state_sum.max(1e-30);
+                                let mut new_sum = 0.0f32;
+                                for v in &mut state_probs {
+                                    let t = scale.mul_add(*v, shift);
+                                    *v = t;
+                                    new_sum += t;
+                                }
+                                state_sum = new_sum.max(1e-30);
+                            }
+
+                            if capture_idx == Some(ref_m) {
+                                let inv = 1.0 / state_sum.max(1e-30);
+                                captured_probs = Some(state_probs.iter().map(|v| v * inv).collect());
+                            }
+
+                            if ref_m < output_start {
+                                continue;
+                            }
+
+                            let n_alleles = ref_markers
+                                .marker(MarkerIdx::new(ref_m as u32))
+                                .n_alleles()
+                                .max(1);
+                            probs_buf.clear();
+                            probs_buf.resize(n_alleles, 0.0);
+                            for (id, p) in priors.ids().iter().zip(state_probs.iter()) {
+                                let hap = HapIdx::new(id.0);
+                                let allele = ref_columns
+                                    .get(ref_m)
+                                    .map(|col| col.get(hap))
+                                    .unwrap_or(255);
+                                if allele == 255 {
+                                    continue;
+                                }
+                                let idx = allele as usize;
+                                if idx < probs_buf.len() {
+                                    let pn = *p / state_sum.max(1e-30);
+                                    probs_buf[idx] += pn.max(0.0);
+                                }
+                            }
+                            let sum: f32 = probs_buf.iter().sum();
+                            if sum <= 0.0 {
+                                return Err(ReagleError::vcf(format!(
+                                    "Transition-only posterior collapsed: window={} sample={} hap={} marker={} states={}",
+                                    window_idx,
+                                    s,
+                                    hap_idx.as_usize(),
+                                    ref_m,
+                                    k
+                                )));
+                            }
+                            let inv = 1.0 / sum;
+                            for v in probs_buf.iter_mut() {
+                                *v *= inv;
+                            }
+                            if n_alleles == 2 {
+                                out.push(AllelePosteriors::Biallelic(
+                                    probs_buf.get(1).copied().unwrap_or(0.0),
+                                ));
+                            } else {
+                                out.push(AllelePosteriors::Multiallelic(
+                                    std::sync::Arc::<[f32]>::from(probs_buf.clone()),
+                                ));
+                            }
+                        }
+
+                        let probs = captured_probs.unwrap_or_else(|| {
+                            let inv = 1.0 / state_sum.max(1e-30);
+                            state_probs.iter().map(|v| v * inv).collect()
+                        });
+                        Ok((out, HaplotypePriors::new(priors.ids().to_vec(), probs)))
+                    };
                     let mut process_haplotype = |hap_idx: HapIdx,
                                                  priors: Option<&HaplotypePriors>,
                                                  input_probs: &mut TargetAlleleProbs,
@@ -5268,34 +5335,6 @@ impl crate::pipelines::ImputationPipeline {
                     Ok((posteriors, next_priors, subsetted_states, informative_ratio))
                 };
 
-                // Apply Li-Stephens recombination decay to a handoff prior.
-                // Over the window's genetic distance, the posterior diffuses
-                // toward uniform at a rate determined by p_recomb. This is
-                // equivalent to running the forward pass with uniform emissions.
-                //
-                // Li-Stephens transition for k states over total recomb r_total:
-                //   retain = exp(-r_total * (1 - 1/k))
-                //   P_new(j) = retain * P_old(j) + (1 - retain) / k
-                let decay_prior = |p: &HaplotypePriors| -> HaplotypePriors {
-                    let k = p.ids().len();
-                    if k == 0 || window_total_p_recomb <= 0.0 {
-                        return p.clone();
-                    }
-                    let retain = (-(window_total_p_recomb as f64)
-                        * (1.0 - 1.0 / k as f64))
-                        .exp() as f32;
-                    if retain >= 1.0 - 1e-9 {
-                        return p.clone();
-                    }
-                    let uniform = (1.0 - retain) / k as f32;
-                    let new_probs: Vec<f32> = p
-                        .probs()
-                        .iter()
-                        .map(|&prob| retain * prob + uniform)
-                        .collect();
-                    HaplotypePriors::new(p.ids().to_vec(), new_probs)
-                };
-
                 let mut hap1_posts: Option<Vec<AllelePosteriors>> = None;
                 let mut hap2_posts: Option<Vec<AllelePosteriors>> = None;
                 let mut p1_out = HaplotypePriors::empty();
@@ -5309,9 +5348,14 @@ impl crate::pipelines::ImputationPipeline {
                     dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        let decayed = decay_prior(p);
-                        hap1_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
-                        p1_out = decayed;
+                        let (posts, propagated) = exact_transition_only_from_priors(
+                            h1_idx,
+                            p,
+                            handoff_capture_idx_h1,
+                            &mut posts_probs_buf,
+                        )?;
+                        hap1_posts = Some(posts);
+                        p1_out = propagated;
                     }
                 } else if use_hmm_h1 {
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
@@ -5327,9 +5371,14 @@ impl crate::pipelines::ImputationPipeline {
                     p1_out = out;
                 } else if has_priors_h1 {
                     if let Some(p) = priors_h1 {
-                        let decayed = decay_prior(p);
-                        hap1_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
-                        p1_out = decayed;
+                        let (posts, propagated) = exact_transition_only_from_priors(
+                            h1_idx,
+                            p,
+                            handoff_capture_idx_h1,
+                            &mut posts_probs_buf,
+                        )?;
+                        hap1_posts = Some(posts);
+                        p1_out = propagated;
                     }
                 } else {
                     let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
@@ -5358,9 +5407,14 @@ impl crate::pipelines::ImputationPipeline {
                     dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        let decayed = decay_prior(p);
-                        hap2_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
-                        p2_out = decayed;
+                        let (posts, propagated) = exact_transition_only_from_priors(
+                            h2_idx,
+                            p,
+                            handoff_capture_idx_h2,
+                            &mut posts_probs_buf,
+                        )?;
+                        hap2_posts = Some(posts);
+                        p2_out = propagated;
                     }
                 } else if use_hmm_h2 {
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
@@ -5376,9 +5430,14 @@ impl crate::pipelines::ImputationPipeline {
                     p2_out = out;
                 } else if has_priors_h2 {
                     if let Some(p) = priors_h2 {
-                        let decayed = decay_prior(p);
-                        hap2_posts = Some(posts_from_priors(&decayed, &mut posts_probs_buf)?);
-                        p2_out = decayed;
+                        let (posts, propagated) = exact_transition_only_from_priors(
+                            h2_idx,
+                            p,
+                            handoff_capture_idx_h2,
+                            &mut posts_probs_buf,
+                        )?;
+                        hap2_posts = Some(posts);
+                        p2_out = propagated;
                     }
                 } else {
                     let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
