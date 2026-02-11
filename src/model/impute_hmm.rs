@@ -1247,9 +1247,23 @@ fn apply_marker_prior_smoothing(
                     floor_mix,
                     adaptive_panel_mix,
                 );
+                apply_entropy_aware_panel_recalibration(
+                    allele_probs,
+                    &panel_probs,
+                    nearest_obs_lambda,
+                    active_states,
+                    panel_haps,
+                );
             }
             AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
                 apply_adaptive_panel_blend(allele_probs, p, floor_mix, adaptive_panel_mix);
+                apply_entropy_aware_panel_recalibration(
+                    allele_probs,
+                    p,
+                    nearest_obs_lambda,
+                    active_states,
+                    panel_haps,
+                );
             }
             _ => {}
         }
@@ -1275,6 +1289,53 @@ fn apply_marker_prior_smoothing(
         )
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
+}
+
+#[inline]
+fn apply_entropy_aware_panel_recalibration(
+    allele_probs: &mut [f32],
+    panel_probs: &[f32],
+    nearest_obs_lambda: f32,
+    active_states: usize,
+    panel_haps: usize,
+) {
+    if allele_probs.len() != panel_probs.len() || allele_probs.len() < 2 {
+        return;
+    }
+
+    // Large distance from typed anchors and sparse state sets both increase
+    // chance of posterior overconfidence on a wrong donor subset. In those
+    // settings, blend toward panel AF with strength calibrated by entropy.
+    let entropy = allele_probs
+        .iter()
+        .copied()
+        .filter(|p| *p > 0.0)
+        .map(|p| -p * p.ln())
+        .sum::<f32>();
+    let max_entropy = (allele_probs.len() as f32).ln().max(1e-6);
+    let confidence = (1.0 - entropy / max_entropy).clamp(0.0, 1.0);
+
+    let distance_uncertainty = 1.0 - (-nearest_obs_lambda.max(0.0)).exp();
+    let subset_uncertainty = if panel_haps > 0 {
+        (1.0 - active_states as f32 / panel_haps as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let confidence_uncertainty = 1.0 - confidence;
+
+    let mix =
+        (0.45 * distance_uncertainty + 0.35 * subset_uncertainty + 0.20 * confidence_uncertainty)
+            .clamp(0.0, 0.85);
+    if mix <= 0.0 {
+        return;
+    }
+
+    let one_minus_mix = 1.0 - mix;
+    for (i, p) in allele_probs.iter_mut().enumerate() {
+        let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        *p = one_minus_mix * *p + mix * panel_p;
+    }
+    normalize_probs(allele_probs);
 }
 
 #[inline]
