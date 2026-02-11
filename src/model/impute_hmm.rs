@@ -1234,7 +1234,7 @@ fn apply_marker_prior_smoothing(
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
     // Only inject panel-frequency information when distance from typed anchors
     // is sufficiently large. Near observed markers, let local LD dominate.
-    let adaptive_panel_mix = (missing_mass * (1.0 - retain)).clamp(0.0, 0.7);
+    let adaptive_panel_mix = adaptive_panel_mix_weight(allele_probs, retain, missing_mass);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1314,6 +1314,50 @@ fn apply_adaptive_panel_blend(
         }
         normalize_probs(allele_probs);
     }
+}
+
+#[inline]
+fn normalized_entropy(probs: &[f32]) -> f32 {
+    if probs.len() <= 1 {
+        return 0.0;
+    }
+    let mut entropy = 0.0f32;
+    for &p in probs {
+        let q = p.max(0.0);
+        if q > 0.0 {
+            entropy -= q * q.ln();
+        }
+    }
+    let max_entropy = (probs.len() as f32).ln().max(1e-30);
+    (entropy / max_entropy).clamp(0.0, 1.0)
+}
+
+#[inline]
+fn adaptive_panel_mix_weight(
+    allele_probs: &[f32],
+    retain: f32,
+    subset_missing_mass: f32,
+) -> f32 {
+    if allele_probs.is_empty() {
+        return 0.0;
+    }
+
+    let distance_mix = (1.0 - retain).clamp(0.0, 1.0);
+    let entropy = normalized_entropy(allele_probs);
+    let max_prob = allele_probs
+        .iter()
+        .copied()
+        .fold(0.0f32, |acc, p| acc.max(p.max(0.0)));
+    let uncertainty = (1.0 - max_prob).clamp(0.0, 1.0);
+
+    // Confidence-aware smoothing:
+    // - subset_missing_mass: donor outside active subset
+    // - entropy/uncertainty terms: posterior collapse protection when sparse,
+    //   low-information stretches produce overconfident local modes.
+    let mix = subset_missing_mass * distance_mix
+        + 0.45 * distance_mix * entropy
+        + 0.20 * distance_mix * uncertainty;
+    mix.clamp(0.0, 0.85)
 }
 
 #[inline]
