@@ -1115,6 +1115,9 @@ fn open_ref_reader(path: &Path) -> Result<RefPanelReader> {
         let windowed = crate::io::bref3::StreamingBref3WindowReader::new(stream_reader);
         Ok(RefPanelReader::Bref3(windowed))
     } else {
+        // Streaming reference VCF path: markers are parsed incrementally into
+        // GenotypeColumn::from_alleles (Dense/Sparse selection), not the
+        // batch dictionary compression path used by io/vcf.rs::VcfReader::read_all.
         let reader = crate::io::bref3::StreamingRefVcfReader::open(path)?;
         Ok(RefPanelReader::StreamingVcf(reader))
     }
@@ -1184,6 +1187,9 @@ fn ensure_binary_reference(ref_path: &Path, config: &Config) -> Result<PathBuf> 
         let tmp_path = path.with_extension("bref3.tmp");
         match convert_ref_vcf_to_bref3(ref_path, &tmp_path) {
             Ok(()) => {
+                // NOTE: current conversion writes ALLELE_CODED BREF3 records.
+                // It improves startup/IO and avoids repeated VCF parsing, but
+                // does not by itself guarantee SeqCoded HMM dispatch.
                 if let Err(err) = std::fs::rename(&tmp_path, &path) {
                     eprintln!(
                         "Reference conversion rename failed at {:?}: {}. Trying next location...",

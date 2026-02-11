@@ -56,6 +56,7 @@
 //! monotonicity under the greedy outer loop.
 
 use crate::model::parameters::ModelParams;
+use crate::model::li_stephens::on_off_transition_log_odds;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -214,26 +215,7 @@ fn continuity_terms(
             .unwrap_or(DonorPoolSize::new(2))
             .as_f32();
         let r_w = params.p_recomb(dist_cm);
-        let a_w = (1.0 - r_w).max(0.0).min(1.0);
-        let p11 = a_w + (1.0 - a_w) / n_pool_f;
-        let p10 = (1.0 - a_w) * (n_pool_f - 1.0) / n_pool_f;
-        let p01 = (1.0 - a_w) / n_pool_f;
-        let p00 = 1.0 - p01;
-        let t11_v = if p11 > 0.0 && p00 > 0.0 {
-            (p11 / p00).ln()
-        } else {
-            NEG_INF
-        };
-        let t10_v = if p10 > 0.0 && p00 > 0.0 {
-            (p10 / p00).ln()
-        } else {
-            NEG_INF
-        };
-        let t01_v = if p01 > 0.0 && p00 > 0.0 {
-            (p01 / p00).ln()
-        } else {
-            NEG_INF
-        };
+        let (t11_v, t10_v, t01_v) = on_off_transition_log_odds(r_w, n_pool_f);
         t11.push(t11_v);
         t10.push(t10_v);
         t01.push(t01_v);

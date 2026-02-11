@@ -68,7 +68,7 @@ use crate::data::alignment::{AlignmentStats, MarkerAlignment};
 use crate::data::condensed::CondensedTarget;
 use crate::data::ref_packed::PackedRefView;
 use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, PbwtInjector};
-use crate::model::hmm::MosaicHmm;
+use crate::model::phase_hmm::MosaicHmm;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{

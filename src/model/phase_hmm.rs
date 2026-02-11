@@ -13,6 +13,7 @@
 
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
+use crate::model::li_stephens::normalized_switch_scale_shift;
 use crate::model::parameters::ModelParams;
 use aligned_vec::{AVec, ConstAlign};
 use std::sync::OnceLock;
@@ -357,8 +358,8 @@ impl HmmUpdater {
                 bwd[i] *= em;
                 sum += bwd[i];
             }
-            let shift = p_switch / n_states as f32;
-            let scale = (1.0 - p_switch) / sum.max(Self::LOG8_EPS);
+            let (scale, shift) =
+                normalized_switch_scale_shift(p_switch, n_states, sum, Self::LOG8_EPS);
             for x in bwd.iter_mut().take(n_states) {
                 *x = scale * *x + shift;
             }
@@ -429,8 +430,7 @@ impl HmmUpdater {
         }
 
         // Then: apply transition
-        let shift = p_switch / n_states as f32;
-        let scale = (1.0 - p_switch) / sum.max(1e-30);
+        let (scale, shift) = normalized_switch_scale_shift(p_switch, n_states, sum, 1e-30);
 
         let shift_vec = f32x8::splat(shift);
         let scale_vec = f32x8::splat(scale);
@@ -561,8 +561,7 @@ impl HmmUpdater {
                 sum += v;
             }
 
-            let shift = p_switch / n_states as f32;
-            let scale = (1.0 - p_switch) / sum.max(1e-30);
+            let (scale, shift) = normalized_switch_scale_shift(p_switch, n_states, sum, 1e-30);
 
             let shift_vec = _mm512_set1_ps(shift);
             let scale_vec = _mm512_set1_ps(scale);
@@ -627,8 +626,7 @@ impl HmmUpdater {
                 sum += v;
             }
 
-            let shift = p_switch / n_states as f32;
-            let scale = (1.0 - p_switch) / sum.max(1e-30);
+            let (scale, shift) = normalized_switch_scale_shift(p_switch, n_states, sum, 1e-30);
 
             let shift_vec = _mm512_set1_ps(shift);
             let scale_vec = _mm512_set1_ps(scale);
@@ -1502,8 +1500,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             for recomp_m in (checkpoint_start + 1)..=m {
                 let recomp_targ_al = target_alleles[recomp_m];
                 let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
-                let shift = p_switch / n_states as f32;
-                let scale = (1.0 - p_switch) / recomp_sum.max(1e-30);
+                let (scale, shift) =
+                    normalized_switch_scale_shift(p_switch, n_states, recomp_sum, 1e-30);
                 let recomp_row_offset = recomp_m * n_states_padded;
                 let recomp_ref_row =
                     &ref_alleles_flat[recomp_row_offset..recomp_row_offset + n_states];
@@ -1523,8 +1521,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             // Compute stats using fwd_recomp and bwd
             let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
             let last_sum = if m > 0 { fwd_sums[m - 1] } else { 1.0 };
-            let shift = p_switch / n_states as f32;
-            let scale = (1.0 - p_switch) / last_sum;
+            let (scale, shift) =
+                normalized_switch_scale_shift(p_switch, n_states, last_sum, 1e-30);
             let no_switch_scale = ((1.0 - p_switch) + shift) / last_sum;
 
             let mut joint_state_sum = 0.0f32;

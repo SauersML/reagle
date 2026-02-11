@@ -552,6 +552,8 @@ fn encode_bref3_marker_record(
     write_string_array(buf, &alleles)?;
     let end_pos = marker.end.map(|v| v as i32).unwrap_or(-1);
     write_be_i32(buf, end_pos)?;
+    // Converter currently emits ALLELE_CODED records only. This preserves
+    // per-marker alleles for correctness but does not create SeqCoded blocks.
     write_byte(buf, ALLELE_CODED)?;
 
     let n_alleles = marker.n_alleles();
@@ -1573,6 +1575,9 @@ impl StreamingRefVcfReader {
             bail!("VCF line has fewer samples than header");
         }
 
+        // Streaming reference VCF path builds one marker at a time and uses
+        // per-marker storage selection (Dense/Sparse). It does not run the
+        // read_all batch dictionary compressor from io/vcf.rs.
         let column = GenotypeColumn::from_alleles(&alleles, n_alleles);
 
         Ok(RefPanelMarker {

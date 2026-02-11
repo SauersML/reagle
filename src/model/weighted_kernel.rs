@@ -4,6 +4,7 @@
 //! Unlike the standard Li-Stephens kernel where transition probability is uniform,
 //! this kernel weights transitions by per-state weights.
 
+use crate::model::li_stephens::subset_linear_clamped_k;
 use wide::f32x8;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -68,17 +69,8 @@ impl WeightedHmmUpdater {
         active_haps: f32,
         fwd_sum: f32,
     ) -> (f32, f32) {
-        let r = recomb_rate.clamp(0.0, 1.0);
-        let n = n_ref_haps.max(1) as f32;
-        let k = if active_haps.is_finite() {
-            active_haps.clamp(1.0, n)
-        } else {
-            1.0
-        };
-        let switch_full = r / n;
-        let z = ((1.0 - r) + k * switch_full).max(1e-30);
-        let scale = (1.0 - r) / (z * fwd_sum.max(1e-30));
-        let base_shift = switch_full / z;
+        let (stay, base_shift) = subset_linear_clamped_k(recomb_rate, active_haps, n_ref_haps);
+        let scale = stay / fwd_sum.max(1e-30);
         (scale, base_shift)
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

@@ -622,7 +622,11 @@ impl VcfReader {
         })
     }
 
-    /// Flush a batch of markers, attempting dictionary compression
+    /// Flush a batch of markers, attempting dictionary compression.
+    ///
+    /// This path is specific to `VcfReader::read_all` (full-matrix loading).
+    /// Streaming reference VCF reading uses `StreamingRefVcfReader` and does
+    /// not call this batch compressor.
     fn flush_batch(
         markers: &mut Markers,
         columns: &mut Vec<GenotypeColumn>,

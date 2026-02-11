@@ -29,7 +29,7 @@ pub use data::storage::GenotypeMatrix;
 pub use error::{ReagleError, Result};
 pub use io::bref3::Bref3Reader;
 pub use io::vcf::{VcfReader, VcfWriter};
-pub use model::hmm::MosaicHmm;
+pub use model::phase_hmm::MosaicHmm;
 pub use model::parameters::ModelParams;
 pub use model::states::ThreadedHaps;
 

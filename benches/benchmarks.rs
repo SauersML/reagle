@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reagle::data::alignment::MarkerAlignment;
 use reagle::data::marker::{AnyMarkerSpace, Nucleotide};
-use reagle::model::hmm::HmmUpdater;
+use reagle::model::phase_hmm::HmmUpdater;
 use reagle::model::types::{RefHapId, RefHapSpace};
 use std::hint::black_box;
 
