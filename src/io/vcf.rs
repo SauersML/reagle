@@ -139,10 +139,10 @@ impl MarkerImputationStats {
 
         let sum = self.sum_p[allele];
         let n = self.n_haps as f32;
-        // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
-        // Return 1.0 because they trivially impute correctly.
+        // Monomorphic sites (sum ≈ 0 or sum ≈ n) have zero variance.
+        // Java Beagle reports DR2=0 in this case because correlation is undefined.
         if sum <= 1e-4 || (sum - n).abs() <= 1e-4 {
-            return 1.0;
+            return 0.0;
         }
 
         let sum_sq = self.sum_p_sq[allele];

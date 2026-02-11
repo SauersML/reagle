@@ -35,6 +35,13 @@ pub struct ModelParams {
 }
 
 impl ModelParams {
+    /// Conservative lower bound for imputation mismatch probability.
+    ///
+    /// The asymptotic Li-Stephens theta prior can become too small for tiny
+    /// reference panels (e.g. a few hundred haplotypes), which over-confidently
+    /// suppresses uncertainty and hurts calibration. Keep a modest floor.
+    pub const MIN_IMPUTE_MISMATCH: f32 = 1e-3;
+
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
 
@@ -100,7 +107,9 @@ impl ModelParams {
     /// haplotype count only (copying states), not target+reference.
     pub fn for_imputation(n_ref_haps: usize, ne: f32, err: Option<f32>) -> Self {
         let recomb_intensity = (0.04 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps));
+        let p_mismatch = err
+            .unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps))
+            .max(Self::MIN_IMPUTE_MISMATCH);
         Self {
             p_mismatch,
             recomb_intensity,

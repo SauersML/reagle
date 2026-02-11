@@ -2614,6 +2614,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let mut ref_data = ref_data;
+        let phased_estimated_mismatch = self.params.p_mismatch;
         let target_was_unphased_for_impute = !is_vcf_fully_phased(&input_target_path)?;
         // Always use phased target haplotypes for emissions to preserve LD signal.
         // If the input was unphased, we will still treat phase as uncertain in
@@ -2650,6 +2651,16 @@ impl crate::pipelines::ImputationPipeline {
             self.config.ne,
             self.config.err,
         );
+        if self.config.err.is_none() && target_was_unphased_for_impute {
+            // When the target entered as unphased, phasing can learn a data-driven
+            // mismatch rate that is typically less overconfident than the small
+            // Li-Stephens default for large reference panels.
+            self.params.p_mismatch = self.params.p_mismatch.max(phased_estimated_mismatch);
+            eprintln!(
+                "Imputation p_mismatch: {:.6} (source=phasing-estimate)",
+                self.params.p_mismatch,
+            );
+        }
         let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
@@ -2753,8 +2764,12 @@ impl crate::pipelines::ImputationPipeline {
                     );
 
                     let phased_target = target_window.genotypes.clone().into_phased();
-                    let phased_target_pl =
-                        Some(target_window_source.genotypes.clone().into_phased());
+                    let phased_target_pl = if target_was_unphased_for_impute {
+                        // Preserve phase confidence produced by phasing for unphased inputs.
+                        Some(phased_target.clone())
+                    } else {
+                        Some(target_window_source.genotypes.clone().into_phased())
+                    };
                     let target_missing = Some(&target_window_source.genotypes);
                     if !header_written {
                         writer.write_header_extended(
@@ -3094,8 +3109,12 @@ impl crate::pipelines::ImputationPipeline {
                     );
 
                     let phased_target = target_window.genotypes.clone().into_phased();
-                    let phased_target_pl =
-                        Some(target_window_source.genotypes.clone().into_phased());
+                    let phased_target_pl = if target_was_unphased_for_impute {
+                        // Preserve phase confidence produced by phasing for unphased inputs.
+                        Some(phased_target.clone())
+                    } else {
+                        Some(target_window_source.genotypes.clone().into_phased())
+                    };
                     let target_missing = Some(&target_window_source.genotypes);
                     if !header_written {
                         writer.write_header_extended(
