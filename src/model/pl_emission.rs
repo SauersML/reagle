@@ -5,7 +5,7 @@ const NEG_INF: f32 = f32::NEG_INFINITY;
 const LN_10_DIV_10: f32 = std::f32::consts::LN_10 * 0.1;
 const HWE_HET_SCALE: f32 = 2.0;
 /// Minimum allele frequency for prior calculation to prevent collapse
-const MIN_AF: f32 = 1e-4;
+const MIN_AF: f32 = 1e-6;
 
 #[derive(Clone, Copy)]
 pub struct PlProvider<'a> {

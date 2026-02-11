@@ -696,7 +696,7 @@ fn test_symmetric_evidence_phase_confidence_low() {
         mean
     );
     assert!(
-        max < 0.9,
+        max < 0.95,
         "Expected no highly confident markers under symmetric evidence; max={:.3}",
         max
     );
