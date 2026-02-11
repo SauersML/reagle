@@ -543,7 +543,7 @@ fn test_small_panel_all0_all1_perfect_match_ser() {
         config.out = out_path.clone();
         config.phase_states = 0;
         config.burnin = 0;
-        config.iterations = 2;
+        config.iterations = 10;
         config.nthreads = Some(1);
         config.ne = 10000.0;
         config.err = Some(0.0001);
@@ -779,9 +779,10 @@ fn test_phase_confidence_brier_score_noisy_input() {
         let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
 
         let mut config = Config::default();
+        config.seed = 42;
         config.phase_states = 0;
         config.burnin = 0;
-        config.iterations = 2;
+        config.iterations = 10;
         config.nthreads = Some(1);
         config.ne = 10000.0;
         config.err = Some(0.0001);
@@ -843,17 +844,12 @@ fn test_phase_confidence_brier_score_noisy_input() {
             }
             conf_sum_keep += conf;
             conf_sum_flip += 1.0 - conf;
-            let y_cal = if (y_keep - y_flip).abs() > f32::EPSILON {
-                0.5
-            } else {
-                y_keep
-            };
             let bin = ((conf * 10.0).floor() as usize).min(9);
-            ece_bins_keep[bin] += y_cal;
+            ece_bins_keep[bin] += y_keep;
             ece_conf_keep[bin] += conf;
             ece_count_keep[bin] += 1;
             let bin_flip = (((1.0 - conf) * 10.0).floor() as usize).min(9);
-            ece_bins_flip[bin_flip] += y_cal;
+            ece_bins_flip[bin_flip] += y_flip;
             ece_conf_flip[bin_flip] += 1.0 - conf;
             ece_count_flip[bin_flip] += 1;
         }
