@@ -1008,6 +1008,13 @@ impl BidirectionalPhaseIbs {
             }
         }
     }
+
+    pub fn best_match_span(&self, hap_idx: u32, marker_idx: usize) -> usize {
+        match self {
+            Self::U16(inner) => inner.best_match_span(hap_idx, marker_idx),
+            Self::U32(inner) => inner.best_match_span(hap_idx, marker_idx),
+        }
+    }
 }
 
 fn normalize_pbwt_alleles(alleles: &mut [u8]) -> usize {
