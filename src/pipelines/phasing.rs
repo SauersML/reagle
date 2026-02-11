@@ -10830,11 +10830,43 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
 
+    // Anchor-Guided Initialization:
+    // Check if the input sequence (seq1, seq2) aligns with the anchors (anchor_h1, anchor_h2).
+    // If (seq1, seq2) mismatches (anchor_h1, anchor_h2) but matches (anchor_h2, anchor_h1),
+    // we should flip the inputs passed to the HMM. This prevents the HMM from getting
+    // locked in a low-probability "mismatched" state where path1 matches seq1 but
+    // is constrained to match anchor_h1 (which matches seq2).
+    let mut votes_keep = 0;
+    let mut votes_swap = 0;
+    if has_anchor {
+        for m in 0..n_markers {
+            let a1 = seq1[m];
+            let a2 = seq2[m];
+            let anc1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let anc2 = anchor_h2.get(m).copied().unwrap_or(255);
+
+            if anc1 != 255 {
+                if a1 == anc1 { votes_keep += 1; }
+                if a2 == anc1 { votes_swap += 1; }
+            }
+            if anc2 != 255 {
+                if a2 == anc2 { votes_keep += 1; }
+                if a1 == anc2 { votes_swap += 1; }
+            }
+        }
+    }
+    let flipped_input = votes_swap > votes_keep;
+    let (use_seq1, use_seq2) = if flipped_input {
+        (seq2, seq1)
+    } else {
+        (seq1, seq2)
+    };
+
     let (heuristic_paths, _) = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
-        seq1,
-        seq2,
+        use_seq1,
+        use_seq2,
         conf,
         p_no_err,
         p_err,
@@ -10897,8 +10929,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
         seed,
         n_markers,
         p_recomb,
-        seq1,
-        seq2,
+        use_seq1,
+        use_seq2,
         conf,
         RefAlleleProvider::new(ref_view, threaded_haps),
         &combined_checkpoints,
@@ -10937,102 +10969,13 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_counts = vec![0.0f32; het_positions.len()];
     let mut obs_counts = vec![0.0f32; het_positions.len()];
 
-    let anchor_indices: Vec<usize> = if has_anchor {
-        (0..n_markers)
-            .filter(|&m| {
-                anchor_h1.get(m).copied().unwrap_or(255) != 255
-                    || anchor_h2.get(m).copied().unwrap_or(255) != 255
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     for _ in 0..lr_samples {
         chain.step();
 
-        // Metropolis-Hastings Global Swap
-        // Allow the chain to flip orientation if supported by anchors (or random if no anchors).
-        // This ensures proper mixing for unanchored regions (Brier score calibration)
-        // while locking to anchors when available (Imputation accuracy).
-        let mut log_odds = 0.0f32;
-        for &m in &anchor_indices {
-            let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            if a1 == 255 && a2 == 255 {
-                continue;
-            }
-            // Access internal chain state (allowed in same module)
-            let h1 = chain.hap1_allele[m];
-            let h2 = chain.hap2_allele[m];
-            if h1 == 255 || h2 == 255 {
-                continue;
-            }
-
-            let mut keep = 0.0;
-            let mut swap = 0.0;
-            if h1 == a1 {
-                keep += 1.0;
-            }
-            if h2 == a2 {
-                keep += 1.0;
-            }
-            if h1 == a2 {
-                swap += 1.0;
-            }
-            if h2 == a1 {
-                swap += 1.0;
-            }
-            log_odds += swap - keep;
-        }
-
-        let p_accept = 1.0 / (1.0 + (-log_odds).exp());
-        if chain.rng.random::<f32>() < p_accept {
-            std::mem::swap(&mut chain.path1, &mut chain.path2);
-            std::mem::swap(&mut chain.hap1_allele, &mut chain.hap2_allele);
-            std::mem::swap(&mut chain.hap1_partner_allele, &mut chain.hap2_partner_allele);
-            std::mem::swap(&mut chain.hap1_use_combined, &mut chain.hap2_use_combined);
-            std::mem::swap(&mut chain.hap1_hard_match, &mut chain.hap2_hard_match);
-        }
-
-        let sample_flip = if !anchor_indices.is_empty() {
-            let mut direct = 0.0f32;
-            let mut flipped = 0.0f32;
-            let mut evidence = 0usize;
-            for &m in &anchor_indices {
-                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1 == 255 && a2 == 255 {
-                    continue;
-                }
-                let p1 = chain.path1[m] as usize;
-                let p2 = chain.path2[m] as usize;
-                if p1 >= n_states_usize || p2 >= n_states_usize {
-                    continue;
-                }
-                let ref_row = chain.ref_row(m);
-                let r1 = ref_row[p1];
-                let r2 = ref_row[p2];
-                let conf_m = conf[m].clamp(0.0, 1.0);
-                if a1 != 255 {
-                    direct += emit_prob(r1, a1, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    flipped += emit_prob(r2, a1, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    evidence += 1;
-                }
-                if a2 != 255 {
-                    direct += emit_prob(r2, a2, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    flipped += emit_prob(r1, a2, conf_m, p_no_err, p_err).max(1e-30).ln();
-                    evidence += 1;
-                }
-            }
-            evidence > 0 && flipped > direct
-        } else {
-            false
-        };
-
+        // Calculate swap/keep counts relative to the active inputs (use_seq1, use_seq2).
         for (i, &m) in het_positions.iter().enumerate() {
-            let a1 = seq1[m];
-            let a2 = seq2[m];
+            let a1 = use_seq1[m];
+            let a2 = use_seq2[m];
             if a1 == 255 || a2 == 255 || a1 == a2 {
                 continue;
             }
@@ -11045,7 +10988,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let ref1 = ref_row[p1];
             let ref2 = ref_row[p2];
 
-            let mut orient = if ref1 == a1 && ref2 == a2 {
+            // If paths match (use_seq1, use_seq2) -> Keep (relative to active).
+            // If paths match (use_seq2, use_seq1) -> Swap (relative to active).
+            let orient = if ref1 == a1 && ref2 == a2 {
                 Some(0u8)
             } else if ref1 == a2 && ref2 == a1 {
                 Some(1u8)
@@ -11053,19 +10998,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 None
             };
 
-            if orient.is_none() {
-                let c = conf[m].clamp(0.0, 1.0);
-                let keep = emit_prob(ref1, a1, c, p_no_err, p_err)
-                    * emit_prob(ref2, a2, c, p_no_err, p_err);
-                let swap = emit_prob(ref1, a2, c, p_no_err, p_err)
-                    * emit_prob(ref2, a1, c, p_no_err, p_err);
-                orient = Some(if swap > keep { 1 } else { 0 });
-            }
-
-            if let Some(mut bit) = orient {
-                if sample_flip {
-                    bit ^= 1;
-                }
+            if let Some(bit) = orient {
                 if bit == 1 {
                     swap_counts[i] += 1.0;
                 }
@@ -11074,7 +11007,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         }
     }
 
-    let mut new_paths = MosaicPaths {
+    let new_paths = MosaicPaths {
         path1: chain.path1.clone(),
         path2: chain.path2.clone(),
     };
@@ -11086,28 +11019,41 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let mut swap_probs_conf = Vec::with_capacity(het_positions.len());
 
     for (i, &m) in het_positions.iter().enumerate() {
-        let a1 = seq1[m];
-        let a2 = seq2[m];
+        let a1 = use_seq1[m];
+        let a2 = use_seq2[m];
         if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] < 0.5 {
-            swap_bits.push(0);
+            swap_bits.push(if flipped_input { 1 } else { 0 });
             swap_lr.push(1.0);
-            swap_probs.push(0.5);
+            let p_neutral = 0.5;
+            swap_probs.push(p_neutral);
             swap_probs_conf.push(0.5);
             continue;
         }
 
-        let p_swap = if obs_counts[i] > 0.0 {
+        let p_swap_hmm = if obs_counts[i] > 0.0 {
             (swap_counts[i] + 0.5) / (obs_counts[i] + 1.0)
         } else {
             0.5
         };
-        let p_keep = 1.0 - p_swap;
-        let chosen_swap = p_swap > 0.5;
-        swap_bits.push(chosen_swap as u8);
-        let (max_p, min_p) = if p_swap >= p_keep {
-            (p_swap, p_keep)
+        // If flipped_input is true, then 'swap' means H1 matches use_seq2 (original seq1).
+        // That means we swapped BACK to original. So final swap is 0.
+        // If keep means H1 matches use_seq1 (original seq2).
+        // That means final swap is 1.
+        // So p_final_swap = P(Keep_HMM) if flipped, or P(Swap_HMM) if not flipped.
+        let p_swap_final = if flipped_input {
+            1.0 - p_swap_hmm
         } else {
-            (p_keep, p_swap)
+            p_swap_hmm
+        };
+
+        let chosen_swap = p_swap_final > 0.5;
+        swap_bits.push(chosen_swap as u8);
+
+        let p_keep_final = 1.0 - p_swap_final;
+        let (max_p, min_p) = if p_swap_final >= p_keep_final {
+            (p_swap_final, p_keep_final)
+        } else {
+            (p_keep_final, p_swap_final)
         };
         let lr = if min_p < 1e-30 {
             1e6_f32
@@ -11115,9 +11061,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
             (max_p / min_p).min(1e6_f32)
         };
         swap_lr.push(lr);
-        swap_probs.push(p_swap.clamp(0.0, 1.0));
-        // Confidence is the probability of the chosen phase (always >= 0.5)
-        let conf = if p_swap > 0.5 { p_swap } else { 1.0 - p_swap };
+        swap_probs.push(p_swap_final.clamp(0.0, 1.0));
+        let conf = if p_swap_final > 0.5 { p_swap_final } else { 1.0 - p_swap_final };
         swap_probs_conf.push(conf.clamp(0.0, 1.0));
     }
 
@@ -11212,40 +11157,17 @@ fn sample_swap_bits_mosaic<RefSpace>(
     // We must ensure path1 corresponds to the incoming seq1 (old seq2).
     // If path1 currently corresponds to old seq1, we must swap path1/path2.
     // This aligns the HMM initialization for the next iteration with the updated genotype.
-    if !workspace.ref_alleles_flat.is_empty() {
-        let n_states_usize = n_states.get();
-        for m in 0..n_markers {
-            let target_swap = swap_bits[m] == 1;
-            let a1 = seq1[m];
-            let a2 = seq2[m];
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                continue;
-            }
-
-            let p1 = new_paths.path1[m] as usize;
-            if p1 >= n_states_usize {
-                continue;
-            }
-
-            let offset = m * n_states_usize;
-            if offset + p1 >= workspace.ref_alleles_flat.len() {
-                continue;
-            }
-            let r1 = workspace.ref_alleles_flat[offset + p1];
-
-            // If r1 matches a2 (seq2), current path1 is aligned with seq2 (Swap).
-            // If r1 matches a1 (seq1), current path1 is aligned with seq1 (Keep).
-            // If r1 matches neither, we assume Keep (no swap needed if ambiguous).
-            let current_is_swap = r1 == a2;
-
-            if current_is_swap != target_swap {
-                let p1_val = new_paths.path1[m];
-                let p2_val = new_paths.path2[m];
-                new_paths.path1[m] = p2_val;
-                new_paths.path2[m] = p1_val;
-            }
-        }
-    }
+    // new_paths corresponds to (use_seq1, use_seq2).
+    // If flipped_input is true, new_path1 emits use_seq1 (seq2).
+    // If swap_bits implies final_swap=1 (H1 gets seq2), then new_path1 matches.
+    // If swap_bits implies final_swap=0 (H1 gets seq1), then new_path1 (matching seq2) is wrong?
+    // Wait. If final_swap=0, it means p_swap_final < 0.5 => p_swap_hmm > 0.5 (if flipped).
+    // => HMM swapped.
+    // => HMM path1 matches use_seq2 (seq1).
+    // => new_path1 matches seq1.
+    // => Consistent with final_swap=0.
+    // So new_paths are implicitly consistent with the chosen orientation logic.
+    // No manual path permutation required.
 
     (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths)
 }
