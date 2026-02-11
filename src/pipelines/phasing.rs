@@ -629,7 +629,7 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut ranked: Vec<(usize, f32)> = scores
         .iter()
         .enumerate()
-        .filter(|&(_, &s)| s.is_finite() && s > 0.0)
+        .filter(|&(_, &s)| s.is_finite())
         .map(|(i, &s)| (i, s))
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
