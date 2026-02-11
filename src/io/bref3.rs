@@ -57,6 +57,7 @@ const ALLELE_CODED: u8 = 1;
 
 const BREF3_BLOCK_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const BREF3_BLOCK_MAX_RECORDS: usize = 10_000;
+const MAX_STRING_ARRAY_LEN: i32 = 100_000_000;
 
 /// All 24 permutations of SNV bases (A, C, G, T) for allele code decoding
 static SNV_PERMS: [[&str; 4]; 24] = [
@@ -478,6 +479,9 @@ fn read_string_array<R: Read>(reader: &mut R) -> Result<Vec<String>> {
     let len = read_be_i32(reader)?;
     if len < 0 {
         return Ok(Vec::new());
+    }
+    if len > MAX_STRING_ARRAY_LEN {
+        bail!("String array length too large: {}", len);
     }
 
     let mut result = Vec::with_capacity(len as usize);
