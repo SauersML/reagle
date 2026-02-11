@@ -3680,11 +3680,15 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let smoothing_cluster_cm = self.config.cluster.max(1e-6);
-        let min_untyped_prior_mix = 0.0f32;
-        let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
-        let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
+        // Floor amount of panel-frequency prior to mix into completely untyped
+        // markers. This term intentionally depends on `cluster` and `err` so
+        // larger values preserve panel AF more aggressively when local typed
+        // evidence is weak.
+        let base_untyped_prior_mix = 0.08f32;
+        let cluster_prior_factor = (self.config.cluster / 0.005f32).powf(0.8).clamp(0.5, 10.0);
+        let err_prior_factor = (self.params.p_mismatch / 1e-4f32).sqrt().clamp(0.5, 10.0);
         let min_untyped_prior_mix =
-            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
+            (base_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
         let overlap_size = 1000.min(output_end);
         let overlap_start = output_end.saturating_sub(overlap_size);
         let build_input_probs_pair = |hap1: HapIdx,
