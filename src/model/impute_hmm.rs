@@ -10,8 +10,9 @@ use crate::data::storage::{
 };
 use crate::error::{ReagleError, Result};
 use crate::model::types::RefHapId;
-use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
+use crate::model::weighted_kernel::{EmissionProbs, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::utils::fast_math::fast_ln;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1193,14 +1194,14 @@ fn smooth_allele_posteriors_subset(
         let p = post.clamp(0.0, 1.0);
         let q = prior.clamp(0.0, 1.0);
         if p > 0.0 {
-            post_entropy -= p * p.ln();
+            post_entropy -= p * fast_ln(p);
         }
         if q > 0.0 {
-            prior_entropy -= q * q.ln();
+            prior_entropy -= q * fast_ln(q);
         }
     }
     let entropy_gap = (prior_entropy - post_entropy).max(0.0);
-    let max_entropy = (allele_probs.len().max(2) as f32).ln().max(1e-6);
+    let max_entropy = fast_ln(allele_probs.len().max(2) as f32).max(1e-6);
     let confidence_boost = (entropy_gap / max_entropy).clamp(0.0, 1.0);
 
     let base_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
@@ -1349,17 +1350,17 @@ fn apply_adaptive_panel_blend(
             let q = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             let m = 0.5 * (p + q);
             if p > 0.0 {
-                p_entropy -= p * p.ln();
+                p_entropy -= p * fast_ln(p);
             }
             if q > 0.0 {
-                q_entropy -= q * q.ln();
+                q_entropy -= q * fast_ln(q);
             }
             if m > 0.0 {
-                m_entropy -= m * m.ln();
+                m_entropy -= m * fast_ln(m);
             }
         }
         let js_div = (m_entropy - 0.5 * (p_entropy + q_entropy)).max(0.0);
-        let max_js = (2.0f32).ln();
+        let max_js = 0.69314718; // ln(2)
         let disagreement = (js_div / max_js).clamp(0.0, 1.0);
 
         // Symmetric blend toward panel frequencies. This avoids one-sided ALT
@@ -1887,12 +1888,13 @@ fn forward_update_impl<C: RefColumnLike>(
             &mut ws.emissions[..active_states],
         );
         if recomb_rate > 0.0 {
-            WeightedHmmUpdater::fwd_update_weighted(
+            // Reagle always uses uniform (1.0) weights for imputation states.
+            // Using the specialized uniform kernel saves memory bandwidth and computation.
+            WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
                 1.0,
                 recomb_rate,
                 transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
                 EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
@@ -1955,12 +1957,11 @@ fn forward_update_seqcoded(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            WeightedHmmUpdater::fwd_update_weighted(
+            WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
                 1.0,
                 recomb_rate,
                 transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
                 EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
@@ -2028,12 +2029,11 @@ fn forward_update_dict(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            WeightedHmmUpdater::fwd_update_weighted(
+            WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
                 1.0,
                 recomb_rate,
                 transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
                 EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )

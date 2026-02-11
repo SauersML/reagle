@@ -51,6 +51,7 @@ use crate::model::reference_pbwt::{PbwtQueryAllele, PbwtStrictAllele, RankBeam, 
 use crate::model::transition_matrix::TransitionMatrix;
 use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
+use crate::utils::fast_math::fast_ln;
 use crate::utils::telemetry::TelemetryBlackboard;
 
 /// Retain only the `k` highest-weight donors, discarding the rest.
@@ -228,7 +229,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
             if p.is_finite() {
                 any_finite = true;
                 if p > 0.0 {
-                    entropy -= p * p.ln();
+                    entropy -= p * fast_ln(p);
                 }
                 n_alleles += 1;
                 if p > max_prob {
@@ -239,7 +240,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
         if !any_finite {
             continue;
         }
-        let max_entropy = (n_alleles.max(2) as f32).ln();
+        let max_entropy = fast_ln(n_alleles.max(2) as f32);
         let info_weight = if max_entropy > 0.0 {
             (1.0 - (entropy / max_entropy)).clamp(0.0, 1.0)
         } else {
