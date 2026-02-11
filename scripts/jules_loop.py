@@ -18,6 +18,12 @@ This should guide our decision-making. This happens through taking proper long-t
 Well, better phasing and imputation leads to downstream better, e.g., predictive power for disease prediction, disease associations, science, etc., which improve lives tangibly.
 This means we must always do what is best for real-world accuracy and performance.
 
+Large changes are not bad (bigness of change is orthogonal to goodness), and should not be avoided. We don’t care about backwards compatibility.
+Model changes or algorithm changes are not bad.
+Instead of having a bias towards the status quo, we should have a bias for what is most likely to be correct when reasoning from first principles.
+Don’t assume the current code has been well-tested or is already deployed. It’s in the prototype stage, and core ideas may change.
+There may not always be correct or verified reasons for the decisions made in the code.
+
 RULES:
 - Always make a real improvement and finish in one PR.
 - Use the provided build log as a signal. If there are compile errors or failing tests, you might diagnose root cause and fix the implementation.
@@ -34,6 +40,9 @@ SCOPE:
 - Focus ONLY on src/*.rs files and Cargo.toml.
 - Run cargo check --all-targets and cargo test to validate changes.
 - You are encouraged to proactively search official Rust documentation when needed.
+
+Remember to keep the overall goals in mind as we implement. Do this yourself in full now without stopping until it is fully finished.
+We must have the perfect, ideal, best version for our goals. We must do it in the best way possible.
 
 OUTPUT:
 - Produce a patch that meaningfully improves the project.
