@@ -1210,9 +1210,7 @@ fn apply_marker_prior_smoothing(
     warned_af_fallback: &mut bool,
     context: ImputeHmmContext,
 ) {
-    if !untyped_uniform_marker {
-        return;
-    }
+    let heavy_smoothing = untyped_uniform_marker;
 
     // Heuristic: If we are using a subset of the panel (active_states < panel_haps),
     // we should mix in the global prior to account for the possibility that the
@@ -1230,11 +1228,20 @@ fn apply_marker_prior_smoothing(
     } else {
         0.0
     };
-    let floor_mix = min_prior_mix.clamp(0.0, 0.9);
+    let floor_mix = if heavy_smoothing {
+        min_prior_mix.clamp(0.0, 0.9)
+    } else {
+        0.0
+    };
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
     // Only inject panel-frequency information when distance from typed anchors
     // is sufficiently large. Near observed markers, let local LD dominate.
-    let adaptive_panel_mix = (missing_mass * (1.0 - retain)).clamp(0.0, 0.7);
+    let adaptive_panel_mix = if heavy_smoothing {
+        (missing_mass * (1.0 - retain)).clamp(0.0, 0.7)
+    } else {
+        // Non-uniform untyped markers still benefit from mild regularization.
+        (0.25 * missing_mass * (1.0 - retain)).clamp(0.0, 0.2)
+    };
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1247,12 +1254,30 @@ fn apply_marker_prior_smoothing(
                     floor_mix,
                     adaptive_panel_mix,
                 );
+                apply_anti_collapse_regularization(
+                    allele_probs,
+                    &panel_probs,
+                    nearest_obs_lambda,
+                    active_states,
+                    panel_haps,
+                );
             }
             AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
                 apply_adaptive_panel_blend(allele_probs, p, floor_mix, adaptive_panel_mix);
+                apply_anti_collapse_regularization(
+                    allele_probs,
+                    p,
+                    nearest_obs_lambda,
+                    active_states,
+                    panel_haps,
+                );
             }
             _ => {}
         }
+    }
+
+    if !heavy_smoothing {
+        return;
     }
 
     let prior_probs = if smoothing_prior_total > 0.0 {
@@ -1275,6 +1300,69 @@ fn apply_marker_prior_smoothing(
         )
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
+}
+
+#[inline]
+fn apply_anti_collapse_regularization(
+    allele_probs: &mut [f32],
+    panel_probs: &[f32],
+    nearest_obs_lambda: f32,
+    active_states: usize,
+    panel_haps: usize,
+) {
+    if allele_probs.len() != panel_probs.len() || allele_probs.len() < 2 {
+        return;
+    }
+
+    let lambda = nearest_obs_lambda.max(0.0);
+    if !lambda.is_finite() || lambda < 0.002 {
+        return;
+    }
+
+    let panel_coverage = if panel_haps > 0 {
+        (active_states as f32 / panel_haps as f32).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+
+    let posterior_entropy = normalized_entropy(allele_probs);
+    let panel_entropy = normalized_entropy(panel_probs);
+    let collapse_gap = (panel_entropy - posterior_entropy).max(0.0);
+    if collapse_gap <= 0.05 {
+        return;
+    }
+
+    // Stronger anti-collapse blending when donor coverage is sparse and the
+    // marker is far from typed anchors. This counters pathological posterior
+    // spikes that overfit a tiny donor subset.
+    let distance_factor = 1.0 - (-lambda * 10.0).exp();
+    let coverage_factor = (1.0 - panel_coverage).sqrt();
+    let blend = (0.45 * collapse_gap * distance_factor * coverage_factor).clamp(0.0, 0.35);
+    if blend <= 0.0 {
+        return;
+    }
+
+    let one_minus = 1.0 - blend;
+    for (prob, panel_p) in allele_probs.iter_mut().zip(panel_probs.iter().copied()) {
+        *prob = one_minus * *prob + blend * panel_p.clamp(0.0, 1.0);
+    }
+    normalize_probs(allele_probs);
+}
+
+#[inline]
+fn normalized_entropy(probs: &[f32]) -> f32 {
+    let k = probs.len();
+    if k <= 1 {
+        return 0.0;
+    }
+    let mut h = 0.0f32;
+    for &p in probs {
+        let q = p.clamp(0.0, 1.0);
+        if q > 0.0 {
+            h -= q * q.ln();
+        }
+    }
+    h / (k as f32).ln().max(f32::EPSILON)
 }
 
 #[inline]

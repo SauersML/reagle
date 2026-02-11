@@ -163,12 +163,15 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     //   w = 1 - H(p)/log(K), K = number of alleles
     // so near-uniform markers contribute little evidence.
     const PRIOR_STRENGTH_MARKERS: f32 = 16.0;
+    let n_markers = input_probs.n_markers().max(1);
+    let mut observed_informative_markers = 0usize;
     let mut weighted_residual_sum = 0.0f32;
     let mut weight_sum = 0.0f32;
     for m in 0..input_probs.n_markers() {
         if !input_probs.is_observed_marker(m) || input_probs.is_uniform_marker(m) {
             continue;
         }
+        observed_informative_markers += 1;
         let probs = input_probs.probs_for_marker(m);
         if probs.is_empty() {
             continue;
@@ -212,6 +215,20 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
+
+    // Sparse scaffold inflation: when very few informative markers are available,
+    // the HMM is much more likely to overfit a thin donor subset and produce
+    // overconfident posteriors. Inflate epsilon in these settings to recover
+    // better calibration and improve rare-variant dosage stability.
+    let informative_density = observed_informative_markers as f32 / n_markers as f32;
+    let sparse_inflation = if informative_density < 0.02 {
+        // Up to +4x at extreme sparsity; smoothly decays to 1x by 2% typed density.
+        let x = (0.02 - informative_density) / 0.02;
+        1.0 + 3.0 * x.powi(2)
+    } else {
+        1.0
+    };
+    let posterior = (posterior * sparse_inflation).min(0.5);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     let min_error = (base * 0.1).max(1e-6).min(base);
