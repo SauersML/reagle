@@ -10945,9 +10945,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
             }
             evidence > 0 && flipped > direct
         } else {
-            // No anchors to orient phase; mix globally to prevent confident lock-in
-            // on arbitrary label orientation.
-            chain.rng.random_bool(0.5)
+            false
         };
 
         for (i, &m) in het_positions.iter().enumerate() {

@@ -208,7 +208,7 @@ impl Default for Config {
             dynamic_mcmc: true,
             dynamic_k: 48,
             mcmc_steps: 8,
-            mcmc_lr_samples: 32,
+            mcmc_lr_samples: 100,
             phase_states: 0,
             rare: 0.002,
             impute: true,
