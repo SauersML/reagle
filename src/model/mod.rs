@@ -56,4 +56,3 @@ pub mod state_allocator;
 pub mod states;
 pub mod transition_matrix;
 pub mod types;
-pub mod weighted_kernel;

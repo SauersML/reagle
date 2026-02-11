@@ -381,6 +381,105 @@ def ensure_simple_genetic_map(ref_vcf, map_path, chrom="22"):
 
     return map_path
 
+
+def ensure_plink_genetic_map(ref_vcf, map_path, chrom="22"):
+    """Create a PLINK-style map file: chrom marker_id cM bp."""
+    map_path = Path(map_path)
+    if map_path.exists() and map_path.stat().st_size > 0:
+        return map_path
+
+    chrom_label = find_chrom_label(ref_vcf, chrom) or f"chr{chrom}"
+    chrom_token = str(chrom).replace("chr", "")
+    if chrom_token.upper() == "X":
+        map_chr = "23"
+    elif chrom_token.upper() == "Y":
+        map_chr = "24"
+    else:
+        map_chr = chrom_token
+
+    positions = []
+    with _open_maybe_gzip(ref_vcf) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip().split("\t")
+            if len(fields) < 2:
+                continue
+            if fields[0] != chrom_label:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            positions.append(pos)
+
+    if not positions:
+        raise RuntimeError(f"No positions found for {chrom_label} in {ref_vcf}")
+
+    positions = sorted(set(positions))
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(map_path, "w") as f:
+        for pos in positions:
+            cm = pos / 1_000_000.0
+            f.write(f"{map_chr}\t.\t{cm:.6f}\t{pos}\n")
+
+    return map_path
+
+
+def ensure_position_genetic_map(ref_vcf, map_path, chrom="22"):
+    """Create a position/rate/cM map usable by tools like IMPUTE5/GLIMPSE."""
+    map_path = Path(map_path)
+    if map_path.exists() and map_path.stat().st_size > 0:
+        return map_path
+
+    chrom_label = find_chrom_label(ref_vcf, chrom) or f"chr{chrom}"
+    positions = []
+    with _open_maybe_gzip(ref_vcf) as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip().split("\t")
+            if len(fields) < 2:
+                continue
+            if fields[0] != chrom_label:
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            positions.append(pos)
+
+    if not positions:
+        raise RuntimeError(f"No positions found for {chrom_label} in {ref_vcf}")
+
+    positions = sorted(set(positions))
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(map_path, "w") as f:
+        f.write("position COMBINED_rate(cM/Mb) Genetic_Map(cM)\n")
+        for pos in positions:
+            cm = pos / 1_000_000.0
+            f.write(f"{pos} 1.0 {cm:.6f}\n")
+
+    return map_path
+
+
+def tool_supports_flag(binary_path, flag):
+    """Best-effort check whether a binary advertises a CLI flag."""
+    try:
+        result = subprocess.run(
+            f"{binary_path} --help 2>&1",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        help_text = (result.stdout or "") + "\n" + (result.stderr or "")
+        return flag in help_text
+    except Exception:
+        return False
+
+
 def eagleimp_map_header_ok(map_path):
     map_path = Path(map_path)
     if not map_path.exists() or map_path.stat().st_size == 0:
@@ -505,9 +604,10 @@ def create_regions_file(sites, output_path):
     return output_path
 
 
-def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2):
+def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2, map_path=None):
     """Run Java Beagle for imputation."""
-    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} gt={target_vcf} out={output_prefix} nthreads={nthreads} gp=true"
+    map_arg = f" map={map_path}" if map_path else ""
+    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} gt={target_vcf} out={output_prefix} nthreads={nthreads} gp=true{map_arg}"
     try:
         run(cmd)
         output = f"{output_prefix}.vcf.gz"
@@ -519,10 +619,11 @@ def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2):
         return None
 
 
-def run_reagle(ref_vcf, target_vcf, output_prefix, reagle_bin):
+def run_reagle(ref_vcf, target_vcf, output_prefix, reagle_bin, map_path=None):
     """Run Reagle for imputation."""
     output_vcf = f"{output_prefix}.vcf.gz"
-    cmd = f"{reagle_bin} --ref {ref_vcf} --target {target_vcf} --out {output_prefix}"
+    map_arg = f" --map {map_path}" if map_path else ""
+    cmd = f"{reagle_bin} --ref {ref_vcf} --target {target_vcf} --out {output_prefix}{map_arg}"
     try:
         run(cmd)
         if os.path.exists(output_vcf):
@@ -3011,12 +3112,18 @@ def stage_beagle():
             sys.exit(1)
 
     print("\n--- Running Java Beagle ---")
+    beagle_map = ensure_plink_genetic_map(
+        paths["ref_vcf"],
+        paths["data_dir"] / "chr22.plink.map",
+        chrom="22"
+    )
     beagle_vcf = run_beagle(
         str(paths['ref_vcf']),
         str(paths['input_vcf']),
         str(paths['beagle_out']),
         str(paths['beagle_jar']),
-        nthreads=2
+        nthreads=2,
+        map_path=str(beagle_map),
     )
 
     if beagle_vcf and os.path.exists(beagle_vcf):
@@ -3048,11 +3155,17 @@ def stage_reagle():
         sys.exit(1)
 
     print("\n--- Running Reagle ---")
+    reagle_map = ensure_plink_genetic_map(
+        paths["ref_vcf"],
+        paths["data_dir"] / "chr22.plink.map",
+        chrom="22"
+    )
     reagle_vcf = run_reagle(
         str(paths['ref_vcf']),
         str(paths['input_vcf']),
         str(paths['reagle_out']),
-        str(paths['reagle_bin'])
+        str(paths['reagle_bin']),
+        map_path=str(reagle_map),
     )
 
     if reagle_vcf and os.path.exists(reagle_vcf):
@@ -3086,7 +3199,15 @@ def _run_reagle_phasing(paths, input_vcf):
     reagle_vcf = Path(str(reagle_prefix) + ".vcf.gz")
     if not reagle_vcf.exists():
         print("\n--- Running Reagle (phasing-only) ---")
-        run(f"{paths['reagle_bin']} --target {input_vcf} --out {reagle_prefix}")
+        reagle_map = ensure_plink_genetic_map(
+            paths["ref_vcf"],
+            paths["data_dir"] / "chr22.plink.map",
+            chrom="22"
+        )
+        run(
+            f"{paths['reagle_bin']} --target {input_vcf} --ref {paths['ref_vcf']} "
+            f"--map {reagle_map} --out {reagle_prefix}"
+        )
     ensure_index(reagle_vcf)
     return reagle_vcf
 
@@ -3831,7 +3952,15 @@ def run_beagle_chr(chrom, paths):
         run(f"curl -L -o {beagle_jar} 'https://faculty.washington.edu/browning/beagle/beagle.22Jul22.46e.jar'")
     
     if not out.exists():
-        run(f"java -Xmx8g -jar {beagle_jar} ref={paths['ref_vcf']} gt={paths['input_vcf']} out={data_dir}/beagle_imputed nthreads=4")
+        map_path = ensure_plink_genetic_map(
+            paths["ref_vcf"],
+            data_dir / f"chr{chrom}.plink.map",
+            chrom=str(chrom)
+        )
+        run(
+            f"java -Xmx8g -jar {beagle_jar} ref={paths['ref_vcf']} gt={paths['input_vcf']} "
+            f"map={map_path} out={data_dir}/beagle_imputed nthreads=4"
+        )
         run(f"bcftools index -f {out}")
 
 
@@ -3839,7 +3968,15 @@ def run_reagle_chr(chrom, paths):
     """Run Reagle for a chromosome."""
     out = paths['data_dir'] / "reagle_imputed.vcf.gz"
     if paths['reagle_bin'].exists() and not out.exists():
-        run(f"{paths['reagle_bin']} --ref {paths['ref_vcf']} --target {paths['input_vcf']} --out {paths['data_dir']}/reagle_imputed")
+        map_path = ensure_plink_genetic_map(
+            paths["ref_vcf"],
+            paths["data_dir"] / f"chr{chrom}.plink.map",
+            chrom=str(chrom)
+        )
+        run(
+            f"{paths['reagle_bin']} --ref {paths['ref_vcf']} --target {paths['input_vcf']} "
+            f"--map {map_path} --out {paths['data_dir']}/reagle_imputed"
+        )
         run(f"bcftools index -f {out}")
 
 
@@ -3893,7 +4030,16 @@ def run_impute5_chr(chrom, paths):
             print(f"IMPUTE5 region: {region_arg}")
             print(f"IMPUTE5 ref: {paths['ref_vcf']}")
             print(f"IMPUTE5 input (phased): {paths['input_vcf']}")
-            run(f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} --r {region_arg} --buffer-region {region_arg} --o {out} --threads 4")
+            impute5_map = ensure_position_genetic_map(
+                paths["ref_vcf"],
+                data_dir / f"chr{chrom}.impute5.map.txt",
+                chrom=str(chrom),
+            )
+            run(
+                f"{impute5_bin} --h {paths['ref_vcf']} --g {paths['input_vcf']} "
+                f"--m {impute5_map} --r {region_arg} --buffer-region {region_arg} "
+                f"--o {out} --threads 4"
+            )
             run(f"bcftools index -f {out}")
         except Exception as e:
             print(f"IMPUTE5 failed on chr{chrom}: {e}")
@@ -3958,7 +4104,20 @@ def run_minimac_chr(chrom, paths):
             print(f"Minimac4 region: {region_arg}")
             print(f"Minimac4 ref (msav): {msav_ref}")
             print(f"Minimac4 input: {paths['input_vcf']}")
-            run(f"{minimac_bin} {msav_ref} {paths['input_vcf']} --output {prefix}.dose.vcf.gz --threads 4 --format GT,DS --region {region_arg}")
+            minimac_map_arg = ""
+            minimac_map = ensure_position_genetic_map(
+                paths["ref_vcf"],
+                data_dir / f"chr{chrom}.minimac.map.txt",
+                chrom=str(chrom),
+            )
+            if tool_supports_flag(str(minimac_bin), "--map"):
+                minimac_map_arg = f" --map {minimac_map}"
+            elif tool_supports_flag(str(minimac_bin), "--mapFile"):
+                minimac_map_arg = f" --mapFile {minimac_map}"
+            run(
+                f"{minimac_bin} {msav_ref} {paths['input_vcf']} --output {prefix}.dose.vcf.gz "
+                f"--threads 4 --format GT,DS --region {region_arg}{minimac_map_arg}"
+            )
             
             # Helper to move output
             dose_out = data_dir / "minimac_imputed.dose.vcf.gz"
@@ -3997,7 +4156,16 @@ def run_glimpse_chr(chrom, paths):
             print(f"GLIMPSE region: {region_arg}")
             print(f"GLIMPSE ref: {paths['ref_vcf']}")
             print(f"GLIMPSE input: {paths['input_vcf']}")
-            run(f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} --input-region {region_arg} --output-region {region_arg} --output {bcf_out} --threads 4")
+            glimpse_map = ensure_position_genetic_map(
+                paths["ref_vcf"],
+                data_dir / f"chr{chrom}.glimpse.map.txt",
+                chrom=str(chrom),
+            )
+            run(
+                f"{glimpse_bin} --input-gl {paths['input_vcf']} --reference {paths['ref_vcf']} "
+                f"--map {glimpse_map} --input-region {region_arg} --output-region {region_arg} "
+                f"--output {bcf_out} --threads 4"
+            )
             run(f"bcftools view {bcf_out} -O z -o {out}")
             run(f"bcftools index -f {out}")
         except Exception as e:

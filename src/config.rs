@@ -31,6 +31,10 @@ pub struct CliArgs {
     #[arg(long, short, value_name = "PREFIX")]
     pub out: PathBuf,
 
+    /// PLINK map file with cM units
+    #[arg(long, value_name = "FILE")]
+    pub map: Option<PathBuf>,
+
     /// Enable profiling output (hierarchical timing tree)
     #[arg(long, default_value = "false")]
     pub profile: bool,
@@ -366,6 +370,9 @@ impl Config {
         config.target = cli.target;
         config.r#ref = cli.r#ref;
         config.out = cli.out;
+        if cli.map.is_some() {
+            config.map = cli.map;
+        }
         if cli.profile {
             config.profile = true;
         }
