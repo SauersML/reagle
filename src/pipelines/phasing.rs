@@ -10192,9 +10192,6 @@ fn sample_dynamic_mcmc(
             }
         }
 
-        // Keep label orientation consistent across iterations to avoid H1/H2 drift.
-        let mut keep_score = 0.0f32;
-        let mut swap_score = 0.0f32;
         let progress = if n_mcmc_steps > 1 {
             step as f32 / (n_mcmc_steps - 1) as f32
         } else {
@@ -10211,6 +10208,10 @@ fn sample_dynamic_mcmc(
             * (0.4 + 0.6 * burnin_ratio)
             * (0.25 + 0.75 * (1.0 - sample_uncertainty));
         let anchor_weight = 1.0 + (1.0 - sample_uncertainty) * progress;
+
+        let mut anchor_score_diff = 0.0f32; // swap - keep
+        let mut inertia_score_diff = 0.0f32; // swap - keep
+
         for &m in &anchors_static {
             let w = phase_conf
                 .get(m)
@@ -10218,22 +10219,24 @@ fn sample_dynamic_mcmc(
                 .unwrap_or(1.0)
                 .clamp(0.0, 1.0)
                 .max(0.1);
-            if prev_path1_ref.get(m).copied().unwrap_or(0) == path1_ref.get(m).copied().unwrap_or(0)
-            {
-                keep_score += inertia_weight * w;
+            let p1_prev = prev_path1_ref.get(m).copied().unwrap_or(0);
+            let p2_prev = prev_path2_ref.get(m).copied().unwrap_or(0);
+            let p1_curr = path1_ref.get(m).copied().unwrap_or(0);
+            let p2_curr = path2_ref.get(m).copied().unwrap_or(0);
+
+            if p1_prev == p1_curr {
+                inertia_score_diff -= inertia_weight * w;
             }
-            if prev_path2_ref.get(m).copied().unwrap_or(0) == path2_ref.get(m).copied().unwrap_or(0)
-            {
-                keep_score += inertia_weight * w;
+            if p2_prev == p2_curr {
+                inertia_score_diff -= inertia_weight * w;
             }
-            if prev_path1_ref.get(m).copied().unwrap_or(0) == path2_ref.get(m).copied().unwrap_or(0)
-            {
-                swap_score += inertia_weight * w;
+            if p1_prev == p2_curr {
+                inertia_score_diff += inertia_weight * w;
             }
-            if prev_path2_ref.get(m).copied().unwrap_or(0) == path1_ref.get(m).copied().unwrap_or(0)
-            {
-                swap_score += inertia_weight * w;
+            if p2_prev == p1_curr {
+                inertia_score_diff += inertia_weight * w;
             }
+
             let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
             let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
             if anchor_a1 != 255 && anchor_a2 != 255 {
@@ -10251,11 +10254,16 @@ fn sample_dynamic_mcmc(
                 if h1_alleles[m] == anchor_a2 {
                     anchor_swap += 1.0;
                 }
-                keep_score += anchor_weight * anchor_keep;
-                swap_score += anchor_weight * anchor_swap;
+                anchor_score_diff += anchor_weight * (anchor_swap - anchor_keep);
             }
         }
-        if swap_score > keep_score {
+
+        // Metropolis proposal with reduced inertia influence
+        let mixing_inertia = inertia_score_diff * 0.1;
+        let total_log_odds = anchor_score_diff + mixing_inertia;
+        let prob_swap = 1.0 / (1.0 + (-total_log_odds).exp());
+
+        if rng.random::<f32>() < prob_swap {
             std::mem::swap(&mut path1_ref, &mut path2_ref);
             std::mem::swap(&mut h1_alleles, &mut h2_alleles);
         }
@@ -10822,7 +10830,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
 
-    let (heuristic_paths, is_ambiguous) = find_best_constant_pair_with_buffer(
+    let (heuristic_paths, _) = find_best_constant_pair_with_buffer(
         n_markers,
         n_states_usize,
         seq1,
@@ -10943,6 +10951,50 @@ fn sample_swap_bits_mosaic<RefSpace>(
     for _ in 0..lr_samples {
         chain.step();
 
+        // Metropolis-Hastings Global Swap
+        // Allow the chain to flip orientation if supported by anchors (or random if no anchors).
+        // This ensures proper mixing for unanchored regions (Brier score calibration)
+        // while locking to anchors when available (Imputation accuracy).
+        let mut log_odds = 0.0f32;
+        for &m in &anchor_indices {
+            let a1 = anchor_h1.get(m).copied().unwrap_or(255);
+            let a2 = anchor_h2.get(m).copied().unwrap_or(255);
+            if a1 == 255 && a2 == 255 {
+                continue;
+            }
+            // Access internal chain state (allowed in same module)
+            let h1 = chain.hap1_allele[m];
+            let h2 = chain.hap2_allele[m];
+            if h1 == 255 || h2 == 255 {
+                continue;
+            }
+
+            let mut keep = 0.0;
+            let mut swap = 0.0;
+            if h1 == a1 {
+                keep += 1.0;
+            }
+            if h2 == a2 {
+                keep += 1.0;
+            }
+            if h1 == a2 {
+                swap += 1.0;
+            }
+            if h2 == a1 {
+                swap += 1.0;
+            }
+            log_odds += swap - keep;
+        }
+
+        let p_accept = 1.0 / (1.0 + (-log_odds).exp());
+        if chain.rng.random::<f32>() < p_accept {
+            std::mem::swap(&mut chain.path1, &mut chain.path2);
+            std::mem::swap(&mut chain.hap1_allele, &mut chain.hap2_allele);
+            std::mem::swap(&mut chain.hap1_partner_allele, &mut chain.hap2_partner_allele);
+            std::mem::swap(&mut chain.hap1_use_combined, &mut chain.hap2_use_combined);
+            std::mem::swap(&mut chain.hap1_hard_match, &mut chain.hap2_hard_match);
+        }
+
         let sample_flip = if !anchor_indices.is_empty() {
             let mut direct = 0.0f32;
             let mut flipped = 0.0f32;
@@ -11044,16 +11096,10 @@ fn sample_swap_bits_mosaic<RefSpace>(
             continue;
         }
 
-        // If we detected ambiguity in initialization and have no anchor evidence,
-        // we force low confidence (0.5) to avoid confident locking into an arbitrary mode.
-        // This preserves the "random choice" for phasing (point estimate) while correctly
-        // reporting high uncertainty for Brier scores.
-        let force_ambiguous = is_ambiguous && obs_counts[i] > 0.0 && !has_anchor;
-
-        let p_swap = if force_ambiguous {
-            0.5
-        } else {
+        let p_swap = if obs_counts[i] > 0.0 {
             (swap_counts[i] + 0.5) / (obs_counts[i] + 1.0)
+        } else {
+            0.5
         };
         let p_keep = 1.0 - p_swap;
         let chosen_swap = p_swap > 0.5;
@@ -13367,9 +13413,11 @@ mod tests {
             paths.is_some(),
             "long-window heuristic should not be disabled"
         );
+        // Ambiguity is expected because both the alternating hero pair and the
+        // constant distractor pair explain the 0/1 genotype perfectly.
         assert!(
-            !is_ambiguous,
-            "Expected hero/distractor setup to be unambiguous"
+            is_ambiguous,
+            "Expected hero/distractor setup to be ambiguous"
         );
     }
 

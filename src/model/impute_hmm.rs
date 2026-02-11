@@ -952,7 +952,9 @@ fn normalize_probs(probs: &mut [f32]) {
 
 #[inline]
 fn adjusted_recomb_rate(recomb_rate: f32) -> f32 {
-    recomb_rate.clamp(0.0, 1.0)
+    // Clamp to a small epsilon to prevent posterior collapse when p_recomb is 0.0
+    // (e.g. markers at same position or very dense maps).
+    recomb_rate.clamp(1e-15, 1.0)
 }
 
 #[inline]
