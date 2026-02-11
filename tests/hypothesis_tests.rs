@@ -161,6 +161,22 @@ fn run_rust_phasing_with_window_toml(
     pipeline.run_auto()
 }
 
+/// Run Rust phasing pipeline with specific state count.
+fn run_rust_phasing_with_states(
+    gt_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    states: usize,
+) -> reagle::Result<()> {
+    let mut config = Config::default();
+    config.target = gt_path.to_path_buf();
+    config.out = out_prefix.to_path_buf();
+    config.seed = seed;
+    config.phase_states = states;
+    let mut pipeline = reagle::PhasingPipeline::new(config, None);
+    pipeline.run_auto()
+}
+
 /// Run Rust phasing pipeline (defaults).
 fn run_rust_phasing_default(gt_path: &Path, out_prefix: &Path, seed: i64) -> reagle::Result<()> {
     let mut config = Config::default();
