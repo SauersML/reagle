@@ -266,6 +266,42 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
 }
 
 #[inline]
+fn adaptive_untyped_prior_mix(
+    observed_ratio: f32,
+    cluster_cm: f32,
+    p_mismatch: f32,
+    unphased_input: bool,
+) -> f32 {
+    // Global panel-frequency floor for completely untyped sites.
+    //
+    // Motivation:
+    // - With dense typed context, we want near-zero floor so local LD dominates.
+    // - In high-missingness windows (or post-phasing uncertainty), we need a
+    //   stronger floor to prevent ALT drift on sparse/noisy evidence.
+    //
+    // The resulting floor is intentionally conservative for well-observed data
+    // and becomes aggressive only when observed_ratio drops.
+    let typed = observed_ratio.clamp(0.0, 1.0);
+    let missing = 1.0 - typed;
+
+    // Cubic ramp keeps the floor almost zero until missingness becomes
+    // meaningful, then increases sharply in sparse windows.
+    let missing_ramp = missing.powi(3);
+
+    // Slightly stronger floor when cluster distance is wide (weaker local
+    // linkage signal) or the model error rate is elevated.
+    let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
+    let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 1.6);
+
+    // Unphased-target imputation has additional uncertainty from phase
+    // transfer, so apply a mild boost.
+    let phase_factor = if unphased_input { 1.25 } else { 1.0 };
+
+    let floor = 0.01 + 0.22 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
+}
+
+#[inline]
 fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllele) -> usize {
     if n_ref_haps == 0 {
         return 1;
@@ -3762,11 +3798,6 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let smoothing_cluster_cm = self.config.cluster.max(1e-6);
-        let min_untyped_prior_mix = 0.0f32;
-        let cluster_prior_factor = (self.config.cluster / 0.04f32).clamp(0.8, 1.4);
-        let err_prior_factor = (self.params.p_mismatch / 4e-4f32).clamp(0.8, 1.4);
-        let min_untyped_prior_mix =
-            (min_untyped_prior_mix * cluster_prior_factor * err_prior_factor).clamp(0.0, 0.5);
         let overlap_size = 1000.min(output_end);
         let overlap_start = output_end.saturating_sub(overlap_size);
         let build_input_probs_pair = |hap1: HapIdx,
@@ -4245,9 +4276,43 @@ impl crate::pipelines::ImputationPipeline {
                 offsets1.push(probs1.len());
                 offsets2.push(probs2.len());
             }
+            let observed_ratio1 = if observed1.is_empty() {
+                0.0
+            } else {
+                observed1.iter().filter(|&&v| v).count() as f32 / observed1.len() as f32
+            };
+            let observed_ratio2 = if observed2.is_empty() {
+                0.0
+            } else {
+                observed2.iter().filter(|&&v| v).count() as f32 / observed2.len() as f32
+            };
+            let min_untyped_prior_mix1 = adaptive_untyped_prior_mix(
+                observed_ratio1,
+                smoothing_cluster_cm,
+                self.params.p_mismatch,
+                true,
+            );
+            let min_untyped_prior_mix2 = adaptive_untyped_prior_mix(
+                observed_ratio2,
+                smoothing_cluster_cm,
+                self.params.p_mismatch,
+                true,
+            );
             (
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix),
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix),
+                TargetAlleleProbs::new(
+                    offsets1,
+                    probs1,
+                    observed1,
+                    None,
+                    min_untyped_prior_mix1,
+                ),
+                TargetAlleleProbs::new(
+                    offsets2,
+                    probs2,
+                    observed2,
+                    None,
+                    min_untyped_prior_mix2,
+                ),
                 last_info1,
                 last_info2,
             )
