@@ -417,6 +417,60 @@ def parse_reagle_seconds_and_artifact(log_text: str) -> tuple[float | None, str 
     return seconds, artifact_name
 
 
+def parse_reagle_metrics_from_log(log_text: str) -> dict | None:
+    """Extract top-level reagle metrics from job log text.
+
+    The integration_test.py metrics stage prints lines like:
+      key: reagle=0.775865 beagle=0.890333 delta=-0.114468
+    We extract the reagle value for each known metric key.
+    Only top-level lines are matched (lines containing by_maf. are skipped).
+    """
+    metric_keys = {m[0] for m in METRICS}
+    result: dict[str, float] = {}
+    pattern = re.compile(r"\s+(\S+):\s+reagle=([\d.eE+-]+)\s+beagle=")
+    for line in log_text.splitlines():
+        if "by_maf." in line:
+            continue
+        m = pattern.search(line)
+        if m:
+            key = m.group(1)
+            if key in metric_keys:
+                try:
+                    result[key] = float(m.group(2))
+                except ValueError:
+                    pass
+    return result if result else None
+
+
+def extract_metrics_from_logs(
+    gh: GitHubClient,
+    run: dict,
+    cache_dir: Path,
+) -> dict[str, dict]:
+    """Fallback: extract metrics from job logs when artifacts are unavailable."""
+    run_id = int(run["id"])
+    jobs = list_run_jobs(gh, run_id)
+    out: dict[str, dict] = {}
+    for job in jobs:
+        name = job.get("name", "")
+        if not name.startswith("impute-and-measure"):
+            continue
+        job_id = int(job["id"])
+        try:
+            log_text = read_job_log(gh, run_id, job_id, cache_dir)
+        except Exception:
+            continue
+        seconds, artifact_name = parse_reagle_seconds_and_artifact(log_text)
+        metrics = parse_reagle_metrics_from_log(log_text)
+        if metrics is not None:
+            if seconds is not None:
+                metrics["reagle_step_seconds"] = seconds
+            # Use artifact name if detected, otherwise synthesize from job name.
+            art_key = artifact_name or f"metrics-{safe_name(name)}"
+            out[art_key] = metrics
+    return out
+
+
 def collect_reagle_step_seconds_by_artifact(
     gh: GitHubClient,
     run: dict,
@@ -672,15 +726,24 @@ def main() -> int:
         if a.get("name", "").startswith("metrics-") and not a.get("expired", False)
     ]
     base_artifact_names = sorted(a["name"] for a in base_arts)
-    if len(base_artifact_names) == 0:
-        raise RuntimeError("No metrics-* artifacts found in base run.")
-    if len(base_artifact_names) != 4:
-        print(f"WARN: Expected 4 metrics artifacts, found {len(base_artifact_names)}")
 
-    base_metrics = collect_run_metrics(gh, base_run, base_artifact_names, cache_dir)
-    missing_base = [name for name, m in base_metrics.items() if m is None]
-    if missing_base:
-        raise RuntimeError(f"Base run is missing REAGLE metrics in artifacts: {missing_base}")
+    if len(base_artifact_names) == 0:
+        print("No metrics-* artifacts found in base run; falling back to log extraction...")
+        log_metrics = extract_metrics_from_logs(gh, base_run, cache_dir)
+        if not log_metrics:
+            raise RuntimeError(
+                "No metrics-* artifacts found in base run and could not extract metrics from logs."
+            )
+        base_artifact_names = sorted(log_metrics.keys())
+        base_metrics = {name: metrics for name, metrics in log_metrics.items()}
+        print(f"Extracted metrics from logs for {len(base_artifact_names)} job(s): {base_artifact_names}")
+    else:
+        if len(base_artifact_names) != 4:
+            print(f"WARN: Expected 4 metrics artifacts, found {len(base_artifact_names)}")
+        base_metrics = collect_run_metrics(gh, base_run, base_artifact_names, cache_dir)
+        missing_base = [name for name, m in base_metrics.items() if m is None]
+        if missing_base:
+            raise RuntimeError(f"Base run is missing REAGLE metrics in artifacts: {missing_base}")
 
     subsequent = [
         r for r in all_runs
