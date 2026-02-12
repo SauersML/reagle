@@ -1715,6 +1715,24 @@ fn normalize_allele_posterior_structural_missing(
     prior_scratch: &mut Vec<f32>,
     target_probs: AlleleProbsView<'_>,
 ) {
+    // Structural posterior decomposition at one marker:
+    //   p_i = (q_i + M_ref * rho_ref_i + M_ood * rho_ood_i) / (Q + M_ref + M_ood)
+    // where:
+    //   q_i      = represented-state mass on allele i
+    //   Q        = sum_i q_i
+    //   M_ref    = mass from reference-missing states (allele code 255)
+    //   M_ood    = mass from out-of-domain allele codes
+    //
+    // Assumptions:
+    // 1) Reference-missing states are MAR w.r.t. allele identity:
+    //      rho_ref_i = q_i / Q
+    // 2) Out-of-domain states use Dirichlet posterior predictive centered at prior pi:
+    //      rho_ood_i = (q_i + alpha*pi_i) / (Q + alpha), alpha = 1
+    //
+    // Substituting yields an affine form used below:
+    //   p_i = q_i * q_coeff + pi_i * pi_coeff
+    //   q_coeff  = (1 + M_ref/Q + M_ood/(Q+alpha)) / (Q+M_ref+M_ood)
+    //   pi_coeff = (M_ood*alpha/(Q+alpha)) / (Q+M_ref+M_ood)
     let subset = subset_total.max(0.0);
     let missing_ref = missing_ref_mass.max(0.0);
     let missing_ood = missing_ood_mass.max(0.0);
@@ -3223,6 +3241,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let missing_raw = AlleleCode::MISSING.raw();
                                 let allele_len = ws.allele_probs.len();
                                 assert!(n_groups <= group_alleles.len());
+                                // Partition marker mass into:
+                                //   subset_total    = represented allele mass Q
+                                //   missing_ref_mass= M_ref (ref allele code 255)
+                                //   missing_ood_mass= M_ood (allele index outside represented set)
+                                // These are fed to the structural posterior update above.
                                 for pid in 0..n_groups {
                                     let mut state_prob = alpha_coeff * ws.pattern_sum_fb[pid]
                                         + beta_coeff * ws.pattern_sum_f[pid]
@@ -3425,6 +3448,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             let allele_len = ws.allele_probs.len();
                             assert!(active_states <= ws.state_patterns.len());
                             assert!(!group_alleles.is_empty() || active_states == 0);
+                            // Same Q/M_ref/M_ood partition as interior markers, but on the
+                            // explicit per-state boundary path (fwd*bwd state masses).
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
