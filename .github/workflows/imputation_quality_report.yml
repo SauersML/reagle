@@ -8,6 +8,8 @@ on:
         required: false
         type: boolean
         default: false
+  schedule:
+    - cron: "0 */2 * * *"
   push:
     branches: [ "main" ]
     paths-ignore:
@@ -92,7 +94,7 @@ jobs:
         id: select-matrix
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.run_all || 'false' }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ] || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.run_all || 'false' }}" = "true" ]; }; then
             echo 'matrix={"include":[{"person":"Kat","file_path":"data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt","truth_glob":"data/kat_suricata/**"},{"person":"Kat","file_path":"data/kat_suricata/ancestrydna.txt","truth_glob":"data/kat_suricata/**"},{"person":"Christopher","file_path":"data/christopher_smith/dna-data-2023-09-26.zip","truth_glob":"data/christopher_smith/**"},{"person":"Christopher","file_path":"data/christopher_smith/genome_Christopher_Smith_v5_Full_20230926164611.zip","truth_glob":"data/christopher_smith/**"}]}' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix={"include":[{"person":"Kat","file_path":"data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt","truth_glob":"data/kat_suricata/**"}]}' >> "$GITHUB_OUTPUT"
