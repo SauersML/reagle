@@ -3222,7 +3222,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     K::group_alleles(&prepared, &ws.dict_pattern_alleles);
                                 let missing_raw = AlleleCode::MISSING.raw();
                                 let allele_len = ws.allele_probs.len();
-                                debug_assert!(n_groups <= group_alleles.len());
+                                assert!(n_groups <= group_alleles.len());
                                 for pid in 0..n_groups {
                                     let mut state_prob = alpha_coeff * ws.pattern_sum_fb[pid]
                                         + beta_coeff * ws.pattern_sum_f[pid]
@@ -3423,8 +3423,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             let mut missing_ood_mass = 0.0f32;
                             let missing_raw = AlleleCode::MISSING.raw();
                             let allele_len = ws.allele_probs.len();
-                            debug_assert!(active_states <= ws.state_patterns.len());
-                            debug_assert!(!group_alleles.is_empty() || active_states == 0);
+                            assert!(active_states <= ws.state_patterns.len());
+                            assert!(!group_alleles.is_empty() || active_states == 0);
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
