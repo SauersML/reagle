@@ -8,6 +8,7 @@ use serde_json::Value;
 
 const BEAGLE_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
 const WORKFLOW_NAME: &str = "imputation_quality_report.yml";
+const RUN_SCAN_LIMIT: &str = "200";
 
 #[test]
 fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
@@ -23,8 +24,8 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     fs::create_dir_all(&dataset_dir).expect("create dataset dir");
 
     let repo = detect_repo_slug(&manifest_dir).expect("repo slug resolution failed");
-    download_latest_quality_artifacts(&repo, work_dir.path());
-    stage_required_inputs(work_dir.path());
+    let (reference_dir, outputs_dir) = download_latest_quality_artifacts(&repo, work_dir.path());
+    stage_required_inputs(&reference_dir, &outputs_dir, work_dir.path());
 
     let ref_vcf = dataset_dir.join("ref.vcf.gz");
     let input_vcf = dataset_dir.join("input.vcf.gz");
@@ -218,7 +219,7 @@ fn parse_repo_slug(remote: &str) -> Option<String> {
     None
 }
 
-fn download_latest_quality_artifacts(repo: &str, out_dir: &Path) {
+fn download_latest_quality_artifacts(repo: &str, out_dir: &Path) -> (PathBuf, PathBuf) {
     let runs_json = run_capture(
         "gh",
         [
@@ -229,7 +230,7 @@ fn download_latest_quality_artifacts(repo: &str, out_dir: &Path) {
             "--workflow",
             WORKFLOW_NAME,
             "--limit",
-            "30",
+            RUN_SCAN_LIMIT,
             "--json",
             "databaseId,status,conclusion",
         ],
@@ -238,6 +239,68 @@ fn download_latest_quality_artifacts(repo: &str, out_dir: &Path) {
     let runs_arr = runs
         .as_array()
         .expect("expected array from gh run list --json");
+
+    let mut reference_run_id: Option<i64> = None;
+    for run_entry in runs_arr {
+        let status = run_entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let conclusion = run_entry
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status != "completed" || (conclusion != "success" && conclusion != "failure") {
+            continue;
+        }
+        let run_id = match run_entry.get("databaseId").and_then(Value::as_i64) {
+            Some(v) => v,
+            None => continue,
+        };
+        let artifacts_json = run_capture(
+            "gh",
+            [
+                "api",
+                &format!("/repos/{repo}/actions/runs/{run_id}/artifacts"),
+            ],
+        );
+        let artifacts: Value = serde_json::from_str(&artifacts_json).expect("parse artifacts json");
+        let artifact_list = artifacts
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut has_reference = false;
+        for artifact in artifact_list {
+            let Some(name) = artifact.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if name == "reference-panel" {
+                has_reference = true;
+            }
+        }
+        if has_reference {
+            reference_run_id = Some(run_id);
+            break;
+        }
+    }
+    let ref_run_id = reference_run_id.expect("no recent run contains reference-panel artifact");
+    let reference_dir = out_dir.join(format!("reference-run-{ref_run_id}"));
+    fs::create_dir_all(&reference_dir).expect("create reference artifact dir");
+    run(
+        "gh",
+        [
+            "run",
+            "download",
+            "--repo",
+            repo,
+            &ref_run_id.to_string(),
+            "-n",
+            "reference-panel",
+            "-D",
+            reference_dir.to_str().expect("reference_dir utf8"),
+        ],
+    );
 
     for run_entry in runs_arr {
         let status = run_entry
@@ -269,22 +332,20 @@ fn download_latest_quality_artifacts(repo: &str, out_dir: &Path) {
             .cloned()
             .unwrap_or_default();
         let mut outputs_kat_name: Option<String> = None;
-        let mut has_reference = false;
         for artifact in artifact_list {
             let Some(name) = artifact.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if name == "reference-panel" {
-                has_reference = true;
-            }
             if name.starts_with("outputs-Kat-") {
                 outputs_kat_name = Some(name.to_string());
+                break;
             }
         }
-        if !has_reference {
+        let Some(outputs_name) = outputs_kat_name else {
             continue;
-        }
-
+        };
+        let candidate_dir = out_dir.join(format!("outputs-run-{run_id}"));
+        fs::create_dir_all(&candidate_dir).expect("create outputs artifact dir");
         run(
             "gh",
             [
@@ -294,51 +355,42 @@ fn download_latest_quality_artifacts(repo: &str, out_dir: &Path) {
                 repo,
                 &run_id.to_string(),
                 "-n",
-                "reference-panel",
+                outputs_name.as_str(),
                 "-D",
-                out_dir.to_str().expect("out_dir utf8"),
+                candidate_dir.to_str().expect("candidate_dir utf8"),
             ],
         );
 
-        if let Some(outputs_name) = outputs_kat_name {
-            run(
-                "gh",
-                [
-                    "run",
-                    "download",
-                    "--repo",
-                    repo,
-                    &run_id.to_string(),
-                    "-n",
-                    outputs_name.as_str(),
-                    "-D",
-                    out_dir.to_str().expect("out_dir utf8"),
-                ],
-            );
-            return;
+        let has_input = find_file_recursive(&candidate_dir, "target.vcf.gz").is_some()
+            || find_file_recursive(&candidate_dir, "input.vcf.gz").is_some();
+        let has_truth = find_file_recursive(&candidate_dir, "truth.vcf.gz").is_some();
+
+        if has_input && has_truth {
+            return (reference_dir, candidate_dir);
         }
-        panic!("found run {} with reference-panel, but no outputs-Kat-* artifact", run_id);
+
+        let _ = fs::remove_dir_all(&candidate_dir);
     }
     panic!(
-        "no recent {} run had both reference-panel and outputs-Kat-* artifacts",
+        "no recent {} run had outputs-Kat-* containing target/input.vcf.gz + truth.vcf.gz",
         WORKFLOW_NAME
     );
 }
 
-fn stage_required_inputs(work_dir: &Path) {
+fn stage_required_inputs(reference_dir: &Path, outputs_dir: &Path, work_dir: &Path) {
     let dataset_dir = work_dir.join("dataset");
     fs::create_dir_all(&dataset_dir).expect("create dataset dir");
 
-    let ref_src = find_file_recursive(work_dir, "ref.vcf.gz")
+    let ref_src = find_file_recursive(reference_dir, "ref.vcf.gz")
         .expect("ref.vcf.gz not found in downloaded artifacts");
     copy_with_index(&ref_src, &dataset_dir.join("ref.vcf.gz"));
 
-    let input_src = find_file_recursive(work_dir, "target.vcf.gz")
-        .or_else(|| find_file_recursive(work_dir, "input.vcf.gz"))
+    let input_src = find_file_recursive(outputs_dir, "target.vcf.gz")
+        .or_else(|| find_file_recursive(outputs_dir, "input.vcf.gz"))
         .expect("target.vcf.gz/input.vcf.gz not found in downloaded artifacts");
     copy_with_index(&input_src, &dataset_dir.join("input.vcf.gz"));
 
-    let truth_src = find_file_recursive(work_dir, "truth.vcf.gz")
+    let truth_src = find_file_recursive(outputs_dir, "truth.vcf.gz")
         .expect("truth.vcf.gz not found in downloaded artifacts");
     copy_with_index(&truth_src, &dataset_dir.join("truth.vcf.gz"));
 }
