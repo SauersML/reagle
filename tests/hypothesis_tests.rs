@@ -134,6 +134,38 @@ fn run_rust_imputation_with_window_toml(
     pipeline.run()
 }
 
+/// Run Rust imputation pipeline with explicit window settings via a local TOML, plus custom Ne.
+fn run_rust_imputation_with_window_toml_and_ne(
+    work_dir: &Path,
+    gt_path: &Path,
+    ref_path: &Path,
+    out_prefix: &Path,
+    seed: i64,
+    window: f32,
+    overlap: f32,
+    window_markers: usize,
+    ne: f32,
+) -> reagle::Result<()> {
+    let toml = format!(
+        "window = {window}\noverlap = {overlap}\nwindow_markers = {window_markers}\nne = {ne}\n"
+    );
+    std::fs::write(work_dir.join("reagle.toml"), toml).expect("write toml");
+    let config = Config::parse_from([
+        "reagle",
+        "--target",
+        gt_path.to_str().unwrap(),
+        "--ref",
+        ref_path.to_str().unwrap(),
+        "--out",
+        out_prefix.to_str().unwrap(),
+        "--seed",
+        &seed.to_string(),
+    ])
+    .expect("config");
+    let mut pipeline = ImputationPipeline::new(config, None);
+    pipeline.run()
+}
+
 /// Run Rust phasing pipeline with explicit window settings via a local TOML.
 fn run_rust_phasing_with_window_toml(
     work_dir: &Path,
@@ -1082,7 +1114,7 @@ fn test_priors_use_recent_context_across_window_boundary() {
         });
 
         let out_prefix = work_dir.path().join(format!("out_{name}"));
-        run_rust_imputation_with_window_toml(
+        run_rust_imputation_with_window_toml_and_ne(
             work_dir.path(),
             &target_vcf,
             &ref_vcf,
@@ -1091,6 +1123,7 @@ fn test_priors_use_recent_context_across_window_boundary() {
             1.1,
             1.0,
             200,
+            1000.0,
         )
         .expect("Rust imputation failed");
 

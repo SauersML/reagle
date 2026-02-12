@@ -1784,9 +1784,10 @@ fn batched_transition_forward(
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
-    // Iterate m from start+1 to end (inclusive) to apply transitions:
-    // start->start+1, ..., end-1->end.
-    for m in start + 1..=end {
+    // Iterate m from start+1 to end (exclusive) to apply transitions:
+    // start->start+1, ..., end-2->end-1.
+    // The transition into 'end' (end-1->end) is handled by forward_update(end).
+    for m in start + 1..end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
             continue;
@@ -1852,6 +1853,8 @@ fn batched_transition_backward(
     let mut touched = false;
     // Iterate m from end down to start+1 to apply transitions:
     // end->end-1, ..., start+1->start.
+    // Iterate m from end down to start+1 to apply transitions:
+    // end->end-1, ..., start+1->start.
     for m in (start + 1..=end).rev() {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
@@ -1907,14 +1910,33 @@ fn fill_bwd_affine_coeffs(
     //
     // s tracks sum(B_m) / sum(B_right), needed because the additive term
     // depends on the running backward mass.
-    let right = block_end - 1;
+    //
+    // Unlike batched_transition_backward which updates state IN PLACE, this function
+    // computes the affine map from B_right (block_end-1) to B_m.
+    // But we start with B_end (from checkpoint).
+    // The previous implementation missed the transition end -> end-1.
+    //
+    // We must iterate from end (block_end) down to start+1.
+    // m corresponds to the source state index for the transition (m -> m-1).
+    // Using `m` index relative to `block_start`.
+    // The loop computes `a_m` where B_m = a_m * B_right + c_m * Sum.
+    //
+    // Actually, we want B_m in terms of B_checkpoint (at block_end).
+    // But the affine cache stores maps relative to the right boundary of the *interior*?
+    // "B_right is the backward vector at right boundary (block_end - 1)."
+    // If so, the caller must supply B at block_end-1.
+    // But the caller supplies B at block_end.
+    // So this function MUST incorporate the transition block_end -> block_end-1.
+    //
+    // We initialize `a` with identity, effectively `B_{block_end-1} = B_{block_end}`?
+    // No, we must start the loop at `block_end-1`.
     let mut a = 1.0f64;
     let mut c = 0.0f64;
     let mut s = 1.0f64; // sum-factor: sum(b_m) / sum(b_right)
-    a_out[right - block_start] = a;
-    b_out[right - block_start] = c;
+    // Overwrite the 'identity' initialization at right boundary with the first transition step.
     let k = active_states as f64;
-    for m in (block_start + 1..right).rev() {
+    for m in (block_start + 1..block_end).rev() {
+        // Transition m+1 -> m uses p_recomb[m+1].
         let recomb_rate = marker_recomb_rate(p_recomb, m + 1);
         if recomb_rate > 0.0 {
             let (stay, shift) =
@@ -2810,7 +2832,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
 
             let mut recomb_rate = marker_recomb_rate(p_recomb, m);
             if let Some(in_idx) = input_prior_idx {
-                if m == in_idx && in_idx > 0 {
+                if m == in_idx {
                     if let Some(priors) = state_priors {
                         let len = priors.len().min(active_states);
                         ws.fwd[..len].copy_from_slice(&priors[..len]);
@@ -2819,14 +2841,16 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         }
                         normalize_probs(&mut ws.fwd[..active_states]);
                     }
-                    // We just injected priors that represent the state *after* transition
-                    // to this marker (handoff from previous window).
-                    // We must still apply the emission probability for this marker,
-                    // but we should suppress the HMM transition (set recomb_rate=0.0)
-                    // to avoid double-counting the transition penalty.
+                    // The prior state passed in (`state_priors`) represents the posterior from
+                    // the previous window's boundary, *already decayed* by `process_haplotype`
+                    // to account for the transition interval into this marker.
+                    // Therefore, we must suppress the HMM's internal transition step here
+                    // (recomb_rate=0.0) to avoid applying decay twice.
+                    // We DO still run `forward_update` to apply the emission probability at `m`.
                     recomb_rate = 0.0;
                 }
             }
+
             kernel.forward_update(
                 ws,
                 m,
