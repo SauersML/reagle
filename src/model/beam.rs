@@ -9,7 +9,7 @@ use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::model::parameters::ModelParams;
-use crate::model::reference_pbwt::{PbwtStrictAllele, RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{DonorPick, PbwtStrictAllele, RankBeam, ReferencePbwt};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
@@ -367,19 +367,10 @@ impl PbwtBeamIndex {
                 &[qa0, qa1],
                 &mut beams,
             );
-            let mut d0: Vec<u32> = Vec::new();
-            let mut d1: Vec<u32> = Vec::new();
-            pbwt.select_donors_into(&beams[0], k, &mut d0);
-            pbwt.select_donors_into(&beams[1], k, &mut d1);
-            let mut union: Vec<u32> = Vec::with_capacity(d0.len() + d1.len());
-            union.extend_from_slice(&d0);
-            for &h in &d1 {
-                if !union.contains(&h) {
-                    union.push(h);
-                }
-            }
-            let mut pos_lens: Vec<(u32, usize, i32)> = Vec::new();
-            pbwt.collect_positions_and_lens(hi_idx, &union, &mut pos_lens);
+            let mut d0: Vec<DonorPick> = Vec::new();
+            let mut d1: Vec<DonorPick> = Vec::new();
+            pbwt.select_donor_picks_into(&beams[0], k, &mut d0);
+            pbwt.select_donor_picks_into(&beams[1], k, &mut d1);
             let gen_pos = hi_freq_gen_positions.get(hi_idx).copied().unwrap_or(0.0);
             let step_morgans = if hi_idx > 0 {
                 (gen_pos - hi_freq_gen_positions[hi_idx - 1]).abs() / 100.0
@@ -388,23 +379,18 @@ impl PbwtBeamIndex {
             } else {
                 0.0
             };
-            let select_best_by_transition = |donors: &mut Vec<u32>, beam: &RankBeam| {
+            let select_best_by_transition = |donors: &mut Vec<DonorPick>, beam: &RankBeam| {
                 const EULER_MASCHERONI: f64 = 0.5772156649015329;
                 let rho = recomb_intensity.max(1e-12) as f64;
                 let d = (step_morgans.max(1e-12)) as f64;
-                let donor_score = |hap: u32| -> f64 {
-                    let Some((_, pos, start)) =
-                        pos_lens.iter().find(|(h, _, _)| *h == hap).copied()
-                    else {
-                        return 0.0;
-                    };
-                    let start_idx = start.max(0) as usize;
+                let donor_score = |pick: &DonorPick| -> f64 {
+                    let start_idx = pick.start.max(0) as usize;
                     let start_pos = hi_freq_gen_positions
                         .get(start_idx)
                         .copied()
                         .unwrap_or(gen_pos);
                     let len_morgans = ((gen_pos - start_pos).abs() / 100.0) as f64;
-                    let (_, cluster_size) = find_cluster(beam, pos);
+                    let (_, cluster_size) = find_cluster(beam, pick.pos as usize);
                     let k = cluster_size.max(0.0) as f64;
                     let h_k = if k >= 2.0 {
                         k.ln() + EULER_MASCHERONI
@@ -421,8 +407,8 @@ impl PbwtBeamIndex {
                     }
                 };
                 donors.sort_unstable_by(|a, b| {
-                    let sa = donor_score(*a);
-                    let sb = donor_score(*b);
+                    let sa = donor_score(a);
+                    let sb = donor_score(b);
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 if donors.len() > k {
@@ -431,8 +417,8 @@ impl PbwtBeamIndex {
             };
             select_best_by_transition(&mut d0, &beams[0]);
             select_best_by_transition(&mut d1, &beams[1]);
-            let meta0 = build_donor_meta(&d0, &beams[0], &pos_lens, gen_pos, hi_freq_gen_positions);
-            let meta1 = build_donor_meta(&d1, &beams[1], &pos_lens, gen_pos, hi_freq_gen_positions);
+            let meta0 = build_donor_meta(&d0, &beams[0], gen_pos, hi_freq_gen_positions);
+            let meta1 = build_donor_meta(&d1, &beams[1], gen_pos, hi_freq_gen_positions);
             donor_meta0.push(Some(meta0));
             donor_meta1.push(Some(meta1));
         }
@@ -471,36 +457,26 @@ fn find_cluster(beam: &RankBeam, pos: usize) -> (u16, f32) {
 }
 
 fn build_donor_meta(
-    donors: &[u32],
+    donors: &[DonorPick],
     beam: &RankBeam,
-    pos_lens: &[(u32, usize, i32)],
     gen_pos: f64,
     hi_freq_gen_positions: &[f64],
 ) -> Vec<PbwtDonorMeta> {
     let mut out = Vec::with_capacity(donors.len());
-    for &hap in donors {
-        if let Some((_, pos, start)) = pos_lens.iter().find(|(h, _, _)| *h == hap).copied() {
-            let start_idx = start.max(0) as usize;
-            let start_pos = hi_freq_gen_positions
-                .get(start_idx)
-                .copied()
-                .unwrap_or(gen_pos);
-            let len_morgans = ((gen_pos - start_pos).abs() / 100.0) as f32;
-            let (cluster_id, cluster_size) = find_cluster(beam, pos);
-            out.push(PbwtDonorMeta {
-                hap,
-                cluster_id,
-                cluster_size,
-                match_len_morgans: len_morgans,
-            });
-        } else {
-            out.push(PbwtDonorMeta {
-                hap,
-                cluster_id: u16::MAX,
-                cluster_size: 0.0,
-                match_len_morgans: 0.0,
-            });
-        }
+    for pick in donors {
+        let start_idx = pick.start.max(0) as usize;
+        let start_pos = hi_freq_gen_positions
+            .get(start_idx)
+            .copied()
+            .unwrap_or(gen_pos);
+        let len_morgans = ((gen_pos - start_pos).abs() / 100.0) as f32;
+        let (cluster_id, cluster_size) = find_cluster(beam, pick.pos as usize);
+        out.push(PbwtDonorMeta {
+            hap: pick.hap,
+            cluster_id,
+            cluster_size,
+            match_len_morgans: len_morgans,
+        });
     }
     out
 }

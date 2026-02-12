@@ -1,6 +1,5 @@
 use crate::model::pbwt::{PbwtAllele, PbwtAlphabet, PbwtBiallelicBin, PbwtDivUpdater, PbwtIndex};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 const MAX_RANK_INTERVALS: usize = 8;
 const PBWT_SCORE_SCALE: u64 = 1_000_000;
@@ -87,9 +86,6 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     donor_seen_marks: Vec<u32>,
     donor_seen_tick: u32,
     step_scratch: Vec<(u32, u32, u64)>,
-    wanted_map: HashMap<u32, usize>,
-    found_pos_start: Vec<(usize, i32)>,
-    found_mask: Vec<bool>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -109,6 +105,13 @@ pub enum PbwtStrictAllele {
 pub struct PbwtBiallelicQueryProb {
     p0: f32,
     p1: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DonorPick {
+    pub hap: u32,
+    pub pos: u32,
+    pub start: i32,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -286,6 +289,24 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     #[inline]
+    fn flush_top_k_choices_into_picks(
+        &self,
+        best: std::collections::BinaryHeap<DonorChoice>,
+        out: &mut Vec<DonorPick>,
+    ) {
+        let mut choices: Vec<DonorChoice> = best.into_vec();
+        choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
+        out.reserve(choices.len());
+        for c in choices {
+            out.push(DonorPick {
+                hap: self.ppa[c.pos].to_u32(),
+                pos: c.pos as u32,
+                start: self.div[c.pos],
+            });
+        }
+    }
+
+    #[inline]
     fn ensure_donor_seen_marks(&mut self, n_ref: usize) {
         if self.donor_seen_marks.len() < n_ref {
             self.donor_seen_marks.resize(n_ref, 0);
@@ -357,9 +378,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             donor_seen_marks: Vec::new(),
             donor_seen_tick: 0,
             step_scratch: Vec::new(),
-            wanted_map: HashMap::new(),
-            found_pos_start: Vec::new(),
-            found_mask: Vec::new(),
         }
     }
 
@@ -565,6 +583,207 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             }
         }
         self.flush_top_k_choices(best, out);
+    }
+
+    pub fn select_donor_picks_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<DonorPick>) {
+        out.clear();
+        if k == 0 {
+            return;
+        }
+        let n_ref = self.ppa.len();
+        if n_ref == 0 {
+            return;
+        }
+        self.ensure_donor_seen_marks(n_ref);
+
+        self.intervals_buf.clear();
+        self.intervals_buf.reserve(beam.intervals().len());
+        for &(l, r) in beam.intervals() {
+            let l = l.min(n_ref as u32) as usize;
+            let r = r.min(n_ref as u32) as usize;
+            if l < r {
+                self.intervals_buf.push((l, r));
+            }
+        }
+
+        if self.intervals_buf.is_empty() {
+            return;
+        }
+
+        self.intervals_buf.sort_unstable_by_key(|&(l, _)| l);
+        let mut merged_len = 0usize;
+        for i in 0..self.intervals_buf.len() {
+            let (l, r) = self.intervals_buf[i];
+            if merged_len == 0 {
+                self.intervals_buf[merged_len] = (l, r);
+                merged_len = 1;
+                continue;
+            }
+            let (prev_l, prev_r) = self.intervals_buf[merged_len - 1];
+            if l <= prev_r {
+                self.intervals_buf[merged_len - 1] = (prev_l, prev_r.max(r));
+            } else {
+                self.intervals_buf[merged_len] = (l, r);
+                merged_len += 1;
+            }
+        }
+        self.intervals_buf.truncate(merged_len);
+
+        let total_len: usize = self.intervals_buf.iter().map(|&(l, r)| r - l).sum();
+        if total_len <= k {
+            out.reserve(total_len);
+            for &(l, r) in &self.intervals_buf {
+                for i in l..r {
+                    out.push(DonorPick {
+                        hap: self.ppa[i].to_u32(),
+                        pos: i as u32,
+                        start: self.div[i],
+                    });
+                }
+            }
+            return;
+        }
+
+        const EXACT_DIV_SCAN_FACTOR: usize = 64;
+        if total_len > k.saturating_mul(EXACT_DIV_SCAN_FACTOR) {
+            const APPROX_SCAN_FACTOR: usize = 24;
+            const MIN_APPROX_SCAN_POINTS: usize = 128;
+            const LOCAL_REFINE_RADIUS: usize = 2;
+
+            let n_scan_targets = total_len.min(
+                k.saturating_mul(APPROX_SCAN_FACTOR)
+                    .max(MIN_APPROX_SCAN_POINTS),
+            );
+            let candidate_tick = self.next_donor_seen_tick();
+            self.donor_candidate_pos.clear();
+            self.donor_candidate_pos.reserve(
+                n_scan_targets
+                    .saturating_mul(2 * LOCAL_REFINE_RADIUS + 1)
+                    .saturating_add(self.intervals_buf.len() * 3),
+            );
+
+            let mut current_interval_idx = 0usize;
+            let mut current_interval_start_offset = 0usize;
+            for i in 0..n_scan_targets {
+                let target = (2 * i + 1) * total_len / (2 * n_scan_targets);
+                while current_interval_idx < self.intervals_buf.len() {
+                    let (l, r) = self.intervals_buf[current_interval_idx];
+                    let len = r - l;
+                    if target < current_interval_start_offset + len {
+                        let offset_in_interval = target - current_interval_start_offset;
+                        let center = l + offset_in_interval;
+                        let start = center.saturating_sub(LOCAL_REFINE_RADIUS).max(l);
+                        let end = (center + LOCAL_REFINE_RADIUS + 1).min(r);
+                        for pos in start..end {
+                            if self.donor_seen_marks[pos] != candidate_tick {
+                                self.donor_seen_marks[pos] = candidate_tick;
+                                self.donor_candidate_pos.push(pos);
+                            }
+                        }
+                        break;
+                    }
+                    current_interval_start_offset += len;
+                    current_interval_idx += 1;
+                }
+            }
+
+            for &(l, r) in &self.intervals_buf {
+                if l < r {
+                    if self.donor_seen_marks[l] != candidate_tick {
+                        self.donor_seen_marks[l] = candidate_tick;
+                        self.donor_candidate_pos.push(l);
+                    }
+                    let rr = r - 1;
+                    if self.donor_seen_marks[rr] != candidate_tick {
+                        self.donor_seen_marks[rr] = candidate_tick;
+                        self.donor_candidate_pos.push(rr);
+                    }
+                    let mid = l + (r - l) / 2;
+                    if self.donor_seen_marks[mid] != candidate_tick {
+                        self.donor_seen_marks[mid] = candidate_tick;
+                        self.donor_candidate_pos.push(mid);
+                    }
+                }
+            }
+
+            if self.donor_candidate_pos.len() < k {
+                let mut spread_interval_idx = 0usize;
+                let mut spread_interval_start_offset = 0usize;
+                for i in 0..k {
+                    let target = (2 * i + 1) * total_len / (2 * k);
+                    while spread_interval_idx < self.intervals_buf.len() {
+                        let (l, r) = self.intervals_buf[spread_interval_idx];
+                        let len = r - l;
+                        if target < spread_interval_start_offset + len {
+                            let offset_in_interval = target - spread_interval_start_offset;
+                            let pos = l + offset_in_interval;
+                            if self.donor_seen_marks[pos] != candidate_tick {
+                                self.donor_seen_marks[pos] = candidate_tick;
+                                self.donor_candidate_pos.push(pos);
+                            }
+                            break;
+                        }
+                        spread_interval_start_offset += len;
+                        spread_interval_idx += 1;
+                    }
+                }
+            }
+
+            let mut best: std::collections::BinaryHeap<DonorChoice> =
+                std::collections::BinaryHeap::with_capacity(k + 1);
+            for &pos in &self.donor_candidate_pos {
+                if pos >= self.div.len() {
+                    continue;
+                }
+                let choice = DonorChoice {
+                    div: self.div[pos],
+                    pos,
+                };
+                Self::push_top_k_choice(&mut best, choice, k);
+            }
+
+            if best.len() < k {
+                let chosen_tick = self.next_donor_seen_tick();
+                for c in best.iter() {
+                    self.donor_seen_marks[c.pos] = chosen_tick;
+                }
+                for &(l, r) in &self.intervals_buf {
+                    for pos in l..r {
+                        if self.donor_seen_marks[pos] == chosen_tick {
+                            continue;
+                        }
+                        self.donor_seen_marks[pos] = chosen_tick;
+                        if pos >= self.div.len() {
+                            continue;
+                        }
+                        let choice = DonorChoice {
+                            div: self.div[pos],
+                            pos,
+                        };
+                        Self::push_top_k_choice(&mut best, choice, k);
+                    }
+                }
+            }
+
+            self.flush_top_k_choices_into_picks(best, out);
+            return;
+        }
+
+        let mut best: std::collections::BinaryHeap<DonorChoice> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        for &(l, r) in &self.intervals_buf {
+            for pos in l..r {
+                if pos >= self.div.len() {
+                    continue;
+                }
+                let choice = DonorChoice {
+                    div: self.div[pos],
+                    pos,
+                };
+                Self::push_top_k_choice(&mut best, choice, k);
+            }
+        }
+        self.flush_top_k_choices_into_picks(best, out);
     }
 
     fn bin_for_allele(a: u8, alphabet: PbwtAlphabet) -> usize {
@@ -1054,56 +1273,24 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     pub fn finalize_step(&mut self, ref_alleles: &[u8], n_alleles: usize, marker: usize) {
-        self.updater
-            .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
+        if n_alleles == 2 {
+            // Exact biallelic fast path:
+            // reuse prepared permuted bits/counts from `prepare_step` instead of
+            // repacking `ref_alleles[prefix[i]]` inside updater again.
+            self.updater.fwd_update_biallelic_prepared(
+                marker,
+                &mut self.ppa,
+                &mut self.div,
+                &self.permuted_bits,
+                &self.permuted_missing_bits,
+                self.binary_counts,
+            );
+        } else {
+            self.updater
+                .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
+        }
     }
 
-    pub fn collect_positions_and_lens(
-        &mut self,
-        marker: usize,
-        haps: &[u32],
-        out: &mut Vec<(u32, usize, i32)>,
-    ) {
-        out.clear();
-        if haps.is_empty() {
-            return;
-        }
-        let m = marker as i32;
-        self.wanted_map.clear();
-        self.wanted_map.reserve(haps.len());
-        for (i, &h) in haps.iter().enumerate() {
-            self.wanted_map.insert(h, i);
-        }
-        if self.found_pos_start.len() < haps.len() {
-            self.found_pos_start.resize(haps.len(), (0, m));
-        }
-        if self.found_mask.len() < haps.len() {
-            self.found_mask.resize(haps.len(), false);
-        }
-        for i in 0..haps.len() {
-            self.found_pos_start[i] = (0, m);
-            self.found_mask[i] = false;
-        }
-        let mut remaining = self.wanted_map.len();
-        for (pos, hap) in self.ppa.iter().enumerate() {
-            if remaining == 0 {
-                break;
-            }
-            let h = hap.to_usize() as u32;
-            if let Some(&idx) = self.wanted_map.get(&h) {
-                let start = self.div.get(pos).copied().unwrap_or(m);
-                self.found_pos_start[idx] = (pos, start);
-                self.found_mask[idx] = true;
-                remaining -= 1;
-            }
-        }
-        for (i, &h) in haps.iter().enumerate() {
-            if self.found_mask[i] {
-                let (pos, start) = self.found_pos_start[i];
-                out.push((h, pos, start));
-            }
-        }
-    }
 }
 
 pub enum ReferencePbwt {
@@ -1124,6 +1311,13 @@ impl ReferencePbwt {
         match self {
             Self::U16(inner) => inner.select_donors_into(beam, k, out),
             Self::U32(inner) => inner.select_donors_into(beam, k, out),
+        }
+    }
+
+    pub fn select_donor_picks_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<DonorPick>) {
+        match self {
+            Self::U16(inner) => inner.select_donor_picks_into(beam, k, out),
+            Self::U32(inner) => inner.select_donor_picks_into(beam, k, out),
         }
     }
 
@@ -1222,15 +1416,4 @@ impl ReferencePbwt {
         }
     }
 
-    pub fn collect_positions_and_lens(
-        &mut self,
-        marker: usize,
-        haps: &[u32],
-        out: &mut Vec<(u32, usize, i32)>,
-    ) {
-        match self {
-            Self::U16(inner) => inner.collect_positions_and_lens(marker, haps, out),
-            Self::U32(inner) => inner.collect_positions_and_lens(marker, haps, out),
-        }
-    }
 }

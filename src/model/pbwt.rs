@@ -585,6 +585,138 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         })
     }
 
+    /// Forward update for biallelic markers using precomputed prepared state.
+    ///
+    /// Exactness:
+    /// - This runs the same counting-sort scatter and divergence propagation as
+    ///   `fwd_update(..., n_alleles=2, ...)`.
+    /// - The only difference is input source: precomputed permuted bits/counts
+    ///   are provided by caller (`ReferencePbwt::prepare_step`) instead of
+    ///   recomputing by scanning `alleles[prefix[i]]` again.
+    pub fn fwd_update_biallelic_prepared(
+        &mut self,
+        marker: usize,
+        prefix: &mut [I],
+        divergence: &mut [i32],
+        permuted_bits: &[u64],
+        permuted_missing_bits: &[u64],
+        binary_counts: [u32; 3],
+    ) {
+        assert_eq!(prefix.len(), self.n_haps);
+        assert!(divergence.len() >= self.n_haps);
+        let n_words = (self.n_haps + 63) / 64;
+        assert!(permuted_bits.len() >= n_words);
+        assert!(permuted_missing_bits.len() >= n_words);
+        assert_eq!(
+            binary_counts[0]
+                .saturating_add(binary_counts[1])
+                .saturating_add(binary_counts[2]) as usize,
+            self.n_haps
+        );
+
+        let n_bins = 3usize;
+        self.ensure_capacity(n_bins);
+        self.counts[0] = binary_counts[0];
+        self.counts[1] = binary_counts[1];
+        self.counts[2] = binary_counts[2];
+
+        let mut running = 0u32;
+        for i in 0..n_bins {
+            self.offsets[i] = running;
+            running += self.counts[i];
+        }
+
+        let has_missing = self.counts[1] > 0;
+        self.compute_biallelic_word_bases(has_missing);
+
+        let init_value = (marker + 1) as i32;
+        self.counts[..n_bins].fill(0);
+        self.p[..n_bins].fill(init_value);
+
+        if !has_missing {
+            let mut p0 = init_value;
+            let mut p1 = init_value;
+            let mut idx = 0usize;
+            for (w, bits_word) in permuted_bits.iter().enumerate().take(n_words) {
+                let mut bits = *bits_word;
+                let mut pos0 = self.word_base0[w];
+                let mut pos1 = self.word_base1[w];
+                let block_end = (idx + 64).min(self.n_haps);
+                while idx < block_end {
+                    let hap = prefix[idx];
+                    let div = divergence[idx];
+                    if div > p0 {
+                        p0 = div;
+                    }
+                    if div > p1 {
+                        p1 = div;
+                    }
+                    if (bits & 1) == 0 {
+                        self.scratch_a[pos0] = hap;
+                        self.scratch_d[pos0] = p0;
+                        p0 = i32::MIN;
+                        pos0 += 1;
+                    } else {
+                        self.scratch_a[pos1] = hap;
+                        self.scratch_d[pos1] = p1;
+                        p1 = i32::MIN;
+                        pos1 += 1;
+                    }
+                    bits >>= 1;
+                    idx += 1;
+                }
+            }
+        } else {
+            let mut p0 = init_value;
+            let mut p1 = init_value;
+            let mut p_miss = init_value;
+            let mut idx = 0usize;
+            for (w, bits_word) in permuted_bits.iter().enumerate().take(n_words) {
+                let mut bits = *bits_word;
+                let mut miss = permuted_missing_bits[w];
+                let mut pos0 = self.word_base0[w];
+                let mut pos1 = self.word_base1[w];
+                let mut pos_miss = self.word_base_miss[w];
+                let block_end = (idx + 64).min(self.n_haps);
+                while idx < block_end {
+                    let hap = prefix[idx];
+                    let div = divergence[idx];
+                    if div > p0 {
+                        p0 = div;
+                    }
+                    if div > p1 {
+                        p1 = div;
+                    }
+                    if div > p_miss {
+                        p_miss = div;
+                    }
+                    if (miss & 1) != 0 {
+                        self.scratch_a[pos_miss] = hap;
+                        self.scratch_d[pos_miss] = p_miss;
+                        p_miss = i32::MIN;
+                        pos_miss += 1;
+                    } else if (bits & 1) == 0 {
+                        self.scratch_a[pos0] = hap;
+                        self.scratch_d[pos0] = p0;
+                        p0 = i32::MIN;
+                        pos0 += 1;
+                    } else {
+                        self.scratch_a[pos1] = hap;
+                        self.scratch_d[pos1] = p1;
+                        p1 = i32::MIN;
+                        pos1 += 1;
+                    }
+                    bits >>= 1;
+                    miss >>= 1;
+                    idx += 1;
+                }
+            }
+        }
+
+        prefix.copy_from_slice(&self.scratch_a[..self.n_haps]);
+        divergence[..self.n_haps].copy_from_slice(&self.scratch_d[..self.n_haps]);
+    }
+
     /// Backward update of prefix and divergence arrays
     ///
     /// Uses In-Place Counting Sort.
