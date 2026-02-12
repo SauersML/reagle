@@ -5426,18 +5426,7 @@ impl crate::pipelines::ImputationPipeline {
                 let mut p1_out = HaplotypePriors::empty();
                 let mut p2_out = HaplotypePriors::empty();
 
-                if no_info_h1 && has_priors_h1 {
-                    if let Some(p) = priors_h1 {
-                        let (posts, propagated) = exact_transition_only_from_priors(
-                            h1_idx,
-                            p,
-                            handoff_capture_idx_h1,
-                            &mut posts_probs_buf,
-                        )?;
-                        hap1_posts = Some(posts);
-                        p1_out = propagated;
-                    }
-                } else if use_hmm_h1 {
+                if use_hmm_h1 {
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h1_idx,
                         priors_h1,
@@ -5496,18 +5485,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
 
-                if no_info_h2 && has_priors_h2 {
-                    if let Some(p) = priors_h2 {
-                        let (posts, propagated) = exact_transition_only_from_priors(
-                            h2_idx,
-                            p,
-                            handoff_capture_idx_h2,
-                            &mut posts_probs_buf,
-                        )?;
-                        hap2_posts = Some(posts);
-                        p2_out = propagated;
-                    }
-                } else if use_hmm_h2 {
+                if use_hmm_h2 {
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h2_idx,
                         priors_h2,

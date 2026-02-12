@@ -2759,22 +2759,52 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let final_pass = 0usize;
     for pass in 0..1 {
         let is_final = pass == final_pass;
-        if let Some(priors) = state_priors {
-            let len = priors.len().min(active_states);
-            ws.fwd[..len].copy_from_slice(&priors[..len]);
-            if len < active_states {
-                ws.fwd[len..active_states].fill(0.0);
+
+        // Default initialization at m=0 if no specific prior marker overrides it later
+        let uniform = 1.0 / active_states.max(1) as f32;
+        ws.fwd[..active_states].fill(uniform);
+
+        // If prior_marker_idx is None, we apply priors at 0 immediately (standard behavior).
+        // If it is Some(0), we also apply it here.
+        // If it is Some(>0), we apply it in the loop.
+        if prior_marker_idx.unwrap_or(0) == 0 {
+            if let Some(priors) = state_priors {
+                let len = priors.len().min(active_states);
+                ws.fwd[..len].copy_from_slice(&priors[..len]);
+                if len < active_states {
+                    ws.fwd[len..active_states].fill(0.0);
+                }
+                normalize_probs(&mut ws.fwd[..active_states]);
             }
-            normalize_probs(&mut ws.fwd[..active_states]);
-        } else {
-            let uniform = 1.0 / active_states.max(1) as f32;
-            ws.fwd[..active_states].fill(uniform);
         }
 
         kernel.reset_forward();
         let mut prev_marker = 0usize;
         for (cp_idx, marker) in checkpoint_grid.iter_forward() {
             let m = marker.as_usize();
+
+            // Inject priors at the specific handoff marker if requested.
+            // This overrides any previous transition/emission accumulation up to this point,
+            // effectively restarting the HMM forward pass from the handoff state.
+            if Some(m) == prior_marker_idx && m > 0 {
+                if let Some(priors) = state_priors {
+                    let len = priors.len().min(active_states);
+                    ws.fwd[..len].copy_from_slice(&priors[..len]);
+                    if len < active_states {
+                        ws.fwd[len..active_states].fill(0.0);
+                    }
+                    normalize_probs(&mut ws.fwd[..active_states]);
+
+                    // We must treat this marker as "done" for the purpose of the forward pass
+                    // state, but we still need to store the checkpoint.
+                    // Importantly, we SKIP the standard transition-to-m and emission-at-m
+                    // because the prior already represents P(state @ m | history).
+                    ws.store_checkpoint(cp_idx, active_states);
+                    prev_marker = m + 1;
+                    continue;
+                }
+            }
+
             if m > prev_marker {
                 batched_transition_forward(
                     &mut ws.fwd[..active_states],
