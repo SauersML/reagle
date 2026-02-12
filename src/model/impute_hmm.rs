@@ -848,12 +848,6 @@ impl RefColumnLike for DenseColumn {
             for (i, hap) in state_haps.iter().enumerate() {
                 let idx = hap.as_usize();
                 if idx >= n_haps {
-                    assert!(
-                        idx < n_haps,
-                        "DenseColumn::fill_ref_alleles received out-of-range hap index {} (n_haps={})",
-                        idx,
-                        n_haps
-                    );
                     out[i] = GenotypeColumn::MISSING_ALLELE;
                     continue;
                 }
@@ -883,16 +877,10 @@ impl RefColumnLike for DenseColumn {
             for (i, hap) in state_haps.iter().enumerate() {
                 let idx = hap.as_usize();
                 if idx >= n_haps {
-                    assert!(
-                        idx < n_haps,
-                        "DenseColumn::fill_ref_alleles received out-of-range hap index {} (n_haps={})",
-                        idx,
-                        n_haps
-                    );
                     out[i] = GenotypeColumn::MISSING_ALLELE;
                     continue;
                 }
-                out[i] = self.get(HapIdx::new(hap.as_u32()));
+                out[i] = self.get_ref(*hap);
             }
         }
     }

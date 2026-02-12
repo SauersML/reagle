@@ -6,6 +6,7 @@
 use bitvec::prelude::*;
 
 use crate::data::HapIdx;
+use crate::model::types::RefHapId;
 use crate::data::marker::bits_per_allele;
 
 /// Dense bit-packed storage for genotype data
@@ -78,27 +79,29 @@ impl DenseColumn {
     /// Get allele for haplotype
     #[inline]
     pub fn get(&self, hap: HapIdx) -> u8 {
-        let idx = hap.as_usize();
+        self.get_idx(hap.as_usize())
+    }
+
+    /// Type-safe reference-panel accessor.
+    ///
+    /// Using `RefHapId` here prevents mixing target/combined hap index spaces
+    /// in reference-only hot paths.
+    #[inline]
+    pub fn get_ref(&self, hap: RefHapId) -> u8 {
+        self.get_idx(hap.as_usize())
+    }
+
+    #[inline]
+    fn get_idx(&self, idx: usize) -> u8 {
         if idx >= self.n_haplotypes as usize {
-            assert!(
-                idx < self.n_haplotypes as usize,
-                "DenseColumn::get received out-of-range hap index {} (n_haplotypes={})",
-                idx,
-                self.n_haplotypes
-            );
             return 255;
         }
-
         if self.missing[idx] {
             return 255;
         }
-
-        // Fast path for biallelic sites (99% of cases): single bit lookup
         if self.bits_per_allele == 1 {
             return self.bits[idx] as u8;
         }
-
-        // General multi-allelic path
         let start = idx * self.bits_per_allele as usize;
         let mut allele = 0u8;
         for b in 0..self.bits_per_allele as usize {
