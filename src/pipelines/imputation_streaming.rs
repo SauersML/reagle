@@ -5811,13 +5811,7 @@ impl crate::pipelines::ImputationPipeline {
                 let mut p1_out = HaplotypePriors::empty();
                 let mut p2_out = HaplotypePriors::empty();
 
-                if no_info_h1 && !has_priors_h1 {
-                    let (posts, priors) =
-                        exact_no_info_posteriors(h1_idx, &donors_h1, &mut posts_probs_buf)?;
-                    hap1_posts = Some(posts);
-                    p1_out = priors;
-                    dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
-                } else if no_info_h1 && has_priors_h1 {
+                if no_info_h1 && has_priors_h1 {
                     if let Some(p) = priors_h1 {
                         let (posts, propagated) = exact_transition_only_from_priors(
                             h1_idx,
@@ -5833,7 +5827,7 @@ impl crate::pipelines::ImputationPipeline {
                         h1_idx,
                         priors_h1,
                         &mut input_probs_h1,
-                        prior_error_rate,
+                        prior_error_rate.clamp(1e-6, 0.5),
                         handoff_capture_idx_h1,
                         &donors_h1,
                     )?;
@@ -5851,6 +5845,12 @@ impl crate::pipelines::ImputationPipeline {
                         hap1_posts = Some(posts);
                         p1_out = propagated;
                     }
+                } else if no_info_h1 {
+                    let (posts, priors) =
+                        exact_no_info_posteriors(h1_idx, &donors_h1, &mut posts_probs_buf)?;
+                    hap1_posts = Some(posts);
+                    p1_out = priors;
+                    dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else {
                     let total: u32 = donors_h1.iter().map(|(_, c)| *c).sum();
                     if total > 0 {
@@ -5870,13 +5870,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 }
 
-                if no_info_h2 && !has_priors_h2 {
-                    let (posts, priors) =
-                        exact_no_info_posteriors(h2_idx, &donors_h2, &mut posts_probs_buf)?;
-                    hap2_posts = Some(posts);
-                    p2_out = priors;
-                    dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
-                } else if no_info_h2 && has_priors_h2 {
+                if no_info_h2 && has_priors_h2 {
                     if let Some(p) = priors_h2 {
                         let (posts, propagated) = exact_transition_only_from_priors(
                             h2_idx,
@@ -5892,7 +5886,7 @@ impl crate::pipelines::ImputationPipeline {
                         h2_idx,
                         priors_h2,
                         &mut input_probs_h2,
-                        prior_error_rate,
+                        prior_error_rate.clamp(1e-6, 0.5),
                         handoff_capture_idx_h2,
                         &donors_h2,
                     )?;
@@ -5910,6 +5904,12 @@ impl crate::pipelines::ImputationPipeline {
                         hap2_posts = Some(posts);
                         p2_out = propagated;
                     }
+                } else if no_info_h2 {
+                    let (posts, priors) =
+                        exact_no_info_posteriors(h2_idx, &donors_h2, &mut posts_probs_buf)?;
+                    hap2_posts = Some(posts);
+                    p2_out = priors;
+                    dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else {
                     let total: u32 = donors_h2.iter().map(|(_, c)| *c).sum();
                     if total > 0 {
