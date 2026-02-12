@@ -80,7 +80,7 @@ impl DenseColumn {
     pub fn get(&self, hap: HapIdx) -> u8 {
         let idx = hap.as_usize();
         if idx >= self.n_haplotypes as usize {
-            debug_assert!(
+            assert!(
                 idx < self.n_haplotypes as usize,
                 "DenseColumn::get received out-of-range hap index {} (n_haplotypes={})",
                 idx,

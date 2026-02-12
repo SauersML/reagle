@@ -90,7 +90,7 @@ pub struct BackPtr {
 
 #[inline]
 fn pack_backptr(prev: u32, swapped: bool) -> u16 {
-    debug_assert!(prev <= MAX_BACKPTR_PREV);
+    assert!(prev <= MAX_BACKPTR_PREV);
     let p = (prev as u16) & (MAX_BACKPTR_PREV as u16);
     p | ((swapped as u16) << 15)
 }

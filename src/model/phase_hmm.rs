@@ -44,8 +44,8 @@ impl EmissionAffine {
 
     #[inline]
     fn invert_prior(self, posterior: f32, emission: f32) -> f32 {
-        debug_assert!(emission > 0.0);
-        debug_assert!(self.scale > 0.0);
+        assert!(emission > 0.0);
+        assert!(self.scale > 0.0);
         ((posterior / emission) - self.shift) / self.scale
     }
 }

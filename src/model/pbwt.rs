@@ -616,11 +616,11 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
         let n_bins = 3usize;
         self.ensure_capacity(n_bins);
-        self.counts[0] = binary_counts[0];
-        self.counts[1] = binary_counts[1];
-        self.counts[2] = binary_counts[2];
+        self.counts[0] = binary_counts[0] as usize;
+        self.counts[1] = binary_counts[1] as usize;
+        self.counts[2] = binary_counts[2] as usize;
 
-        let mut running = 0u32;
+        let mut running = 0usize;
         for i in 0..n_bins {
             self.offsets[i] = running;
             running += self.counts[i];
