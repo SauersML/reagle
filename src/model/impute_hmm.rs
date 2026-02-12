@@ -1646,6 +1646,31 @@ fn normalized_allele_prior<'a>(
 }
 
 #[inline]
+fn normalize_allele_posterior_with_missing_mix(
+    allele_probs: &mut [f32],
+    subset_total: f32,
+    missing_mass: f32,
+    prior_scratch: &mut Vec<f32>,
+    target_probs: AlleleProbsView<'_>,
+) {
+    let subset = subset_total.max(0.0);
+    let missing = missing_mass.max(0.0);
+    if missing > 0.0 {
+        let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let norm = (subset + missing).max(1e-30);
+        let inv = 1.0 / norm;
+        for (p, &pi) in allele_probs.iter_mut().zip(prior.as_slice().iter()) {
+            *p = (*p + missing * pi) * inv;
+        }
+    } else {
+        let inv = 1.0 / subset.max(1e-30);
+        for p in allele_probs.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+#[inline]
 fn subset_transition_params(
     recomb_rate: f32,
     active_states: usize,
@@ -3016,35 +3041,19 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         // Out-of-domain allele index contributes to unrepresented
                                         // mass; treat it as missing-equivalent so:
                                         //   total == subset_total + missing_mass
-                                        // remains true. The simplified redistribution is exact
-                                        // under this decomposition.
+                                        // remains true.
                                         missing_mass += state_prob;
                                     }
                                 }
                                 if total > 0.0 {
-                                    // Algebraic simplification:
-                                    // If missing mass is redistributed in proportion to subset
-                                    // posteriors, final normalized posterior equals normalizing
-                                    // non-missing masses by subset_total directly.
-                                    if subset_total > 0.0 {
-                                        let inv = 1.0 / subset_total;
-                                        for p in ws.allele_probs.iter_mut() {
-                                            *p *= inv;
-                                        }
-                                    } else if missing_mass > 0.0 {
-                                        if !warned_af_fallback {
-                                            eprintln!(
-                                                "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
-                                                context.window_idx,
-                                                context.sample_idx,
-                                                context.hap_idx,
-                                                m
-                                            );
-                                            warned_af_fallback = true;
-                                        }
-                                        let prior =
-                                            normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
-                                        ws.allele_probs.copy_from_slice(prior.as_slice());
+                                    if subset_total > 0.0 || missing_mass > 0.0 {
+                                        normalize_allele_posterior_with_missing_mix(
+                                            &mut ws.allele_probs,
+                                            subset_total,
+                                            missing_mass,
+                                            &mut ws.allele_prior_scratch,
+                                            probs,
+                                        );
                                     } else {
                                         // No subset support reached the represented allele space
                                         // (e.g., out-of-domain reference alleles). Fall back to
@@ -3215,25 +3224,14 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 }
                             }
                             if total > 0.0 {
-                                if subset_total > 0.0 {
-                                    let inv = 1.0 / subset_total;
-                                    for p in ws.allele_probs.iter_mut() {
-                                        *p *= inv;
-                                    }
-                                } else if missing_mass > 0.0 {
-                                    if !warned_af_fallback {
-                                        eprintln!(
-                                            "[warn] AF fallback in impute_hmm (no state info): window={} sample={} hap={} marker={}",
-                                            context.window_idx,
-                                            context.sample_idx,
-                                            context.hap_idx,
-                                            m_rev
-                                        );
-                                        warned_af_fallback = true;
-                                    }
-                                    let prior =
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
-                                    ws.allele_probs.copy_from_slice(prior.as_slice());
+                                if subset_total > 0.0 || missing_mass > 0.0 {
+                                    normalize_allele_posterior_with_missing_mix(
+                                        &mut ws.allele_probs,
+                                        subset_total,
+                                        missing_mass,
+                                        &mut ws.allele_prior_scratch,
+                                        probs,
+                                    );
                                 } else {
                                     if !warned_af_fallback {
                                         eprintln!(
