@@ -800,7 +800,8 @@ impl VcfReader {
             // Parse genotype (handle both phased | and unphased /)
             let (a1, a2, phased, is_haploid) = parse_genotype_bytes(gt_field)?;
 
-            let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw();
+            let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw()
+                || a2 == crate::data::storage::AlleleCode::MISSING.raw();
             if !phased {
                 is_phased = false;
             }
@@ -1053,7 +1054,9 @@ fn parse_genotype_bytes(gt: &[u8]) -> Result<(u8, u8, bool, bool)> {
     let a1 = parse_allele_bytes(left);
     let a2 = parse_allele_bytes(right);
 
-    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+        || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+    {
         return Ok((u8::MAX, u8::MAX, false, false));
     }
 
@@ -1132,7 +1135,9 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     // For biallelic: 0/0 -> 0, 0/1 -> 1, 1/1 -> 2
     // For multiallelic: use triangular number formula
     let (min_a, max_a) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
-    let gt_idx = if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+    let gt_idx = if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+        || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+    {
         // Missing allele - can't compute confidence
         return None;
     } else {
@@ -1217,7 +1222,9 @@ pub fn compute_pl_confidence(pl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     if pls.len() < 3 {
         return None;
     }
-    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+        || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+    {
         return None;
     }
     let (min_a, max_a) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
@@ -1794,7 +1801,9 @@ mod tests {
         let a2 = parse_allele(right);
 
         // Java behavior: if one allele is missing, treat both as missing
-        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+            || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+        {
             return Ok((u8::MAX, u8::MAX, false, false));
         }
 
@@ -1839,8 +1848,14 @@ mod tests {
         assert_eq!(parse_genotype("0|1").unwrap(), (0, 1, true, false));
         assert_eq!(parse_genotype("1|0").unwrap(), (1, 0, true, false));
         assert_eq!(parse_genotype("0/1").unwrap(), (0, 1, false, false));
-        assert_eq!(parse_genotype("./.").unwrap(), (u8::MAX, u8::MAX, true, false));
-        assert_eq!(parse_genotype(".|.").unwrap(), (u8::MAX, u8::MAX, true, false));
+        assert_eq!(
+            parse_genotype("./.").unwrap(),
+            (u8::MAX, u8::MAX, true, false)
+        );
+        assert_eq!(
+            parse_genotype(".|.").unwrap(),
+            (u8::MAX, u8::MAX, true, false)
+        );
     }
 
     #[test]
@@ -1854,7 +1869,10 @@ mod tests {
         // Haploid genotypes: single allele, duplicated for storage
         assert_eq!(parse_genotype("0").unwrap(), (0, 0, true, true));
         assert_eq!(parse_genotype("1").unwrap(), (1, 1, true, true));
-        assert_eq!(parse_genotype(".").unwrap(), (u8::MAX, u8::MAX, true, false)); // Missing is diploid
+        assert_eq!(
+            parse_genotype(".").unwrap(),
+            (u8::MAX, u8::MAX, true, false)
+        ); // Missing is diploid
     }
 
     #[test]

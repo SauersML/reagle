@@ -241,7 +241,9 @@ impl GenotypeColumn {
         // so we only use it if there are no missing alleles or if we are okay
         // with missing being treated as REF/ALT in sparse storage (usually rare variants don't have many missing).
         // For correctness, if there's missing data, use Dense storage.
-        let has_missing = alleles.iter().any(|&a| AlleleCode::from_raw(a).is_missing());
+        let has_missing = alleles
+            .iter()
+            .any(|&a| AlleleCode::from_raw(a).is_missing());
 
         if maf < 0.01 && n_alleles == 2 && !has_missing {
             // Determine if we should store ALT or REF carriers (whichever is fewer)

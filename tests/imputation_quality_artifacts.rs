@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
 
 use serde_json::Value;
@@ -19,7 +19,9 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     ensure_cmd_exists("curl");
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let test_tmp_root = manifest_dir.join(".tmp").join("imputation_quality_artifacts");
+    let test_tmp_root = manifest_dir
+        .join(".tmp")
+        .join("imputation_quality_artifacts");
     fs::create_dir_all(&test_tmp_root).expect("create test tmp root");
     let work_dir = tempfile::Builder::new()
         .prefix("run-")
@@ -94,8 +96,16 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
 
     let reagle_vcf = reagle_out_prefix.with_extension("vcf.gz");
     let beagle_vcf = beagle_out_prefix.with_extension("vcf.gz");
-    assert!(reagle_vcf.exists(), "missing reagle output {}", reagle_vcf.display());
-    assert!(beagle_vcf.exists(), "missing beagle output {}", beagle_vcf.display());
+    assert!(
+        reagle_vcf.exists(),
+        "missing reagle output {}",
+        reagle_vcf.display()
+    );
+    assert!(
+        beagle_vcf.exists(),
+        "missing beagle output {}",
+        beagle_vcf.display()
+    );
 
     harmonize_sample_names(work_dir.path(), &[&truth_vcf, &reagle_vcf, &beagle_vcf]);
 
@@ -110,7 +120,8 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     assert!(
         reagle_r2 > beagle_r2,
         "Expected Reagle r_squared > Beagle r_squared; reagle={:.6}, beagle={:.6}",
-        reagle_r2, beagle_r2
+        reagle_r2,
+        beagle_r2
     );
 }
 
@@ -119,7 +130,10 @@ fn ensure_cmd_exists(cmd: &str) {
         .arg(cmd)
         .status()
         .expect("which command failed");
-    assert!(status.success(), "required command not found in PATH: {cmd}");
+    assert!(
+        status.success(),
+        "required command not found in PATH: {cmd}"
+    );
 }
 
 fn run(cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>>) {
@@ -443,7 +457,9 @@ fn next_truth_site(reader: &mut BufReader<std::process::ChildStdout>) -> Option<
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).expect("read truth query output");
+        let n = reader
+            .read_line(&mut line)
+            .expect("read truth query output");
         if n == 0 {
             return None;
         }
@@ -469,7 +485,9 @@ fn next_imputed_site(reader: &mut BufReader<std::process::ChildStdout>) -> Optio
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).expect("read imputed query output");
+        let n = reader
+            .read_line(&mut line)
+            .expect("read imputed query output");
         if n == 0 {
             return None;
         }
@@ -531,11 +549,7 @@ fn parse_gp(v: &str) -> Option<Vec<f64>> {
         }
         out.push(tok.parse::<f64>().ok()?);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn gt_to_nonref_dosage(gt: &str) -> Option<f64> {
@@ -623,8 +637,11 @@ fn compute_dosage_r2_streaming(truth_vcf: &Path, imputed_vcf: &Path) -> (f64, us
                     .ds
                     .or_else(|| i_cur.gp.as_ref().and_then(|g| ds_from_gp_biallelic(g)))
                     .or_else(|| gt_to_nonref_dosage(&i_cur.gt));
-                if let (Some(t_dos), Some(mut i_dos_val)) = (gt_to_nonref_dosage(&t_cur.gt), i_dos.take()) {
-                    if t_cur.ref_allele != i_cur.ref_allele || t_cur.alt_allele != i_cur.alt_allele {
+                if let (Some(t_dos), Some(mut i_dos_val)) =
+                    (gt_to_nonref_dosage(&t_cur.gt), i_dos.take())
+                {
+                    if t_cur.ref_allele != i_cur.ref_allele || t_cur.alt_allele != i_cur.alt_allele
+                    {
                         let biallelic_truth = !t_cur.alt_allele.contains(',');
                         let biallelic_imp = !i_cur.alt_allele.contains(',');
                         let swapped = biallelic_truth
@@ -655,7 +672,10 @@ fn compute_dosage_r2_streaming(truth_vcf: &Path, imputed_vcf: &Path) -> (f64, us
     wait_child_ok(truth_child, "bcftools truth query");
     wait_child_ok(imputed_child, "bcftools imputed query");
 
-    assert!(n > 1, "insufficient comparable points for r_squared (n={n})");
+    assert!(
+        n > 1,
+        "insufficient comparable points for r_squared (n={n})"
+    );
     let n_f = n as f64;
     let mean_t = sum_t / n_f;
     let mean_i = sum_i / n_f;

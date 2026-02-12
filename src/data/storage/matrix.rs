@@ -914,7 +914,7 @@ mod tests {
         // Create confidence scores: marker 0 has full confidence, marker 1 has 50% for sample 0
         let confidence = vec![
             vec![u8::MAX, u8::MAX], // marker 0: full confidence for both samples
-            vec![128, u8::MAX], // marker 1: 50% for sample 0, full for sample 1
+            vec![128, u8::MAX],     // marker 1: 50% for sample 0, full for sample 1
         ];
 
         let matrix = GenotypeMatrix::new_unphased_with_confidence(

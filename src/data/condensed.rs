@@ -77,7 +77,9 @@ impl CondensedTarget {
         for (hi_idx, &orig_m) in hi_freq_to_orig.iter().enumerate() {
             let a1 = sample_phase.allele1(orig_m);
             let a2 = sample_phase.allele2(orig_m);
-            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+                || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+            {
                 continue;
             }
             if a1 != a2 && a1 <= 1 && a2 <= 1 {
@@ -279,7 +281,9 @@ fn build_segment_mask<RefSpace>(
         let orig_m = hi_freq_to_orig[hi_idx];
         let a1 = sample_phase.allele1(orig_m);
         let a2 = sample_phase.allele2(orig_m);
-        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+            || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+        {
             continue;
         }
         if a1 == a2 && a1 <= 1 {

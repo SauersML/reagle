@@ -413,11 +413,11 @@ mod tests {
         // Test that missing data (u8::MAX) is preserved correctly
         let geno = MutableGenotypes::from_fn(4, 2, |m, h| {
             match (m, h) {
-                (0, 0) => 0,   // REF
-                (0, 1) => 1,   // ALT
+                (0, 0) => 0,       // REF
+                (0, 1) => 1,       // ALT
                 (1, 0) => u8::MAX, // Missing
-                (1, 1) => 0,   // REF
-                (2, 0) => 1,   // ALT
+                (1, 1) => 0,       // REF
+                (2, 0) => 1,       // ALT
                 (2, 1) => u8::MAX, // Missing
                 (3, _) => u8::MAX, // Both missing
                 _ => 0,
@@ -476,12 +476,12 @@ mod tests {
     fn test_swap_with_missing() {
         let mut geno = MutableGenotypes::from_fn(3, 2, |m, h| {
             match (m, h) {
-                (0, 0) => 1,   // ALT
+                (0, 0) => 1,       // ALT
                 (0, 1) => u8::MAX, // Missing
                 (1, 0) => u8::MAX, // Missing
-                (1, 1) => 0,   // REF
-                (2, 0) => 0,   // REF
-                (2, 1) => 1,   // ALT
+                (1, 1) => 0,       // REF
+                (2, 0) => 0,       // REF
+                (2, 1) => 1,       // ALT
                 _ => 0,
             }
         });
@@ -511,9 +511,9 @@ mod tests {
                 (1, 0) => 2, // ALT2
                 (1, 1) => 3, // ALT3
                 (2, 0) => 0,
-                (2, 1) => 2,   // ALT2
+                (2, 1) => 2,       // ALT2
                 (3, 0) => u8::MAX, // Missing
-                (3, 1) => 3,   // ALT3
+                (3, 1) => 3,       // ALT3
                 _ => 0,
             }
         });

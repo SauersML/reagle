@@ -1129,7 +1129,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                         lut.set_called_allele(a as u8, emit);
                                     }
                                 }
-                                let p_miss = (p_err_other + (p_no_err - p_err_other) * concentration)
+                                let p_miss = (p_err_other
+                                    + (p_no_err - p_err_other) * concentration)
                                     .max(1e-30);
                                 lut.set_missing_emission(p_miss);
                                 let used_pattern = try_fill_pattern_emissions(
@@ -1329,7 +1330,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     }
                     MarkerKind::Generic => {
                         if let Some(plp) = pl_provider {
-                            let partner = partner_alleles.get(m_next).copied().unwrap_or(MISSING_ALLELE);
+                            let partner = partner_alleles
+                                .get(m_next)
+                                .copied()
+                                .unwrap_or(MISSING_ALLELE);
                             let pl = plp.pl(m_next).filter(|v| !v.is_empty());
                             if let Some(pl) = pl {
                                 let biallelic_freqs = allele_freqs
@@ -1387,9 +1391,9 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                             lut.set_called_allele(a as u8, emit);
                                         }
                                     }
-                                    let p_miss =
-                                        (p_err_other + (p_no_err - p_err_other) * concentration)
-                                            .max(1e-30);
+                                    let p_miss = (p_err_other
+                                        + (p_no_err - p_err_other) * concentration)
+                                        .max(1e-30);
                                     lut.set_missing_emission(p_miss);
                                     let used_pattern = try_fill_pattern_emissions(
                                         m_next,
@@ -1429,7 +1433,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 }
                             }
                         } else {
-                            let partner = partner_alleles.get(m_next).copied().unwrap_or(MISSING_ALLELE);
+                            let partner = partner_alleles
+                                .get(m_next)
+                                .copied()
+                                .unwrap_or(MISSING_ALLELE);
                             let used_pattern = try_fill_pattern_emissions(
                                 m_next,
                                 partner,
@@ -1527,11 +1534,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let n_states_padded = ((n_states + 63) / 64) * 64;
         let total_size = n_markers * n_states_padded;
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
-        let mut ref_alleles_flat =
-            AVec::<u8, ConstAlign<64>>::from_iter(
-                64,
-                std::iter::repeat(MISSING_ALLELE).take(total_size),
-            );
+        let mut ref_alleles_flat = AVec::<u8, ConstAlign<64>>::from_iter(
+            64,
+            std::iter::repeat(MISSING_ALLELE).take(total_size),
+        );
         let mut precompute_cursor = MosaicCursor::from_threaded(threaded_haps);
         for m in 0..n_markers {
             precompute_cursor.advance_to_marker(m, threaded_haps);
@@ -1723,18 +1729,18 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             };
 
             for k in 0..n_states {
-                    let ref_al = ref_row[k];
-                    let observed = targ_al != MISSING_ALLELE && ref_al != MISSING_ALLELE;
-                    let is_mismatch = observed && ref_al != targ_al;
-                    let em = if !observed {
-                        if targ_al == MISSING_ALLELE {
-                            1.0
-                        } else {
-                            p_no_err
-                        }
-                    } else if !is_mismatch {
-                        p_no_err
+                let ref_al = ref_row[k];
+                let observed = targ_al != MISSING_ALLELE && ref_al != MISSING_ALLELE;
+                let is_mismatch = observed && ref_al != targ_al;
+                let em = if !observed {
+                    if targ_al == MISSING_ALLELE {
+                        1.0
                     } else {
+                        p_no_err
+                    }
+                } else if !is_mismatch {
+                    p_no_err
+                } else {
                     p_err
                 };
 

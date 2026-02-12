@@ -643,7 +643,10 @@ where
         let idx = marker
             .saturating_mul(self.n_haps)
             .saturating_add(hap as usize);
-        self.alleles_flat.get(idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
+        self.alleles_flat
+            .get(idx)
+            .copied()
+            .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
     }
 
     #[inline]
@@ -652,7 +655,11 @@ where
         let base = marker.saturating_mul(self.n_haps);
         for i in 0..n {
             let idx = base.saturating_add(haps[i] as usize);
-            out[i] = self.alleles_flat.get(idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            out[i] = self
+                .alleles_flat
+                .get(idx)
+                .copied()
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
         }
     }
 

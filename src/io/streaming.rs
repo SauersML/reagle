@@ -1054,7 +1054,8 @@ impl StreamingVcfReader {
                 let gt = std::str::from_utf8(gt_field).unwrap_or("<non-utf8>");
                 ReagleError::parse(line_idx, format!("Invalid GT '{}': {}", gt, e))
             })?;
-            let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw();
+            let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw()
+                || a2 == crate::data::storage::AlleleCode::MISSING.raw();
             let phased = gt_field.iter().any(|&b| b == b'|');
             phase_mask.push(if phased && !is_missing { 1 } else { 0 });
 
@@ -1274,7 +1275,9 @@ fn parse_gt_bytes(gt: &[u8]) -> std::result::Result<(u8, u8), String> {
     let a1 = parse_allele_char_bytes(left)?;
     let a2 = parse_allele_char_bytes(right)?;
 
-    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw()
+        || a2 == crate::data::storage::AlleleCode::MISSING.raw()
+    {
         Ok((
             crate::data::storage::AlleleCode::MISSING.raw(),
             crate::data::storage::AlleleCode::MISSING.raw(),

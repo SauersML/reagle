@@ -144,9 +144,13 @@ impl DenseColumn {
             // bits.count_ones() includes bits that might have been set for missing data
             // if we didn't clear them. But our set/from_alleles clears them.
             // Still, it's safer and clearer to use the iter or bit-parallel logic that respects 'missing'.
-            self.iter().filter(|&a| a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw()).count()
+            self.iter()
+                .filter(|&a| a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw())
+                .count()
         } else {
-            self.iter().filter(|&a| a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw()).count()
+            self.iter()
+                .filter(|&a| a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw())
+                .count()
         }
     }
 

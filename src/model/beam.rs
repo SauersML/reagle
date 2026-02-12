@@ -1700,7 +1700,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             out.resize(list.len(), u8::MAX);
         }
         for (i, &h) in list.iter().enumerate() {
-            out[i] = self.packed_ref.ref_allele_targ(marker, h).unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            out[i] = self
+                .packed_ref
+                .ref_allele_targ(marker, h)
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
         }
     }
 

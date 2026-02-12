@@ -10,8 +10,8 @@ use crate::data::storage::{
 };
 use crate::error::{ReagleError, Result};
 use crate::model::li_stephens::subset_linear_exact_k;
-use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::model::types::RefHapId;
+use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -730,7 +730,8 @@ impl ImputeWorkspace {
             self.weights.resize(n_states, 1.0);
         }
         if self.state_alleles.len() < n_states {
-            self.state_alleles.resize(n_states, AlleleCode::MISSING.raw());
+            self.state_alleles
+                .resize(n_states, AlleleCode::MISSING.raw());
         }
         if self.state_patterns.len() < n_states {
             self.state_patterns.resize(n_states, 0);
@@ -1463,7 +1464,8 @@ fn apply_marker_prior_smoothing(
     // decomposition (represented vs missing-ref vs out-of-domain). Fall back to
     // the legacy active/panel sparsity proxy only if local mass accounting is
     // unavailable at this call site.
-    let observed_total = subset_total.max(0.0) + missing_ref_mass.max(0.0) + missing_ood_mass.max(0.0);
+    let observed_total =
+        subset_total.max(0.0) + missing_ref_mass.max(0.0) + missing_ood_mass.max(0.0);
     let observed_missing_mass = if observed_total > 0.0 {
         ((missing_ref_mass.max(0.0) + missing_ood_mass.max(0.0)) / observed_total).clamp(0.0, 1.0)
     } else {
@@ -1791,7 +1793,12 @@ fn scale_slice_in_place(values: &mut [f32], scale: f32) {
 }
 
 #[inline]
-fn affine_blend_with_prior_in_place(values: &mut [f32], prior: &[f32], q_coeff: f32, pi_coeff: f32) {
+fn affine_blend_with_prior_in_place(
+    values: &mut [f32],
+    prior: &[f32],
+    q_coeff: f32,
+    pi_coeff: f32,
+) {
     let n = values.len().min(prior.len());
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -3382,8 +3389,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let groups_len = group_alleles.len();
                                 let group_limit = n_groups.min(groups_len);
                                 if n_groups > groups_len {
-                                    structural_invariant_violations = structural_invariant_violations
-                                        .saturating_add(n_groups - groups_len);
+                                    structural_invariant_violations =
+                                        structural_invariant_violations
+                                            .saturating_add(n_groups - groups_len);
                                     if !warned_structural_invariant {
                                         eprintln!(
                                             "[warn] impute_hmm structural group mismatch: window={} sample={} hap={} marker={} kernel={} groups={} alleles={}",
@@ -3650,8 +3658,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 }
                             }
                             if pid_oob {
-                                structural_invariant_violations = structural_invariant_violations
-                                    .saturating_add(1);
+                                structural_invariant_violations =
+                                    structural_invariant_violations.saturating_add(1);
                                 if !warned_structural_invariant {
                                     eprintln!(
                                         "[warn] impute_hmm structural group mismatch: window={} sample={} hap={} marker={} kernel={} active_states={} alleles={}",
@@ -3864,7 +3872,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     if structural_invariant_violations > 0 && !warned_structural_invariant {
         eprintln!(
             "[warn] impute_hmm structural invariant violations: window={} sample={} hap={} count={}",
-            context.window_idx, context.sample_idx, context.hap_idx, structural_invariant_violations
+            context.window_idx,
+            context.sample_idx,
+            context.hap_idx,
+            structural_invariant_violations
         );
     }
     Ok((final_posteriors, final_prior_state_post))

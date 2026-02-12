@@ -172,8 +172,7 @@ impl PackedRefColumn {
         if n_alleles > crate::data::storage::AlleleCode::MISSING.raw() as usize {
             return Err(ReagleError::vcf(format!(
                 "marker has {} alleles; maximum supported is {} because that code is reserved for missing",
-                n_alleles
-                ,
+                n_alleles,
                 crate::data::storage::AlleleCode::MISSING.raw()
             )));
         }
@@ -183,7 +182,8 @@ impl PackedRefColumn {
             let mut alleles = Vec::with_capacity(n_haps);
             for h in 0..n_haps {
                 let a = col.get(crate::data::haplotype::HapIdx::new(h as u32));
-                if a != crate::data::storage::AlleleCode::MISSING.raw() && (a as usize) >= n_alleles {
+                if a != crate::data::storage::AlleleCode::MISSING.raw() && (a as usize) >= n_alleles
+                {
                     return Err(ReagleError::vcf(format!(
                         "invalid allele {} at marker {} (n_alleles={})",
                         a,
@@ -698,7 +698,13 @@ mod tests {
         );
         markers.push(marker);
 
-        let alleles = vec![0u8, 1, 0, 1, crate::data::storage::AlleleCode::MISSING.raw()];
+        let alleles = vec![
+            0u8,
+            1,
+            0,
+            1,
+            crate::data::storage::AlleleCode::MISSING.raw(),
+        ];
         let col = GenotypeColumn::from_alleles(&alleles, 2);
         let packed = PackedRefColumn::pack_from_column(MarkerIdx::new(0), &markers, &col).unwrap();
 
