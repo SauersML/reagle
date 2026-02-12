@@ -249,7 +249,8 @@ fn validate_reference_marker_count(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackwardAffine, ForwardAffine, subset_transition_params, transition_only_forward_update,
+        AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles, fill_emissions,
+        missing_emission_prob, subset_transition_params, transition_only_forward_update,
     };
     use super::{RefColumnLike, RefHapId};
     use crate::data::storage::{DenseColumn, GenotypeColumn};
@@ -386,6 +387,42 @@ mod tests {
 
         assert_eq!(out[0], 2);
         assert_eq!(out[1], GenotypeColumn::MISSING_ALLELE);
+    }
+
+    #[test]
+    fn test_missing_emission_prob_tracks_target_concentration() {
+        let match_prob = 0.99f32;
+        let mismatch_prob = 0.01f32;
+
+        let concentrated = AlleleProbsView::from_trusted(&[1.0, 0.0]);
+        let diffuse = AlleleProbsView::from_trusted(&[0.5, 0.5]);
+
+        let c = missing_emission_prob(concentrated, match_prob, mismatch_prob);
+        let d = missing_emission_prob(diffuse, match_prob, mismatch_prob);
+
+        assert!((c - match_prob).abs() < 1e-6);
+        assert!(d < c);
+        assert!(d > mismatch_prob);
+    }
+
+    #[test]
+    fn test_fill_emissions_missing_not_superior_to_best_called() {
+        let ref_raw = [255u8, 0, 1];
+        let ref_alleles = RefAlleles { slice: &ref_raw };
+        let target_probs = AlleleProbsView::from_trusted(&[0.5, 0.5]);
+        let mut emission_by_allele = Vec::new();
+        let mut emissions = vec![0.0f32; ref_raw.len()];
+
+        fill_emissions(
+            &ref_alleles,
+            target_probs,
+            0.01,
+            &mut emission_by_allele,
+            &mut emissions,
+        );
+
+        let best_called = emissions[1].max(emissions[2]);
+        assert!(emissions[0] <= best_called + 1e-6);
     }
 }
 
@@ -1077,6 +1114,7 @@ fn fill_emissions(
         error_rate
     };
     let match_prob = 1.0 - error_rate;
+    let missing_prob = missing_emission_prob(target_probs, match_prob, mismatch_prob);
 
     if emission_by_allele.len() < n_alleles {
         emission_by_allele.resize(n_alleles, 1.0);
@@ -1088,7 +1126,7 @@ fn fill_emissions(
 
     for (i, &ref_allele) in ref_alleles.slice.iter().enumerate() {
         if ref_allele == 255 {
-            emissions[i] = 1.0;
+            emissions[i] = missing_prob;
             continue;
         }
         let idx = ref_allele as usize;
@@ -1122,6 +1160,7 @@ fn fill_pattern_emissions(
         error_rate
     };
     let match_prob = 1.0 - error_rate;
+    let missing_prob = missing_emission_prob(target_probs, match_prob, mismatch_prob);
     if emission_by_allele.len() < n_alleles {
         emission_by_allele.resize(n_alleles, 1.0);
     }
@@ -1134,7 +1173,7 @@ fn fill_pattern_emissions(
     }
     for (i, &allele) in pattern_alleles.iter().enumerate() {
         if allele == 255 {
-            pattern_emissions[i] = 1.0;
+            pattern_emissions[i] = missing_prob;
         } else {
             let idx = allele as usize;
             if idx < emission_by_allele.len() {
@@ -1146,6 +1185,31 @@ fn fill_pattern_emissions(
         }
     }
     mismatch_prob
+}
+
+#[inline]
+fn missing_emission_prob(
+    target_probs: AlleleProbsView<'_>,
+    match_prob: f32,
+    mismatch_prob: f32,
+) -> f32 {
+    let n = target_probs.len();
+    if n == 0 {
+        return 1.0;
+    }
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    for i in 0..n {
+        let p = target_probs.get(i).unwrap_or(0.0).max(0.0);
+        sum += p;
+        sum_sq += p * p;
+    }
+    let concentration = if sum > 0.0 {
+        (sum_sq / (sum * sum)).clamp(0.0, 1.0)
+    } else {
+        1.0 / n as f32
+    };
+    mismatch_prob + (match_prob - mismatch_prob) * concentration
 }
 
 #[inline]
@@ -1698,6 +1762,60 @@ fn subset_transition_params(
 }
 
 #[inline]
+fn adaptive_transition_lambda_from_probs(probs: &[f32], sum: f32) -> f32 {
+    const LAMBDA_MAX: f32 = 0.98;
+    if probs.len() <= 1 {
+        return 1.0;
+    }
+    let norm = sum.max(1e-30);
+    let mut sum_q2 = 0.0f32;
+    for &v in probs {
+        let q = (v / norm).max(0.0);
+        sum_q2 += q * q;
+    }
+    if !sum_q2.is_finite() || sum_q2 <= 0.0 {
+        return 0.0;
+    }
+    let k = probs.len() as f32;
+    let ess = (1.0 / sum_q2).clamp(1.0, k);
+    let ess_norm = ((ess - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
+    let confidence = 1.0 - ess_norm;
+    (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX)
+}
+
+#[inline]
+fn subset_transition_params_adaptive_q(
+    recomb_rate: f32,
+    active_states: usize,
+    n_ref_haps: usize,
+    lambda: f32,
+) -> (f32, f32) {
+    if active_states == 0 {
+        return (0.0, 0.0);
+    }
+    let r = recomb_rate.clamp(0.0, 1.0);
+    let n = n_ref_haps.max(1) as f32;
+    let k = active_states as f32;
+    let lam = lambda.clamp(0.0, 1.0);
+    // Truncation-aware conditioning with confidence-adaptive shrink:
+    // q_t(j) is represented by active-state posterior; shrink to uniform 1/N by (1-lambda).
+    // Denominator conditions on the event "next donor remains represented".
+    let rho = lam + (1.0 - lam) * (k / n);
+    let d = ((1.0 - r) + r * rho).max(1e-30);
+    let stay = ((1.0 - r) + r * lam) / d;
+    let shift = (r * (1.0 - lam) / n) / d;
+    assert!(
+        (stay + k * shift - 1.0).abs() < 1e-3 || !stay.is_finite() || !shift.is_finite(),
+        "adaptive subset transition mass drift: stay={} shift={} K={} stay+K*shift={}",
+        stay,
+        shift,
+        active_states,
+        stay + k * shift
+    );
+    (stay, shift)
+}
+
+#[inline]
 fn transition_only_forward_update(
     fwd: &mut [f32],
     fwd_sum: f32,
@@ -1711,7 +1829,9 @@ fn transition_only_forward_update(
         return fwd_sum;
     }
     let denom = fwd_sum.max(1e-30);
-    let (stay_gap, shift) = subset_transition_params(recomb_rate, fwd.len(), transition_haps);
+    let lambda = adaptive_transition_lambda_from_probs(fwd, denom);
+    let (stay_gap, shift) =
+        subset_transition_params_adaptive_q(recomb_rate, fwd.len(), transition_haps, lambda);
     let scale = stay_gap / denom;
     let mut new_sum = 0.0f32;
     for v in fwd.iter_mut() {
@@ -1732,7 +1852,9 @@ fn transition_only_backward_update(
     if bwd.is_empty() || recomb_rate <= 0.0 {
         return bwd_sum;
     }
-    let (stay_gap, shift_base) = subset_transition_params(recomb_rate, bwd.len(), transition_haps);
+    let lambda = adaptive_transition_lambda_from_probs(bwd, bwd_sum);
+    let (stay_gap, shift_base) =
+        subset_transition_params_adaptive_q(recomb_rate, bwd.len(), transition_haps, lambda);
     let shift = shift_base * bwd_sum;
     let scale = stay_gap;
     for v in bwd.iter_mut() {

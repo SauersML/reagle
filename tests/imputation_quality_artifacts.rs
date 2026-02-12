@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -99,42 +100,22 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
 
     harmonize_sample_names(work_dir.path(), &[&truth_vcf, &reagle_vcf, &beagle_vcf]);
 
-    let reagle_metrics_prefix = work_dir.path().join("reagle_py");
-    let beagle_metrics_prefix = work_dir.path().join("beagle_py");
-    run_python_calculate_metrics(
-        &manifest_dir,
-        &truth_vcf,
-        &reagle_vcf,
-        &reagle_metrics_prefix,
-        &ref_vcf,
-    );
-    run_python_calculate_metrics(
-        &manifest_dir,
-        &truth_vcf,
-        &beagle_vcf,
-        &beagle_metrics_prefix,
-        &ref_vcf,
-    );
+    let truth_map = load_truth_sites(&truth_vcf);
+    let reagle_map = load_imputed_sites(&reagle_vcf);
+    let beagle_map = load_imputed_sites(&beagle_vcf);
 
-    let reagle_r2 = read_r_squared(&PathBuf::from(format!(
-        "{}_metrics.json",
-        reagle_metrics_prefix.display()
-    )));
-    let beagle_r2 = read_r_squared(&PathBuf::from(format!(
-        "{}_metrics.json",
-        beagle_metrics_prefix.display()
-    )));
+    let (reagle_r2, reagle_n) = compute_dosage_r2(&truth_map, &reagle_map);
+    let (beagle_r2, beagle_n) = compute_dosage_r2(&truth_map, &beagle_map);
 
     println!(
-        "Reagle r_squared: {:.6} | Beagle r_squared: {:.6}",
-        reagle_r2, beagle_r2
+        "Native dosage r_squared | Reagle: {:.6} (n={}) | Beagle: {:.6} (n={})",
+        reagle_r2, reagle_n, beagle_r2, beagle_n
     );
 
     assert!(
         reagle_r2 > beagle_r2,
         "Expected Reagle r_squared > Beagle r_squared; reagle={:.6}, beagle={:.6}",
-        reagle_r2,
-        beagle_r2
+        reagle_r2, beagle_r2
     );
 }
 
@@ -460,57 +441,224 @@ fn find_file_recursive(root: &Path, filename: &str) -> Option<PathBuf> {
     None
 }
 
-fn run_python_calculate_metrics(
-    repo_root: &Path,
-    truth_vcf: &Path,
-    imputed_vcf: &Path,
-    output_prefix: &Path,
-    reference_vcf: &Path,
-) {
-    let script = r#"
-import importlib.util
-import pathlib
-import sys
-
-module_path = pathlib.Path(sys.argv[1])
-truth_vcf = sys.argv[2]
-imputed_vcf = sys.argv[3]
-output_prefix = sys.argv[4]
-reference_vcf = sys.argv[5]
-
-spec = importlib.util.spec_from_file_location("integration_test_module", str(module_path))
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-mod.calculate_metrics(truth_vcf, imputed_vcf, output_prefix, reference_vcf=reference_vcf)
-"#;
-
-    run_in(
-        repo_root,
-        "python3",
-        [
-            "-c",
-            script,
-            "tests/integration_test.py",
-            truth_vcf.to_str().expect("truth path utf8"),
-            imputed_vcf.to_str().expect("imputed path utf8"),
-            output_prefix.to_str().expect("output prefix path utf8"),
-            reference_vcf.to_str().expect("reference path utf8"),
-        ],
-    );
+#[derive(Clone)]
+struct TruthSite {
+    ref_allele: String,
+    alt_allele: String,
+    gt: String,
 }
 
-fn read_r_squared(metrics_json: &Path) -> f64 {
-    let raw = fs::read_to_string(metrics_json).unwrap_or_else(|e| {
-        panic!(
-            "failed reading metrics json {}: {e}",
-            metrics_json.display()
-        )
-    });
-    let parsed: Value = serde_json::from_str(&raw).expect("parse metrics json");
-    parsed
-        .get("r_squared")
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("r_squared missing or non-numeric in {}", metrics_json.display()))
+#[derive(Clone)]
+struct ImputedSite {
+    ref_allele: String,
+    alt_allele: String,
+    gt: String,
+    ds: Option<f64>,
+    gp: Option<Vec<f64>>,
+}
+
+fn load_truth_sites(vcf: &Path) -> HashMap<(String, i64), TruthSite> {
+    let out = run_capture(
+        "bcftools",
+        [
+            "query",
+            "-f",
+            "%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n",
+            vcf.to_str().expect("truth path utf8"),
+        ],
+    );
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let pos = match fields[1].parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        map.insert(
+            (fields[0].to_string(), pos),
+            TruthSite {
+                ref_allele: fields[2].to_string(),
+                alt_allele: fields[3].to_string(),
+                gt: fields[4].to_string(),
+            },
+        );
+    }
+    map
+}
+
+fn load_imputed_sites(vcf: &Path) -> HashMap<(String, i64), ImputedSite> {
+    let out = run_capture(
+        "bcftools",
+        [
+            "query",
+            "-f",
+            "%CHROM\t%POS\t%REF\t%ALT[\t%GT:%DS:%GP]\n",
+            vcf.to_str().expect("imputed path utf8"),
+        ],
+    );
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let pos = match fields[1].parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let (gt, ds, gp) = parse_imputed_sample(fields[4]);
+        map.insert(
+            (fields[0].to_string(), pos),
+            ImputedSite {
+                ref_allele: fields[2].to_string(),
+                alt_allele: fields[3].to_string(),
+                gt,
+                ds,
+                gp,
+            },
+        );
+    }
+    map
+}
+
+fn parse_imputed_sample(sample: &str) -> (String, Option<f64>, Option<Vec<f64>>) {
+    let parts: Vec<&str> = sample.split(':').collect();
+    let gt = parts.first().unwrap_or(&".").to_string();
+    let ds = parts.get(1).and_then(|v| parse_ds(v));
+    let gp = parts.get(2).and_then(|v| parse_gp(v));
+    (gt, ds, gp)
+}
+
+fn parse_ds(v: &str) -> Option<f64> {
+    if v.is_empty() || *v == "." {
+        return None;
+    }
+    if v.contains(',') {
+        let mut sum = 0.0;
+        for tok in v.split(',') {
+            if tok.is_empty() || tok == "." {
+                continue;
+            }
+            let value = tok.parse::<f64>().ok()?;
+            sum += value;
+        }
+        return Some(sum);
+    }
+    v.parse::<f64>().ok()
+}
+
+fn parse_gp(v: &str) -> Option<Vec<f64>> {
+    if v.is_empty() || *v == "." {
+        return None;
+    }
+    let mut out = Vec::new();
+    for tok in v.split(',') {
+        if tok.is_empty() || tok == "." {
+            return None;
+        }
+        out.push(tok.parse::<f64>().ok()?);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn gt_to_nonref_dosage(gt: &str) -> Option<f64> {
+    if gt.is_empty() || gt == "." || gt == "./." || gt == ".|." {
+        return None;
+    }
+    let sep = if gt.contains('|') { '|' } else { '/' };
+    let parts: Vec<&str> = gt.split(sep).collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let a = parts[0].parse::<i32>().ok()?;
+    let b = parts[1].parse::<i32>().ok()?;
+    Some((if a != 0 { 1.0 } else { 0.0 }) + (if b != 0 { 1.0 } else { 0.0 }))
+}
+
+fn ds_from_gp_biallelic(gp: &[f64]) -> Option<f64> {
+    if gp.len() < 3 {
+        return None;
+    }
+    let p0 = gp[0];
+    let p1 = gp[1];
+    let p2 = gp[2];
+    let sum = p0 + p1 + p2;
+    if sum <= 0.0 {
+        return None;
+    }
+    Some((p1 + 2.0 * p2) / sum)
+}
+
+fn compute_dosage_r2(
+    truth: &HashMap<(String, i64), TruthSite>,
+    imputed: &HashMap<(String, i64), ImputedSite>,
+) -> (f64, usize) {
+    let mut sum_t = 0.0_f64;
+    let mut sum_i = 0.0_f64;
+    let mut sum_ti = 0.0_f64;
+    let mut sum_tt = 0.0_f64;
+    let mut sum_ii = 0.0_f64;
+    let mut n: usize = 0;
+
+    for (key, t_site) in truth {
+        let Some(i_site) = imputed.get(key) else {
+            continue;
+        };
+
+        let Some(t_dos) = gt_to_nonref_dosage(&t_site.gt) else {
+            continue;
+        };
+
+        let mut i_dos = i_site
+            .ds
+            .or_else(|| i_site.gp.as_ref().and_then(|g| ds_from_gp_biallelic(g)))
+            .or_else(|| gt_to_nonref_dosage(&i_site.gt));
+        let Some(mut i_dos_val) = i_dos.take() else {
+            continue;
+        };
+
+        if t_site.ref_allele != i_site.ref_allele || t_site.alt_allele != i_site.alt_allele {
+            let biallelic_truth = !t_site.alt_allele.contains(',');
+            let biallelic_imp = !i_site.alt_allele.contains(',');
+            let swapped = biallelic_truth
+                && biallelic_imp
+                && t_site.ref_allele == i_site.alt_allele
+                && t_site.alt_allele == i_site.ref_allele;
+            if swapped {
+                i_dos_val = 2.0 - i_dos_val;
+            } else {
+                continue;
+            }
+        }
+
+        sum_t += t_dos;
+        sum_i += i_dos_val;
+        sum_ti += t_dos * i_dos_val;
+        sum_tt += t_dos * t_dos;
+        sum_ii += i_dos_val * i_dos_val;
+        n += 1;
+    }
+
+    assert!(n > 1, "insufficient comparable points for r_squared (n={n})");
+    let n_f = n as f64;
+    let mean_t = sum_t / n_f;
+    let mean_i = sum_i / n_f;
+    let cov = sum_ti / n_f - mean_t * mean_i;
+    let var_t = sum_tt / n_f - mean_t * mean_t;
+    let var_i = sum_ii / n_f - mean_i * mean_i;
+    assert!(
+        var_t > 0.0 && var_i > 0.0,
+        "non-positive variance for r_squared (var_t={var_t}, var_i={var_i}, n={n})"
+    );
+    let r = cov / (var_t * var_i).sqrt();
+    (r * r, n)
 }
 
 fn harmonize_sample_names(work_dir: &Path, vcfs: &[&Path]) {

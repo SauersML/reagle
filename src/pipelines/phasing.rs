@@ -713,9 +713,7 @@ fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
         let pb = bwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
         let lf = (pf / (1.0 - pf)).ln();
         let lb = (pb / (1.0 - pb)).ln();
-        // Conservative symmetric fusion of directional estimates:
-        // average log-odds avoids squared-odds overconfidence from pure multiplication.
-        let logit = 0.5 * (lf + lb);
+        let logit = lf + lb;
         let p = 1.0 / (1.0 + (-logit).exp());
         out.push(p.clamp(1e-6, 1.0 - 1e-6));
     }
@@ -3578,6 +3576,15 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         }
 
         let mut overlap = PhasedOverlap::new(n_overlap, n_haps, alleles);
+        let n_samples = phased.n_samples();
+        let mut phase_confidence = Vec::with_capacity(n_overlap * n_samples);
+        for s in 0..n_samples {
+            for m in start..end {
+                let m_idx = MarkerIdx::new(m as u32);
+                phase_confidence.push(phased.sample_phase_confidence_f32(m_idx, s).clamp(0.0, 1.0));
+            }
+        }
+        overlap.set_phase_confidence(phase_confidence);
 
         // Attach soft-information handoff payloads if available.
         if let Some(handoff) = handoff {
@@ -3829,6 +3836,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .unwrap_or(false);
         let mut sample_phases = self.create_sample_phases_with_overlap(
             &geno,
+            phased_overlap,
             &missing_mask,
             &confidence_by_sample,
             phase_mask,
@@ -4263,10 +4271,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     fn create_sample_phases_with_overlap(
         &self,
         geno: &MutableGenotypes,
+        phased_overlap: Option<&PhasedOverlap>,
         missing_mask: &[BitBox<u8, Lsb0>],
         confidence_by_sample: &[Vec<f32>],
         phase_mask: Option<&crate::data::storage::matrix::BitMatrix>,
     ) -> Vec<SamplePhase> {
+        const DEFAULT_OVERLAP_PHASE_CONF: f32 = 0.90;
+        const MAX_SOFT_OVERLAP_PHASE_CONF: f32 = 0.995;
+
         let n_samples = geno.n_haps() / 2;
         let n_markers = geno.n_markers();
 
@@ -4305,7 +4317,49 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .collect();
 
                 let conf = &confidence_by_sample[s];
-                SamplePhase::new(n_markers, &alleles1, &alleles2, conf, &unphased, &missing)
+                let mut sp =
+                    SamplePhase::new(n_markers, &alleles1, &alleles2, conf, &unphased, &missing);
+
+                // Soft overlap constraint: keep overlap-seeded hets re-phasable, but
+                // inject a confidence prior so disagreement pays a probabilistic cost.
+                if let Some(overlap) = phased_overlap {
+                    let n_overlap = overlap.n_markers.min(n_markers);
+                    let h1 = hap1.as_usize();
+                    let h2 = hap2.as_usize();
+                    for m in 0..n_overlap {
+                        if !sp.is_unphased(m) {
+                            continue;
+                        }
+                        if missing_mask[h1][m] || missing_mask[h2][m] {
+                            continue;
+                        }
+                        let ov_a1 = overlap.allele(m, h1);
+                        let ov_a2 = overlap.allele(m, h2);
+                        if ov_a1 == 255 || ov_a2 == 255 || ov_a1 == ov_a2 {
+                            continue;
+                        }
+                        let a1 = alleles1[m];
+                        let a2 = alleles2[m];
+                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                            continue;
+                        }
+                        if ov_a1 != a1 || ov_a2 != a2 {
+                            continue;
+                        }
+                        let overlap_conf = overlap
+                            .phase_confidence_at(m, s)
+                            .unwrap_or(DEFAULT_OVERLAP_PHASE_CONF)
+                            .clamp(0.5, MAX_SOFT_OVERLAP_PHASE_CONF);
+                        let geno_conf = conf[m].clamp(0.0, 1.0);
+                        let soft_prior = 0.5 + (overlap_conf - 0.5) * geno_conf;
+                        sp.set_phase_confidence(
+                            m,
+                            soft_prior.clamp(0.5, MAX_SOFT_OVERLAP_PHASE_CONF),
+                        );
+                    }
+                }
+
+                sp
             })
             .collect()
     }

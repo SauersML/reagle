@@ -203,6 +203,10 @@ pub struct PhasedOverlap {
 
     /// Genetic position (cM) for the prior marker used to export haplotype priors.
     pub prior_stage1_gen_pos: Option<f64>,
+
+    /// Per-sample phase confidence over overlap markers.
+    /// Layout: phase_confidence[sample * n_markers + marker]
+    pub phase_confidence: Option<Vec<f32>>,
 }
 
 impl PhasedOverlap {
@@ -222,6 +226,7 @@ impl PhasedOverlap {
             hap_priors: None,
             prior_stage1_global_marker: None,
             prior_stage1_gen_pos: None,
+            phase_confidence: None,
         }
     }
 
@@ -258,6 +263,22 @@ impl PhasedOverlap {
     /// Get genetic position (cM) for the prior marker used to export haplotype priors.
     pub fn prior_stage1_gen_pos(&self) -> Option<f64> {
         self.prior_stage1_gen_pos
+    }
+
+    /// Set per-sample phase confidence over overlap markers.
+    pub fn set_phase_confidence(&mut self, phase_confidence: Vec<f32>) {
+        self.phase_confidence = Some(phase_confidence);
+    }
+
+    /// Get per-sample phase confidence for a marker.
+    #[inline]
+    pub fn phase_confidence_at(&self, marker: usize, sample: usize) -> Option<f32> {
+        let conf = self.phase_confidence.as_ref()?;
+        let n_samples = self.n_haps / 2;
+        if sample >= n_samples || marker >= self.n_markers {
+            return None;
+        }
+        conf.get(sample * self.n_markers + marker).copied()
     }
 
     /// Get the allele for a specific haplotype at a specific marker

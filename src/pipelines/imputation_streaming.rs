@@ -154,7 +154,6 @@ const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
-const ORIENTATION_SWITCH_SCALE: f64 = 0.35;
 const ORIENTATION_ALPHA_MIN: f64 = 0.60;
 const ORIENTATION_ALPHA_MAX: f64 = 1.00;
 const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
@@ -6034,35 +6033,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut handoff_marker_idx: Option<usize> = None;
 
         let phase_mask = target_win.phase_mask();
-        let mut lambda_samples: Vec<f64> = Vec::new();
-        if output_end > output_start + 1 {
-            lambda_samples.reserve(output_end - output_start - 1);
-            for ref_m in (output_start + 1)..output_end {
-                let dist_cm = (gen_positions[ref_m] - gen_positions[ref_m - 1]).abs();
-                if dist_cm <= 0.0 || !dist_cm.is_finite() {
-                    continue;
-                }
-                let p = p_recomb
-                    .get(ref_m)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(1e-8, 0.49) as f64;
-                let lambda = (-(1.0 - p).ln()) / dist_cm;
-                if lambda.is_finite() && lambda > 0.0 {
-                    lambda_samples.push(lambda);
-                }
-            }
-        }
-        let orientation_lambda = if lambda_samples.is_empty() {
-            1e-6
-        } else {
-            lambda_samples
-                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = lambda_samples[lambda_samples.len() / 2];
-            (median * ORIENTATION_SWITCH_SCALE).clamp(1e-6, 10.0)
-        };
         let output_markers = output_end.saturating_sub(output_start);
-        let mut scratch_prefix_cm: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_emit0: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_emit1: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_orient_alpha: Vec<f64> = vec![ORIENTATION_ALPHA_MAX; output_markers];
@@ -6177,7 +6148,6 @@ impl crate::pipelines::ImputationPipeline {
             if n == 0 {
                 return None;
             }
-            let prefix_cm = &mut scratch_prefix_cm;
             let emit0 = &mut scratch_emit0;
             let emit1 = &mut scratch_emit1;
             let orient_alpha = &mut scratch_orient_alpha;
@@ -6188,7 +6158,6 @@ impl crate::pipelines::ImputationPipeline {
             let bwd0 = &mut scratch_bwd0;
             let bwd1 = &mut scratch_bwd1;
             let swapped = &mut scratch_swapped;
-            prefix_cm.resize(n, 0.0);
             emit0.resize(n, 0.0);
             emit1.resize(n, 0.0);
             orient_alpha.resize(n, ORIENTATION_ALPHA_MAX);
@@ -6200,12 +6169,6 @@ impl crate::pipelines::ImputationPipeline {
             bwd1.resize(n, 0.0);
             swapped.resize(n, false);
 
-            prefix_cm[0] = 0.0;
-            for local_m in 1..n {
-                let ref_m = output_start + local_m;
-                let d = (gen_positions[ref_m] - gen_positions[ref_m - 1]).abs();
-                prefix_cm[local_m] = prefix_cm[local_m - 1] + if d.is_finite() { d } else { 0.0 };
-            }
             let eps = 1e-30f64;
 
             for local_m in 0..n {
@@ -6291,12 +6254,12 @@ impl crate::pipelines::ImputationPipeline {
             log_stay[0] = 0.0;
             log_flip[0] = f64::NEG_INFINITY;
             for local_m in 1..n {
-                let gap_cm = (prefix_cm[local_m] - prefix_cm[local_m - 1]).max(0.0);
-                let p_flip = if gap_cm > 0.0 && gap_cm.is_finite() {
-                    (1.0 - (-orientation_lambda * gap_cm).exp()).clamp(1e-8, 0.49)
-                } else {
-                    1e-8
-                };
+                let ref_m = output_start + local_m;
+                let p_flip = p_recomb
+                    .get(ref_m)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(1e-8, 0.49) as f64;
                 let alpha_gap = (orient_alpha[local_m - 1] + orient_alpha[local_m]) * 0.5;
                 // Entropy-modulated transition odds:
                 // odds' = odds^alpha, alpha in [alpha_min, 1].

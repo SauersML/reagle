@@ -779,6 +779,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let n_calls = condensed.call_sites.len();
         let mut backptrs: Vec<Vec<u16>> = Vec::with_capacity(n_calls);
         let mut segment_ptrs: Vec<Vec<u32>> = Vec::with_capacity(n_calls);
+        let mut logsum_unswapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
+        let mut logsum_swapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         for i in 0..n_calls {
             let segment = &condensed.segments[i];
             let call = &condensed.call_sites[i];
@@ -833,6 +835,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     call,
                     active_pool,
                     &mut next,
+                    &mut logsum_unswapped,
+                    &mut logsum_swapped,
                     i,
                     cutoff,
                     &mut scratch,
@@ -891,13 +895,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 idx = 0;
             }
             phases.reverse();
-            let p_swapped = compute_swap_posteriors_retained(
-                &beam,
-                trailing_ptrs.as_ref(),
-                &backptrs,
-                &segment_ptrs,
-                n_calls,
-            );
+            let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
             let has_input_anchor = sample_phase.has_input_phase_anchor();
             for (i, phase_swapped) in phases.iter().enumerate() {
                 let call = &condensed.call_sites[i];
@@ -1194,6 +1192,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         call: &CallSite,
         active_pool: &ActivePool,
         out: &mut Vec<BeamPath>,
+        logsum_unswapped: &mut [f64],
+        logsum_swapped: &mut [f64],
         call_idx: usize,
         cutoff: i64,
         scratch: &mut BeamScratch,
@@ -1230,6 +1230,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 active_pool,
                 &pool_alleles,
                 out,
+                logsum_unswapped,
+                logsum_swapped,
                 cutoff,
                 scratch,
             );
@@ -1247,6 +1249,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 active_pool,
                 &pool_alleles,
                 out,
+                logsum_unswapped,
+                logsum_swapped,
                 cutoff,
                 scratch,
             );
@@ -1263,6 +1267,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 active_pool,
                 &pool_alleles,
                 out,
+                logsum_unswapped,
+                logsum_swapped,
                 cutoff,
                 scratch,
             );
@@ -1284,6 +1290,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         out: &mut Vec<BeamPath>,
+        logsum_unswapped: &mut [f64],
+        logsum_swapped: &mut [f64],
         cutoff: i64,
         scratch: &mut BeamScratch,
     ) {
@@ -1354,6 +1362,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 };
                 let score = score_no_flip + flip_penalty;
                 let model_score = model_score_no_flip + flip_penalty;
+                let logp = -(model_score as f64) / 1_000_000.0;
+                if swapped {
+                    logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp);
+                } else {
+                    logsum_unswapped[call_idx] = logaddexp(logsum_unswapped[call_idx], logp);
+                }
                 let (history_bits, history_len) =
                     push_history_bits(path.history_bits, path.history_len, swapped);
                 if score <= cutoff {
@@ -1947,106 +1961,48 @@ fn hap_constraints_penalty<RefSpace>(
     (penalty, penalty == 0)
 }
 
-fn compute_swap_posteriors_retained(
-    final_beam: &[BeamPath],
-    trailing_ptrs: Option<&Vec<u32>>,
-    backptrs: &[Vec<u16>],
-    segment_ptrs: &[Vec<u32>],
-    n_calls: usize,
-) -> Vec<f32> {
-    if n_calls == 0 || backptrs.is_empty() {
-        return vec![0.5; n_calls];
+#[inline]
+fn logaddexp(a: f64, b: f64) -> f64 {
+    if a.is_infinite() && a.is_sign_negative() {
+        return b;
     }
-    let mut out = vec![0.5f32; n_calls];
-    let last_len = backptrs
-        .get(n_calls.saturating_sub(1))
-        .map(|v| v.len())
-        .unwrap_or(0);
-    if last_len == 0 || final_beam.is_empty() {
-        return out;
+    if b.is_infinite() && b.is_sign_negative() {
+        return a;
     }
+    let m = if a > b { a } else { b };
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
 
-    let mut best_score = i64::MAX;
-    for p in final_beam {
-        if p.model_score < best_score {
-            best_score = p.model_score;
-        }
-    }
-    let mut curr_weights = vec![0.0f64; last_len];
-    let mut total = 0.0f64;
-    for (final_idx, p) in final_beam.iter().enumerate() {
-        let rel = ((p.model_score - best_score) as f64) / 1_000_000.0;
-        let w = (-rel).exp();
-        let mapped = trailing_ptrs
-            .and_then(|ptrs| ptrs.get(final_idx).copied())
-            .map(|v| v as usize)
-            .unwrap_or(final_idx);
-        if mapped < curr_weights.len() {
-            curr_weights[mapped] += w;
-            total += w;
-        }
-    }
-    if total <= 0.0 {
-        return out;
-    }
-    for w in &mut curr_weights {
-        *w /= total;
-    }
-
-    for step in (0..n_calls).rev() {
-        let ptrs = match backptrs.get(step) {
-            Some(v) if !v.is_empty() => v,
-            _ => continue,
-        };
-        let mut mass_swapped = 0.0f64;
-        let mut mass_unswapped = 0.0f64;
-        let prev_len = if step > 0 {
-            backptrs.get(step - 1).map(|v| v.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        let mut prev_weights = if step > 0 {
-            vec![0.0f64; prev_len]
-        } else {
-            Vec::new()
-        };
-
-        for (idx, &packed) in ptrs.iter().enumerate() {
-            let w = curr_weights.get(idx).copied().unwrap_or(0.0);
-            if w <= 0.0 {
-                continue;
-            }
-            let bp = unpack_backptr(packed);
-            if bp.swapped {
-                mass_swapped += w;
+fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(logsum_swapped.len());
+    for i in 0..logsum_swapped.len() {
+        let ls = logsum_swapped[i];
+        let lu = logsum_unswapped
+            .get(i)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
+        if ls.is_infinite() && ls.is_sign_negative() {
+            if lu.is_infinite() && lu.is_sign_negative() {
+                out.push(0.5);
             } else {
-                mass_unswapped += w;
+                out.push(0.0);
             }
-            if step > 0 {
-                let prev_idx = bp.prev as usize;
-                let mapped_prev = segment_ptrs
-                    .get(step)
-                    .and_then(|m| m.get(prev_idx))
-                    .copied()
-                    .unwrap_or(0) as usize;
-                if mapped_prev < prev_weights.len() {
-                    prev_weights[mapped_prev] += w;
-                }
-            }
+            continue;
         }
-
-        let denom = mass_swapped + mass_unswapped;
-        if denom > 0.0 {
-            out[step] = (mass_swapped / denom).clamp(0.0, 1.0) as f32;
+        if lu.is_infinite() && lu.is_sign_negative() {
+            out.push(1.0);
+            continue;
+        }
+        let m = if ls > lu { ls } else { lu };
+        let ps = (ls - m).exp();
+        let pu = (lu - m).exp();
+        let denom = ps + pu;
+        if denom <= 0.0 {
+            out.push(0.5);
         } else {
-            out[step] = 0.5;
-        }
-
-        if step > 0 {
-            curr_weights = prev_weights;
+            out.push((ps / denom).clamp(0.0, 1.0) as f32);
         }
     }
-
     out
 }
 
@@ -2081,39 +2037,11 @@ mod tests {
 
     #[test]
     fn swap_posteriors_keep_discrimination_beyond_i32_scale() {
-        let final_beam = vec![
-            BeamPath {
-                hap1: 0,
-                hap2: 1,
-                cluster1: u16::MAX,
-                cluster2: u16::MAX,
-                score: 3_000_000_000,
-                model_score: 3_000_000_000,
-                last_swapped: false,
-                history_bits: 0,
-                history_len: 0,
-                prev_idx: 0,
-                prev_swapped: false,
-            },
-            BeamPath {
-                hap1: 0,
-                hap2: 1,
-                cluster1: u16::MAX,
-                cluster2: u16::MAX,
-                score: 3_150_000_000,
-                model_score: 3_150_000_000,
-                last_swapped: true,
-                history_bits: 0,
-                history_len: 0,
-                prev_idx: 0,
-                prev_swapped: true,
-            },
-        ];
-        let backptrs = vec![vec![pack_backptr(0, false), pack_backptr(0, true)]];
-        let segment_ptrs = vec![Vec::<u32>::new()];
-        let p = compute_swap_posteriors_retained(&final_beam, None, &backptrs, &segment_ptrs, 1);
+        let logsum_unswapped = vec![-3_000.0];
+        let logsum_swapped = vec![-3_150.0];
+        let p = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
         assert_eq!(p.len(), 1);
-        // 150 nats separation should produce near-certain mass on the best (unswapped) path.
+        // 150 nats separation should produce near-certain mass on the better (unswapped) branch.
         assert!(
             p[0] < 1e-6,
             "expected strong posterior discrimination, got {}",

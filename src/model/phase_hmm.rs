@@ -83,14 +83,14 @@ impl RefEmissionLut {
     }
 
     #[inline]
-    fn set_missing_neutral(&mut self) {
-        self.vals[MISSING_ALLELE as usize] = 1.0;
+    fn set_missing_emission(&mut self, value: f32) {
+        self.vals[MISSING_ALLELE as usize] = value;
     }
 
     #[inline]
     fn emission(self, ref_allele: RefAllele) -> f32 {
         match ref_allele {
-            RefAllele::Missing => 1.0,
+            RefAllele::Missing => self.vals[MISSING_ALLELE as usize],
             RefAllele::Called(a) => self.vals[a as usize],
         }
     }
@@ -213,12 +213,13 @@ impl HmmUpdater {
         req: u8,
         p_match: f32,
         p_mismatch: f32,
+        p_missing: f32,
         n_states: usize,
     ) -> f32 {
         if n_states >= Self::LOG8_SWITCH_STATES {
             for i in 0..n_states {
                 let em = if ref_alleles[i] == MISSING_ALLELE {
-                    1.0
+                    p_missing
                 } else if ref_alleles[i] == req {
                     p_match
                 } else {
@@ -240,7 +241,7 @@ impl HmmUpdater {
                     let missing_vec = _mm512_set1_epi8(MISSING_ALLELE as i8);
                     let match_vec = _mm512_set1_ps(p_match);
                     let mismatch_vec = _mm512_set1_ps(p_mismatch);
-                    let neutral_vec = _mm512_set1_ps(1.0);
+                    let neutral_vec = _mm512_set1_ps(p_missing);
                     let shift_vec = _mm512_set1_ps(shift);
                     let scale_vec = _mm512_set1_ps(scale);
                     let mut sum_vec = _mm512_setzero_ps();
@@ -302,7 +303,7 @@ impl HmmUpdater {
                         let f = *fwd_ptr.add(i);
                         let ra = *ref_ptr.add(i);
                         let em = if ra == MISSING_ALLELE {
-                            1.0
+                            p_missing
                         } else if ra == req {
                             p_match
                         } else {
@@ -322,7 +323,7 @@ impl HmmUpdater {
         for i in 0..n_states {
             let f = fwd[i];
             let em = if ref_alleles[i] == MISSING_ALLELE {
-                1.0
+                p_missing
             } else if ref_alleles[i] == req {
                 p_match
             } else {
@@ -861,6 +862,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let mut req_allele = vec![255u8; n_markers];
         let mut p_match = vec![1.0f32; n_markers];
         let mut p_mismatch = vec![1.0f32; n_markers];
+        let mut p_missing = vec![1.0f32; n_markers];
         for m in 0..n_markers {
             let conf = target_conf
                 .and_then(|c| c.get(m).copied())
@@ -884,6 +886,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             if req != 255 {
                 p_match[m] = p_no_err_base * conf + 0.5 * (1.0 - conf);
                 p_mismatch[m] = p_err_base * conf + 0.5 * (1.0 - conf);
+                let p_req = 0.5 * (1.0 + conf);
+                p_missing[m] = p_req * p_match[m] + (1.0 - p_req) * p_mismatch[m];
             }
         }
 
@@ -892,6 +896,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             if req != 255 {
                 let p_no_err = p_match[m];
                 let p_err = p_mismatch[m];
+                let p_miss = p_missing[m];
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 {
                     if ref_alleles.len() >= 64
@@ -903,7 +908,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                             let missing_vec = _mm512_set1_epi8(MISSING_ALLELE as i8);
                             let match_vec = _mm512_set1_ps(p_no_err);
                             let mismatch_vec = _mm512_set1_ps(p_err);
-                            let neutral_vec = _mm512_set1_ps(1.0);
+                            let neutral_vec = _mm512_set1_ps(p_miss);
                             let mut k = 0usize;
                             let out_ptr = emissions.as_mut_ptr();
                             let in_ptr = ref_alleles.as_ptr();
@@ -942,7 +947,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 let emit = if ra == req {
                                     p_no_err
                                 } else if ra == MISSING_ALLELE {
-                                    1.0
+                                    p_miss
                                 } else {
                                     p_err
                                 };
@@ -954,7 +959,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 }
                 let mut lut = RefEmissionLut::filled(p_err);
                 lut.set_called_allele(req, p_no_err);
-                lut.set_missing_neutral();
+                lut.set_missing_emission(p_miss);
                 for (k, &ra) in ref_alleles.iter().enumerate() {
                     emissions[k] = lut.emission(RefAllele::from_raw(ra));
                 }
@@ -1113,16 +1118,20 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     p_err_base.max(1e-30)
                                 };
                                 let mut lut = RefEmissionLut::filled(unknown_prob);
+                                let mut concentration = 0.0f32;
                                 for a in 0..255usize {
                                     if a < n_alleles {
                                         let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
+                                        concentration += p_true * p_true;
                                         let emit = (p_no_err * p_true
                                             + p_err_other * (1.0 - p_true))
                                             .max(1e-30);
                                         lut.set_called_allele(a as u8, emit);
                                     }
                                 }
-                                lut.set_missing_neutral();
+                                let p_miss = (p_err_other + (p_no_err - p_err_other) * concentration)
+                                    .max(1e-30);
+                                lut.set_missing_emission(p_miss);
                                 let used_pattern = try_fill_pattern_emissions(
                                     m,
                                     partner,
@@ -1202,8 +1211,9 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let req = req_allele[m];
                 let p_no_err = p_match[m];
                 let p_err = p_mismatch[m];
+                let p_miss = p_missing[m];
                 fwd_sum = HmmUpdater::fwd_update_homo_emissions_scale(
-                    curr_row, scale, shift, ref_row, req, p_no_err, p_err, n_states,
+                    curr_row, scale, shift, ref_row, req, p_no_err, p_err, p_miss, n_states,
                 )
                 .max(1e-30);
             } else {
@@ -1365,17 +1375,22 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                         p_err_base.max(1e-30)
                                     };
                                     let mut lut = RefEmissionLut::filled(unknown_prob);
+                                    let mut concentration = 0.0f32;
                                     for a in 0..255usize {
                                         if a < n_alleles {
                                             let p_true =
                                                 allele_probs.get(a).copied().unwrap_or(0.0);
+                                            concentration += p_true * p_true;
                                             let emit = (p_no_err * p_true
                                                 + p_err_other * (1.0 - p_true))
                                                 .max(1e-30);
                                             lut.set_called_allele(a as u8, emit);
                                         }
                                     }
-                                    lut.set_missing_neutral();
+                                    let p_miss =
+                                        (p_err_other + (p_no_err - p_err_other) * concentration)
+                                            .max(1e-30);
+                                    lut.set_missing_emission(p_miss);
                                     let used_pattern = try_fill_pattern_emissions(
                                         m_next,
                                         partner,
@@ -1561,8 +1576,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let em = if targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                    let em = if targ_al == MISSING_ALLELE {
                         1.0
+                    } else if ref_al == MISSING_ALLELE {
+                        p_no_err
                     } else if ref_al == targ_al {
                         p_no_err
                     } else {
@@ -1578,8 +1595,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let em = if targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                    let em = if targ_al == MISSING_ALLELE {
                         1.0
+                    } else if ref_al == MISSING_ALLELE {
+                        p_no_err
                     } else if ref_al == targ_al {
                         p_no_err
                     } else {
@@ -1637,8 +1656,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = recomp_ref_row[k];
-                    let em = if recomp_targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                    let em = if recomp_targ_al == MISSING_ALLELE {
                         1.0
+                    } else if ref_al == MISSING_ALLELE {
+                        p_no_err
                     } else if ref_al == recomp_targ_al {
                         p_no_err
                     } else {
@@ -1672,8 +1693,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     let mut sum = 0.0f32;
                     for k in 0..n_states {
                         let ref_al = recomp_ref_row[k];
-                        let em = if recomp_targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                        let em = if recomp_targ_al == MISSING_ALLELE {
                             1.0
+                        } else if ref_al == MISSING_ALLELE {
+                            p_no_err
                         } else if ref_al == recomp_targ_al {
                             p_no_err
                         } else {
@@ -1697,14 +1720,18 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             };
 
             for k in 0..n_states {
-                let ref_al = ref_row[k];
-                let observed = targ_al != MISSING_ALLELE && ref_al != MISSING_ALLELE;
-                let is_mismatch = observed && ref_al != targ_al;
-                let em = if !observed {
-                    1.0
-                } else if !is_mismatch {
-                    p_no_err
-                } else {
+                    let ref_al = ref_row[k];
+                    let observed = targ_al != MISSING_ALLELE && ref_al != MISSING_ALLELE;
+                    let is_mismatch = observed && ref_al != targ_al;
+                    let em = if !observed {
+                        if targ_al == MISSING_ALLELE {
+                            1.0
+                        } else {
+                            p_no_err
+                        }
+                    } else if !is_mismatch {
+                        p_no_err
+                    } else {
                     p_err
                 };
 
@@ -1747,8 +1774,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut constant_term = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let em = if targ_al_next == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                    let em = if targ_al_next == MISSING_ALLELE {
                         1.0
+                    } else if ref_al == MISSING_ALLELE {
+                        p_no_err
                     } else if ref_al == targ_al_next {
                         p_no_err
                     } else {
@@ -1827,11 +1856,11 @@ mod tests {
     fn test_ref_emission_lut_missing_is_neutral() {
         let mut lut = RefEmissionLut::filled(0.02);
         lut.set_called_allele(1, 0.98);
-        lut.set_missing_neutral();
+        lut.set_missing_emission(0.98);
 
         assert!((lut.emission(RefAllele::Called(1)) - 0.98).abs() < 1e-8);
         assert!((lut.emission(RefAllele::Called(0)) - 0.02).abs() < 1e-8);
-        assert!((lut.emission(RefAllele::Missing) - 1.0).abs() < 1e-8);
+        assert!((lut.emission(RefAllele::Missing) - 0.98).abs() < 1e-8);
     }
 
     #[test]
@@ -1863,13 +1892,14 @@ mod tests {
     }
 
     #[test]
-    fn test_fwd_homo_missing_ref_is_neutral() {
+    fn test_fwd_homo_missing_ref_uses_marginalized_emission() {
         let mut fwd = vec![0.2f32, 0.4, 0.6, 0.8, 1.0];
         let original = fwd.clone();
         let ref_alleles = vec![0u8, 255, 1, 255, 0];
         let req = 0u8;
         let p_match = 0.99f32;
         let p_mismatch = 0.01f32;
+        let p_missing = 0.77f32;
         let scale = 0.8f32;
         let shift = 0.05f32;
         let n_states = fwd.len();
@@ -1882,6 +1912,7 @@ mod tests {
             req,
             p_match,
             p_mismatch,
+            p_missing,
             n_states,
         );
 
@@ -1889,7 +1920,7 @@ mod tests {
         let mut expected_sum = 0.0f32;
         for i in 0..n_states {
             let em = if ref_alleles[i] == MISSING_ALLELE {
-                1.0
+                p_missing
             } else if ref_alleles[i] == req {
                 p_match
             } else {
