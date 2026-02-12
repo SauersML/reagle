@@ -1784,7 +1784,9 @@ fn batched_transition_forward(
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
-    for m in start..end {
+    // Iterate m from start+1 to end (inclusive) to apply transitions:
+    // start->start+1, ..., end-1->end.
+    for m in start + 1..=end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
             continue;
@@ -1848,7 +1850,9 @@ fn batched_transition_backward(
     let mut a = 1.0f64;
     let mut b_coeff = 0.0f64;
     let mut touched = false;
-    for m in (start..end).rev() {
+    // Iterate m from end down to start+1 to apply transitions:
+    // end->end-1, ..., start+1->start.
+    for m in (start + 1..=end).rev() {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
             continue;
@@ -2063,14 +2067,13 @@ fn forward_update_impl<C: RefColumnLike>(
     state_haps: &[RefHapId],
     ref_columns: &[C],
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rate: f32,
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
 ) -> f32 {
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = marker_recomb_rate(p_recomb, m);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -2129,7 +2132,7 @@ fn forward_update_seqcoded(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rate: f32,
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
@@ -2137,7 +2140,6 @@ fn forward_update_seqcoded(
 ) -> f32 {
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = marker_recomb_rate(p_recomb, m);
 
     let col = seqcoded_col(&ref_columns[m]);
     let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
@@ -2197,7 +2199,7 @@ fn forward_update_dict(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
-    p_recomb: &[f32],
+    recomb_rate: f32,
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
@@ -2205,7 +2207,6 @@ fn forward_update_dict(
 ) -> f32 {
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
-    let recomb_rate = marker_recomb_rate(p_recomb, m);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -2288,7 +2289,7 @@ trait ImputeKernel {
         state_haps: &[RefHapId],
         ref_columns: &[GenotypeColumn],
         target_probs: &TargetAlleleProbs,
-        p_recomb: &[f32],
+        recomb_rate: f32,
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
@@ -2386,7 +2387,7 @@ impl ImputeKernel for DenseKernel {
         state_haps: &[RefHapId],
         ref_columns: &[GenotypeColumn],
         target_probs: &TargetAlleleProbs,
-        p_recomb: &[f32],
+        recomb_rate: f32,
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
@@ -2397,7 +2398,7 @@ impl ImputeKernel for DenseKernel {
             state_haps,
             ref_columns,
             target_probs,
-            p_recomb,
+            recomb_rate,
             current_error,
             active_states,
             transition_haps,
@@ -2449,7 +2450,7 @@ trait PatternSource {
         state_haps: &[RefHapId],
         ref_columns: &[GenotypeColumn],
         target_probs: &TargetAlleleProbs,
-        p_recomb: &[f32],
+        recomb_rate: f32,
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
@@ -2484,7 +2485,7 @@ impl PatternSource for SeqcodedSource {
         state_haps: &[RefHapId],
         ref_columns: &[GenotypeColumn],
         target_probs: &TargetAlleleProbs,
-        p_recomb: &[f32],
+        recomb_rate: f32,
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
@@ -2495,7 +2496,7 @@ impl PatternSource for SeqcodedSource {
             state_haps,
             ref_columns,
             target_probs,
-            p_recomb,
+            recomb_rate,
             current_error,
             active_states,
             transition_haps,
@@ -2546,7 +2547,7 @@ impl PatternSource for DictionarySource {
         state_haps: &[RefHapId],
         ref_columns: &[GenotypeColumn],
         target_probs: &TargetAlleleProbs,
-        p_recomb: &[f32],
+        recomb_rate: f32,
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
@@ -2557,7 +2558,7 @@ impl PatternSource for DictionarySource {
             state_haps,
             ref_columns,
             target_probs,
-            p_recomb,
+            recomb_rate,
             current_error,
             active_states,
             transition_haps,
@@ -2632,7 +2633,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
         state_haps: &[RefHapId],
         ref_columns: &[GenotypeColumn],
         target_probs: &TargetAlleleProbs,
-        p_recomb: &[f32],
+        recomb_rate: f32,
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
@@ -2644,7 +2645,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
             state_haps,
             ref_columns,
             target_probs,
-            p_recomb,
+            recomb_rate,
             current_error,
             active_states,
             transition_haps,
@@ -2807,6 +2808,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 );
             }
 
+            let mut recomb_rate = marker_recomb_rate(p_recomb, m);
             if let Some(in_idx) = input_prior_idx {
                 if m == in_idx && in_idx > 0 {
                     if let Some(priors) = state_priors {
@@ -2817,16 +2819,21 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         }
                         normalize_probs(&mut ws.fwd[..active_states]);
                     }
+                    // We just injected priors that represent the state *after* transition
+                    // to this marker (handoff from previous window).
+                    // We must still apply the emission probability for this marker,
+                    // but we should suppress the HMM transition (set recomb_rate=0.0)
+                    // to avoid double-counting the transition penalty.
+                    recomb_rate = 0.0;
                 }
             }
-
             kernel.forward_update(
                 ws,
                 m,
                 state_haps,
                 ref_columns,
                 target_probs,
-                p_recomb,
+                recomb_rate,
                 current_error,
                 active_states,
                 transition_haps,
