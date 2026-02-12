@@ -6,12 +6,12 @@
 
 use crate::data::HapIdx;
 use crate::data::storage::{
-    DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
+    AlleleCode, DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
 use crate::error::{ReagleError, Result};
 use crate::model::li_stephens::subset_linear_exact_k;
-use crate::model::types::RefHapId;
 use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
+use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_fill_emissions_missing_not_superior_to_best_called() {
-        let ref_raw = [255u8, 0, 1];
+        let ref_raw = [AlleleCode::MISSING.raw(), 0, 1];
         let ref_alleles = RefAlleles { slice: &ref_raw };
         let target_probs = AlleleProbsView::from_trusted(&[0.5, 0.5]);
         let mut emission_by_allele = Vec::new();
@@ -662,7 +662,7 @@ impl ImputeWorkspace {
             fwd_checkpoints: Vec::new(),
             fwd_scales: vec![1.0; n_markers],
             weights: vec![1.0; n_states],
-            state_alleles: vec![255u8; n_states],
+            state_alleles: vec![AlleleCode::MISSING.raw(); n_states],
             state_patterns: vec![0u16; n_states],
             pattern_emissions: Vec::new(),
             allele_probs: Vec::new(),
@@ -695,7 +695,7 @@ impl ImputeWorkspace {
             self.weights.resize(n_states, 1.0);
         }
         if self.state_alleles.len() < n_states {
-            self.state_alleles.resize(n_states, 255);
+            self.state_alleles.resize(n_states, AlleleCode::MISSING.raw());
         }
         if self.state_patterns.len() < n_states {
             self.state_patterns.resize(n_states, 0);
@@ -906,7 +906,7 @@ impl RefColumnLike for DenseColumn {
                     };
                 }
                 if ((cached_missing_word >> bit_idx) & 1) != 0 {
-                    out[i] = 255;
+                    out[i] = AlleleCode::MISSING.raw();
                     continue;
                 }
                 out[i] = ((cached_bits_word >> bit_idx) & 1) as u8;
@@ -1125,7 +1125,7 @@ fn fill_emissions(
     }
 
     for (i, &ref_allele) in ref_alleles.slice.iter().enumerate() {
-        if ref_allele == 255 {
+        if AlleleCode::from_raw(ref_allele).is_missing() {
             emissions[i] = missing_prob;
             continue;
         }
@@ -1172,7 +1172,7 @@ fn fill_pattern_emissions(
         pattern_emissions.resize(pattern_alleles.len(), 1.0);
     }
     for (i, &allele) in pattern_alleles.iter().enumerate() {
-        if allele == 255 {
+        if AlleleCode::from_raw(allele).is_missing() {
             pattern_emissions[i] = missing_prob;
         } else {
             let idx = allele as usize;
@@ -1697,26 +1697,52 @@ fn normalized_allele_prior<'a>(
 }
 
 #[inline]
-fn normalize_allele_posterior_with_missing_mix(
+fn normalize_allele_posterior_structural_missing(
     allele_probs: &mut [f32],
     subset_total: f32,
-    missing_mass: f32,
+    missing_ref_mass: f32,
+    missing_ood_mass: f32,
     prior_scratch: &mut Vec<f32>,
     target_probs: AlleleProbsView<'_>,
 ) {
     let subset = subset_total.max(0.0);
-    let missing = missing_mass.max(0.0);
-    if missing > 0.0 {
+    let missing_ref = missing_ref_mass.max(0.0);
+    let missing_ood = missing_ood_mass.max(0.0);
+    let total = subset + missing_ref + missing_ood;
+    if total <= 0.0 {
         let prior = normalized_allele_prior(prior_scratch, target_probs);
-        let norm = (subset + missing).max(1e-30);
-        let inv = 1.0 / norm;
+        allele_probs.copy_from_slice(prior.as_slice());
+        return;
+    }
+
+    if subset <= 0.0 {
+        // No represented-state evidence: unknown mass cannot inherit local shape.
+        // Fall back to the target prior to avoid undefined q/Q terms.
+        let prior = normalized_allele_prior(prior_scratch, target_probs);
+        allele_probs.copy_from_slice(prior.as_slice());
+        return;
+    }
+
+    let inv_subset = 1.0 / subset;
+    let inv_total = 1.0 / total;
+    if missing_ood > 0.0 {
+        // Fixed structural prior strength (Dirichlet alpha=1):
+        // rho_ood = (q + alpha*pi)/(Q + alpha), alpha = 1.
+        const OOD_DIRICHLET_ALPHA: f32 = 1.0;
+        let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let inv_rho = 1.0 / (subset + OOD_DIRICHLET_ALPHA);
         for (p, &pi) in allele_probs.iter_mut().zip(prior.as_slice().iter()) {
-            *p = (*p + missing * pi) * inv;
+            let q = *p;
+            let q_norm = q * inv_subset;
+            let rho_ood = (q + OOD_DIRICHLET_ALPHA * pi) * inv_rho;
+            *p = (q + missing_ref * q_norm + missing_ood * rho_ood) * inv_total;
         }
     } else {
-        let inv = 1.0 / subset.max(1e-30);
+        // No OOD mass: exact MAR redistribution for reference-missing states.
         for p in allele_probs.iter_mut() {
-            *p *= inv;
+            let q = *p;
+            let q_norm = q * inv_subset;
+            *p = (q + missing_ref * q_norm) * inv_total;
         }
     }
 }
@@ -1894,6 +1920,7 @@ fn batched_transition_forward(
     // This driver keeps forward vectors normalized in the HMM recursion, so the
     // composed update is applied to a probability vector and re-normalized for
     // floating-point drift if needed.
+    let lambda = adaptive_transition_lambda_from_probs(&fwd[..active_states], 1.0);
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
@@ -1903,7 +1930,12 @@ fn batched_transition_forward(
             continue;
         }
         touched = true;
-        let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+        let (stay, shift) = subset_transition_params_adaptive_q(
+            recomb_rate,
+            active_states,
+            transition_haps,
+            lambda,
+        );
         let stay = stay as f64;
         let shift = shift as f64;
         a *= stay;
@@ -1958,6 +1990,7 @@ fn batched_transition_backward(
     //   a   = product_t stay_t
     //   add = b_coeff * bwd_sum
     // and b_coeff follows the same affine recurrence as forward composition.
+    let lambda = adaptive_transition_lambda_from_probs(&bwd[..active_states], bwd_sum);
     let mut a = 1.0f64;
     let mut b_coeff = 0.0f64;
     let mut touched = false;
@@ -1967,7 +2000,12 @@ fn batched_transition_backward(
             continue;
         }
         touched = true;
-        let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+        let (stay, shift) = subset_transition_params_adaptive_q(
+            recomb_rate,
+            active_states,
+            transition_haps,
+            lambda,
+        );
         let stay = stay as f64;
         let shift = shift as f64;
         a *= stay;
@@ -2206,15 +2244,34 @@ fn forward_update_impl<C: RefColumnLike>(
             &mut ws.emissions[..active_states],
         );
         if recomb_rate > 0.0 {
-            WeightedHmmUpdater::fwd_update_weighted(
-                &mut ws.fwd,
-                1.0,
-                recomb_rate,
-                transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
-                EmissionProbs::new(&ws.emissions[..active_states]),
-                active_states,
-            )
+            let fwd_sum = ws.fwd[..active_states].iter().copied().sum::<f32>().max(1e-30);
+            let lambda = adaptive_transition_lambda_from_probs(&ws.fwd[..active_states], fwd_sum);
+            if lambda <= 1e-6 {
+                WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    1.0,
+                    recomb_rate,
+                    transition_haps,
+                    PatternCounts::new(&ws.weights[..active_states]),
+                    EmissionProbs::new(&ws.emissions[..active_states]),
+                    active_states,
+                )
+            } else {
+                let (stay_gap, shift) = subset_transition_params_adaptive_q(
+                    recomb_rate,
+                    active_states,
+                    transition_haps,
+                    lambda,
+                );
+                let scale = stay_gap / fwd_sum;
+                let mut sum = 0.0f32;
+                for i in 0..active_states {
+                    let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
+                    ws.fwd[i] = t;
+                    sum += t;
+                }
+                sum.max(1e-30)
+            }
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -2274,15 +2331,34 @@ fn forward_update_seqcoded(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            WeightedHmmUpdater::fwd_update_weighted(
-                &mut ws.fwd,
-                1.0,
-                recomb_rate,
-                transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
-                EmissionProbs::new(&ws.emissions[..active_states]),
-                active_states,
-            )
+            let fwd_sum = ws.fwd[..active_states].iter().copied().sum::<f32>().max(1e-30);
+            let lambda = adaptive_transition_lambda_from_probs(&ws.fwd[..active_states], fwd_sum);
+            if lambda <= 1e-6 {
+                WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    1.0,
+                    recomb_rate,
+                    transition_haps,
+                    PatternCounts::new(&ws.weights[..active_states]),
+                    EmissionProbs::new(&ws.emissions[..active_states]),
+                    active_states,
+                )
+            } else {
+                let (stay_gap, shift) = subset_transition_params_adaptive_q(
+                    recomb_rate,
+                    active_states,
+                    transition_haps,
+                    lambda,
+                );
+                let scale = stay_gap / fwd_sum;
+                let mut sum = 0.0f32;
+                for i in 0..active_states {
+                    let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
+                    ws.fwd[i] = t;
+                    sum += t;
+                }
+                sum.max(1e-30)
+            }
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -2347,15 +2423,34 @@ fn forward_update_dict(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            WeightedHmmUpdater::fwd_update_weighted(
-                &mut ws.fwd,
-                1.0,
-                recomb_rate,
-                transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
-                EmissionProbs::new(&ws.emissions[..active_states]),
-                active_states,
-            )
+            let fwd_sum = ws.fwd[..active_states].iter().copied().sum::<f32>().max(1e-30);
+            let lambda = adaptive_transition_lambda_from_probs(&ws.fwd[..active_states], fwd_sum);
+            if lambda <= 1e-6 {
+                WeightedHmmUpdater::fwd_update_weighted(
+                    &mut ws.fwd,
+                    1.0,
+                    recomb_rate,
+                    transition_haps,
+                    PatternCounts::new(&ws.weights[..active_states]),
+                    EmissionProbs::new(&ws.emissions[..active_states]),
+                    active_states,
+                )
+            } else {
+                let (stay_gap, shift) = subset_transition_params_adaptive_q(
+                    recomb_rate,
+                    active_states,
+                    transition_haps,
+                    lambda,
+                );
+                let scale = stay_gap / fwd_sum;
+                let mut sum = 0.0f32;
+                for i in 0..active_states {
+                    let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
+                    ws.fwd[i] = t;
+                    sum += t;
+                }
+                sum.max(1e-30)
+            }
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -2443,17 +2538,18 @@ impl DenseKernel {
 
         let n_groups = if n_alleles == 0 { 1 } else { n_alleles + 1 };
         if ws.dict_pattern_alleles.len() < n_groups {
-            ws.dict_pattern_alleles.resize(n_groups, 255);
+            ws.dict_pattern_alleles
+                .resize(n_groups, AlleleCode::MISSING.raw());
         }
         for i in 0..n_alleles {
             ws.dict_pattern_alleles[i] = i as u8;
         }
-        ws.dict_pattern_alleles[n_groups - 1] = 255;
+        ws.dict_pattern_alleles[n_groups - 1] = AlleleCode::MISSING.raw();
 
         let missing_pid = (n_groups - 1) as u16;
         for i in 0..active_states {
             let ref_allele = ref_alleles.get(i);
-            let pid = if ref_allele == 255 {
+            let pid = if AlleleCode::from_raw(ref_allele).is_missing() {
                 missing_pid
             } else {
                 let idx = ref_allele as usize;
@@ -2479,7 +2575,7 @@ impl ImputeKernel for DenseKernel {
     type MarkerCtx = PreparedGroups;
     const LABEL: &'static str = "dense/sparse";
     const CLAMP_AFFINE_GROUP_MASS: bool = true;
-    const MAX_NON_MISSING_ALLELES: usize = 255;
+    const MAX_NON_MISSING_ALLELES: usize = AlleleCode::MISSING.raw() as usize;
 
     #[inline]
     fn reset_forward(&mut self) {}
@@ -2718,7 +2814,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
     type MarkerCtx = PreparedGroups;
     const LABEL: &'static str = S::LABEL;
     const CLAMP_AFFINE_GROUP_MASS: bool = false;
-    const MAX_NON_MISSING_ALLELES: usize = 255;
+    const MAX_NON_MISSING_ALLELES: usize = AlleleCode::MISSING.raw() as usize;
 
     #[inline]
     fn reset_forward(&mut self) {
@@ -3112,7 +3208,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let mut subset_total = 0.0f32;
                                 let mut smoothing_prior_total = 0.0f32;
                                 let mut total = 0.0f32;
-                                let mut missing_mass = 0.0f32;
+                                let mut missing_ref_mass = 0.0f32;
+                                let mut missing_ood_mass = 0.0f32;
                                 let group_alleles =
                                     K::group_alleles(&prepared, &ws.dict_pattern_alleles);
                                 for pid in 0..n_groups {
@@ -3128,9 +3225,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         };
                                     }
                                     total += state_prob;
-                                    let ref_allele = *group_alleles.get(pid).unwrap_or(&255);
-                                    if ref_allele == 255 {
-                                        missing_mass += state_prob;
+                                    let ref_allele = *group_alleles
+                                        .get(pid)
+                                        .unwrap_or(&AlleleCode::MISSING.raw());
+                                    if AlleleCode::from_raw(ref_allele).is_missing() {
+                                        missing_ref_mass += state_prob;
                                         continue;
                                     }
                                     let idx = ref_allele as usize;
@@ -3140,19 +3239,20 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         smoothing_prior_counts[idx] += ws.pattern_state_count[pid];
                                         smoothing_prior_total += ws.pattern_state_count[pid];
                                     } else {
-                                        // Out-of-domain allele index contributes to unrepresented
-                                        // mass; treat it as missing-equivalent so:
-                                        //   total == subset_total + missing_mass
-                                        // remains true.
-                                        missing_mass += state_prob;
+                                        // Out-of-domain allele mass uses prior-shrunk redistribution.
+                                        missing_ood_mass += state_prob;
                                     }
                                 }
                                 if total > 0.0 {
-                                    if subset_total > 0.0 || missing_mass > 0.0 {
-                                        normalize_allele_posterior_with_missing_mix(
+                                    if subset_total > 0.0
+                                        || missing_ref_mass > 0.0
+                                        || missing_ood_mass > 0.0
+                                    {
+                                        normalize_allele_posterior_structural_missing(
                                             &mut ws.allele_probs,
                                             subset_total,
-                                            missing_mass,
+                                            missing_ref_mass,
+                                            missing_ood_mass,
                                             &mut ws.allele_prior_scratch,
                                             probs,
                                         );
@@ -3307,14 +3407,17 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             let mut subset_total = 0.0f32;
                             let mut smoothing_prior_total = 0.0f32;
                             let mut total = 0.0f32;
-                            let mut missing_mass = 0.0f32;
+                            let mut missing_ref_mass = 0.0f32;
+                            let mut missing_ood_mass = 0.0f32;
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
                                 let pid = ws.state_patterns[i] as usize;
-                                let ref_allele = *group_alleles.get(pid).unwrap_or(&255);
-                                if ref_allele == 255 {
-                                    missing_mass += state_prob;
+                                let ref_allele = *group_alleles
+                                    .get(pid)
+                                    .unwrap_or(&AlleleCode::MISSING.raw());
+                                if AlleleCode::from_raw(ref_allele).is_missing() {
+                                    missing_ref_mass += state_prob;
                                     continue;
                                 }
                                 let idx = ref_allele as usize;
@@ -3325,16 +3428,20 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     smoothing_prior_total += 1.0;
                                 } else {
                                     // Keep mass accounting consistent with interior path:
-                                    // unrepresented mass is tracked as missing-equivalent.
-                                    missing_mass += state_prob;
+                                    // out-of-domain mass is tracked separately.
+                                    missing_ood_mass += state_prob;
                                 }
                             }
                             if total > 0.0 {
-                                if subset_total > 0.0 || missing_mass > 0.0 {
-                                    normalize_allele_posterior_with_missing_mix(
+                                if subset_total > 0.0
+                                    || missing_ref_mass > 0.0
+                                    || missing_ood_mass > 0.0
+                                {
+                                    normalize_allele_posterior_structural_missing(
                                         &mut ws.allele_probs,
                                         subset_total,
-                                        missing_mass,
+                                        missing_ref_mass,
+                                        missing_ood_mass,
                                         &mut ws.allele_prior_scratch,
                                         probs,
                                     );
@@ -3436,8 +3543,14 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         emit_beta_sum += emit * ws.bwd[i];
                     }
                     let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                    let (stay_gap, shift_base) =
-                        subset_transition_params(recomb_rate, active_states, transition_haps);
+                    let lambda =
+                        adaptive_transition_lambda_from_probs(&ws.bwd[..active_states], bwd_sum);
+                    let (stay_gap, shift_base) = subset_transition_params_adaptive_q(
+                        recomb_rate,
+                        active_states,
+                        transition_haps,
+                        lambda,
+                    );
                     let scale = stay_gap / c_t;
                     let shift = shift_base * (emit_beta_sum / c_t);
                     let mut new_sum = 0.0f32;
