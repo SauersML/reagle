@@ -3132,9 +3132,9 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
-                        // Phase-confidence-guided emissions are valid only when the
-                        // original target input was already phased.
-                        !target_was_unphased_for_impute,
+                        // For originally unphased targets, upstream phasing now provides
+                        // calibrated per-site phase confidence that should inform emissions.
+                        true,
                         &mut sample_error_rates,
                     )?;
 
@@ -3438,9 +3438,9 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
-                        // Phase-confidence-guided emissions are valid only when the
-                        // original target input was already phased.
-                        !target_was_unphased_for_impute,
+                        // For originally unphased targets, upstream phasing now provides
+                        // calibrated per-site phase confidence that should inform emissions.
+                        true,
                         &mut sample_error_rates,
                     )?;
 
