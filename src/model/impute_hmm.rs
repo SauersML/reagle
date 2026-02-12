@@ -1384,6 +1384,9 @@ fn apply_marker_prior_smoothing(
     let adaptive_panel_mix =
         (missing_mass * (1.0 - retain) * (1.0 + 1.5 * sparsity_boost)).clamp(0.0, 0.85);
 
+    // Scale floor_mix by information decay to avoid overriding strong local LD.
+    let effective_floor_mix = floor_mix * (1.0 - retain);
+
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
             AllelePosteriors::Biallelic(p_alt) if allele_probs.len() == 2 => {
@@ -1392,12 +1395,17 @@ fn apply_marker_prior_smoothing(
                 apply_adaptive_panel_blend(
                     allele_probs,
                     &panel_probs,
-                    floor_mix,
+                    effective_floor_mix,
                     adaptive_panel_mix,
                 );
             }
             AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
-                apply_adaptive_panel_blend(allele_probs, p, floor_mix, adaptive_panel_mix);
+                apply_adaptive_panel_blend(
+                    allele_probs,
+                    p,
+                    effective_floor_mix,
+                    adaptive_panel_mix,
+                );
             }
             _ => {}
         }
