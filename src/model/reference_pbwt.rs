@@ -83,6 +83,7 @@ pub struct ReferencePbwtImpl<I: PbwtIndex> {
     offsets: Vec<u32>,
     intervals_buf: Vec<(usize, usize)>,
     donor_candidate_pos: Vec<usize>,
+    donor_picks_buf: Vec<DonorPick>,
     donor_seen_marks: Vec<u32>,
     donor_seen_tick: u32,
     step_scratch: Vec<(u32, u32, u64)>,
@@ -275,20 +276,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
     }
 
     #[inline]
-    fn flush_top_k_choices(
-        &self,
-        best: std::collections::BinaryHeap<DonorChoice>,
-        out: &mut Vec<u32>,
-    ) {
-        let mut choices: Vec<DonorChoice> = best.into_vec();
-        choices.sort_unstable_by(|a, b| a.div.cmp(&b.div).then_with(|| a.pos.cmp(&b.pos)));
-        out.reserve(choices.len());
-        for c in choices {
-            out.push(self.ppa[c.pos].to_u32());
-        }
-    }
-
-    #[inline]
     fn flush_top_k_choices_into_picks(
         &self,
         best: std::collections::BinaryHeap<DonorChoice>,
@@ -375,6 +362,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
             offsets: Vec::new(),
             intervals_buf: Vec::new(),
             donor_candidate_pos: Vec::new(),
+            donor_picks_buf: Vec::new(),
             donor_seen_marks: Vec::new(),
             donor_seen_tick: 0,
             step_scratch: Vec::new(),
@@ -383,206 +371,14 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
 
     pub fn select_donors_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<u32>) {
         out.clear();
-        if k == 0 {
-            return;
+        let mut picks = std::mem::take(&mut self.donor_picks_buf);
+        self.select_donor_picks_into(beam, k, &mut picks);
+        out.reserve(picks.len());
+        for pick in &picks {
+            out.push(pick.hap);
         }
-        let n_ref = self.ppa.len();
-        if n_ref == 0 {
-            return;
-        }
-        self.ensure_donor_seen_marks(n_ref);
-
-        self.intervals_buf.clear();
-        self.intervals_buf.reserve(beam.intervals().len());
-        for &(l, r) in beam.intervals() {
-            let l = l.min(n_ref as u32) as usize;
-            let r = r.min(n_ref as u32) as usize;
-            if l < r {
-                self.intervals_buf.push((l, r));
-            }
-        }
-
-        if self.intervals_buf.is_empty() {
-            return;
-        }
-
-        // Defensive normalization: some callers may provide adjacent/overlapping ranges.
-        // Merging here guarantees unique positional coverage for donor selection.
-        self.intervals_buf.sort_unstable_by_key(|&(l, _)| l);
-        let mut merged_len = 0usize;
-        for i in 0..self.intervals_buf.len() {
-            let (l, r) = self.intervals_buf[i];
-            if merged_len == 0 {
-                self.intervals_buf[merged_len] = (l, r);
-                merged_len = 1;
-                continue;
-            }
-            let (prev_l, prev_r) = self.intervals_buf[merged_len - 1];
-            if l <= prev_r {
-                self.intervals_buf[merged_len - 1] = (prev_l, prev_r.max(r));
-            } else {
-                self.intervals_buf[merged_len] = (l, r);
-                merged_len += 1;
-            }
-        }
-        self.intervals_buf.truncate(merged_len);
-
-        let total_len: usize = self.intervals_buf.iter().map(|&(l, r)| r - l).sum();
-        if total_len <= k {
-            out.reserve(total_len);
-            for &(l, r) in &self.intervals_buf {
-                for i in l..r {
-                    out.push(self.ppa[i].to_u32());
-                }
-            }
-            return;
-        }
-
-        // For very wide beams, avoid full scans but still prioritize low-divergence
-        // donors rather than uniform positional samples.
-        const EXACT_DIV_SCAN_FACTOR: usize = 64;
-        if total_len > k.saturating_mul(EXACT_DIV_SCAN_FACTOR) {
-            const APPROX_SCAN_FACTOR: usize = 24;
-            const MIN_APPROX_SCAN_POINTS: usize = 128;
-            const LOCAL_REFINE_RADIUS: usize = 2;
-
-            let n_scan_targets = total_len.min(
-                k.saturating_mul(APPROX_SCAN_FACTOR)
-                    .max(MIN_APPROX_SCAN_POINTS),
-            );
-            let candidate_tick = self.next_donor_seen_tick();
-            self.donor_candidate_pos.clear();
-            self.donor_candidate_pos.reserve(
-                n_scan_targets
-                    .saturating_mul(2 * LOCAL_REFINE_RADIUS + 1)
-                    .saturating_add(self.intervals_buf.len() * 3),
-            );
-
-            let mut current_interval_idx = 0usize;
-            let mut current_interval_start_offset = 0usize;
-            for i in 0..n_scan_targets {
-                let target = (2 * i + 1) * total_len / (2 * n_scan_targets);
-                while current_interval_idx < self.intervals_buf.len() {
-                    let (l, r) = self.intervals_buf[current_interval_idx];
-                    let len = r - l;
-                    if target < current_interval_start_offset + len {
-                        let offset_in_interval = target - current_interval_start_offset;
-                        let center = l + offset_in_interval;
-                        let start = center.saturating_sub(LOCAL_REFINE_RADIUS).max(l);
-                        let end = (center + LOCAL_REFINE_RADIUS + 1).min(r);
-                        for pos in start..end {
-                            if self.donor_seen_marks[pos] != candidate_tick {
-                                self.donor_seen_marks[pos] = candidate_tick;
-                                self.donor_candidate_pos.push(pos);
-                            }
-                        }
-                        break;
-                    }
-                    current_interval_start_offset += len;
-                    current_interval_idx += 1;
-                }
-            }
-
-            // Ensure interval edges and centers are represented.
-            for &(l, r) in &self.intervals_buf {
-                if l < r {
-                    if self.donor_seen_marks[l] != candidate_tick {
-                        self.donor_seen_marks[l] = candidate_tick;
-                        self.donor_candidate_pos.push(l);
-                    }
-                    let rr = r - 1;
-                    if self.donor_seen_marks[rr] != candidate_tick {
-                        self.donor_seen_marks[rr] = candidate_tick;
-                        self.donor_candidate_pos.push(rr);
-                    }
-                    let mid = l + (r - l) / 2;
-                    if self.donor_seen_marks[mid] != candidate_tick {
-                        self.donor_seen_marks[mid] = candidate_tick;
-                        self.donor_candidate_pos.push(mid);
-                    }
-                }
-            }
-
-            // If candidate generation was too sparse, add deterministic spread points.
-            if self.donor_candidate_pos.len() < k {
-                let mut spread_interval_idx = 0usize;
-                let mut spread_interval_start_offset = 0usize;
-                for i in 0..k {
-                    let target = (2 * i + 1) * total_len / (2 * k);
-                    while spread_interval_idx < self.intervals_buf.len() {
-                        let (l, r) = self.intervals_buf[spread_interval_idx];
-                        let len = r - l;
-                        if target < spread_interval_start_offset + len {
-                            let offset_in_interval = target - spread_interval_start_offset;
-                            let pos = l + offset_in_interval;
-                            if self.donor_seen_marks[pos] != candidate_tick {
-                                self.donor_seen_marks[pos] = candidate_tick;
-                                self.donor_candidate_pos.push(pos);
-                            }
-                            break;
-                        }
-                        spread_interval_start_offset += len;
-                        spread_interval_idx += 1;
-                    }
-                }
-            }
-
-            let mut best: std::collections::BinaryHeap<DonorChoice> =
-                std::collections::BinaryHeap::with_capacity(k + 1);
-            for &pos in &self.donor_candidate_pos {
-                if pos >= self.div.len() {
-                    continue;
-                }
-                let choice = DonorChoice {
-                    div: self.div[pos],
-                    pos,
-                };
-                Self::push_top_k_choice(&mut best, choice, k);
-            }
-
-            // Safety net: if approximation produced too few unique candidates, backfill exactly.
-            if best.len() < k {
-                let chosen_tick = self.next_donor_seen_tick();
-                for c in best.iter() {
-                    self.donor_seen_marks[c.pos] = chosen_tick;
-                }
-                for &(l, r) in &self.intervals_buf {
-                    for pos in l..r {
-                        if self.donor_seen_marks[pos] == chosen_tick {
-                            continue;
-                        }
-                        self.donor_seen_marks[pos] = chosen_tick;
-                        if pos >= self.div.len() {
-                            continue;
-                        }
-                        let choice = DonorChoice {
-                            div: self.div[pos],
-                            pos,
-                        };
-                        Self::push_top_k_choice(&mut best, choice, k);
-                    }
-                }
-            }
-
-            self.flush_top_k_choices(best, out);
-            return;
-        }
-
-        let mut best: std::collections::BinaryHeap<DonorChoice> =
-            std::collections::BinaryHeap::with_capacity(k + 1);
-        for &(l, r) in &self.intervals_buf {
-            for pos in l..r {
-                if pos >= self.div.len() {
-                    continue;
-                }
-                let choice = DonorChoice {
-                    div: self.div[pos],
-                    pos,
-                };
-                Self::push_top_k_choice(&mut best, choice, k);
-            }
-        }
-        self.flush_top_k_choices(best, out);
+        picks.clear();
+        self.donor_picks_buf = picks;
     }
 
     pub fn select_donor_picks_into(&mut self, beam: &RankBeam, k: usize, out: &mut Vec<DonorPick>) {
