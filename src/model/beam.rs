@@ -628,6 +628,24 @@ struct SwitchSupportCache {
     cluster_match_counts1: [usize; MAX_PBWT_CLUSTER_INTERVALS],
 }
 
+struct AlignedPoolAlleles<'a> {
+    active_pool: &'a ActivePool,
+    haps: &'a [usize],
+    alleles: &'a [u8],
+}
+
+impl<'a> AlignedPoolAlleles<'a> {
+    #[inline]
+    fn alleles(&self) -> &'a [u8] {
+        self.alleles
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (usize, u8)> + 'a {
+        self.haps.iter().copied().zip(self.alleles.iter().copied())
+    }
+}
+
 impl BeamScratch {
     fn new(cap: usize) -> Self {
         Self {
@@ -658,8 +676,7 @@ impl SwitchSupportCache {
         &mut self,
         marker_idx: usize,
         pbwt_version: u32,
-        active_pool: &ActivePool,
-        pool_alleles: &[u8],
+        pool_alleles: &AlignedPoolAlleles<'_>,
     ) {
         if self.initialized && self.marker_idx == marker_idx && self.pbwt_version == pbwt_version {
             return;
@@ -670,20 +687,11 @@ impl SwitchSupportCache {
         self.global_match_counts = [0, 0];
         self.cluster_match_counts0.fill(0);
         self.cluster_match_counts1.fill(0);
-        assert_eq!(
-            pool_alleles.len(),
-            active_pool.list().len(),
-            "pool_alleles length mismatch at marker {}: {} vs {}",
-            marker_idx,
-            pool_alleles.len(),
-            active_pool.list().len()
-        );
 
-        for (idx, &hap) in active_pool.list().iter().enumerate() {
-            let allele = pool_alleles[idx];
+        for (hap, allele) in pool_alleles.iter() {
             if allele == 0 {
                 self.global_match_counts[0] = self.global_match_counts[0].saturating_add(1);
-                if let Some(meta) = active_pool.pbwt_meta(0, hap, pbwt_version) {
+                if let Some(meta) = pool_alleles.active_pool.pbwt_meta(0, hap, pbwt_version) {
                     if let Some(cid) = PbwtClusterIx::from_u16(meta.cluster_id) {
                         let idx = cid.as_usize();
                         self.cluster_match_counts0[idx] =
@@ -692,7 +700,7 @@ impl SwitchSupportCache {
                 }
             } else if allele == 1 {
                 self.global_match_counts[1] = self.global_match_counts[1].saturating_add(1);
-                if let Some(meta) = active_pool.pbwt_meta(1, hap, pbwt_version) {
+                if let Some(meta) = pool_alleles.active_pool.pbwt_meta(1, hap, pbwt_version) {
                     if let Some(cid) = PbwtClusterIx::from_u16(meta.cluster_id) {
                         let idx = cid.as_usize();
                         self.cluster_match_counts1[idx] =
@@ -1215,71 +1223,70 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.hi_idx
         } as u32;
         let mut pool_alleles = std::mem::take(&mut scratch.pool_alleles);
-        self.fill_pool_alleles(marker_idx, active_pool, &mut pool_alleles);
-        scratch.switch_support.ensure_initialized(
-            marker_idx,
-            pbwt_version,
-            active_pool,
-            &pool_alleles,
-        );
-        let flip_event_cost = self.orientation_flip_event_cost(call.dist_morgans);
+        {
+            let aligned_pool = self.fill_pool_alleles(marker_idx, active_pool, &mut pool_alleles);
+            scratch
+                .switch_support
+                .ensure_initialized(marker_idx, pbwt_version, &aligned_pool);
+            let flip_event_cost = self.orientation_flip_event_cost(call.dist_morgans);
 
-        if call.fixed {
-            self.expand_orientation(
-                path,
-                parent_idx,
-                call,
-                call_idx,
-                flip_event_cost,
-                a1,
-                a2,
-                false,
-                pbwt_version,
-                active_pool,
-                &pool_alleles,
-                out,
-                logsum_unswapped,
-                logsum_swapped,
-                cutoff,
-                scratch,
-            );
-        } else {
-            self.expand_orientation(
-                path,
-                parent_idx,
-                call,
-                call_idx,
-                flip_event_cost,
-                a1,
-                a2,
-                false,
-                pbwt_version,
-                active_pool,
-                &pool_alleles,
-                out,
-                logsum_unswapped,
-                logsum_swapped,
-                cutoff,
-                scratch,
-            );
-            self.expand_orientation(
-                path,
-                parent_idx,
-                call,
-                call_idx,
-                flip_event_cost,
-                a2,
-                a1,
-                true,
-                pbwt_version,
-                active_pool,
-                &pool_alleles,
-                out,
-                logsum_unswapped,
-                logsum_swapped,
-                cutoff,
-                scratch,
-            );
+            if call.fixed {
+                self.expand_orientation(
+                    path,
+                    parent_idx,
+                    call,
+                    call_idx,
+                    flip_event_cost,
+                    a1,
+                    a2,
+                    false,
+                    pbwt_version,
+                    active_pool,
+                    aligned_pool.alleles(),
+                    out,
+                    logsum_unswapped,
+                    logsum_swapped,
+                    cutoff,
+                    scratch,
+                );
+            } else {
+                self.expand_orientation(
+                    path,
+                    parent_idx,
+                    call,
+                    call_idx,
+                    flip_event_cost,
+                    a1,
+                    a2,
+                    false,
+                    pbwt_version,
+                    active_pool,
+                    aligned_pool.alleles(),
+                    out,
+                    logsum_unswapped,
+                    logsum_swapped,
+                    cutoff,
+                    scratch,
+                );
+                self.expand_orientation(
+                    path,
+                    parent_idx,
+                    call,
+                    call_idx,
+                    flip_event_cost,
+                    a2,
+                    a1,
+                    true,
+                    pbwt_version,
+                    active_pool,
+                    aligned_pool.alleles(),
+                    out,
+                    logsum_unswapped,
+                    logsum_swapped,
+                    cutoff,
+                    scratch,
+                );
+            }
         }
         scratch.pool_alleles = pool_alleles;
     }
@@ -1694,16 +1701,27 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn fill_pool_alleles(&self, marker: usize, active_pool: &ActivePool, out: &mut Vec<u8>) {
+    fn fill_pool_alleles<'b>(
+        &self,
+        marker: usize,
+        active_pool: &'b ActivePool,
+        out: &'b mut Vec<u8>,
+    ) -> AlignedPoolAlleles<'b> {
         let list = active_pool.list();
-        if out.len() < list.len() {
-            out.resize(list.len(), u8::MAX);
-        }
-        for (i, &h) in list.iter().enumerate() {
-            out[i] = self
+        out.clear();
+        out.reserve(list.len());
+        for &h in list {
+            out.push(
+                self
                 .packed_ref
                 .ref_allele_targ(marker, h)
-                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
+            );
+        }
+        AlignedPoolAlleles {
+            active_pool,
+            haps: list,
+            alleles: out.as_slice(),
         }
     }
 
@@ -2020,6 +2038,15 @@ fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::alignment::MarkerAlignment;
+    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
+    use crate::data::ref_packed::PackedRefView;
+    use crate::data::haplotype::Samples;
+    use crate::data::storage::phase_state::{Phased, Unphased};
+    use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::ChromIdx;
+    use crate::model::parameters::ModelParams;
+    use std::sync::Arc;
 
     #[test]
     fn beam_score_fields_are_i64() {
@@ -2058,5 +2085,86 @@ mod tests {
             "expected strong posterior discrimination, got {}",
             p[0]
         );
+    }
+
+    fn make_markers() -> Markers<AnyMarkerSpace> {
+        let mut markers = Markers::<AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+        markers.push(Marker::new(
+            ChromIdx::new(0),
+            100,
+            None,
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        markers.push(Marker::new(
+            ChromIdx::new(0),
+            200,
+            None,
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        markers
+    }
+
+    fn make_target_gt() -> GenotypeMatrix<Unphased, AnyMarkerSpace> {
+        let markers = make_markers();
+        let samples = Arc::new(Samples::from_ids(vec!["T0".to_string()]));
+        let col0 = GenotypeColumn::from_alleles(&[0, 1], 2);
+        let col1 = GenotypeColumn::from_alleles(&[1, 0], 2);
+        GenotypeMatrix::new_unphased(markers, vec![col0, col1], samples)
+    }
+
+    fn make_ref_gt() -> GenotypeMatrix<Phased, AnyMarkerSpace> {
+        let markers = make_markers();
+        let samples = Arc::new(Samples::from_ids(vec![
+            "R0".to_string(),
+            "R1".to_string(),
+            "R2".to_string(),
+            "R3".to_string(),
+        ]));
+        let col0 = GenotypeColumn::from_alleles(&[0, 0, 1, 1, 0, 1, 0, 1], 2);
+        let col1 = GenotypeColumn::from_alleles(&[1, 0, 1, 0, 1, 1, 0, 0], 2);
+        GenotypeMatrix::new_phased(markers, vec![col0, col1], samples)
+    }
+
+    #[test]
+    fn fill_pool_alleles_shrinks_with_active_pool() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+        let mut active_pool = ActivePool::new(ref_gt.n_haplotypes());
+
+        for hap in 0..ref_gt.n_haplotypes() {
+            active_pool.touch(hap, 10);
+        }
+
+        let mut scratch_pool_alleles = Vec::new();
+
+        {
+            let aligned =
+                phaser.fill_pool_alleles(0usize, &active_pool, &mut scratch_pool_alleles);
+            assert_eq!(aligned.alleles().len(), active_pool.list().len());
+            let mut switch_support = SwitchSupportCache::new();
+            switch_support.ensure_initialized(0usize, 10, &aligned);
+        }
+
+        active_pool.touch(0, 100);
+        active_pool.touch(1, 100);
+        active_pool.sweep(100, 0);
+        assert_eq!(active_pool.list().len(), 2);
+
+        {
+            let aligned =
+                phaser.fill_pool_alleles(1usize, &active_pool, &mut scratch_pool_alleles);
+            assert_eq!(aligned.alleles().len(), active_pool.list().len());
+            let mut switch_support = SwitchSupportCache::new();
+            switch_support.ensure_initialized(1usize, 100, &aligned);
+        }
+        assert_eq!(scratch_pool_alleles.len(), active_pool.list().len());
     }
 }
