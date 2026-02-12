@@ -410,7 +410,6 @@ impl HmmUpdater {
     /// * `emit_probs` - Two-element array: [p_match, p_mismatch]
     /// * `mismatches` - Number of mismatches (0 or 1) for each state
     /// * `n_states` - Number of states to process
-    #[cfg(test)]
     #[inline]
     pub fn bwd_update(
         bwd: &mut [f32],
@@ -587,7 +586,7 @@ impl HmmUpdater {
         }
     }
 
-    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn bwd_update_avx512(
         bwd: &mut [f32],
@@ -652,7 +651,7 @@ impl HmmUpdater {
         }
     }
 
-    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx512f,avx512bw,fma")]
     unsafe fn bwd_update_avx512_fma(
         bwd: &mut [f32],
