@@ -1575,6 +1575,7 @@ fn write_panel_freq_posterior(
 fn build_checkpoint_markers(
     uniform_mask: &MarkerMask<bool>,
     prior_marker_idx: Option<usize>,
+    input_prior_idx: Option<usize>,
     n_markers: usize,
 ) -> CheckpointGrid {
     if n_markers == 0 {
@@ -1596,6 +1597,15 @@ fn build_checkpoint_markers(
             match markers.binary_search(&pm) {
                 Ok(_) => {}
                 Err(ins) => markers.insert(ins, pm),
+            }
+        }
+    }
+    if let Some(im) = input_prior_idx {
+        if im < n_markers {
+            let im = MarkerIx::new(im);
+            match markers.binary_search(&im) {
+                Ok(_) => {}
+                Err(ins) => markers.insert(ins, im),
             }
         }
     }
@@ -2705,6 +2715,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     p_recomb: &[f32],
     error_rate: f32,
     prior_marker_idx: Option<usize>,
+    input_prior_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
@@ -2741,7 +2752,12 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         use_prior_smoothing,
     );
     let panel_priors = target_probs.panel_priors();
-    let checkpoint_grid = build_checkpoint_markers(&uniform_mask, prior_marker_idx, active_markers);
+    let checkpoint_grid = build_checkpoint_markers(
+        &uniform_mask,
+        prior_marker_idx,
+        input_prior_idx,
+        active_markers,
+    );
     ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
     ws.ensure_affine_window_cache(
         p_recomb,
@@ -2759,14 +2775,19 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let final_pass = 0usize;
     for pass in 0..1 {
         let is_final = pass == final_pass;
+        let mut initialized_from_priors = false;
         if let Some(priors) = state_priors {
-            let len = priors.len().min(active_states);
-            ws.fwd[..len].copy_from_slice(&priors[..len]);
-            if len < active_states {
-                ws.fwd[len..active_states].fill(0.0);
+            if input_prior_idx.unwrap_or(0) == 0 {
+                let len = priors.len().min(active_states);
+                ws.fwd[..len].copy_from_slice(&priors[..len]);
+                if len < active_states {
+                    ws.fwd[len..active_states].fill(0.0);
+                }
+                normalize_probs(&mut ws.fwd[..active_states]);
+                initialized_from_priors = true;
             }
-            normalize_probs(&mut ws.fwd[..active_states]);
-        } else {
+        }
+        if !initialized_from_priors {
             let uniform = 1.0 / active_states.max(1) as f32;
             ws.fwd[..active_states].fill(uniform);
         }
@@ -2785,6 +2806,20 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     transition_haps,
                 );
             }
+
+            if let Some(in_idx) = input_prior_idx {
+                if m == in_idx && in_idx > 0 {
+                    if let Some(priors) = state_priors {
+                        let len = priors.len().min(active_states);
+                        ws.fwd[..len].copy_from_slice(&priors[..len]);
+                        if len < active_states {
+                            ws.fwd[len..active_states].fill(0.0);
+                        }
+                        normalize_probs(&mut ws.fwd[..active_states]);
+                    }
+                }
+            }
+
             kernel.forward_update(
                 ws,
                 m,
@@ -3338,6 +3373,7 @@ fn run_hmm_generic(
     p_recomb: &[f32],
     error_rate: f32,
     prior_marker_idx: Option<usize>,
+    input_prior_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
@@ -3352,6 +3388,7 @@ fn run_hmm_generic(
         p_recomb,
         error_rate,
         prior_marker_idx,
+        input_prior_idx,
         state_priors,
         ref_allele_freqs,
         context,
@@ -3367,6 +3404,7 @@ fn run_hmm_seqcoded(
     p_recomb: &[f32],
     error_rate: f32,
     prior_marker_idx: Option<usize>,
+    input_prior_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
@@ -3381,6 +3419,7 @@ fn run_hmm_seqcoded(
         p_recomb,
         error_rate,
         prior_marker_idx,
+        input_prior_idx,
         state_priors,
         ref_allele_freqs,
         context,
@@ -3399,6 +3438,7 @@ fn run_hmm_dictionary(
     p_recomb: &[f32],
     error_rate: f32,
     prior_marker_idx: Option<usize>,
+    input_prior_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
@@ -3413,6 +3453,7 @@ fn run_hmm_dictionary(
         p_recomb,
         error_rate,
         prior_marker_idx,
+        input_prior_idx,
         state_priors,
         ref_allele_freqs,
         context,
@@ -3430,6 +3471,7 @@ pub fn run_impute_hmm(
     p_recomb: &[f32],
     error_rate: f32,
     prior_marker_idx: Option<usize>,
+    input_prior_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
@@ -3461,6 +3503,7 @@ pub fn run_impute_hmm(
             p_recomb,
             error_rate,
             prior_marker_idx,
+            input_prior_idx,
             state_priors,
             ref_allele_freqs,
             context,
@@ -3480,6 +3523,7 @@ pub fn run_impute_hmm(
             p_recomb,
             error_rate,
             prior_marker_idx,
+            input_prior_idx,
             state_priors,
             ref_allele_freqs,
             context,
@@ -3499,6 +3543,7 @@ pub fn run_impute_hmm(
             p_recomb,
             error_rate,
             prior_marker_idx,
+            input_prior_idx,
             state_priors,
             ref_allele_freqs,
             context,
@@ -3522,6 +3567,7 @@ pub fn run_impute_hmm(
             p_recomb,
             error_rate,
             prior_marker_idx,
+            input_prior_idx,
             state_priors,
             ref_allele_freqs,
             context,
@@ -3537,6 +3583,7 @@ pub fn run_impute_hmm(
         p_recomb,
         error_rate,
         prior_marker_idx,
+        input_prior_idx,
         state_priors,
         ref_allele_freqs,
         context,

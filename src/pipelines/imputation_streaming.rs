@@ -4734,13 +4734,11 @@ impl crate::pipelines::ImputationPipeline {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dbg_use_hmm = AtomicUsize::new(0);
         let dbg_no_hmm = AtomicUsize::new(0);
+        let dbg_has_priors = AtomicUsize::new(0);
         let dbg_no_info = AtomicUsize::new(0);
         let dbg_insufficient = AtomicUsize::new(0);
         let dbg_low_conf = AtomicUsize::new(0);
         let dbg_few_donors = AtomicUsize::new(0);
-        let dbg_has_priors = AtomicUsize::new(0);
-        let dbg_fallback_selected_priors = AtomicUsize::new(0);
-
         let sample_results: Vec<ImputeResult> = sample_error_rates
             .par_iter_mut()
             .enumerate()
@@ -4751,10 +4749,9 @@ impl crate::pipelines::ImputationPipeline {
                 let priors_h1 = overlap_hap_priors.and_then(|p| p.get(h1_idx.as_usize()));
                 let priors_h2 = overlap_hap_priors.and_then(|p| p.get(h2_idx.as_usize()));
 
-                    let (mut input_probs_h1, mut input_probs_h2, last_info_h1, last_info_h2) =
-                        build_input_probs_pair(h1_idx, h2_idx, s);
-                let handoff_capture_idx_h1 = last_info_h1.or(prior_marker_idx);
-                let handoff_capture_idx_h2 = last_info_h2.or(prior_marker_idx);
+                let (mut input_probs_h1, mut input_probs_h2, ..) =
+                    build_input_probs_pair(h1_idx, h2_idx, s);
+                let hmm_input_idx = output_start.saturating_sub(1);
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
         let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
@@ -5084,6 +5081,7 @@ impl crate::pipelines::ImputationPipeline {
                                                  input_probs: &mut TargetAlleleProbs,
                                                  error_rate: f32,
                                                  prior_marker_idx: Option<usize>,
+                                                 input_prior_idx: Option<usize>,
                                                  donors: &[(RefHapId, u32)]|
                  -> Result<(
                     Vec<AllelePosteriors>,
@@ -5168,6 +5166,39 @@ impl crate::pipelines::ImputationPipeline {
                                     0.0
                                 };
                             }
+
+                            // Apply explicit transition decay for the gap between handoff (output_end-1 of prev window)
+                            // and initialization (hmm_input_idx). If hmm_input_idx > 0, run_impute_hmm implicitly
+                            // decays via HMM steps from 0..hmm_input_idx, but if hmm_input_idx == 0 (typical in
+                            // dense streaming), run_impute_hmm treats the prior as the *initial* distribution at 0,
+                            // skipping the transition from the previous window's end.
+                            // p_recomb[hmm_input_idx] captures the recombination distance from the previous context.
+                            let recomb_rate = p_recomb
+                                .get(hmm_input_idx)
+                                .copied()
+                                .unwrap_or(0.0)
+                                .clamp(0.0, 1.0);
+                            if recomb_rate > 0.0 {
+                                let n_states = mapped_priors_buf.len();
+                                let (stay, shift) =
+                                    crate::model::li_stephens::subset_linear_exact_k(
+                                        recomb_rate,
+                                        n_states as f32,
+                                        plan.n_ref_haps,
+                                    );
+                                let mut sum = 0.0f32;
+                                for v in mapped_priors_buf.iter_mut() {
+                                    *v = *v * stay + shift;
+                                    sum += *v;
+                                }
+                                if sum > 0.0 {
+                                    let inv = 1.0 / sum;
+                                    for v in mapped_priors_buf.iter_mut() {
+                                        *v *= inv;
+                                    }
+                                }
+                            }
+
                             Some(mapped_priors_buf.as_slice())
                         }
                     } else {
@@ -5199,6 +5230,7 @@ impl crate::pipelines::ImputationPipeline {
                             &p_recomb,
                             effective_error_rate,
                             prior_marker_idx,
+                            input_prior_idx,
                             state_priors_slice.take(),
                             &ref_allele_freqs,
                             ImputeHmmContext {
@@ -5233,7 +5265,8 @@ impl crate::pipelines::ImputationPipeline {
                         priors_h1,
                         &mut input_probs_h1,
                         (*prior_error_rate).clamp(1e-6, 0.5),
-                        handoff_capture_idx_h1,
+                        prior_marker_idx,
+                        Some(hmm_input_idx),
                         &donors_h1,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
@@ -5265,7 +5298,8 @@ impl crate::pipelines::ImputationPipeline {
                         priors_h2,
                         &mut input_probs_h2,
                         (*prior_error_rate).clamp(1e-6, 0.5),
-                        handoff_capture_idx_h2,
+                        prior_marker_idx,
+                        Some(hmm_input_idx),
                         &donors_h2,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
@@ -5311,28 +5345,26 @@ impl crate::pipelines::ImputationPipeline {
                         hap_posteriors: (hap1_posts, hap2_posts),
                     },
                     priors: Some((p1_out, p2_out)),
-                    last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    },
-                }
-                )
+                    // The HMM (and donor fallback) provides state valid at the end of the window.
+                    // We report prior_marker_idx (output_end - 1) as the handoff position to
+                    // ensure the next window calculates transition distance from this end point,
+                    // avoiding double-decay (decay in this window + decay in next window).
+                    last_info_idx: prior_marker_idx,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
         if should_log {
+            let use_hmm = dbg_use_hmm.load(Ordering::Relaxed);
+            let no_hmm = dbg_no_hmm.load(Ordering::Relaxed);
+            let has_priors = dbg_has_priors.load(Ordering::Relaxed);
+            let no_info = dbg_no_info.load(Ordering::Relaxed);
+            let insufficient = dbg_insufficient.load(Ordering::Relaxed);
+            let low_conf = dbg_low_conf.load(Ordering::Relaxed);
+            let few_donors = dbg_few_donors.load(Ordering::Relaxed);
             eprintln!(
-                "    [debug hmm] use_hmm={} no_hmm={} has_priors={} no_info={} insufficient={} low_conf={} few_donors={} fallback_ref_freq={}",
-                dbg_use_hmm.load(Ordering::Relaxed),
-                dbg_no_hmm.load(Ordering::Relaxed),
-                dbg_has_priors.load(Ordering::Relaxed),
-                dbg_no_info.load(Ordering::Relaxed),
-                dbg_insufficient.load(Ordering::Relaxed),
-                dbg_low_conf.load(Ordering::Relaxed),
-                dbg_few_donors.load(Ordering::Relaxed),
-                dbg_fallback_selected_priors.load(Ordering::Relaxed)
+                "    [debug hmm] use_hmm={} no_hmm={} (priors={} no_info={} insuff={} low_conf={} few_donors={})",
+                use_hmm, no_hmm, has_priors, no_info, insufficient, low_conf, few_donors
             );
         }
 
