@@ -678,7 +678,9 @@ fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
         let pb = bwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
         let lf = (pf / (1.0 - pf)).ln();
         let lb = (pb / (1.0 - pb)).ln();
-        let logit = lf + lb;
+        // Conservative symmetric fusion of directional estimates:
+        // average log-odds avoids squared-odds overconfidence from pure multiplication.
+        let logit = 0.5 * (lf + lb);
         let p = 1.0 / (1.0 + (-logit).exp());
         out.push(p.clamp(1e-6, 1.0 - 1e-6));
     }

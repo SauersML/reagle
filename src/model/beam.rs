@@ -1621,7 +1621,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     fn orientation_flip_event_cost(&self, dist_morgans: f32) -> i32 {
         let d = dist_morgans.max(0.0) as f64;
         let rho = self.costs.recomb_intensity.max(1e-12);
-        let p_stay = (-rho * d).exp().clamp(0.500001, 1.0 - 1e-6);
+        let p_stay = (-rho * d).exp().clamp(1e-6, 1.0 - 1e-6);
         ((p_stay / (1.0 - p_stay)).ln() * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
