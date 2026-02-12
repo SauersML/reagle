@@ -10,7 +10,11 @@ use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::model::parameters::ModelParams;
 use crate::model::reference_pbwt::{DonorPick, PbwtStrictAllele, RankBeam, ReferencePbwt};
-use std::collections::HashMap;
+
+const BACKPTR_INDEX_BITS: usize = 15;
+const MAX_BACKPTR_PREV: u32 = (1u32 << BACKPTR_INDEX_BITS) - 1;
+const MAX_BEAM_WIDTH_FOR_PACKED_BACKPTR: usize = (MAX_BACKPTR_PREV as usize) + 1;
+const MAX_PBWT_CLUSTER_INTERVALS: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct BeamConfig {
@@ -61,14 +65,15 @@ pub struct BackPtr {
 
 #[inline]
 fn pack_backptr(prev: u32, swapped: bool) -> u16 {
-    let p = (prev as u16) & 0x7FFF;
+    debug_assert!(prev <= MAX_BACKPTR_PREV);
+    let p = (prev as u16) & (MAX_BACKPTR_PREV as u16);
     p | ((swapped as u16) << 15)
 }
 
 #[inline]
 fn unpack_backptr(packed: u16) -> BackPtr {
     BackPtr {
-        prev: (packed & 0x7FFF) as u32,
+        prev: (packed & (MAX_BACKPTR_PREV as u16)) as u32,
         swapped: (packed & 0x8000) != 0,
     }
 }
@@ -580,8 +585,8 @@ struct SwitchSupportCache {
     pbwt_version: u32,
     initialized: bool,
     global_match_counts: [usize; 2],
-    cluster_match_counts0: HashMap<u16, usize>,
-    cluster_match_counts1: HashMap<u16, usize>,
+    cluster_match_counts0: [usize; MAX_PBWT_CLUSTER_INTERVALS],
+    cluster_match_counts1: [usize; MAX_PBWT_CLUSTER_INTERVALS],
 }
 
 impl BeamScratch {
@@ -605,8 +610,8 @@ impl SwitchSupportCache {
             pbwt_version: u32::MAX,
             initialized: false,
             global_match_counts: [1, 1],
-            cluster_match_counts0: HashMap::new(),
-            cluster_match_counts1: HashMap::new(),
+            cluster_match_counts0: [0; MAX_PBWT_CLUSTER_INTERVALS],
+            cluster_match_counts1: [0; MAX_PBWT_CLUSTER_INTERVALS],
         }
     }
 
@@ -624,28 +629,28 @@ impl SwitchSupportCache {
         self.marker_idx = marker_idx;
         self.pbwt_version = pbwt_version;
         self.global_match_counts = [0, 0];
-        self.cluster_match_counts0.clear();
-        self.cluster_match_counts1.clear();
+        self.cluster_match_counts0.fill(0);
+        self.cluster_match_counts1.fill(0);
 
         for (idx, &hap) in active_pool.list().iter().enumerate() {
             let allele = pool_alleles.get(idx).copied().unwrap_or(255);
             if allele == 0 {
                 self.global_match_counts[0] = self.global_match_counts[0].saturating_add(1);
                 if let Some(meta) = active_pool.pbwt_meta(0, hap, pbwt_version) {
-                    let e = self
-                        .cluster_match_counts0
-                        .entry(meta.cluster_id)
-                        .or_insert(0);
-                    *e = e.saturating_add(1);
+                    let cid = meta.cluster_id as usize;
+                    if cid < MAX_PBWT_CLUSTER_INTERVALS {
+                        self.cluster_match_counts0[cid] =
+                            self.cluster_match_counts0[cid].saturating_add(1);
+                    }
                 }
             } else if allele == 1 {
                 self.global_match_counts[1] = self.global_match_counts[1].saturating_add(1);
                 if let Some(meta) = active_pool.pbwt_meta(1, hap, pbwt_version) {
-                    let e = self
-                        .cluster_match_counts1
-                        .entry(meta.cluster_id)
-                        .or_insert(0);
-                    *e = e.saturating_add(1);
+                    let cid = meta.cluster_id as usize;
+                    if cid < MAX_PBWT_CLUSTER_INTERVALS {
+                        self.cluster_match_counts1[cid] =
+                            self.cluster_match_counts1[cid].saturating_add(1);
+                    }
                 }
             }
         }
@@ -667,16 +672,19 @@ impl SwitchSupportCache {
         if cluster_id == u16::MAX {
             return 1;
         }
+        let cid = cluster_id as usize;
         let count = if allele == 0 {
-            self.cluster_match_counts0
-                .get(&cluster_id)
-                .copied()
-                .unwrap_or(0)
+            if cid < MAX_PBWT_CLUSTER_INTERVALS {
+                self.cluster_match_counts0[cid]
+            } else {
+                0
+            }
         } else {
-            self.cluster_match_counts1
-                .get(&cluster_id)
-                .copied()
-                .unwrap_or(0)
+            if cid < MAX_PBWT_CLUSTER_INTERVALS {
+                self.cluster_match_counts1[cid]
+            } else {
+                0
+            }
         };
         count.max(1)
     }
@@ -688,6 +696,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         params: &ModelParams,
         config: BeamConfig,
     ) -> Self {
+        assert!(
+            config.beam_width > 0,
+            "beam_width must be > 0 for BeamPhaser"
+        );
+        assert!(
+            config.beam_width <= MAX_BEAM_WIDTH_FOR_PACKED_BACKPTR,
+            "beam_width={} exceeds packed-backpointer capacity {}; increase backpointer width or lower beam_width",
+            config.beam_width,
+            MAX_BEAM_WIDTH_FOR_PACKED_BACKPTR
+        );
         Self {
             config,
             costs: BeamCosts::from_params(params),
@@ -796,7 +814,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             self.prune_and_collapse(&mut next);
             let mut step_ptrs: Vec<u16> = Vec::with_capacity(next.len());
             for p in &next {
-                assert!(p.prev_idx <= 0x7FFF, "beam backptr overflow");
+                assert!(p.prev_idx <= MAX_BACKPTR_PREV, "beam backptr overflow");
                 step_ptrs.push(pack_backptr(p.prev_idx, p.prev_swapped));
             }
             backptrs.push(step_ptrs);
@@ -1504,7 +1522,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         dist_morgans: f32,
     ) -> (i32, i32) {
         // Coalescent-based stay probability from PBWT one-sided match length with
-        // explicit recombination intensity scaling (rho = 4Ne in Morgans):
+        // explicit recombination-intensity scaling.
+        // Here rho is ModelParams::recomb_intensity (typically 0.04 * Ne / nHaps),
+        // used with distance in Morgans (same convention as ModelParams::p_recomb).
         //   prior: t ~ Exp(1) over TMRCA (coalescent units)
         //   L | t ~ Exp(rate = rho * t)
         //   t | L ~ Gamma(α=2, β=1 + rho * L) for a single exponential draw
