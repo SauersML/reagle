@@ -110,6 +110,7 @@ pub struct BeamPath {
     pub cluster1: u16,
     pub cluster2: u16,
     pub score: i32,
+    pub model_score: i32,
     pub last_swapped: bool,
     pub history_bits: u64,
     pub history_len: u8,
@@ -611,8 +612,8 @@ pub struct BeamPhaser<'a, RefSpace = AnyMarkerSpace> {
 struct BeamScratch {
     hap1_candidates: Vec<(usize, i32)>,
     hap2_candidates: Vec<(usize, i32)>,
-    hap1_allele: Vec<(usize, i32, i32)>,
-    hap2_allele: Vec<(usize, i32, i32)>,
+    hap1_allele: Vec<(usize, i32, i32, i32)>,
+    hap2_allele: Vec<(usize, i32, i32, i32)>,
     spread: Vec<usize>,
     pool_alleles: Vec<u8>,
     switch_support: SwitchSupportCache,
@@ -968,6 +969,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     cluster1: u16::MAX,
                     cluster2: u16::MAX,
                     score: 0,
+                    model_score: 0,
                     last_swapped: false,
                     history_bits: 0,
                     history_len: 0,
@@ -1037,6 +1039,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     cluster1: u16::MAX,
                     cluster2: u16::MAX,
                     score: 0,
+                    model_score: 0,
                     last_swapped: false,
                     history_bits: 0,
                     history_len: 0,
@@ -1061,6 +1064,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     cluster1: u16::MAX,
                     cluster2: u16::MAX,
                     score: 0,
+                    model_score: 0,
                     last_swapped: true,
                     history_bits: 0,
                     history_len: 0,
@@ -1122,6 +1126,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         cluster1: u16::MAX,
                         cluster2: u16::MAX,
                         score: path.score + *c1 + *c2,
+                        model_score: path.model_score + *c1 + *c2,
                         last_swapped: path.last_swapped,
                         history_bits: path.history_bits,
                         history_len: path.history_len,
@@ -1328,12 +1333,18 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             &mut scratch.hap2_allele,
             &mut scratch.spread,
         );
-        for (h1, c1, e1) in scratch.hap1_allele.iter() {
-            for (h2, c2, e2) in scratch.hap2_allele.iter() {
+        for (h1, c1_total, c1_model, e1) in scratch.hap1_allele.iter() {
+            for (h2, c2_total, c2_model, e2) in scratch.hap2_allele.iter() {
                 let score_no_flip = path
                     .score
-                    .saturating_add(*c1)
-                    .saturating_add(*c2)
+                    .saturating_add(*c1_total)
+                    .saturating_add(*c2_total)
+                    .saturating_add(*e1)
+                    .saturating_add(*e2);
+                let model_score_no_flip = path
+                    .model_score
+                    .saturating_add(*c1_model)
+                    .saturating_add(*c2_model)
                     .saturating_add(*e1)
                     .saturating_add(*e2);
                 let flip_penalty = if call_idx == 0 {
@@ -1344,6 +1355,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     0
                 };
                 let score = score_no_flip.saturating_add(flip_penalty);
+                let model_score = model_score_no_flip.saturating_add(flip_penalty);
                 let (history_bits, history_len) =
                     push_history_bits(path.history_bits, path.history_len, swapped);
                 if score <= cutoff {
@@ -1361,6 +1373,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         cluster1: c1,
                         cluster2: c2,
                         score,
+                        model_score,
                         last_swapped: swapped,
                         history_bits,
                         history_len,
@@ -1385,7 +1398,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         switch_support: &SwitchSupportCache,
-        out: &mut Vec<(usize, i32, i32)>,
+        out: &mut Vec<(usize, i32, i32, i32)>,
         spread: &mut Vec<usize>,
     ) {
         out.clear();
@@ -1427,7 +1440,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // For phased anchors, always scan the full pool to ensure we honor the fixed allele
             // while still exploring better-matching donors.
             if matches {
-                out.push((hap, pbwt_stay_cost, effective_match_cost));
+                out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_match_cost));
             }
             for (idx, &h) in active_pool.list().iter().rev().enumerate() {
                 let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
@@ -1447,19 +1460,24 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     };
                     let effective_switch_cost =
                         pbwt_switch_event_cost.saturating_add(selection_cost);
-                    out.push((h, effective_switch_cost, effective_match_cost));
+                    out.push((
+                        h,
+                        effective_switch_cost,
+                        pbwt_switch_event_cost,
+                        effective_match_cost,
+                    ));
                     if out.len() >= self.config.switch_candidates {
                         break;
                     }
                 }
             }
             if out.is_empty() {
-                out.push((hap, pbwt_stay_cost, effective_mismatch_cost));
+                out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_mismatch_cost));
             }
             return;
         }
         if matches {
-            out.push((hap, pbwt_stay_cost, effective_match_cost));
+            out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_match_cost));
             // also allow a limited switch to a strong candidate for future-proofing
             for (idx, &h) in active_pool.list().iter().rev().take(1).enumerate() {
                 let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
@@ -1476,7 +1494,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     };
                     let effective_switch_cost =
                         pbwt_switch_event_cost.saturating_add(selection_cost);
-                    out.push((h, effective_switch_cost, effective_match_cost));
+                    out.push((
+                        h,
+                        effective_switch_cost,
+                        pbwt_switch_event_cost,
+                        effective_match_cost,
+                    ));
                 }
             }
             return;
@@ -1502,7 +1525,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     selection_cost_global
                 };
                 let effective_switch_cost = pbwt_switch_event_cost.saturating_add(selection_cost);
-                out.push((h, effective_switch_cost, effective_match_cost));
+                out.push((
+                    h,
+                    effective_switch_cost,
+                    pbwt_switch_event_cost,
+                    effective_match_cost,
+                ));
             }
             if out.len() >= self.config.switch_candidates {
                 break;
@@ -1523,7 +1551,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     };
                     let effective_switch_cost =
                         pbwt_switch_event_cost.saturating_add(selection_cost);
-                    out.push((h, effective_switch_cost, effective_match_cost));
+                    out.push((
+                        h,
+                        effective_switch_cost,
+                        pbwt_switch_event_cost,
+                        effective_match_cost,
+                    ));
                 }
                 if out.len() >= self.config.switch_candidates {
                     break;
@@ -1532,7 +1565,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
         // Always allow staying with a mismatch cost to avoid forced switching.
         // Mismatch cost is error-rate dependent under the uniform error model.
-        out.push((hap, pbwt_stay_cost, effective_mismatch_cost));
+        out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_mismatch_cost));
     }
 
     #[inline]
@@ -1937,14 +1970,14 @@ fn compute_swap_posteriors_retained(
 
     let mut best_score = i32::MAX;
     for p in final_beam {
-        if p.score < best_score {
-            best_score = p.score;
+        if p.model_score < best_score {
+            best_score = p.model_score;
         }
     }
     let mut curr_weights = vec![0.0f64; last_len];
     let mut total = 0.0f64;
     for (final_idx, p) in final_beam.iter().enumerate() {
-        let rel = ((p.score - best_score) as f64) / 1_000_000.0;
+        let rel = ((p.model_score - best_score) as f64) / 1_000_000.0;
         let w = (-rel).exp();
         let mapped = trailing_ptrs
             .and_then(|ptrs| ptrs.get(final_idx).copied())
