@@ -152,9 +152,9 @@ const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const ORIENTATION_SWITCH_SCALE: f64 = 0.35;
-const ORIENTATION_HANDOFF_RADIUS_MARKERS: usize = 32;
 const ORIENTATION_ALPHA_MIN: f64 = 0.60;
 const ORIENTATION_ALPHA_MAX: f64 = 1.00;
+const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
@@ -280,7 +280,7 @@ fn adaptive_untyped_prior_mix(
     observed_ratio: f32,
     cluster_cm: f32,
     p_mismatch: f32,
-    unphased_input: bool,
+    phase_confidence_unavailable: bool,
 ) -> f32 {
     // Global panel-frequency floor for completely untyped sites.
     //
@@ -305,7 +305,7 @@ fn adaptive_untyped_prior_mix(
 
     // Unphased-target imputation has additional uncertainty from phase
     // transfer, so apply a mild boost.
-    let phase_factor = if unphased_input { 1.25 } else { 1.0 };
+    let phase_factor = if phase_confidence_unavailable { 1.25 } else { 1.0 };
 
     let floor = 0.01 + 0.22 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
@@ -326,6 +326,47 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
     (min_k as f32 + span * u)
         .round()
         .clamp(min_k as f32, max_k as f32) as usize
+}
+
+#[inline]
+fn blend_haplotype_priors(
+    p_keep: &HaplotypePriors,
+    p_swap: &HaplotypePriors,
+    swap_prob: f32,
+) -> HaplotypePriors {
+    let w_swap = swap_prob.clamp(0.0, 1.0);
+    let w_keep = 1.0 - w_swap;
+    if w_swap <= 0.0 {
+        return p_keep.clone();
+    }
+    if w_keep <= 0.0 {
+        return p_swap.clone();
+    }
+    let ids_keep = p_keep.ids();
+    let probs_keep = p_keep.probs();
+    let ids_swap = p_swap.ids();
+    let probs_swap = p_swap.probs();
+    let mut out_ids: Vec<GlobalHapId> = Vec::with_capacity(ids_keep.len().max(ids_swap.len()));
+    let mut out_probs: Vec<f32> = Vec::with_capacity(out_ids.capacity());
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < ids_keep.len() || j < ids_swap.len() {
+        if i < ids_keep.len() && (j >= ids_swap.len() || ids_keep[i] < ids_swap[j]) {
+            out_ids.push(ids_keep[i]);
+            out_probs.push(w_keep * probs_keep[i]);
+            i += 1;
+        } else if j < ids_swap.len() && (i >= ids_keep.len() || ids_swap[j] < ids_keep[i]) {
+            out_ids.push(ids_swap[j]);
+            out_probs.push(w_swap * probs_swap[j]);
+            j += 1;
+        } else {
+            out_ids.push(ids_keep[i]);
+            out_probs.push(w_keep * probs_keep[i] + w_swap * probs_swap[j]);
+            i += 1;
+            j += 1;
+        }
+    }
+    HaplotypePriors::new(out_ids, out_probs)
 }
 
 #[derive(Clone, Debug)]
@@ -5861,6 +5902,18 @@ impl crate::pipelines::ImputationPipeline {
             let median = lambda_samples[lambda_samples.len() / 2];
             (median * ORIENTATION_SWITCH_SCALE).clamp(1e-6, 10.0)
         };
+        let output_markers = output_end.saturating_sub(output_start);
+        let mut scratch_prefix_cm: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_emit0: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_emit1: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_orient_alpha: Vec<f64> = vec![ORIENTATION_ALPHA_MAX; output_markers];
+        let mut scratch_log_stay: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_log_flip: Vec<f64> = vec![f64::NEG_INFINITY; output_markers];
+        let mut scratch_fwd0: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_fwd1: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_bwd0: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_bwd1: Vec<f64> = vec![0.0; output_markers];
+        let mut scratch_swapped: Vec<bool> = vec![false; output_markers];
         let get_result_prob =
             |result: &SampleImputationResult, hap: usize, local_m: usize, allele: u8| -> Option<f32> {
                 if allele == 255 {
@@ -5872,7 +5925,11 @@ impl crate::pipelines::ImputationPipeline {
                     result.hap_posteriors.1.as_ref()
                 };
                 if let Some(p) = post.and_then(|v| v.get(local_m)) {
-                    return Some(p.prob(allele as usize).clamp(0.0, 1.0));
+                    let q = p.prob(allele as usize);
+                    if q.is_finite() {
+                        return Some(q.clamp(0.0, 1.0));
+                    }
+                    return None;
                 }
                 if allele > 1 {
                     return None;
@@ -5883,7 +5940,11 @@ impl crate::pipelines::ImputationPipeline {
                     result.hap_alt_probs.1.as_ref()
                 };
                 alt.and_then(|v| v.get(local_m)).map(|&p_alt| {
-                    let p_alt = p_alt.clamp(0.0, 1.0);
+                    let p_alt = if p_alt.is_finite() {
+                        p_alt.clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
                     if allele == 1 { p_alt } else { 1.0 - p_alt }
                 })
             };
@@ -5947,43 +6008,72 @@ impl crate::pipelines::ImputationPipeline {
             }
             Some((a1, a2, conf.clamp(0.5, 1.0)))
         };
-        let smooth_sample_orientation = |result: &mut SampleImputationResult,
-                                         capture_ref_idx: Option<usize>|
-         -> Option<bool> {
+        let mut smooth_sample_orientation = |result: &mut SampleImputationResult,
+                                             capture_ref_idx: Option<usize>|
+         -> Option<f32> {
             let n = output_end.saturating_sub(output_start);
             if n == 0 {
                 return None;
             }
+            let prefix_cm = &mut scratch_prefix_cm;
+            let emit0 = &mut scratch_emit0;
+            let emit1 = &mut scratch_emit1;
+            let orient_alpha = &mut scratch_orient_alpha;
+            let log_stay = &mut scratch_log_stay;
+            let log_flip = &mut scratch_log_flip;
+            let fwd0 = &mut scratch_fwd0;
+            let fwd1 = &mut scratch_fwd1;
+            let bwd0 = &mut scratch_bwd0;
+            let bwd1 = &mut scratch_bwd1;
+            let swapped = &mut scratch_swapped;
+            prefix_cm.resize(n, 0.0);
+            emit0.resize(n, 0.0);
+            emit1.resize(n, 0.0);
+            orient_alpha.resize(n, ORIENTATION_ALPHA_MAX);
+            log_stay.resize(n, 0.0);
+            log_flip.resize(n, f64::NEG_INFINITY);
+            fwd0.resize(n, 0.0);
+            fwd1.resize(n, 0.0);
+            bwd0.resize(n, 0.0);
+            bwd1.resize(n, 0.0);
+            swapped.resize(n, false);
 
-            let mut prefix_cm = vec![0.0f64; n];
+            prefix_cm[0] = 0.0;
             for local_m in 1..n {
                 let ref_m = output_start + local_m;
                 let d = (gen_positions[ref_m] - gen_positions[ref_m - 1]).abs();
                 prefix_cm[local_m] = prefix_cm[local_m - 1] + if d.is_finite() { d } else { 0.0 };
             }
-            let mut emit_strength = vec![0.0f64; n];
-            let mut orient_alpha = vec![ORIENTATION_ALPHA_MAX; n];
             let eps = 1e-30f64;
-            let informative_eps = 1e-6f64;
-            let mut event_idx: Vec<usize> = Vec::new();
-            let mut event_emit0: Vec<f64> = Vec::new();
-            let mut event_emit1: Vec<f64> = Vec::new();
 
             for local_m in 0..n {
                 let ref_m = output_start + local_m;
-                let (emit0, emit1, anchored, alpha_local) = if let Some((a_left, a_right, phase_conf)) =
+                let (e0, e1, alpha_local) = if let Some((a_left, a_right, phase_conf)) =
                     get_anchor_obs(result.sample_idx, ref_m)
                 {
                     let p1_left = get_result_prob(result, 0, local_m, a_left).unwrap_or(0.5);
                     let p1_right = get_result_prob(result, 0, local_m, a_right).unwrap_or(0.5);
                     let p2_left = get_result_prob(result, 1, local_m, a_left).unwrap_or(0.5);
                     let p2_right = get_result_prob(result, 1, local_m, a_right).unwrap_or(0.5);
-                    let same = (p1_left * p2_right).clamp(0.0, 1.0);
-                    let swapped = (p1_right * p2_left).clamp(0.0, 1.0);
+                    let same = if (p1_left as f64).is_finite() && (p2_right as f64).is_finite() {
+                        (p1_left * p2_right).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
+                    let swapped_prob = if (p1_right as f64).is_finite() && (p2_left as f64).is_finite()
+                    {
+                        (p1_right * p2_left).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
                     let c = phase_conf as f64;
-                    let same_mix = (c * same as f64 + (1.0 - c) * swapped as f64).max(eps).ln();
-                    let swap_mix = (c * swapped as f64 + (1.0 - c) * same as f64).max(eps).ln();
-                    (same_mix, swap_mix, true, c.clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX))
+                    let same_mix = (c * same as f64 + (1.0 - c) * swapped_prob as f64).max(eps).ln();
+                    let swap_mix = (c * swapped_prob as f64 + (1.0 - c) * same as f64).max(eps).ln();
+                    (
+                        same_mix,
+                        swap_mix,
+                        c.clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX),
+                    )
                 } else {
                     let mut alpha = ORIENTATION_ALPHA_MIN;
                     if let (Some(p1v), Some(p2v)) =
@@ -6017,97 +6107,85 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     // Unanchored marker-level orientation is unidentifiable from
                     // independent haplotype posteriors alone; keep neutral emission.
-                    (0.0, 0.0, false, alpha)
+                    (0.0, 0.0, alpha)
                 };
-                let e = emit0 - emit1;
-                let strength = e.abs();
-                emit_strength[local_m] = strength;
+                emit0[local_m] = e0;
+                emit1[local_m] = e1;
                 orient_alpha[local_m] = alpha_local;
-                if anchored || strength > informative_eps {
-                    event_idx.push(local_m);
-                    event_emit0.push(emit0);
-                    event_emit1.push(emit1);
-                }
             }
 
-            let mut swapped = vec![false; n];
-            if !event_idx.is_empty() {
-                let k = event_idx.len();
-                let mut prev_to0_from1 = vec![false; k];
-                let mut prev_to1_from0 = vec![false; k];
-                let mut dp0 = event_emit0[0];
-                let mut dp1 = event_emit1[0];
-
-                for eidx in 1..k {
-                    let prev_local = event_idx[eidx - 1];
-                    let local = event_idx[eidx];
-                    let gap_cm = (prefix_cm[local] - prefix_cm[prev_local]).max(0.0);
-                    let p_flip = if gap_cm > 0.0 && gap_cm.is_finite() {
-                        (1.0 - (-orientation_lambda * gap_cm).exp()).clamp(1e-8, 0.49)
-                    } else {
-                        1e-8
-                    };
-                    let alpha_gap = (orient_alpha[prev_local] + orient_alpha[local]) * 0.5;
-                    // Entropy-modulated transition odds:
-                    // odds' = odds^alpha, alpha in [alpha_min, 1]
-                    // so low-confidence regions (smaller alpha) allow easier switching.
-                    let odds = ((1.0 - p_flip) / p_flip).max(1e-8);
-                    let adj_odds = odds.powf(alpha_gap);
-                    let p_flip_adj = (1.0 / (1.0 + adj_odds)).clamp(1e-8, 0.49);
-                    let log_stay = (1.0 - p_flip_adj).ln();
-                    let log_flip = p_flip_adj.ln();
-
-                    let stay0 = dp0 + log_stay;
-                    let flip_to0 = dp1 + log_flip;
-                    let new0 = if flip_to0 > stay0 {
-                        prev_to0_from1[eidx] = true;
-                        flip_to0 + event_emit0[eidx]
-                    } else {
-                        stay0 + event_emit0[eidx]
-                    };
-                    let stay1 = dp1 + log_stay;
-                    let flip_to1 = dp0 + log_flip;
-                    let new1 = if flip_to1 > stay1 {
-                        prev_to1_from0[eidx] = true;
-                        flip_to1 + event_emit1[eidx]
-                    } else {
-                        stay1 + event_emit1[eidx]
-                    };
-                    dp0 = new0;
-                    dp1 = new1;
+            let logsumexp2 = |a: f64, b: f64| -> f64 {
+                let m = a.max(b);
+                if !m.is_finite() {
+                    return m;
                 }
+                m + ((a - m).exp() + (b - m).exp()).ln()
+            };
+            log_stay[0] = 0.0;
+            log_flip[0] = f64::NEG_INFINITY;
+            for local_m in 1..n {
+                let gap_cm = (prefix_cm[local_m] - prefix_cm[local_m - 1]).max(0.0);
+                let p_flip = if gap_cm > 0.0 && gap_cm.is_finite() {
+                    (1.0 - (-orientation_lambda * gap_cm).exp()).clamp(1e-8, 0.49)
+                } else {
+                    1e-8
+                };
+                let alpha_gap = (orient_alpha[local_m - 1] + orient_alpha[local_m]) * 0.5;
+                // Entropy-modulated transition odds:
+                // odds' = odds^alpha, alpha in [alpha_min, 1].
+                let odds = ((1.0 - p_flip) / p_flip).max(1e-8);
+                let adj_odds = odds.powf(alpha_gap);
+                let p_flip_adj = (1.0 / (1.0 + adj_odds)).clamp(1e-8, 0.49);
+                log_stay[local_m] = (1.0 - p_flip_adj).ln();
+                log_flip[local_m] = p_flip_adj.ln();
+            }
 
-                let mut event_state = vec![false; k];
-                let mut state_swapped = dp1 > dp0;
-                for eidx in (0..k).rev() {
-                    event_state[eidx] = state_swapped;
-                    if eidx == 0 {
-                        break;
-                    }
-                    state_swapped = if !state_swapped {
-                        prev_to0_from1[eidx]
-                    } else {
-                        !prev_to1_from0[eidx]
-                    };
-                }
+            let log_half = (0.5f64).ln();
+            fwd0[0] = log_half + emit0[0];
+            fwd1[0] = log_half + emit1[0];
+            for local_m in 1..n {
+                let prev0 = fwd0[local_m - 1];
+                let prev1 = fwd1[local_m - 1];
+                fwd0[local_m] =
+                    emit0[local_m] + logsumexp2(prev0 + log_stay[local_m], prev1 + log_flip[local_m]);
+                fwd1[local_m] =
+                    emit1[local_m] + logsumexp2(prev1 + log_stay[local_m], prev0 + log_flip[local_m]);
+            }
 
-                let first = event_idx[0];
-                for local_m in 0..first {
-                    swapped[local_m] = event_state[0];
-                }
-                for eidx in 0..k {
-                    let start = event_idx[eidx];
-                    let end = if eidx + 1 < k { event_idx[eidx + 1] } else { n };
-                    for local_m in start..end {
-                        swapped[local_m] = event_state[eidx];
-                    }
-                }
+            bwd0[n - 1] = 0.0;
+            bwd1[n - 1] = 0.0;
+            for local_m in (0..n - 1).rev() {
+                let next = local_m + 1;
+                bwd0[local_m] = logsumexp2(
+                    log_stay[next] + emit0[next] + bwd0[next],
+                    log_flip[next] + emit1[next] + bwd1[next],
+                );
+                bwd1[local_m] = logsumexp2(
+                    log_flip[next] + emit0[next] + bwd0[next],
+                    log_stay[next] + emit1[next] + bwd1[next],
+                );
+            }
+
+            let log_z = logsumexp2(fwd0[n - 1], fwd1[n - 1]);
+            if !log_z.is_finite() {
+                return Some(0.5);
+            }
+            for local_m in 0..n {
+                let log_p1 = fwd1[local_m] + bwd1[local_m] - log_z;
+                let p1 = if log_p1.is_finite() {
+                    log_p1.exp().clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                swapped[local_m] = p1 >= 0.5;
             }
 
             for (local_m, &is_swapped) in swapped.iter().enumerate() {
                 if !is_swapped {
                     continue;
                 }
+                // Invariant: every hap-ordered field in SampleImputationResult must be
+                // swapped consistently if orientation is swapped.
                 if let (Some(p1), Some(p2)) =
                     (result.hap_posteriors.0.as_mut(), result.hap_posteriors.1.as_mut())
                 {
@@ -6133,18 +6211,16 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 })
                 .unwrap_or(n.saturating_sub(1));
-            let vote_start = handoff_local.saturating_sub(ORIENTATION_HANDOFF_RADIUS_MARKERS);
-            let vote_end = (handoff_local + ORIENTATION_HANDOFF_RADIUS_MARKERS + 1).min(n);
-            let mut vote = 0.0f64;
-            for local_m in vote_start..vote_end {
-                let w = 1.0 + emit_strength[local_m];
-                if swapped[local_m] {
-                    vote += w;
-                } else {
-                    vote -= w;
-                }
+            let log_p1_handoff = fwd1[handoff_local] + bwd1[handoff_local] - log_z;
+            let p1_handoff = if log_p1_handoff.is_finite() {
+                log_p1_handoff.exp().clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            if (p1_handoff - 0.5).abs() < ORIENTATION_HANDOFF_MIN_MARGIN {
+                return Some(0.5);
             }
-            Some(vote > 0.0)
+            Some(p1_handoff as f32)
         };
 
         for mut item in sample_results {
@@ -6176,19 +6252,15 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
             let capture_ref_idx = item.last_info_idx.or(prior_marker_idx);
-            let handoff_swapped = smooth_sample_orientation(&mut item.result, capture_ref_idx)
-                .unwrap_or(false);
+            let handoff_swap_prob = smooth_sample_orientation(&mut item.result, capture_ref_idx)
+                .unwrap_or(0.5);
             all_results.push(item.result);
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
                 if base + 1 < next_priors_vec.len() {
-                    if handoff_swapped {
-                        next_priors_vec[base] = p2;
-                        next_priors_vec[base + 1] = p1;
-                    } else {
-                        next_priors_vec[base] = p1;
-                        next_priors_vec[base + 1] = p2;
-                    }
+                    next_priors_vec[base] = blend_haplotype_priors(&p1, &p2, handoff_swap_prob);
+                    next_priors_vec[base + 1] =
+                        blend_haplotype_priors(&p2, &p1, handoff_swap_prob);
                 }
             }
             if let Some(idx) = item.last_info_idx {
