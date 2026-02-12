@@ -4718,6 +4718,7 @@ impl crate::pipelines::ImputationPipeline {
                 std::cell::RefCell::new(None);
         }
 
+
         let prior_marker_idx = if output_end > 0 {
             Some(output_end.saturating_sub(1))
         } else {
@@ -4751,10 +4752,8 @@ impl crate::pipelines::ImputationPipeline {
                 let priors_h1 = overlap_hap_priors.and_then(|p| p.get(h1_idx.as_usize()));
                 let priors_h2 = overlap_hap_priors.and_then(|p| p.get(h2_idx.as_usize()));
 
-                    let (mut input_probs_h1, mut input_probs_h2, last_info_h1, last_info_h2) =
+                    let (mut input_probs_h1, mut input_probs_h2, _, _) =
                         build_input_probs_pair(h1_idx, h2_idx, s);
-                let handoff_capture_idx_h1 = last_info_h1.or(prior_marker_idx);
-                let handoff_capture_idx_h2 = last_info_h2.or(prior_marker_idx);
                 // Information-weighted fallback decision: ratio of confused info to total info.
                 // Missing targets provide no information, so treat missingness as low confidence.
         let total_info_h1 = sm_total_info[h1_idx.as_usize()].max(1e-9);
@@ -5095,7 +5094,8 @@ impl crate::pipelines::ImputationPipeline {
                                                  priors: Option<&HaplotypePriors>,
                                                  input_probs: &mut TargetAlleleProbs,
                                                  error_rate: f32,
-                                                 prior_marker_idx: Option<usize>,
+                                                 input_prior_idx: Option<usize>,
+                                                 output_capture_idx: Option<usize>,
                                                  donors: &[(RefHapId, u32)]|
                  -> Result<(
                     Vec<AllelePosteriors>,
@@ -5210,7 +5210,8 @@ impl crate::pipelines::ImputationPipeline {
                             input_probs,
                             &p_recomb,
                             effective_error_rate,
-                            prior_marker_idx,
+                            input_prior_idx,
+                            output_capture_idx,
                             state_priors_slice.take(),
                             &ref_allele_freqs,
                             ImputeHmmContext {
@@ -5239,13 +5240,24 @@ impl crate::pipelines::ImputationPipeline {
                     Ok((posteriors, next_priors, subsetted_states, informative_ratio))
                 };
 
+                let output_markers = output_end.saturating_sub(output_start);
+                // Capture the posterior state at the last marker of the current window output
+                // (before the overlap buffer for the next window begins, or at the exact boundary).
+                let output_capture_local = if output_markers > 0 {
+                    Some(output_end.saturating_sub(1))
+                } else {
+                    None
+                };
+
                 let (hap1_posts, p1_out) = if use_hmm_h1 {
+                    let input_prior_idx = priors_h1.map(|_| output_start.saturating_sub(1));
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h1_idx,
                         priors_h1,
                         &mut input_probs_h1,
                         (*prior_error_rate).clamp(1e-6, 0.5),
-                        handoff_capture_idx_h1,
+                        input_prior_idx,
+                        output_capture_local,
                         &donors_h1,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
@@ -5272,12 +5284,14 @@ impl crate::pipelines::ImputationPipeline {
                 };
 
                 let (hap2_posts, p2_out) = if use_hmm_h2 {
+                    let input_prior_idx = priors_h2.map(|_| output_start.saturating_sub(1));
                     let (posts, out, subsetted_states, informative_ratio) = process_haplotype(
                         h2_idx,
                         priors_h2,
                         &mut input_probs_h2,
                         (*prior_error_rate).clamp(1e-6, 0.5),
-                        handoff_capture_idx_h2,
+                        input_prior_idx,
+                        output_capture_local,
                         &donors_h2,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
@@ -5323,14 +5337,8 @@ impl crate::pipelines::ImputationPipeline {
                         hap_posteriors: (hap1_posts, hap2_posts),
                     },
                     priors: Some((p1_out, p2_out)),
-                    last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    },
-                }
-                )
+                    last_info_idx: output_capture_local,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
