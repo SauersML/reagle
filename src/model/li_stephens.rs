@@ -36,6 +36,7 @@ pub fn subset_linear_clamped_k(recomb_rate: f32, k_subset: f32, n_total: usize) 
     (stay, shift)
 }
 
+#[cfg(test)]
 #[inline]
 pub fn normalized_switch_scale_shift(
     p_switch: f32,

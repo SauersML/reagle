@@ -8187,16 +8187,30 @@ fn emit_prob_hard(
     emit_prob(ref_al, targ_al, conf, p_no_err, p_err)
 }
 
+struct TransitionParams {
+    stay_gap: f32,
+    shift: f32,
+    stay: f32,
+}
+
 #[inline(always)]
-fn subset_transition_params(r: f32, n_states: usize, panel_haps: usize) -> (f32, f32, f32) {
+fn subset_transition_params(r: f32, n_states: usize, panel_haps: usize) -> TransitionParams {
     if n_states == 0 {
-        return (0.0, 0.0, 1.0);
+        return TransitionParams {
+            stay_gap: 0.0,
+            shift: 0.0,
+            stay: 1.0,
+        };
     }
     // Canonical Li-Stephens subset conditioning:
     // switch_full = r / N_total, then renormalize over the K active states.
     let (stay_gap, shift) = subset_linear_exact_k(r, n_states as f32, panel_haps);
     let stay = (stay_gap + shift).clamp(0.0, 1.0);
-    (stay_gap, shift, stay)
+    TransitionParams {
+        stay_gap,
+        shift,
+        stay,
+    }
 }
 
 /// Emission mode for combined diploid genotype
@@ -8607,8 +8621,8 @@ fn build_fwd_checkpoints<RefSpace>(
         if m > 0 {
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
             let params = subset_transition_params(r, n_states, panel_haps);
-            let stay_gap = params.0;
-            let shift = params.1;
+            let stay_gap = params.stay_gap;
+            let shift = params.shift;
             let scale = stay_gap / fwd_sum.max(1e-30);
 
             // SIMD-optimized fwd_prior = scale * fwd + shift
@@ -8871,8 +8885,8 @@ fn sample_path_from_checkpoints<RefSpace>(
         for m in (start + 1)..end {
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
             let params = subset_transition_params(r, n_states, panel_haps);
-            let stay_gap = params.0;
-            let shift = params.1;
+            let stay_gap = params.stay_gap;
+            let shift = params.shift;
             let scale = stay_gap / prev_sum;
 
             let a1 = seq1[m];
@@ -9042,8 +9056,8 @@ fn sample_path_from_checkpoints<RefSpace>(
         if let Some(ns) = next_state {
             let r = p_recomb.get(end).copied().unwrap_or(0.0);
             let params = subset_transition_params(r, n_states, panel_haps);
-            let shift = params.1;
-            let stay = params.2;
+            let shift = params.shift;
+            let stay = params.stay;
             for i in 0..n_states {
                 let t = if i == ns { stay } else { shift };
                 weights[i] = last_row[i] * t;
@@ -9059,8 +9073,8 @@ fn sample_path_from_checkpoints<RefSpace>(
             let next_state = path[m] as usize;
             let r = p_recomb.get(m).copied().unwrap_or(0.0);
             let params = subset_transition_params(r, n_states, panel_haps);
-            let shift = params.1;
-            let stay = params.2;
+            let shift = params.shift;
+            let stay = params.stay;
             let row_idx = (m - 1 - start) * row_stride;
             let prev_row = &fwd_buf[row_idx..row_idx + row_stride];
 
@@ -9173,8 +9187,8 @@ fn ffbs_haploid_constrained(
 
         let r = p_recomb.get(m).copied().unwrap_or(0.0);
         let params = subset_transition_params(r, actual_n_states, panel_haps);
-        let stay_gap = params.0;
-        let shift = params.1;
+        let stay_gap = params.stay_gap;
+        let shift = params.shift;
         let scale = stay_gap / fwd_sum;
         let conf_m = constrained_emission_confidence(
             geno_a1[m],
@@ -9311,8 +9325,8 @@ fn ffbs_haploid_constrained(
         let next_state = path[m] as usize;
         let r = p_recomb.get(m).copied().unwrap_or(0.0);
         let params = subset_transition_params(r, actual_n_states, panel_haps);
-        let shift = params.1;
-        let stay = params.2;
+        let shift = params.shift;
+        let stay = params.stay;
 
         let prev_start = (m - 1) * actual_n_states;
         let prev_fwd = &fwd_at_marker[prev_start..prev_start + actual_n_states];

@@ -13,7 +13,9 @@
 
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
-use crate::model::li_stephens::{normalized_switch_scale_shift, subset_linear_exact_k};
+use crate::model::li_stephens::subset_linear_exact_k;
+#[cfg(test)]
+use crate::model::li_stephens::normalized_switch_scale_shift;
 use crate::model::parameters::ModelParams;
 use aligned_vec::{AVec, ConstAlign};
 use std::sync::OnceLock;
@@ -40,13 +42,6 @@ impl EmissionAffine {
     #[inline]
     fn forward(self, prior: f32, emission: f32) -> f32 {
         emission * (self.scale * prior + self.shift)
-    }
-
-    #[inline]
-    fn invert_prior(self, posterior: f32, emission: f32) -> f32 {
-        assert!(emission > 0.0);
-        assert!(self.scale > 0.0);
-        ((posterior / emission) - self.shift) / self.scale
     }
 }
 
@@ -415,6 +410,7 @@ impl HmmUpdater {
     /// * `emit_probs` - Two-element array: [p_match, p_mismatch]
     /// * `mismatches` - Number of mismatches (0 or 1) for each state
     /// * `n_states` - Number of states to process
+    #[cfg(test)]
     #[inline]
     pub fn bwd_update(
         bwd: &mut [f32],
@@ -591,7 +587,7 @@ impl HmmUpdater {
         }
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn bwd_update_avx512(
         bwd: &mut [f32],
@@ -656,7 +652,7 @@ impl HmmUpdater {
         }
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "avx512f,avx512bw,fma")]
     unsafe fn bwd_update_avx512_fma(
         bwd: &mut [f32],
@@ -2209,30 +2205,4 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-6, "Sum should be 1.0");
     }
 
-    #[test]
-    fn test_invert_emission_affine_forward_round_trip() {
-        let cases = [
-            (0.01f32, 0.98f32, 0.25f32, 0.0025f32),
-            (0.05f32, 0.95f32, 0.5f32, 0.01f32),
-            (0.20f32, 0.80f32, 0.001f32, 0.0003f32),
-            (0.001f32, 0.999f32, 3.0f32, 0.0001f32),
-        ];
-        for (emission, one_minus_emission, prior, shift) in cases {
-            let scale = one_minus_emission.max(1e-6);
-            let affine = EmissionAffine::new(scale, shift);
-            let posterior = affine.forward(prior, emission);
-            let recovered = affine.invert_prior(posterior, emission);
-            let err = (recovered - prior).abs();
-            assert!(
-                err < 1e-5,
-                "inverse failed: prior={} recovered={} err={} emission={} scale={} shift={}",
-                prior,
-                recovered,
-                err,
-                emission,
-                scale,
-                shift
-            );
-        }
-    }
 }
