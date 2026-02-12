@@ -4928,7 +4928,18 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(full) = full_states.as_ref() {
                         return full.clone();
                     }
-                    let k = per_window_cap_local.max(1).min(plan.n_ref_haps.max(1));
+                    let mut k = per_window_cap_local.max(1).min(plan.n_ref_haps.max(1));
+                    // Allow budget expansion to preserve continuity. If the prior
+                    // set is larger than the prescan-derived cap (e.g. in sparse regions),
+                    // we expand k to accommodate relevant history.
+                    if let Some(p) = priors {
+                        let p_len = p.ids().len();
+                        if p_len > k {
+                            k = k.max(p_len.min(k.saturating_mul(2)));
+                        }
+                    }
+                    k = k.min(plan.n_ref_haps.max(1));
+
                     let mut out: Vec<RefHapId> = Vec::with_capacity(k);
                     let mut seen: std::collections::HashSet<RefHapId> =
                         std::collections::HashSet::with_capacity(k * 2);
