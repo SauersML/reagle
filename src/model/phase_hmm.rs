@@ -13,7 +13,7 @@
 
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
-use crate::model::li_stephens::normalized_switch_scale_shift;
+use crate::model::li_stephens::{normalized_switch_scale_shift, subset_linear_exact_k};
 use crate::model::parameters::ModelParams;
 use aligned_vec::{AVec, ConstAlign};
 use std::sync::OnceLock;
@@ -834,13 +834,14 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         );
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
         let mut cursor_history: Vec<StateSwitch<HapSpace>> = Vec::new();
-        let inv_n_states = 1.0 / n_states as f32;
+        let donor_pool_n = self.ref_gt.n_haps().max(1);
         let mut shift_by_marker = vec![0.0f32; n_markers];
-        let mut one_minus_by_marker = vec![0.0f32; n_markers];
+        let mut stay_by_marker = vec![0.0f32; n_markers];
         for m in 0..n_markers {
             let p = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            shift_by_marker[m] = p * inv_n_states;
-            one_minus_by_marker[m] = 1.0 - p;
+            let (stay, shift) = subset_linear_exact_k(p, n_states as f32, donor_pool_n);
+            stay_by_marker[m] = stay;
+            shift_by_marker[m] = shift;
         }
 
         let mut req_allele = vec![255u8; n_markers];
@@ -1177,8 +1178,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let curr_row = &mut curr_and_after[..n_states];
                 curr_row.copy_from_slice(prev_row);
                 let shift = shift_by_marker[m];
-                let one_minus = one_minus_by_marker[m];
-                let scale = one_minus / fwd_sum.max(1e-30);
+                let stay = stay_by_marker[m];
+                let scale = stay / fwd_sum.max(1e-30);
                 let req = req_allele[m];
                 let p_no_err = p_match[m];
                 let p_err = p_mismatch[m];
@@ -1193,8 +1194,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let curr_row = &mut curr_and_after[..n_states];
                 curr_row.copy_from_slice(prev_row);
                 let shift = shift_by_marker[m];
-                let one_minus = one_minus_by_marker[m];
-                let scale = one_minus / fwd_sum.max(1e-30);
+                let stay = stay_by_marker[m];
+                let scale = stay / fwd_sum.max(1e-30);
                 const STATE_BLOCK: usize = 256;
                 if n_states > STATE_BLOCK {
                     let mut new_sum = 0.0f32;
@@ -1423,8 +1424,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 }
 
                 let shift = shift_by_marker[m_next];
-                let one_minus = one_minus_by_marker[m_next];
-                let scale = one_minus / constant_term.max(1e-30);
+                let stay = stay_by_marker[m_next];
+                let scale = stay / constant_term.max(1e-30);
                 const STATE_BLOCK: usize = 256;
                 if n_states > STATE_BLOCK {
                     let mut start = 0usize;
@@ -1479,14 +1480,14 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
         let p_err = self.params.p_mismatch;
         let p_no_err = 1.0 - p_err;
-        let emit_probs = [p_no_err, p_err];
-        let inv_n_states = 1.0 / n_states as f32;
+        let donor_pool_n = self.ref_gt.n_haps().max(1);
         let mut shift_by_marker = vec![0.0f32; n_markers];
-        let mut one_minus_by_marker = vec![0.0f32; n_markers];
+        let mut stay_by_marker = vec![0.0f32; n_markers];
         for m in 0..n_markers {
             let p = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            shift_by_marker[m] = p * inv_n_states;
-            one_minus_by_marker[m] = 1.0 - p;
+            let (stay, shift) = subset_linear_exact_k(p, n_states as f32, donor_pool_n);
+            stay_by_marker[m] = stay;
+            shift_by_marker[m] = shift;
         }
 
         let n_states_padded = ((n_states + 63) / 64) * 64;
@@ -1536,7 +1537,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
             if m > 0 {
                 let shift = shift_by_marker[m];
-                let scale = one_minus_by_marker[m] / last_fwd_sum;
+                let scale = stay_by_marker[m] / last_fwd_sum;
 
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
@@ -1574,9 +1575,9 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         // 2. Combined backward pass with forward recomputation and stats accumulation
         // Process in reverse order, recomputing forward from checkpoints as needed
         let mut bwd = vec![1.0f32; n_states];
-        let mut mismatches = vec![0u8; n_states];
         let mut fwd_recomp = vec![0.0f32; n_states];
         let mut fwd_prev = vec![0.0f32; n_states];
+        let mut emissions_tmp = vec![0.0f32; n_states];
 
         let h_factor = n_states as f32 / (n_states - 1) as f32;
 
@@ -1597,9 +1598,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             // Recompute forward from checkpoint_start+1 to m
             for recomp_m in (checkpoint_start + 1)..=m {
                 let recomp_targ_al = target_alleles[recomp_m];
-                let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
-                let (scale, shift) =
-                    normalized_switch_scale_shift(p_switch, n_states, recomp_sum, 1e-30);
+                let shift = shift_by_marker[recomp_m];
+                let scale = stay_by_marker[recomp_m] / recomp_sum.max(1e-30);
                 let transition = EmissionAffine::new(scale, shift);
                 let recomp_row_offset = recomp_m * n_states_padded;
                 let recomp_ref_row =
@@ -1629,9 +1629,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut prev_recomp_sum = fwd_sums[prev_checkpoint_start];
                 for recomp_m in (prev_checkpoint_start + 1)..=prev_m {
                     let recomp_targ_al = target_alleles[recomp_m];
-                    let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
-                    let (scale, shift) =
-                        normalized_switch_scale_shift(p_switch, n_states, prev_recomp_sum, 1e-30);
+                    let shift = shift_by_marker[recomp_m];
+                    let scale = stay_by_marker[recomp_m] / prev_recomp_sum.max(1e-30);
                     let transition = EmissionAffine::new(scale, shift);
                     let recomp_row_offset = recomp_m * n_states_padded;
                     let recomp_ref_row =
@@ -1652,9 +1651,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             let mut state_sum = 0.0f32;
             let mut mismatch_sum = 0.0f32;
             let same_state_scale = if m > 0 {
-                let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let sum_prev = fwd_sums[m - 1].max(1e-30);
-                ((1.0 - p_switch) + (p_switch / n_states as f32)) / sum_prev
+                stay_by_marker[m] / fwd_sums[m - 1].max(1e-30)
             } else {
                 0.0
             };
@@ -1695,14 +1692,26 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             if m > 0 {
                 let m_next = m; // We're about to move to m-1, so m is the "next" marker from m-1's perspective
                 let targ_al_next = target_alleles[m_next];
-                let p_recomb = self.p_recomb.get(m_next).copied().unwrap_or(0.0);
-
+                let shift = shift_by_marker[m_next];
+                let stay = stay_by_marker[m_next];
+                let mut constant_term = 0.0f32;
                 for k in 0..n_states {
-                    let r = ref_row[k];
-                    mismatches[k] = if r == targ_al_next { 0 } else { 1 };
+                    let em = if ref_row[k] == targ_al_next {
+                        p_no_err
+                    } else {
+                        p_err
+                    };
+                    emissions_tmp[k] = em;
+                    constant_term += bwd[k] * em;
                 }
-
-                HmmUpdater::bwd_update(&mut bwd, p_recomb, &emit_probs, &mismatches, n_states);
+                let scale = stay / constant_term.max(1e-30);
+                HmmUpdater::bwd_update_constant_scale(
+                    &mut bwd,
+                    scale,
+                    shift,
+                    &emissions_tmp,
+                    n_states,
+                );
             }
         }
     }
