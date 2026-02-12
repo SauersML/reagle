@@ -790,7 +790,11 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![255u8; batch_haps.len()];
+    let mut ref_alleles = vec![255u8; n_ref_haps];
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
+    let mut query_rows_by_allele: Vec<Vec<usize>> = Vec::new();
+    let mut map_lut = [255u8; 256];
+    let mut map_lut_seen = [false; 256];
 
     for m in 0..n_markers {
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -807,6 +811,22 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             .marker(MarkerIdx::new(m as u32))
             .n_alleles()
             .max(1);
+        if query_rows_by_allele.len() < n_alleles {
+            query_rows_by_allele.resize_with(n_alleles, Vec::new);
+        }
+        for rows in query_rows_by_allele.iter_mut().take(n_alleles) {
+            rows.clear();
+        }
+        for (i, &a) in query_alleles.iter().enumerate() {
+            if a == 255 {
+                continue;
+            }
+            let idx = a as usize;
+            if idx < n_alleles {
+                query_rows_by_allele[idx].push(i);
+            }
+        }
+
         if ref_bins.len() < n_alleles {
             ref_bins.resize_with(n_alleles, Vec::new);
         }
@@ -815,12 +835,21 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
         }
 
         let col = &ref_columns[ref_m.as_usize()];
-        for rh in 0..n_ref_haps {
-            let ref_a = col.allele(rh);
+        col.fill_alleles(&mut ref_alleles);
+        map_lut_seen.fill(false);
+        for (rh, &ref_a) in ref_alleles.iter().enumerate() {
             if ref_a == 255 {
                 continue;
             }
-            let mapped = alignment.reverse_map_allele(m, ref_a);
+            let lut_idx = ref_a as usize;
+            let mapped = if map_lut_seen[lut_idx] {
+                map_lut[lut_idx]
+            } else {
+                let v = alignment.reverse_map_allele(m, ref_a);
+                map_lut[lut_idx] = v;
+                map_lut_seen[lut_idx] = true;
+                v
+            };
             if mapped == 255 {
                 continue;
             }
@@ -831,30 +860,43 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             ref_bins[idx].push(rh as u32);
         }
 
-        for (i, _) in batch_haps.iter().enumerate() {
-            let targ = query_alleles[i];
-            if targ == 255 {
+        // Exact grouped update:
+        // Original per-row score for row i, hap h at marker m:
+        //   S_i[h] += w_{m,a_i} * 1{a_h == a_i}
+        // where a_i is target allele for row i and w_{m,a} = -ln(freq_{m,a}).
+        //
+        // Grouping rows by a_i is algebraically identical:
+        // for each allele a, all rows in group G_a share the same w_{m,a},
+        // and all h in bin B_a satisfy 1{a_h == a}. Applying the same delta
+        // to every (i in G_a, h in B_a) yields exactly the same sum.
+        for targ_idx in 0..n_alleles {
+            let rows = &query_rows_by_allele[targ_idx];
+            if rows.is_empty() {
                 continue;
             }
             let freq = freqs
                 .get(m)
-                .and_then(|f| f.get(targ as usize))
+                .and_then(|f| f.get(targ_idx))
                 .copied()
                 .unwrap_or(0.0);
             if freq <= 0.0 {
                 continue;
             }
             let weight = -(freq.max(min_freq)).ln();
-            let bins = ref_bins.get(targ as usize);
+            let bins = ref_bins.get(targ_idx);
             let Some(bins) = bins else { continue };
-            for &rh in bins {
-                let idx = rh as usize;
-                global_scores[i][idx] += weight;
-                let w = &mut window_scores[i][idx];
-                if w.is_finite() {
-                    *w += weight;
-                } else {
-                    *w = weight;
+            for &i in rows {
+                let row_global = &mut global_scores[i];
+                let row_window = &mut window_scores[i];
+                for &rh in bins {
+                    let idx = rh as usize;
+                    row_global[idx] += weight;
+                    let w = &mut row_window[idx];
+                    if w.is_finite() {
+                        *w += weight;
+                    } else {
+                        *w = weight;
+                    }
                 }
             }
         }
