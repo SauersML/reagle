@@ -7168,6 +7168,112 @@ mod tests {
         GenotypeMatrix::new_unphased(markers, columns, samples)
     }
 
+    fn build_phased_matrix_from_columns(
+        markers: Markers,
+        n_samples: usize,
+        cols: Vec<Vec<u8>>,
+        n_alleles_per_marker: &[usize],
+    ) -> GenotypeMatrix<Phased> {
+        let samples = Arc::new(Samples::from_ids(
+            (0..n_samples).map(|i| format!("s{i}")).collect(),
+        ));
+        let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(cols.len());
+        for (m, alleles) in cols.into_iter().enumerate() {
+            let n_alleles = n_alleles_per_marker.get(m).copied().unwrap_or(2).max(1);
+            columns.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
+        }
+        GenotypeMatrix::new_phased(markers, columns, samples)
+    }
+
+    fn score_window_batch_exact_packed_naive<TargetSpace, RefSpace>(
+        batch_haps: &[usize],
+        target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+        ref_columns: &[PackedRefColumn],
+        n_ref_haps: usize,
+        alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+        global_scores: &mut [Vec<f32>],
+        window_scores: &mut [Vec<f32>],
+    ) {
+        let n_markers = target_gt.n_markers();
+        if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
+            return;
+        }
+
+        let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
+        let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
+
+        let mut query_alleles = vec![255u8; batch_haps.len()];
+        let mut ref_bins: Vec<Vec<u32>> = Vec::new();
+
+        for m in 0..n_markers {
+            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                query_alleles[i] =
+                    target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+            }
+
+            let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) else {
+                continue;
+            };
+
+            let n_alleles = target_gt
+                .markers()
+                .marker(MarkerIdx::new(m as u32))
+                .n_alleles()
+                .max(1);
+            if ref_bins.len() < n_alleles {
+                ref_bins.resize_with(n_alleles, Vec::new);
+            }
+            for bins in ref_bins.iter_mut().take(n_alleles) {
+                bins.clear();
+            }
+
+            let col = &ref_columns[ref_m.as_usize()];
+            for rh in 0..n_ref_haps {
+                let ref_a = col.allele(rh);
+                if ref_a == 255 {
+                    continue;
+                }
+                let mapped = alignment.reverse_map_allele(m, ref_a);
+                if mapped == 255 {
+                    continue;
+                }
+                let idx = mapped as usize;
+                if idx >= ref_bins.len() {
+                    ref_bins.resize_with(idx + 1, Vec::new);
+                }
+                ref_bins[idx].push(rh as u32);
+            }
+
+            for (i, _) in batch_haps.iter().enumerate() {
+                let targ = query_alleles[i];
+                if targ == 255 {
+                    continue;
+                }
+                let freq = freqs
+                    .get(m)
+                    .and_then(|f| f.get(targ as usize))
+                    .copied()
+                    .unwrap_or(0.0);
+                if freq <= 0.0 {
+                    continue;
+                }
+                let weight = -(freq.max(min_freq)).ln();
+                let bins = ref_bins.get(targ as usize);
+                let Some(bins) = bins else { continue };
+                for &rh in bins {
+                    let idx = rh as usize;
+                    global_scores[i][idx] += weight;
+                    let w = &mut window_scores[i][idx];
+                    if w.is_finite() {
+                        *w += weight;
+                    } else {
+                        *w = weight;
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_calibrated_emission_error_sharp_observations_clamped_to_base() {
         // 3 observed, informative markers: near-certain hard calls.
@@ -7346,5 +7452,116 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_exact_prescan_grouped_matches_naive_multiallelic_missing() {
+        let chrom = ChromIdx::new(0);
+        let positions = [101u32, 202u32, 303u32, 404u32];
+        let n_alleles_per_marker = [2usize, 3, 2, 3];
+        let build_markers_with_arity = |positions: &[u32], n_alleles: &[usize]| {
+            let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+            markers.add_chrom("chr1");
+            for (idx, (&pos, &n_al)) in positions.iter().zip(n_alleles.iter()).enumerate() {
+                let mut alts = Vec::new();
+                if n_al >= 2 {
+                    alts.push(Allele::Base(Nucleotide::C));
+                }
+                if n_al >= 3 {
+                    alts.push(Allele::Base(Nucleotide::G));
+                }
+                if n_al >= 4 {
+                    alts.push(Allele::Base(Nucleotide::T));
+                }
+                let marker = Marker::new(
+                    chrom,
+                    pos,
+                    Some(format!("m{idx}").into()),
+                    Allele::Base(Nucleotide::A),
+                    alts,
+                );
+                markers.push(marker);
+            }
+            markers
+        };
+        let target_markers = build_markers_with_arity(&positions, &n_alleles_per_marker);
+        let ref_markers = build_markers_with_arity(&positions, &n_alleles_per_marker);
+
+        let n_target_samples = 2usize;
+        let n_ref_samples = 3usize;
+        let n_target_haps = n_target_samples * 2;
+        let n_ref_haps = n_ref_samples * 2;
+
+        // 4 target haplotypes across 4 markers; include missing + multi-allelic.
+        let target_cols = vec![
+            vec![0, 1, 1, 0],
+            vec![2, 2, 0, 1],
+            vec![1, 255, 1, 0],
+            vec![0, 2, 2, 1],
+        ];
+        let target_n_alleles = n_alleles_per_marker.to_vec();
+        let target_gt = build_phased_matrix_from_columns(
+            target_markers,
+            n_target_samples,
+            target_cols,
+            &target_n_alleles,
+        );
+        assert_eq!(target_gt.n_haplotypes(), n_target_haps);
+
+        // 6 ref haplotypes across 4 markers; include missing + multi-allelic.
+        let ref_cols_raw = vec![
+            vec![0, 1, 1, 0, 0, 1],
+            vec![2, 1, 0, 2, 255, 1],
+            vec![1, 1, 0, 0, 1, 255],
+            vec![0, 2, 2, 1, 1, 0],
+        ];
+        let ref_n_alleles = n_alleles_per_marker.to_vec();
+        let ref_matrix = build_phased_matrix_from_columns(
+            ref_markers.clone(),
+            n_ref_samples,
+            ref_cols_raw,
+            &ref_n_alleles,
+        );
+        assert_eq!(ref_matrix.n_haplotypes(), n_ref_haps);
+
+        let alignment = MarkerAlignment::new_with_ref_markers(&target_gt, &ref_markers);
+        let mut packed_cols: Vec<PackedRefColumn> = Vec::with_capacity(ref_matrix.n_markers());
+        for m in 0..ref_matrix.n_markers() {
+            let packed = PackedRefColumn::pack_from_column(
+                MarkerIdx::new(m as u32),
+                ref_matrix.markers(),
+                ref_matrix.column(MarkerIdx::new(m as u32)),
+            )
+            .expect("pack reference column");
+            packed_cols.push(packed);
+        }
+
+        let batch_haps = vec![0usize, 1, 2, 3];
+        let mut global_a = vec![vec![0.0f32; n_ref_haps]; batch_haps.len()];
+        let mut window_a = vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_haps.len()];
+        let mut global_b = vec![vec![0.0f32; n_ref_haps]; batch_haps.len()];
+        let mut window_b = vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_haps.len()];
+
+        score_window_batch_exact_packed_naive(
+            &batch_haps,
+            &target_gt,
+            &packed_cols,
+            n_ref_haps,
+            &alignment,
+            &mut global_a,
+            &mut window_a,
+        );
+        score_window_batch_exact_packed(
+            &batch_haps,
+            &target_gt,
+            &packed_cols,
+            n_ref_haps,
+            &alignment,
+            &mut global_b,
+            &mut window_b,
+        );
+
+        assert_eq!(global_a, global_b, "global score matrices diverged");
+        assert_eq!(window_a, window_b, "window score matrices diverged");
     }
 }
