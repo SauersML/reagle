@@ -1576,6 +1576,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let mut bwd = vec![1.0f32; n_states];
         let mut mismatches = vec![0u8; n_states];
         let mut fwd_recomp = vec![0.0f32; n_states];
+        let mut fwd_prev = vec![0.0f32; n_states];
 
         let h_factor = n_states as f32 / (n_states - 1) as f32;
 
@@ -1615,32 +1616,57 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 recomp_sum = sum.max(1e-30);
             }
 
-            // Now fwd_recomp contains forward values at marker m
-            // Compute stats using fwd_recomp and bwd
-            let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0);
-            let last_sum = if m > 0 { fwd_sums[m - 1] } else { 1.0 };
-            let (scale, shift) =
-                normalized_switch_scale_shift(p_switch, n_states, last_sum, 1e-30);
-            let transition = EmissionAffine::new(scale, shift);
-            let no_switch_scale = ((1.0 - p_switch) + shift) / last_sum;
+            // Now fwd_recomp contains forward values at marker m.
+            // For transition EM statistics we need alpha at marker m-1 exactly.
+            if m > 0 {
+                let prev_m = m - 1;
+                let prev_checkpoint_idx = prev_m / CHECKPOINT_INTERVAL;
+                let prev_checkpoint_start = prev_checkpoint_idx * CHECKPOINT_INTERVAL;
+                let prev_checkpoint_off = prev_checkpoint_idx * n_states;
+                fwd_prev.copy_from_slice(
+                    &fwd_checkpoints[prev_checkpoint_off..prev_checkpoint_off + n_states],
+                );
+                let mut prev_recomp_sum = fwd_sums[prev_checkpoint_start];
+                for recomp_m in (prev_checkpoint_start + 1)..=prev_m {
+                    let recomp_targ_al = target_alleles[recomp_m];
+                    let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
+                    let (scale, shift) =
+                        normalized_switch_scale_shift(p_switch, n_states, prev_recomp_sum, 1e-30);
+                    let transition = EmissionAffine::new(scale, shift);
+                    let recomp_row_offset = recomp_m * n_states_padded;
+                    let recomp_ref_row =
+                        &ref_alleles_flat[recomp_row_offset..recomp_row_offset + n_states];
+                    let mut sum = 0.0f32;
+                    for k in 0..n_states {
+                        let ref_al = recomp_ref_row[k];
+                        let is_mismatch = ref_al != recomp_targ_al;
+                        let em = if is_mismatch { p_err } else { p_no_err };
+                        fwd_prev[k] = transition.forward(fwd_prev[k], em);
+                        sum += fwd_prev[k];
+                    }
+                    prev_recomp_sum = sum.max(1e-30);
+                }
+            }
 
             let mut joint_state_sum = 0.0f32;
             let mut state_sum = 0.0f32;
             let mut mismatch_sum = 0.0f32;
+            let same_state_scale = if m > 0 {
+                let p_switch = self.p_recomb.get(m).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let sum_prev = fwd_sums[m - 1].max(1e-30);
+                ((1.0 - p_switch) + (p_switch / n_states as f32)) / sum_prev
+            } else {
+                0.0
+            };
 
             for k in 0..n_states {
                 let ref_al = ref_row[k];
                 let is_mismatch = ref_al != targ_al;
                 let em = if is_mismatch { p_err } else { p_no_err };
 
-                // Use fwd values from before emission update for joint probability
-                let fwd_prior_k = if m > 0 {
-                    transition.invert_prior(fwd_recomp[k], em)
-                } else {
-                    1.0 / n_states as f32
-                };
-
-                joint_state_sum += bwd[k] * em * no_switch_scale * fwd_prior_k.max(0.0);
+                if m > 0 {
+                    joint_state_sum += bwd[k] * em * fwd_prev[k].max(0.0) * same_state_scale;
+                }
 
                 let state_prob = fwd_recomp[k] * bwd[k];
                 state_sum += state_prob;
@@ -1657,7 +1683,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             }
 
             if m > 0 && state_sum > 0.0 {
-                let switch_prob = h_factor * (1.0 - joint_state_sum / state_sum);
+                let switch_prob =
+                    (h_factor * (1.0 - joint_state_sum / state_sum).clamp(0.0, 1.0)).clamp(0.0, 1.0);
                 if switch_prob > 0.0 {
                     let gen_dist = gen_dists.get(m - 1).copied().unwrap_or(0.0);
                     estimates.add_switch(gen_dist, switch_prob as f64);
