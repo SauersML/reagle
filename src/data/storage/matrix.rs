@@ -308,7 +308,7 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased, Space = AnyMarkerSpace> 
     is_reversed: bool,
 
     /// Optional per-sample genotype confidence scores (from GL/PL/GQ-derived posterior confidence).
-    /// Stored as u8 (0-255) representing confidence 0.0-1.0.
+    /// Stored as u8 (0-u8::MAX) representing confidence 0.0-1.0.
     /// Layout: `confidence[marker][sample]`
     /// None if no confidence information available (assume full confidence).
     confidence: Option<FlatU8Matrix>,
@@ -317,7 +317,7 @@ pub struct GenotypeMatrix<State: PhaseState = Unphased, Space = AnyMarkerSpace> 
     /// 1 means missing genotype for this marker/sample.
     missing_genotypes: Option<BitMatrix>,
 
-    /// Optional per-sample phase confidence scores (0-255 => 0.0-1.0).
+    /// Optional per-sample phase confidence scores (0-u8::MAX => 0.0-1.0).
     /// Represents confidence in the current phased orientation at heterozygotes.
     /// Layout: `phase_confidence[marker][sample]`
     phase_confidence: Option<FlatU8Matrix>,
@@ -463,7 +463,7 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
 
     /// Check if confidence scores are available
 
-    /// Get confidence score for a sample at a marker (0-255 representing 0.0-1.0).
+    /// Get confidence score for a sample at a marker (0-u8::MAX representing 0.0-1.0).
     /// Returns `u8::MAX` (full confidence) if confidence data is not available.
     #[inline]
     pub fn sample_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
@@ -510,7 +510,7 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.confidence.as_ref().map(FlatU8Matrix::to_nested_clone)
     }
 
-    /// Get phase confidence score for a sample at a marker (0-255).
+    /// Get phase confidence score for a sample at a marker (0-u8::MAX).
     /// Returns `u8::MAX` (full confidence) if phase confidence is not available.
     #[inline]
     pub fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {

@@ -548,7 +548,7 @@ impl VcfReader {
                 Some(
                     all_confidences
                         .into_iter()
-                        .map(|c| c.unwrap_or_else(|| vec![255; n_samples]))
+                        .map(|c| c.unwrap_or_else(|| vec![u8::MAX; n_samples]))
                         .collect(),
                 )
             } else {
@@ -1002,14 +1002,14 @@ fn gq_to_confidence(gq_buf: &[u8]) -> Option<u8> {
     let conf = if p <= 0.5 {
         0
     } else {
-        (255.0 * (2.0 * p - 1.0)).round() as u8
+        (f64::from(u8::MAX) * (2.0 * p - 1.0)).round() as u8
     };
     Some(conf)
 }
 
 fn parse_genotype_bytes(gt: &[u8]) -> Result<(u8, u8, bool, bool)> {
     if gt == b"." || gt == b"./." || gt == b".|." {
-        return Ok((255, 255, true, false));
+        return Ok((u8::MAX, u8::MAX, true, false));
     }
 
     let mut phased = false;
@@ -1047,14 +1047,14 @@ fn parse_genotype_bytes(gt: &[u8]) -> Result<(u8, u8, bool, bool)> {
 
     let (left, right) = match (left, right) {
         (Some(l), Some(r)) => (l, r),
-        _ => return Ok((255, 255, false, false)),
+        _ => return Ok((u8::MAX, u8::MAX, false, false)),
     };
 
     let a1 = parse_allele_bytes(left);
     let a2 = parse_allele_bytes(right);
 
     if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
-        return Ok((255, 255, false, false));
+        return Ok((u8::MAX, u8::MAX, false, false));
     }
 
     Ok((a1, a2, phased, false))
@@ -1098,7 +1098,7 @@ pub const MAX_ALLELE_INDEX: u16 = 254;
 /// GL field contains log10 likelihoods for each possible genotype.
 /// For diploid biallelic: GL = P(0/0), P(0/1), P(1/1)
 ///
-/// Returns confidence (0-255) for the called genotype.
+/// Returns confidence (0-u8::MAX) for the called genotype.
 ///
 /// # Arguments
 /// * `gl_str` - GL field value, e.g., "-0.48,-0.48,-0.48" or "0,-5,-10"
@@ -1165,18 +1165,18 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     //
     // The HMM emission logic uses linear interpolation between the high-confidence
     // model and a uniform random-guess floor (0.5 for biallelic/diploid logic):
-    // E = (C/255) * (1 - epsilon) + (1 - C/255) * 0.5
+    // E = (C/u8::MAX) * (1 - epsilon) + (1 - C/u8::MAX) * 0.5
     //
     // Assuming epsilon (model mismatch) is negligible for the mapping derivation:
-    // E = (C/255) * 1.0 + (1 - C/255) * 0.5
-    // E = (C/255) * 0.5 + 0.5
+    // E = (C/u8::MAX) * 1.0 + (1 - C/u8::MAX) * 0.5
+    // E = (C/u8::MAX) * 0.5 + 0.5
     //
     // We solve for C by setting E = W (the true Bayesian posterior):
-    // W = (C/255) * 0.5 + 0.5
-    // W - 0.5 = (C/255) * 0.5
-    // 2 * (W - 0.5) = C/255
-    // 2W - 1 = C/255
-    // C = 255 * (2W - 1)
+    // W = (C/u8::MAX) * 0.5 + 0.5
+    // W - 0.5 = (C/u8::MAX) * 0.5
+    // 2 * (W - 0.5) = C/u8::MAX
+    // 2W - 1 = C/u8::MAX
+    // C = u8::MAX * (2W - 1)
     //
     // Proof of optimality:
     // This formulation is optimal because it creates a mathematically exact alignment
@@ -1202,8 +1202,8 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     let confidence = if w <= 0.5 {
         0
     } else {
-        // Map (0.5, 1.0] -> (0, 255]
-        (255.0 * (2.0 * w - 1.0)).round() as u8
+        // Map (0.5, 1.0] -> (0, u8::MAX]
+        (f64::from(u8::MAX) * (2.0 * w - 1.0)).round() as u8
     };
 
     Some(confidence)
@@ -1242,7 +1242,7 @@ pub fn compute_pl_confidence(pl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     let confidence = if w <= 0.5 {
         0
     } else {
-        (255.0 * (2.0 * w - 1.0)).round() as u8
+        (f64::from(u8::MAX) * (2.0 * w - 1.0)).round() as u8
     };
     Some(confidence)
 }
@@ -1766,12 +1766,12 @@ mod tests {
     /// This follows the Java VcfRecGTParser behavior:
     /// - If one allele is missing, treat both as missing
     /// - Returns (allele1, allele2, is_phased, is_haploid)
-    /// - Missing alleles are represented as 255
+    /// - Missing alleles are represented as u8::MAX
     /// - For haploid genotypes, allele2 is set to same as allele1 (for storage compatibility)
     fn parse_genotype(gt: &str) -> Result<(u8, u8, bool, bool)> {
         // Handle completely missing genotypes
         if gt == "." || gt == "./." || gt == ".|." {
-            return Ok((255, 255, true, false)); // Missing, treated as phased diploid
+            return Ok((u8::MAX, u8::MAX, true, false)); // Missing, treated as phased diploid
         }
 
         // Determine if phased (| separator) or unphased (/ separator)
@@ -1795,15 +1795,15 @@ mod tests {
 
         // Java behavior: if one allele is missing, treat both as missing
         if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
-            return Ok((255, 255, false, false));
+            return Ok((u8::MAX, u8::MAX, false, false));
         }
 
         Ok((a1, a2, phased, false))
     }
 
     /// Parse a single allele string to a u8
-    /// Returns 255 for missing (.)
-    /// Returns 255 with a log warning if allele index exceeds 254 (u8 limitation)
+    /// Returns u8::MAX for missing (.)
+    /// Returns u8::MAX with a log warning if allele index exceeds 254 (u8 limitation)
     #[inline]
     fn parse_allele(s: &str) -> u8 {
         if s == "." || s.is_empty() {
@@ -1827,9 +1827,9 @@ mod tests {
                     val,
                     MAX_ALLELE_INDEX
                 );
-                255
+                u8::MAX
             }
-            Err(_) => 255,
+            Err(_) => u8::MAX,
         }
     }
 
@@ -1839,8 +1839,8 @@ mod tests {
         assert_eq!(parse_genotype("0|1").unwrap(), (0, 1, true, false));
         assert_eq!(parse_genotype("1|0").unwrap(), (1, 0, true, false));
         assert_eq!(parse_genotype("0/1").unwrap(), (0, 1, false, false));
-        assert_eq!(parse_genotype("./.").unwrap(), (255, 255, true, false));
-        assert_eq!(parse_genotype(".|.").unwrap(), (255, 255, true, false));
+        assert_eq!(parse_genotype("./.").unwrap(), (u8::MAX, u8::MAX, true, false));
+        assert_eq!(parse_genotype(".|.").unwrap(), (u8::MAX, u8::MAX, true, false));
     }
 
     #[test]
@@ -1854,7 +1854,7 @@ mod tests {
         // Haploid genotypes: single allele, duplicated for storage
         assert_eq!(parse_genotype("0").unwrap(), (0, 0, true, true));
         assert_eq!(parse_genotype("1").unwrap(), (1, 1, true, true));
-        assert_eq!(parse_genotype(".").unwrap(), (255, 255, true, false)); // Missing is diploid
+        assert_eq!(parse_genotype(".").unwrap(), (u8::MAX, u8::MAX, true, false)); // Missing is diploid
     }
 
     #[test]
@@ -2020,7 +2020,7 @@ mod tests {
         // GL: 0, -5, -10 (Log10)
         // Lin: 1.0, 1e-5, 1e-10
         // W approx 1.0
-        // Conf approx 255
+        // Conf approx u8::MAX
         let conf = compute_gl_confidence("0,-5,-10", 0, 0).unwrap();
         assert!(conf > 250);
 
@@ -2036,7 +2036,7 @@ mod tests {
         // GL: 0, -0.301, -10 (approx log10(0.5))
         // Lin: 1, 0.5, 0 -> Sum = 1.5
         // W = 1 / 1.5 = 0.666
-        // Conf = 255 * (2 * 0.666 - 1) = 255 * 0.333 = 85
+        // Conf = u8::MAX * (2 * 0.666 - 1) = u8::MAX * 0.333 = 85
         let conf = compute_gl_confidence("0,-0.301,-10", 0, 0).unwrap();
         assert!(conf >= 80 && conf <= 90, "Expected ~85, got {}", conf);
 

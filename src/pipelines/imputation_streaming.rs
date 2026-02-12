@@ -4118,15 +4118,17 @@ impl crate::pipelines::ImputationPipeline {
                     {
                         let mapped1 = if (allele1 as usize) < mapping.targ_to_ref.len() {
                             let r = mapping.targ_to_ref[allele1 as usize];
-                            if r >= 0 { r as u8 } else { 255 }
+                            u8::try_from(r)
+                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
                         } else {
-                            255
+                            crate::data::storage::AlleleCode::MISSING.raw()
                         };
                         let mapped2 = if (allele2 as usize) < mapping.targ_to_ref.len() {
                             let r = mapping.targ_to_ref[allele2 as usize];
-                            if r >= 0 { r as u8 } else { 255 }
+                            u8::try_from(r)
+                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
                         } else {
-                            255
+                            crate::data::storage::AlleleCode::MISSING.raw()
                         };
                         (mapped1, mapped2)
                     } else {
@@ -4652,11 +4654,11 @@ impl crate::pipelines::ImputationPipeline {
                                     if let Some(mapping) = mapping {
                                         if (a as usize) < mapping.targ_to_ref.len() {
                                             let r = mapping.targ_to_ref[a as usize];
-                                            if r >= 0 {
-                                                return r as u8;
+                                            if let Ok(mapped) = u8::try_from(r) {
+                                                return mapped;
                                             }
                                         }
-                                        255
+                                        crate::data::storage::AlleleCode::MISSING.raw()
                                     } else {
                                         a
                                     }
@@ -5869,11 +5871,11 @@ impl crate::pipelines::ImputationPipeline {
                                     if let Some(mapping) = mapping {
                                         if (a as usize) < mapping.targ_to_ref.len() {
                                             let r = mapping.targ_to_ref[a as usize];
-                                            if r >= 0 {
-                                                return r as u8;
+                                            if let Ok(mapped) = u8::try_from(r) {
+                                                return mapped;
                                             }
                                         }
-                                        255
+                                        crate::data::storage::AlleleCode::MISSING.raw()
                                     } else {
                                         a
                                     }
@@ -6126,11 +6128,11 @@ impl crate::pipelines::ImputationPipeline {
                 if let Some(m) = mapping {
                     if (a as usize) < m.targ_to_ref.len() {
                         let r = m.targ_to_ref[a as usize];
-                        if r >= 0 {
-                            return r as u8;
+                        if let Ok(mapped) = u8::try_from(r) {
+                            return mapped;
                         }
                     }
-                    255
+                    crate::data::storage::AlleleCode::MISSING.raw()
                 } else {
                     a
                 }
@@ -6725,9 +6727,10 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(m) = mapping {
                         if (a as usize) < m.targ_to_ref.len() {
                             let r = m.targ_to_ref[a as usize];
-                            if r >= 0 { r as u8 } else { 255 }
+                            u8::try_from(r)
+                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
                         } else {
-                            255
+                            crate::data::storage::AlleleCode::MISSING.raw()
                         }
                     } else {
                         a
@@ -6815,9 +6818,10 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(m) = mapping {
                         if (a as usize) < m.targ_to_ref.len() {
                             let r = m.targ_to_ref[a as usize];
-                            if r >= 0 { r as u8 } else { 255 }
+                            u8::try_from(r)
+                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
                         } else {
-                            255
+                            crate::data::storage::AlleleCode::MISSING.raw()
                         }
                     } else {
                         a
@@ -8092,7 +8096,7 @@ mod tests {
         let target_cols = vec![
             vec![0, 1, 1, 0],
             vec![2, 2, 0, 1],
-            vec![1, 255, 1, 0],
+            vec![1, u8::MAX, 1, 0],
             vec![0, 2, 2, 1],
         ];
         let target_n_alleles = n_alleles_per_marker.to_vec();
@@ -8107,8 +8111,8 @@ mod tests {
         // 6 ref haplotypes across 4 markers; include missing + multi-allelic.
         let ref_cols_raw = vec![
             vec![0, 1, 1, 0, 0, 1],
-            vec![2, 1, 0, 2, 255, 1],
-            vec![1, 1, 0, 0, 1, 255],
+            vec![2, 1, 0, 2, u8::MAX, 1],
+            vec![1, 1, 0, 0, 1, u8::MAX],
             vec![0, 2, 2, 1, 1, 0],
         ];
         let ref_n_alleles = n_alleles_per_marker.to_vec();

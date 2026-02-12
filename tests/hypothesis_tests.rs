@@ -351,8 +351,8 @@ fn test_missing_confidence_is_not_full_by_default() {
     // Hypothesis: missing GL/PL causes confidence to default to 1.0 (hard evidence).
     // This test should FAIL if that hypothesis is true.
     // Create a single-marker, single-sample matrix where the genotype is
-    // missing (both alleles = 255). The missing_genotypes mask should flag
-    // this, causing sample_confidence to return 0 rather than 255.
+    // missing (both alleles = u8::MAX). The missing_genotypes mask should flag
+    // this, causing sample_confidence to return 0 rather than u8::MAX.
     use reagle::data::ChromIdx;
     use reagle::data::marker::{Allele, Marker};
     use reagle::data::storage::GenotypeColumn;
@@ -367,8 +367,8 @@ fn test_missing_confidence_is_not_full_by_default() {
     let samples = std::sync::Arc::new(reagle::data::haplotype::Samples::from_ids(vec![
         "s0".into(),
     ]));
-    // Both haplotype alleles = 255 (missing)
-    let col = GenotypeColumn::from_alleles(&[255, 255], 2);
+    // Both haplotype alleles = u8::MAX (missing)
+    let col = GenotypeColumn::from_alleles(&[u8::MAX, u8::MAX], 2);
     let matrix = reagle::data::storage::GenotypeMatrix::new_unphased(markers, vec![col], samples);
     let conf = matrix.sample_confidence_f32(MarkerIdx::new(0), 0);
     eprintln!("default sample_confidence_f32 = {}", conf);

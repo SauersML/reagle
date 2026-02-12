@@ -683,7 +683,7 @@ def _gt_nonref_dosage(gt):
     a0, a1 = gt
     if a0 is None or a1 is None:
         return None
-    if a0 == 255 or a1 == 255:
+    if a0 == 0xFF or a1 == 0xFF:
         return None
     return float((1 if a0 != 0 else 0) + (1 if a1 != 0 else 0))
 
@@ -698,7 +698,7 @@ def _gt_class_nonref(gt):
     if gt is None:
         return None
     a0, a1 = gt
-    if a0 == 255 or a1 == 255:
+    if a0 == 0xFF or a1 == 0xFF:
         return None
     if a0 == 0 and a1 == 0:
         return 0

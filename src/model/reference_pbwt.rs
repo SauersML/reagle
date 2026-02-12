@@ -744,7 +744,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
 
     pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
         let alphabet = PbwtAlphabet::new(n_alleles)
-            .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
+            .expect("invalid PBWT alphabet: n_alleles must be in 2..=u8::MAX");
         let n_ref = self.ppa.len();
         let n_bins = if alphabet.n_alleles() == 2 {
             3
@@ -844,7 +844,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         let alphabet = PbwtAlphabet::new(n_alleles)
-            .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
+            .expect("invalid PBWT alphabet: n_alleles must be in 2..=u8::MAX");
         let n_ref = self.ppa.len();
         let n_bins = if alphabet.n_alleles() == 2 {
             3
@@ -1006,7 +1006,7 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         scratch: &mut Vec<(u32, u32, u64)>,
     ) {
         let alphabet = PbwtAlphabet::new(n_alleles)
-            .expect("invalid PBWT alphabet: n_alleles must be in 2..=255");
+            .expect("invalid PBWT alphabet: n_alleles must be in 2..=u8::MAX");
         let n_ref = self.ppa.len();
         let n_bins = if alphabet.n_alleles() == 2 {
             3

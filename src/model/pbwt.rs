@@ -44,7 +44,7 @@ pub struct PbwtAlphabet {
 
 impl PbwtAlphabet {
     pub fn new(n_alleles: usize) -> Option<Self> {
-        if (2..=255).contains(&n_alleles) {
+        if (2..=usize::from(u8::MAX)).contains(&n_alleles) {
             Some(Self {
                 n_alleles: n_alleles as u16,
             })
@@ -362,7 +362,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
     ///
     /// # Missing Data Handling
     ///
-    /// Missing data (allele 255, or invalid allele >= n_alleles) is placed in
+    /// Missing data (allele u8::MAX, or invalid allele >= n_alleles) is placed in
     /// its own bin at index 1. This keeps missing separate from both REF (0)
     /// and ALT bins.
     ///
@@ -391,7 +391,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
             assert!(divergence.len() >= self.n_haps);
             let alphabet = PbwtAlphabet::new(n_alleles).unwrap_or_else(|| {
                 panic!(
-                    "PBWT invalid n_alleles={} (expected 2..=255 with 255 reserved for missing)",
+                    "PBWT invalid n_alleles={} (expected 2..=u8::MAX with u8::MAX reserved for missing)",
                     n_alleles
                 )
             });
@@ -735,7 +735,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
     ///
     /// # Missing Data Handling
     ///
-    /// Missing data (allele 255, or invalid allele >= n_alleles) is placed in
+    /// Missing data (allele u8::MAX, or invalid allele >= n_alleles) is placed in
     /// its own bin at index 1. This keeps missing separate from both REF (0)
     /// and ALT bins.
     ///
@@ -753,7 +753,7 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         assert!(divergence.len() >= self.n_haps);
         let alphabet = PbwtAlphabet::new(n_alleles).unwrap_or_else(|| {
             panic!(
-                "PBWT invalid n_alleles={} (expected 2..=255 with 255 reserved for missing)",
+                "PBWT invalid n_alleles={} (expected 2..=u8::MAX with u8::MAX reserved for missing)",
                 n_alleles
             )
         });
@@ -1074,7 +1074,7 @@ mod tests {
         );
     }
 
-    /// Test that missing data (255) is handled correctly without reference bias.
+    /// Test that missing data (u8::MAX) is handled correctly without reference bias.
     ///
     /// This tests the fix for the CRITIC-identified bug where missing data was
     /// being mapped to REF (allele 0), creating systematic reference bias.
@@ -1088,12 +1088,12 @@ mod tests {
         // Haplotypes:
         // Hap 0: REF (0)
         // Hap 1: ALT (1)
-        // Hap 2: MISSING (255)
+        // Hap 2: MISSING (u8::MAX)
         // Hap 3: REF (0)
-        let alleles = vec![0u8, 1, 255, 0];
+        let alleles = vec![0u8, 1, u8::MAX, 0];
         updater.fwd_update(&alleles, 2, 0, &mut prefix, &mut divergence);
 
-        // With the fix: missing (255) goes to Bin 1 (between REF and ALT)
+        // With the fix: missing (u8::MAX) goes to Bin 1 (between REF and ALT)
         // Sorted order should be: [REF haps (0,3), MISSING hap (2), ALT hap (1)]
         // This ensures the missing haplotype has access to neighbors from BOTH Ref and Alt groups.
 
@@ -1139,9 +1139,9 @@ mod tests {
         // Haplotypes:
         // Hap 0: REF (0)
         // Hap 1: ALT (1)
-        // Hap 2: MISSING (255)
+        // Hap 2: MISSING (u8::MAX)
         // Hap 3: REF (0)
-        let alleles = vec![0u8, 1, 255, 0];
+        let alleles = vec![0u8, 1, u8::MAX, 0];
         let marker = 5; // Use marker 5 so init_value = 4
         updater.bwd_update(&alleles, 2, marker, &mut prefix, &mut divergence);
 

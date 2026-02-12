@@ -1050,7 +1050,10 @@ impl StreamingVcfReader {
                 self.all_phased = false;
             }
 
-            let (a1, a2) = parse_gt_bytes(gt_field);
+            let (a1, a2) = parse_gt_bytes(gt_field).map_err(|e| {
+                let gt = std::str::from_utf8(gt_field).unwrap_or("<non-utf8>");
+                ReagleError::parse(line_idx, format!("Invalid GT '{}': {}", gt, e))
+            })?;
             let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw();
             let phased = gt_field.iter().any(|&b| b == b'|');
             phase_mask.push(if phased && !is_missing { 1 } else { 0 });
@@ -1223,12 +1226,12 @@ fn nth_colon_field<'a>(buf: &'a [u8], idx: usize) -> Option<&'a [u8]> {
 }
 
 /// Parse genotype field to (allele1, allele2)
-fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
+fn parse_gt_bytes(gt: &[u8]) -> std::result::Result<(u8, u8), String> {
     if gt == b"." || gt == b"./." || gt == b".|." {
-        return (
+        return Ok((
             crate::data::storage::AlleleCode::MISSING.raw(),
             crate::data::storage::AlleleCode::MISSING.raw(),
-        );
+        ));
     }
 
     let mut sep: Option<u8> = None;
@@ -1245,8 +1248,8 @@ fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
     let sep = match sep {
         Some(s) => s,
         None => {
-            let a1 = parse_allele_char_bytes(gt);
-            return (a1, a1);
+            let a1 = parse_allele_char_bytes(gt)?;
+            return Ok((a1, a1));
         }
     };
 
@@ -1264,53 +1267,58 @@ fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
     let (left, right) = match (left, right) {
         (Some(l), Some(r)) => (l, r),
         _ => {
-            return (
-                crate::data::storage::AlleleCode::MISSING.raw(),
-                crate::data::storage::AlleleCode::MISSING.raw(),
-            )
+            return Err("malformed diploid genotype token".to_string());
         }
     };
 
-    let a1 = parse_allele_char_bytes(left);
-    let a2 = parse_allele_char_bytes(right);
+    let a1 = parse_allele_char_bytes(left)?;
+    let a2 = parse_allele_char_bytes(right)?;
 
     if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
-        (
+        Ok((
             crate::data::storage::AlleleCode::MISSING.raw(),
             crate::data::storage::AlleleCode::MISSING.raw(),
-        )
+        ))
     } else {
-        (a1, a2)
+        Ok((a1, a2))
     }
 }
 
-fn parse_allele_char_bytes(s: &[u8]) -> u8 {
-    if s.is_empty() || s == b"." {
-        return crate::data::storage::AlleleCode::MISSING.raw();
+fn parse_allele_char_bytes(s: &[u8]) -> std::result::Result<u8, String> {
+    if s == b"." {
+        return Ok(crate::data::storage::AlleleCode::MISSING.raw());
+    }
+    if s.is_empty() {
+        return Err("empty allele token".to_string());
     }
     if s.len() == 1 {
         let c = s[0];
         if c >= b'0' && c <= b'9' {
-            return c - b'0';
+            return Ok(c - b'0');
         }
     }
     let mut val: u16 = 0;
     for &b in s {
         if b < b'0' || b > b'9' {
-            return crate::data::storage::AlleleCode::MISSING.raw();
+            let token = std::str::from_utf8(s).unwrap_or("<non-utf8>");
+            return Err(format!("invalid allele token '{}'", token));
         }
         val = val.saturating_mul(10).saturating_add((b - b'0') as u16);
     }
     if val > crate::io::vcf::MAX_ALLELE_INDEX {
-        crate::data::storage::AlleleCode::MISSING.raw()
+        Err(format!(
+            "allele index {} exceeds maximum supported value {}",
+            val,
+            crate::io::vcf::MAX_ALLELE_INDEX
+        ))
     } else {
-        val as u8
+        Ok(val as u8)
     }
 }
 
 #[cfg(test)]
 fn parse_gt(gt: &str) -> (u8, u8) {
-    parse_gt_bytes(gt.as_bytes())
+    parse_gt_bytes(gt.as_bytes()).expect("parse_gt test helper expects valid tokens")
 }
 
 #[cfg(test)]

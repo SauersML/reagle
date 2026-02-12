@@ -33,13 +33,30 @@ impl PackedRefColumn {
 
     pub fn allele(&self, hap: usize) -> u8 {
         match self {
-            PackedRefColumn::Bytes { alleles } => alleles.get(hap).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
+            PackedRefColumn::Bytes { alleles } => {
+                assert!(
+                    hap < alleles.len(),
+                    "PackedRefColumn::Bytes hap index {} out of bounds {}",
+                    hap,
+                    alleles.len()
+                );
+                alleles
+                    .get(hap)
+                    .copied()
+                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
+            }
             PackedRefColumn::Bits {
                 bits,
                 n_haps,
                 words,
                 missing,
             } => {
+                assert!(
+                    hap < *n_haps,
+                    "PackedRefColumn::Bits hap index {} out of bounds {}",
+                    hap,
+                    n_haps
+                );
                 if hap >= *n_haps {
                     return crate::data::storage::AlleleCode::MISSING.raw();
                 }

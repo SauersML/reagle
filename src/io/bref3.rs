@@ -543,7 +543,7 @@ fn encode_bref3_marker_record(
     let pos = marker.pos as i32;
     buf.extend_from_slice(&pos.to_be_bytes());
     write_byte(buf, 0)?;
-    write_byte(buf, 255)?;
+    write_byte(buf, u8::MAX)?;
     let mut alleles: Vec<String> = Vec::with_capacity(1 + marker.alt_alleles.len());
     alleles.push(marker.ref_allele.to_string());
     for alt in &marker.alt_alleles {
@@ -1514,7 +1514,9 @@ impl StreamingRefVcfReader {
 
         for (idx, sample_field) in fields.take(n_samples).enumerate() {
             let gt_field = self.field_at_colon(sample_field, gt_idx).unwrap_or("./.");
-            let (a1, a2) = self.parse_gt_local(gt_field);
+            let (a1, a2) = self
+                .parse_gt_local(gt_field)
+                .with_context(|| format!("Invalid GT '{}' at sample {}", gt_field, idx))?;
             alleles.push(a1);
             alleles.push(a2);
             if idx + 1 == n_samples {
@@ -1537,38 +1539,50 @@ impl StreamingRefVcfReader {
         })
     }
 
-    fn parse_gt_local(&self, gt: &str) -> (u8, u8) {
+    fn parse_gt_local(&self, gt: &str) -> Result<(u8, u8)> {
         if gt == "." || gt == "./." || gt == ".|." {
-            return (
+            return Ok((
                 crate::data::storage::AlleleCode::MISSING.raw(),
                 crate::data::storage::AlleleCode::MISSING.raw(),
-            );
+            ));
         }
         if let Some(idx) = gt.find('|') {
-            let a1 = self.parse_allele_local(&gt[..idx]);
-            let a2 = self.parse_allele_local(&gt[idx + 1..]);
-            return (a1, a2);
+            let a1 = self.parse_allele_local(&gt[..idx])?;
+            let a2 = self.parse_allele_local(&gt[idx + 1..])?;
+            return Ok((a1, a2));
         }
         if let Some(idx) = gt.find('/') {
-            let a1 = self.parse_allele_local(&gt[..idx]);
-            let a2 = self.parse_allele_local(&gt[idx + 1..]);
-            return (a1, a2);
+            let a1 = self.parse_allele_local(&gt[..idx])?;
+            let a2 = self.parse_allele_local(&gt[idx + 1..])?;
+            return Ok((a1, a2));
         }
-        let a = self.parse_allele_local(gt);
-        (a, a)
+        let a = self.parse_allele_local(gt)?;
+        Ok((a, a))
     }
 
-    fn parse_allele_local(&self, s: &str) -> u8 {
-        if s == "." || s.is_empty() {
-            return crate::data::storage::AlleleCode::MISSING.raw();
+    fn parse_allele_local(&self, s: &str) -> Result<u8> {
+        if s == "." {
+            return Ok(crate::data::storage::AlleleCode::MISSING.raw());
+        }
+        if s.is_empty() {
+            bail!("empty allele token");
         }
         if s.len() == 1 {
             let c = s.as_bytes()[0];
             if c >= b'0' && c <= b'9' {
-                return c - b'0';
+                return Ok(c - b'0');
             }
         }
-        lexical_parse::<u8>(s.as_bytes()).unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
+        let val: u16 = lexical_parse::<u16>(s.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid allele token '{}'", s))?;
+        if val > crate::io::vcf::MAX_ALLELE_INDEX {
+            bail!(
+                "allele index {} exceeds maximum supported value {}",
+                val,
+                crate::io::vcf::MAX_ALLELE_INDEX
+            );
+        }
+        Ok(val as u8)
     }
 
     fn field_at_colon<'a>(&self, s: &'a str, idx: usize) -> Option<&'a str> {

@@ -155,7 +155,7 @@ impl SyntheticVcfBuilder {
                 let gt_parts: Vec<String> = alleles
                     .iter()
                     .map(|&a| {
-                        if a == 255 {
+                        if a == u8::MAX {
                             ".".to_string()
                         } else {
                             a.to_string()
@@ -562,7 +562,7 @@ fn test_synthetic_slam_dunk() {
 
     let target_file = SyntheticVcfBuilder::new(n_markers, 1)
         .unphased()
-        .allele_generator(|m, _| if m % 2 != 0 { 255 } else { 0 })
+        .allele_generator(|m, _| if m % 2 != 0 { u8::MAX } else { 0 })
         .build();
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -616,7 +616,7 @@ fn test_synthetic_slam_dunk() {
     // For slam dunk:
     // Markers 1, 3... are target sites.
     // Ref has 0 for h < 50, 1 for h >= 50.
-    // Target matches hap 0 (all 0s) except odd markers are 255 (missing).
+    // Target matches hap 0 (all 0s) except odd markers are u8::MAX (missing).
     // So truth at target odd markers is 0.0.
     // Dosages should be close to 0.0.
     let mut truth_vec = Vec::new();
@@ -653,7 +653,7 @@ fn test_synthetic_recombination() {
             // Keep overall breakpoint pattern from the 50-marker version, scaled by 2:
             // old missing markers 15/25 -> 30/50, old breakpoint 20 -> 40.
             if m == 30 || m == 50 {
-                255
+                u8::MAX
             } else if m < 40 {
                 0
             } else {
@@ -721,7 +721,7 @@ fn test_synthetic_recombination() {
     // m >= 40: 1
     // Missing at 30 (should be 0) and 50 (should be 1 -> dosage 2.0 for diploid?)
     // Note: The allele generator says:
-    // if m == 30 || m == 50 { 255 }
+    // if m == 30 || m == 50 { u8::MAX }
     // else if m < 40 { 0 }
     // else { 1 }
     // Wait, target is diploid (n_ploidy=2 default in Builder).
@@ -1247,7 +1247,7 @@ fn test_rare_variant() {
         .positions(positions)
         .unphased()
         .allele_generator(|m, _| {
-            if m == 25 { 255 } // Missing
+            if m == 25 { u8::MAX } // Missing
             else { 0 } // Match hap 0
         })
         .build();
@@ -1341,7 +1341,7 @@ fn test_dr2_validation() {
             if m % 10 == 0 {
                 ((m + h) % 2) as u8
             } else {
-                255 // Missing
+                u8::MAX // Missing
             }
         })
         .build();
@@ -1513,7 +1513,7 @@ fn test_singleton_imputation() {
             if m == 0 || m == 10 || m == 19 {
                 if h == 0 { 1 } else { 0 } // Haplotype 0 matches ref hap 0
             } else {
-                255 // Missing
+                u8::MAX // Missing
             }
         })
         .build();
@@ -1589,7 +1589,7 @@ fn test_high_recombination_stress() {
         .positions(positions)
         .allele_generator(|m, _| {
             if m % 5 == 0 { 0 } // Genotyped every 5th marker
-            else { 255 } // Missing
+            else { u8::MAX } // Missing
         })
         .build();
 
@@ -1664,7 +1664,7 @@ fn test_ultra_dense_markers() {
             if m % 10 == 0 {
                 0 // All target haplotypes get allele 0, matching ref haps 0-9
             } else {
-                255
+                u8::MAX
             }
         })
         .build();
@@ -1810,7 +1810,7 @@ fn test_diverse_reference_with_mismatch() {
                 // Genotyped markers - pattern matches haplotype group 1
                 ((m + 1) % 2) as u8
             } else {
-                255
+                u8::MAX
             }
         })
         .build();
@@ -1924,7 +1924,7 @@ fn test_microarray_vs_wgs_imputation() {
                     let block = m / BLOCK_SIZE;
                     hap_block_alleles[h][block]
                 } else {
-                    255 // Missing - to be imputed
+                    u8::MAX // Missing - to be imputed
                 }
             }
         })
@@ -2125,7 +2125,7 @@ fn test_imputation_polarity_consistency() {
                     let block = m / BLOCK_SIZE;
                     hap_block_alleles[h][block]
                 } else {
-                    255
+                    u8::MAX
                 }
             }
         })

@@ -4,7 +4,7 @@
 //! Based on Java's SamplePhase.java from Beagle.
 //!
 //! Supports multiallelic markers by storing full byte values (0-254 for alleles,
-//! 255 for missing). This matches Java Beagle's approach.
+//! u8::MAX for missing). This matches Java Beagle's approach.
 
 /// Status of a genotype cluster
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +28,7 @@ impl ClusterStatus {
 /// Phase state tracking for a single sample
 ///
 /// Uses byte storage (1 byte per allele) to support multiallelic markers.
-/// Allele values: 0 = REF, 1-254 = ALT alleles, 255 = missing
+/// Allele values: 0 = REF, 1-254 = ALT alleles, u8::MAX = missing
 #[derive(Clone, Debug)]
 pub struct SamplePhase {
     /// Alleles on first haplotype (byte per marker for multiallelic support)
@@ -54,7 +54,7 @@ impl SamplePhase {
     ///
     /// # Arguments
     /// * `n_markers` - Number of markers
-    /// * `hap1_alleles` - Alleles on first haplotype (0-254 for alleles, 255 for missing)
+    /// * `hap1_alleles` - Alleles on first haplotype (0-254 for alleles, u8::MAX for missing)
     /// * `hap2_alleles` - Alleles on second haplotype
     /// * `confidence` - Per-marker genotype confidence (0.0-1.0)
     /// * `unphased_hets` - Sorted indices of markers that are unphased heterozygotes
@@ -155,14 +155,14 @@ impl SamplePhase {
     }
 
     /// Returns the allele on haplotype 1 for the specified marker.
-    /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
+    /// Values: 0 = REF, 1-254 = ALT alleles, u8::MAX = missing
     #[inline]
     pub fn allele1(&self, marker: usize) -> u8 {
         self.hap1[marker]
     }
 
     /// Returns the allele on haplotype 2 for the specified marker.
-    /// Values: 0 = REF, 1-254 = ALT alleles, 255 = missing
+    /// Values: 0 = REF, 1-254 = ALT alleles, u8::MAX = missing
     #[inline]
     pub fn allele2(&self, marker: usize) -> u8 {
         self.hap2[marker]
@@ -375,8 +375,8 @@ mod tests {
     #[test]
     fn test_multiallelic_support() {
         // Test that multiallelic alleles (2, 3, etc.) are preserved correctly
-        let hap1 = vec![0, 1, 2, 3, 255]; // REF, ALT1, ALT2, ALT3, missing
-        let hap2 = vec![2, 0, 1, 2, 255]; // ALT2, REF, ALT1, ALT2, missing
+        let hap1 = vec![0, 1, 2, 3, u8::MAX]; // REF, ALT1, ALT2, ALT3, missing
+        let hap2 = vec![2, 0, 1, 2, u8::MAX]; // ALT2, REF, ALT1, ALT2, missing
         let conf = vec![1.0; 5];
         let unphased = vec![1usize, 2, 3];
         let missing = vec![4usize];
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(sp.allele2(0), 2);
         assert_eq!(sp.allele1(2), 2); // ALT2 preserved
         assert_eq!(sp.allele1(3), 3); // ALT3 preserved
-        assert_eq!(sp.allele1(4), 255); // Missing preserved
+        assert_eq!(sp.allele1(4), u8::MAX); // Missing preserved
     }
 
     #[test]

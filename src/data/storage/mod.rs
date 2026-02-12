@@ -31,7 +31,7 @@ use std::sync::Arc;
 pub struct AlleleCode(u8);
 
 impl AlleleCode {
-    pub const MISSING: Self = Self(255);
+    pub const MISSING: Self = Self(u8::MAX);
 
     #[inline]
     pub const fn from_raw(raw: u8) -> Self {

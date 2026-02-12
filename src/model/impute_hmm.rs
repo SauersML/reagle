@@ -253,6 +253,7 @@ mod tests {
         missing_emission_prob, subset_transition_params, transition_only_forward_update,
     };
     use super::{RefColumnLike, RefHapId};
+    use crate::data::storage::AlleleCode;
     use crate::data::storage::{DenseColumn, GenotypeColumn};
 
     #[test]
@@ -1836,7 +1837,7 @@ fn normalize_allele_posterior_structural_missing(
     // where:
     //   q_i      = represented-state mass on allele i
     //   Q        = sum_i q_i
-    //   M_ref    = mass from reference-missing states (allele code 255)
+    //   M_ref    = mass from reference-missing states (allele code u8::MAX)
     //   M_ood    = mass from out-of-domain allele codes
     //
     // Assumptions:
@@ -1949,28 +1950,24 @@ fn adaptive_transition_lambda_from_probs(probs: &[f32], sum: f32) -> f32 {
 }
 
 #[inline]
-fn sum_and_adaptive_lambda_from_probs(probs: &[f32]) -> (f32, f32) {
+fn adaptive_transition_lambda_from_normalized_probs(probs: &[f32]) -> f32 {
     const LAMBDA_MAX: f32 = 0.98;
     if probs.is_empty() {
-        return (0.0, 0.0);
+        return 0.0;
     }
     if probs.len() == 1 {
-        return (probs[0].max(1e-30), LAMBDA_MAX);
+        return LAMBDA_MAX;
     }
-    let mut sum = 0.0f32;
     let mut sum_sq = 0.0f32;
     for &v in probs {
-        sum += v;
         sum_sq += v * v;
     }
-    let sum = sum.max(1e-30);
-    let norm_sq = (sum_sq / (sum * sum)).max(1e-30);
+    let norm_sq = sum_sq.max(1e-30);
     let k = probs.len() as f32;
     let ess = (1.0 / norm_sq).clamp(1.0, k);
     let ess_norm = ((ess - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
     let confidence = 1.0 - ess_norm;
-    let lambda = (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX);
-    (sum, lambda)
+    (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX)
 }
 
 #[inline]
@@ -1994,14 +1991,16 @@ fn subset_transition_params_adaptive_q(
     let d = ((1.0 - r) + r * rho).max(1e-30);
     let stay = ((1.0 - r) + r * lam) / d;
     let shift = (r * (1.0 - lam) / n) / d;
-    assert!(
-        (stay + k * shift - 1.0).abs() < 1e-3 || !stay.is_finite() || !shift.is_finite(),
-        "adaptive subset transition mass drift: stay={} shift={} K={} stay+K*shift={}",
-        stay,
-        shift,
-        active_states,
-        stay + k * shift
-    );
+    if cfg!(debug_assertions) {
+        assert!(
+            (stay + k * shift - 1.0).abs() < 1e-3 || !stay.is_finite() || !shift.is_finite(),
+            "adaptive subset transition mass drift: stay={} shift={} K={} stay+K*shift={}",
+            stay,
+            shift,
+            active_states,
+            stay + k * shift
+        );
+    }
     (stay, shift)
 }
 
@@ -2084,7 +2083,7 @@ fn batched_transition_forward(
     // This driver keeps forward vectors normalized in the HMM recursion, so the
     // composed update is applied to a probability vector and re-normalized for
     // floating-point drift if needed.
-    let lambda = adaptive_transition_lambda_from_probs(&fwd[..active_states], 1.0);
+    let lambda = adaptive_transition_lambda_from_normalized_probs(&fwd[..active_states]);
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
@@ -2408,7 +2407,8 @@ fn forward_update_impl<C: RefColumnLike>(
             &mut ws.emissions[..active_states],
         );
         if recomb_rate > 0.0 {
-            let (fwd_sum, lambda) = sum_and_adaptive_lambda_from_probs(&ws.fwd[..active_states]);
+            let fwd_sum = 1.0f32;
+            let lambda = adaptive_transition_lambda_from_normalized_probs(&ws.fwd[..active_states]);
             if lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
@@ -2494,7 +2494,8 @@ fn forward_update_seqcoded(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            let (fwd_sum, lambda) = sum_and_adaptive_lambda_from_probs(&ws.fwd[..active_states]);
+            let fwd_sum = 1.0f32;
+            let lambda = adaptive_transition_lambda_from_normalized_probs(&ws.fwd[..active_states]);
             if lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
@@ -2585,7 +2586,8 @@ fn forward_update_dict(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            let (fwd_sum, lambda) = sum_and_adaptive_lambda_from_probs(&ws.fwd[..active_states]);
+            let fwd_sum = 1.0f32;
+            let lambda = adaptive_transition_lambda_from_normalized_probs(&ws.fwd[..active_states]);
             if lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
@@ -3398,7 +3400,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 }
                                 // Partition marker mass into:
                                 //   subset_total    = represented allele mass Q
-                                //   missing_ref_mass= M_ref (ref allele code 255)
+                                //   missing_ref_mass= M_ref (ref allele code u8::MAX)
                                 //   missing_ood_mass= M_ood (allele index outside represented set)
                                 // These are fed to the structural posterior update above.
                                 for pid in 0..group_limit {

@@ -100,7 +100,7 @@ impl RefEmissionLut {
 pub struct HmmUpdater;
 
 impl HmmUpdater {
-    const LOG8_LEVELS: f32 = 255.0;
+    const LOG8_LEVELS: f32 = u8::MAX as f32;
     const LOG8_RANGE_NATS: f32 = 24.0;
     const LOG8_EPS: f32 = 1e-30;
     const LOG8_SWITCH_STATES: usize = usize::MAX;

@@ -370,7 +370,7 @@ impl Ibs2 {
     /// - Same phase: (a1, a2) matches (b1, b2)
     /// - Opposite phase: (a1, a2) matches (b2, b1)
     ///
-    /// Missing data (255) is treated as "compatible" - it doesn't break IBS2.
+    /// Missing data (u8::MAX) is treated as "compatible" - it doesn't break IBS2.
     fn is_ibs2_at(gt: &GenotypeMatrix, marker: usize, s1: SampleIdx, s2: SampleIdx) -> bool {
         let m_idx = MarkerIdx::new(marker as u32);
 
@@ -395,7 +395,7 @@ impl Ibs2 {
 
     /// Check if two phased genotypes are consistent (allowing missing data).
     ///
-    /// Returns true if the alleles match or either is missing (255).
+    /// Returns true if the alleles match or either is missing (u8::MAX).
     /// This is a helper for is_ibs2_at to check one phase ordering.
     fn are_phase_consistent(a1: u8, a2: u8, b1: u8, b2: u8) -> bool {
         (a1 == crate::data::storage::AlleleCode::MISSING.raw() || b1 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == b1) && (a2 == crate::data::storage::AlleleCode::MISSING.raw() || b2 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == b2)
@@ -905,15 +905,15 @@ mod tests {
         assert!(!Ibs2::are_phase_consistent(0, 0, 1, 1));
 
         // Missing data is always consistent
-        assert!(Ibs2::are_phase_consistent(255, 1, 0, 1));
-        assert!(Ibs2::are_phase_consistent(0, 255, 0, 1));
+        assert!(Ibs2::are_phase_consistent(u8::MAX, 1, 0, 1));
+        assert!(Ibs2::are_phase_consistent(0, u8::MAX, 0, 1));
     }
 
     #[test]
     fn test_is_ibs2_at_swapped_informative_with_missing() {
         // Observed comparison exists only under swapped ordering: (a1,b2) = (0,0).
         // Previous informative gate incorrectly rejected this case.
-        let gt = single_marker_gt(0, 255, 255, 0);
+        let gt = single_marker_gt(0, u8::MAX, u8::MAX, 0);
         assert!(Ibs2::is_ibs2_at(
             &gt,
             0,

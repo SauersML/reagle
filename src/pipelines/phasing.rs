@@ -2407,7 +2407,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         };
 
         // Create mutable genotype storage for phasing
-        // MutableGenotypes now internally tracks missing data (allele = 255)
+        // MutableGenotypes now internally tracks missing data (allele = u8::MAX)
         // so we can use from_fn to initialize all values including missing
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
             target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
@@ -3713,7 +3713,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             self.params.initial_lr = (1.2 * max_lr).max(4.0);
         }
 
-        // Initialize genotypes preserving actual allele values including missing (255)
+        // Initialize genotypes preserving actual allele values including missing (u8::MAX)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
             target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32))
         });
@@ -4382,7 +4382,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 let hap2 = HapIdx::new((s * 2 + 1) as u32);
 
                 // Use bulk haplotype access instead of per-marker get()
-                // geno.haplotype() returns 255 for missing positions
+                // geno.haplotype() returns u8::MAX for missing positions
                 let alleles1 = geno.haplotype(hap1);
                 let alleles2 = geno.haplotype(hap2);
 
@@ -6036,7 +6036,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                                 let ra = ref_gt.allele(ref_m, HapIdx::new(h as u32));
                                                 alignment.reverse_map_allele(orig_marker, ra)
                                             } else {
-                                                255
+                                                u8::MAX
                                             }
                                         } else {
                                             subset_view.allele(MarkerIdx::new(i as u32), hap_idx)
@@ -6104,7 +6104,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                                         ref_gt.allele(ref_m, HapIdx::new(h as u32));
                                                     alignment.reverse_map_allele(orig_marker, ra)
                                                 } else {
-                                                    255
+                                                    u8::MAX
                                                 }
                                             } else {
                                                 subset_view.allele(MarkerIdx::new(i as u32), hap_idx)
@@ -6808,7 +6808,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         for (s, sp) in sample_phases.iter().enumerate() {
             for m in 0..n_markers {
                 let p = sp.phase_confidence(m).clamp(0.0, 1.0);
-                phase_confidence[m][s] = (p * 255.0).round() as u8;
+                phase_confidence[m][s] = (p * u8::MAX as f32).round() as u8;
             }
         }
 
@@ -7080,10 +7080,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let ref_allele = ref_gt.allele(ref_m, HapIdx::new(ref_h as u32));
                             alignment.reverse_map_allele(marker, ref_allele)
                         } else {
-                            255
+                            u8::MAX
                         }
                     } else {
-                        255
+                        u8::MAX
                     }
                 }
             };
@@ -7368,10 +7368,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         ref_gt.allele(ref_m, HapIdx::new(ref_h as u32));
                                     alignment.reverse_map_allele(marker, ref_allele)
                                 } else {
-                                    255 // Missing - marker not in reference
+                                    u8::MAX // Missing - marker not in reference
                                 }
                             } else {
-                                255 // No reference panel
+                                u8::MAX // No reference panel
                             }
                         }
                     };
@@ -8301,7 +8301,7 @@ fn subset_transition_params(r: f32, n_states: usize, panel_haps: usize) -> Trans
 #[derive(Clone, Copy)]
 enum CombinedEmitMode {
     AllMissing,             // a1== crate::data::storage::AlleleCode::MISSING.raw() && a2== crate::data::storage::AlleleCode::MISSING.raw(): always p_no_err
-    Het { a1: u8, a2: u8 }, // a1!=a2: match if ref in {a1,a2,255}
+    Het { a1: u8, a2: u8 }, // a1!=a2: match if ref in {a1,a2,u8::MAX}
     HomOrHemi { obs: u8 },  // hom or one missing: match if ref==obs or missing
 }
 
@@ -8368,7 +8368,7 @@ enum EmissionMode {
 /// * `ref_al` - Reference haplotype allele at this marker
 /// * `geno_a1` - First allele of genotype
 /// * `geno_a2` - Second allele of genotype
-/// * `fixed_allele` - The allele of the fixed haplotype (H2), or 255 if homozygous
+/// * `fixed_allele` - The allele of the fixed haplotype (H2), or u8::MAX if homozygous
 /// * `conf` - Genotype confidence (0..1)
 /// * `p_no_err` - Probability of no error (e.g., 0.999)
 /// * `p_err` - Probability of error (e.g., 0.001)
@@ -8481,10 +8481,15 @@ fn compute_pl_allele_probs(
 fn build_pl_emit_lut(lut: &mut [f32; 256], allele_probs: &[f32], p_no_err: f32, p_err_other: f32) {
     let default_emit = p_err_other.max(1e-30);
     lut.fill(default_emit);
-    for (a, &p_true) in allele_probs.iter().take(255).enumerate() {
+    for (a, &p_true) in allele_probs
+        .iter()
+        .take(usize::from(u8::MAX))
+        .enumerate()
+    {
         lut[a] = (p_no_err * p_true + p_err_other * (1.0 - p_true)).max(1e-30);
     }
-    lut[255] = emit_from_allele_probs(255, allele_probs, p_no_err, p_err_other);
+    lut[usize::from(u8::MAX)] =
+        emit_from_allele_probs(u8::MAX, allele_probs, p_no_err, p_err_other);
 }
 
 #[inline]
@@ -9204,7 +9209,7 @@ fn ffbs_haploid_constrained(
     geno_a2: &[u8],
     conf: &[f32],
     phase_conf: &[f32],
-    fixed_allele: &[u8], // Allele assigned to OTHER haplotype (255 = no constraint)
+    fixed_allele: &[u8], // Allele assigned to OTHER haplotype (u8::MAX = no constraint)
     neighbors: &[u32],   // Selected neighbor haplotype indices
     phase_ibs: &BidirectionalPhaseIbs,
     p_no_err: f32,
@@ -10139,7 +10144,7 @@ fn sample_dynamic_mcmc(
             donor_scores_buf.clear();
             donor_scores_buf.resize(candidates_buf.len(), 0.0);
             donor_alleles_buf.clear();
-            donor_alleles_buf.resize(candidates_buf.len(), 255);
+            donor_alleles_buf.resize(candidates_buf.len(), u8::MAX);
             let score_markers = if recipient_stability >= 0.95 && target_states <= n_states / 2 {
                 &score_markers_sparse
             } else {
@@ -10920,8 +10925,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
         FwdCheckpoints::from_buffer(block_starts.clone(), n_states_usize, combined_data);
 
     if workspace.dummy_target.len() < n_markers {
-        workspace.dummy_target.resize(n_markers, 255);
-        workspace.dummy_partner.resize(n_markers, 255);
+        workspace.dummy_target.resize(n_markers, u8::MAX);
+        workspace.dummy_partner.resize(n_markers, u8::MAX);
         workspace.dummy_combined.resize(n_markers, true);
         workspace.dummy_hard_match.resize(n_markers, false);
     } else {
@@ -12337,15 +12342,15 @@ mod tests {
             emit_mismatch
         );
 
-        // At homozygous site (fixed_allele = 255), H1 must match genotype
-        let emit_hom = emit_haploid_constrained(0, 0, 0, 255, conf, p_no_err, p_err);
+        // At homozygous site (fixed_allele = u8::MAX), H1 must match genotype
+        let emit_hom = emit_haploid_constrained(0, 0, 0, u8::MAX, conf, p_no_err, p_err);
         assert!(
             emit_hom > 0.9,
             "Expected high emission at hom site when ref matches, got {}",
             emit_hom
         );
 
-        let emit_hom_mismatch = emit_haploid_constrained(1, 0, 0, 255, conf, p_no_err, p_err);
+        let emit_hom_mismatch = emit_haploid_constrained(1, 0, 0, u8::MAX, conf, p_no_err, p_err);
         assert!(
             emit_hom_mismatch < 0.1,
             "Expected low emission at hom when ref doesn't match, got {}",
@@ -12387,7 +12392,7 @@ mod tests {
         let p_no_err = 0.999;
         let p_err = 0.001;
         let conf = 1.0;
-        let emit = emit_haploid_constrained(255, 0, 1, 0, conf, p_no_err, p_err);
+        let emit = emit_haploid_constrained(u8::MAX, 0, 1, 0, conf, p_no_err, p_err);
         assert!(
             (emit - 0.5).abs() < 1e-6,
             "Missing reference allele should be neutral, got {}",
@@ -13154,7 +13159,7 @@ mod tests {
         let n_total_haps = n_target_haps + n_ref_haps;
 
         // Build PBWT with target + reference
-        // Target haps (0, 1): missing (255) - we're phasing these
+        // Target haps (0, 1): missing (u8::MAX) - we're phasing these
         // Reference haps (2-9): all have allele 0
         let alleles: Vec<Vec<u8>> = (0..n_markers)
             .map(|_| {
@@ -13251,7 +13256,7 @@ mod tests {
         let n_total_haps = n_target_haps + n_ref_haps;
 
         // Build PBWT with target + reference
-        // Target haps (0, 1): missing (255)
+        // Target haps (0, 1): missing (u8::MAX)
         // Reference haps (2-9): all have allele 1
         let alleles: Vec<Vec<u8>> = (0..n_markers)
             .map(|_| {

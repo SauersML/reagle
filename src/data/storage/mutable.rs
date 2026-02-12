@@ -5,7 +5,7 @@
 //!
 //! Memory model:
 //! - Primary storage: BitVec (1 bit per allele) for biallelic SNPs
-//! - Exception store: block-sparse vectors for multiallelic (2+) and missing (255)
+//! - Exception store: block-sparse vectors for multiallelic (2+) and missing (u8::MAX)
 //!
 //! For typical datasets (99%+ biallelic, <1% missing), this provides
 //! ~8x memory reduction vs byte-per-allele storage.
@@ -16,13 +16,13 @@ use bitvec::prelude::*;
 /// Bit-packed mutable genotype storage for phasing
 ///
 /// Uses 1 bit per allele for the common biallelic case (0 or 1),
-/// with a sparse exception map for multiallelic (2-254) and missing (255).
+/// with a sparse exception map for multiallelic (2-254) and missing (u8::MAX).
 ///
 /// Memory efficiency:
 /// - 1M markers × 6K haps biallelic: ~750 MB (vs ~6 GB byte-packed)
 /// - Exception blocks add ~9 bytes per exception (typically <1%)
 ///
-/// Allele values: 0 = REF, 1 = ALT1, 2+ = ALT2+, 255 = missing
+/// Allele values: 0 = REF, 1 = ALT1, 2+ = ALT2+, u8::MAX = missing
 #[derive(Clone, Debug)]
 pub struct MutableGenotypes {
     /// Bit-packed alleles: 1 bit per position
@@ -66,7 +66,7 @@ impl MutableGenotypes {
 
     /// Create from a function that provides alleles
     ///
-    /// Allele values: 0 = REF, 1-254 = ALT alleles, 255 = missing
+    /// Allele values: 0 = REF, 1-254 = ALT alleles, u8::MAX = missing
     pub fn from_fn<F>(n_markers: usize, n_haps: usize, mut f: F) -> Self
     where
         F: FnMut(usize, usize) -> u8,
@@ -123,7 +123,7 @@ impl MutableGenotypes {
 
     /// Get allele at (marker, haplotype)
     ///
-    /// Returns 0 (REF), 1-254 (ALT alleles), or 255 (missing)
+    /// Returns 0 (REF), 1-254 (ALT alleles), or u8::MAX (missing)
     #[inline]
     pub fn get(&self, marker: usize, hap: HapIdx) -> u8 {
         let h = hap.as_usize();
@@ -188,7 +188,7 @@ impl MutableGenotypes {
 
     /// Set allele at (marker, haplotype)
     ///
-    /// Allele values: 0 = REF, 1-254 = ALT alleles, 255 = missing
+    /// Allele values: 0 = REF, 1-254 = ALT alleles, u8::MAX = missing
     #[inline]
     pub fn set(&mut self, marker: usize, hap: HapIdx, allele: u8) {
         let h = hap.as_usize();
@@ -278,7 +278,7 @@ impl MutableGenotypes {
 
     /// Get all alleles for a haplotype
     ///
-    /// Returns a vector with values: 0 (REF), 1-254 (ALT), or 255 (missing)
+    /// Returns a vector with values: 0 (REF), 1-254 (ALT), or u8::MAX (missing)
     ///
     /// Optimized: avoids per-marker HashMap lookups by using a two-pass approach:
     /// 1. Extract all bits directly (fast, cache-friendly)
@@ -410,16 +410,16 @@ mod tests {
 
     #[test]
     fn test_missing_data() {
-        // Test that missing data (255) is preserved correctly
+        // Test that missing data (u8::MAX) is preserved correctly
         let geno = MutableGenotypes::from_fn(4, 2, |m, h| {
             match (m, h) {
                 (0, 0) => 0,   // REF
                 (0, 1) => 1,   // ALT
-                (1, 0) => 255, // Missing
+                (1, 0) => u8::MAX, // Missing
                 (1, 1) => 0,   // REF
                 (2, 0) => 1,   // ALT
-                (2, 1) => 255, // Missing
-                (3, _) => 255, // Both missing
+                (2, 1) => u8::MAX, // Missing
+                (3, _) => u8::MAX, // Both missing
                 _ => 0,
             }
         });
@@ -427,12 +427,12 @@ mod tests {
         // Check get returns correct values
         assert_eq!(geno.get(0, HapIdx::new(0)), 0);
         assert_eq!(geno.get(0, HapIdx::new(1)), 1);
-        assert_eq!(geno.get(1, HapIdx::new(0)), 255); // Missing preserved!
+        assert_eq!(geno.get(1, HapIdx::new(0)), u8::MAX); // Missing preserved!
         assert_eq!(geno.get(1, HapIdx::new(1)), 0);
         assert_eq!(geno.get(2, HapIdx::new(0)), 1);
-        assert_eq!(geno.get(2, HapIdx::new(1)), 255); // Missing preserved!
-        assert_eq!(geno.get(3, HapIdx::new(0)), 255);
-        assert_eq!(geno.get(3, HapIdx::new(1)), 255);
+        assert_eq!(geno.get(2, HapIdx::new(1)), u8::MAX); // Missing preserved!
+        assert_eq!(geno.get(3, HapIdx::new(0)), u8::MAX);
+        assert_eq!(geno.get(3, HapIdx::new(1)), u8::MAX);
 
         // Check is_missing
         assert!(!geno.is_missing(0, HapIdx::new(0)));
@@ -441,12 +441,12 @@ mod tests {
         assert!(geno.is_missing(3, HapIdx::new(0)));
         assert!(geno.is_missing(3, HapIdx::new(1)));
 
-        // Check haplotype returns 255 for missing
+        // Check haplotype returns u8::MAX for missing
         let hap0 = geno.haplotype(HapIdx::new(0));
-        assert_eq!(hap0, vec![0, 255, 1, 255]);
+        assert_eq!(hap0, vec![0, u8::MAX, 1, u8::MAX]);
 
         let hap1 = geno.haplotype(HapIdx::new(1));
-        assert_eq!(hap1, vec![1, 0, 255, 255]);
+        assert_eq!(hap1, vec![1, 0, u8::MAX, u8::MAX]);
 
         // Verify exceptions are stored
         assert_eq!(geno.n_exceptions(), 4); // 4 missing values
@@ -458,11 +458,11 @@ mod tests {
 
         // Set some values including missing
         geno.set(0, HapIdx::new(0), 1);
-        geno.set(1, HapIdx::new(0), 255); // Set missing
+        geno.set(1, HapIdx::new(0), u8::MAX); // Set missing
         geno.set(2, HapIdx::new(0), 0);
 
         assert_eq!(geno.get(0, HapIdx::new(0)), 1);
-        assert_eq!(geno.get(1, HapIdx::new(0)), 255);
+        assert_eq!(geno.get(1, HapIdx::new(0)), u8::MAX);
         assert_eq!(geno.get(2, HapIdx::new(0)), 0);
         assert!(geno.is_missing(1, HapIdx::new(0)));
 
@@ -477,8 +477,8 @@ mod tests {
         let mut geno = MutableGenotypes::from_fn(3, 2, |m, h| {
             match (m, h) {
                 (0, 0) => 1,   // ALT
-                (0, 1) => 255, // Missing
-                (1, 0) => 255, // Missing
+                (0, 1) => u8::MAX, // Missing
+                (1, 0) => u8::MAX, // Missing
                 (1, 1) => 0,   // REF
                 (2, 0) => 0,   // REF
                 (2, 1) => 1,   // ALT
@@ -488,14 +488,14 @@ mod tests {
 
         // Before swap
         assert_eq!(geno.get(0, HapIdx::new(0)), 1);
-        assert_eq!(geno.get(0, HapIdx::new(1)), 255);
+        assert_eq!(geno.get(0, HapIdx::new(1)), u8::MAX);
         assert!(geno.is_missing(0, HapIdx::new(1)));
 
         // Swap at marker 0
         geno.swap(0, HapIdx::new(0), HapIdx::new(1));
 
         // After swap - missing should move with the haplotype
-        assert_eq!(geno.get(0, HapIdx::new(0)), 255); // Was 1, now missing
+        assert_eq!(geno.get(0, HapIdx::new(0)), u8::MAX); // Was 1, now missing
         assert_eq!(geno.get(0, HapIdx::new(1)), 1); // Was missing, now ALT
         assert!(geno.is_missing(0, HapIdx::new(0)));
         assert!(!geno.is_missing(0, HapIdx::new(1)));
@@ -512,7 +512,7 @@ mod tests {
                 (1, 1) => 3, // ALT3
                 (2, 0) => 0,
                 (2, 1) => 2,   // ALT2
-                (3, 0) => 255, // Missing
+                (3, 0) => u8::MAX, // Missing
                 (3, 1) => 3,   // ALT3
                 _ => 0,
             }
@@ -523,16 +523,16 @@ mod tests {
         assert_eq!(geno.get(1, HapIdx::new(0)), 2);
         assert_eq!(geno.get(1, HapIdx::new(1)), 3);
         assert_eq!(geno.get(2, HapIdx::new(1)), 2);
-        assert_eq!(geno.get(3, HapIdx::new(0)), 255);
+        assert_eq!(geno.get(3, HapIdx::new(0)), u8::MAX);
         assert_eq!(geno.get(3, HapIdx::new(1)), 3);
 
         let hap0 = geno.haplotype(HapIdx::new(0));
-        assert_eq!(hap0, vec![0, 2, 0, 255]);
+        assert_eq!(hap0, vec![0, 2, 0, u8::MAX]);
 
         let hap1 = geno.haplotype(HapIdx::new(1));
         assert_eq!(hap1, vec![1, 3, 2, 3]);
 
-        // 5 exceptions: 2, 3, 2, 255, 3
+        // 5 exceptions: 2, 3, 2, u8::MAX, 3
         assert_eq!(geno.n_exceptions(), 5);
     }
 

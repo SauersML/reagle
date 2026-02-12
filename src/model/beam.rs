@@ -670,9 +670,17 @@ impl SwitchSupportCache {
         self.global_match_counts = [0, 0];
         self.cluster_match_counts0.fill(0);
         self.cluster_match_counts1.fill(0);
+        assert_eq!(
+            pool_alleles.len(),
+            active_pool.list().len(),
+            "pool_alleles length mismatch at marker {}: {} vs {}",
+            marker_idx,
+            pool_alleles.len(),
+            active_pool.list().len()
+        );
 
         for (idx, &hap) in active_pool.list().iter().enumerate() {
-            let allele = pool_alleles.get(idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let allele = pool_alleles[idx];
             if allele == 0 {
                 self.global_match_counts[0] = self.global_match_counts[0].saturating_add(1);
                 if let Some(meta) = active_pool.pbwt_meta(0, hap, pbwt_version) {
@@ -1456,7 +1464,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
             for (idx, &h) in active_pool.list().iter().rev().enumerate() {
                 let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
-                let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                let pooled = pool_alleles[pool_idx];
                 if h == hap && matches {
                     continue;
                 }
@@ -1493,7 +1501,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             // also allow a limited switch to a strong candidate for future-proofing
             for (idx, &h) in active_pool.list().iter().rev().take(1).enumerate() {
                 let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
-                let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                let pooled = pool_alleles[pool_idx];
                 if h != hap && pooled == targ_allele {
                     let same_cluster = active_pool
                         .pbwt_meta(allele, h, pbwt_version)
@@ -1525,7 +1533,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             .enumerate()
         {
             let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
-            let pooled = pool_alleles.get(pool_idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let pooled = pool_alleles[pool_idx];
             if pooled == targ_allele {
                 let same_cluster = active_pool
                     .pbwt_meta(allele, h, pbwt_version)
@@ -1689,7 +1697,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     fn fill_pool_alleles(&self, marker: usize, active_pool: &ActivePool, out: &mut Vec<u8>) {
         let list = active_pool.list();
         if out.len() < list.len() {
-            out.resize(list.len(), 255);
+            out.resize(list.len(), u8::MAX);
         }
         for (i, &h) in list.iter().enumerate() {
             out[i] = self.packed_ref.ref_allele_targ(marker, h).unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());

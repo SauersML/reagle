@@ -88,6 +88,12 @@ impl DenseColumn {
     /// in reference-only hot paths.
     #[inline]
     pub fn get_ref(&self, hap: RefHapId) -> u8 {
+        assert!(
+            hap.as_usize() < self.n_haplotypes as usize,
+            "reference hap index {} out of bounds for {} haplotypes",
+            hap.as_usize(),
+            self.n_haplotypes
+        );
         self.get_idx(hap.as_usize())
     }
 
