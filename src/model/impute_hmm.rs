@@ -631,7 +631,7 @@ impl ImputeWorkspace {
         self.fwd[..n_states].copy_from_slice(&self.fwd_checkpoints[off..off + n_states]);
     }
 
-    pub fn ensure_bwd_affine_scratch(&mut self, block_len: usize) {
+    pub fn ensure_affine_scratch(&mut self, block_len: usize) {
         if self.fwd_affine_a.len() < block_len {
             self.fwd_affine_a.resize(block_len, 0.0);
         }
@@ -1529,6 +1529,10 @@ fn subset_transition_params(
     // Preserve historical imputation behavior: use exact active subset size
     // (no clamping of k). Recombination is still clamped in li_stephens.
     let (stay, shift) = subset_linear_exact_k(recomb_rate, active_states as f32, n_ref_haps);
+    // Invariant for mass-preserving affine transition on K active states:
+    //   stay + K*shift == 1
+    // We keep this as a hard assert so any upstream transition regression
+    // fails fast rather than silently biasing posteriors.
     assert!(
         ((stay + shift * active_states as f32) - 1.0).abs() < 1e-4 || !stay.is_finite() || !shift.is_finite(),
         "subset transition mass drift: stay={} shift={} K={} stay+K*shift={}",
@@ -1786,8 +1790,14 @@ fn fill_fwd_affine_coeffs(
     //   b' = stay * b + shift * (a + K*b)
     //
     // where K is active state count. This form remains exact even if S_u != 1.
+    //
+    // Slot 0 corresponds to the block boundary marker itself and is initialized
+    // to identity for robustness (`a=1, b=0`). Interior processing should only
+    // consume slots for m in (block_start, block_end).
     let mut a = 1.0f64;
     let mut b = 0.0f64;
+    a_out[0] = a;
+    b_out[0] = b;
     let k = active_states as f64;
     for m in block_start + 1..block_end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
@@ -2666,7 +2676,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     {
                         (fwd_sum_left - 1.0).abs() < 1e-3 || active_states == 0
                     },
-                    "checkpoint forward mass drift before interior affine block"
+                    "checkpoint forward mass drift before interior affine block (S_u assumption)"
                 );
                 if let Some(interior) =
                     UniformInteriorRange::from_block_checked(block, &uniform_mask, context, K::LABEL)?
@@ -2676,7 +2686,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     // - We keep transition propagation in affine form across the block.
                     // - Distance-to-typed-anchor is used only by skip_untyped_mask to decide
                     //   whether to skip full posterior evaluation at a given interior marker.
-                    ws.ensure_bwd_affine_scratch(block_len);
+                    ws.ensure_affine_scratch(block_len);
                     fill_fwd_affine_coeffs(
                         &mut ws.fwd_affine_a[..block_len],
                         &mut ws.fwd_affine_b[..block_len],
@@ -2841,6 +2851,13 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         subset_total += state_prob;
                                         smoothing_prior_counts[idx] += ws.pattern_state_count[pid];
                                         smoothing_prior_total += ws.pattern_state_count[pid];
+                                    } else {
+                                        // Out-of-domain allele index contributes to unrepresented
+                                        // mass; treat it as missing-equivalent so:
+                                        //   total == subset_total + missing_mass
+                                        // remains true. The simplified redistribution is exact
+                                        // under this decomposition.
+                                        missing_mass += state_prob;
                                     }
                                 }
                                 if total > 0.0 {
@@ -3030,6 +3047,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     subset_total += state_prob;
                                     smoothing_prior_counts[idx] += 1.0;
                                     smoothing_prior_total += 1.0;
+                                } else {
+                                    // Keep mass accounting consistent with interior path:
+                                    // unrepresented mass is tracked as missing-equivalent.
+                                    missing_mass += state_prob;
                                 }
                             }
                             if total > 0.0 {
