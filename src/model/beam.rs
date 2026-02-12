@@ -16,6 +16,31 @@ const MAX_BACKPTR_PREV: u32 = (1u32 << BACKPTR_INDEX_BITS) - 1;
 const MAX_BEAM_WIDTH_FOR_PACKED_BACKPTR: usize = (MAX_BACKPTR_PREV as usize) + 1;
 const MAX_PBWT_CLUSTER_INTERVALS: usize = 8;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+struct PbwtClusterIx(u8);
+
+impl PbwtClusterIx {
+    const CAP: usize = MAX_PBWT_CLUSTER_INTERVALS;
+
+    #[inline]
+    fn from_u16(cluster_id: u16) -> Option<Self> {
+        if cluster_id == u16::MAX {
+            return None;
+        }
+        if (cluster_id as usize) < Self::CAP {
+            Some(Self(cluster_id as u8))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BeamConfig {
     pub beam_width: usize,
@@ -637,19 +662,19 @@ impl SwitchSupportCache {
             if allele == 0 {
                 self.global_match_counts[0] = self.global_match_counts[0].saturating_add(1);
                 if let Some(meta) = active_pool.pbwt_meta(0, hap, pbwt_version) {
-                    let cid = meta.cluster_id as usize;
-                    if cid < MAX_PBWT_CLUSTER_INTERVALS {
-                        self.cluster_match_counts0[cid] =
-                            self.cluster_match_counts0[cid].saturating_add(1);
+                    if let Some(cid) = PbwtClusterIx::from_u16(meta.cluster_id) {
+                        let idx = cid.as_usize();
+                        self.cluster_match_counts0[idx] =
+                            self.cluster_match_counts0[idx].saturating_add(1);
                     }
                 }
             } else if allele == 1 {
                 self.global_match_counts[1] = self.global_match_counts[1].saturating_add(1);
                 if let Some(meta) = active_pool.pbwt_meta(1, hap, pbwt_version) {
-                    let cid = meta.cluster_id as usize;
-                    if cid < MAX_PBWT_CLUSTER_INTERVALS {
-                        self.cluster_match_counts1[cid] =
-                            self.cluster_match_counts1[cid].saturating_add(1);
+                    if let Some(cid) = PbwtClusterIx::from_u16(meta.cluster_id) {
+                        let idx = cid.as_usize();
+                        self.cluster_match_counts1[idx] =
+                            self.cluster_match_counts1[idx].saturating_add(1);
                     }
                 }
             }
@@ -669,22 +694,14 @@ impl SwitchSupportCache {
 
     #[inline]
     fn cluster_match_count(&self, allele: u8, cluster_id: u16) -> usize {
-        if cluster_id == u16::MAX {
+        let Some(cid) = PbwtClusterIx::from_u16(cluster_id) else {
             return 1;
-        }
-        let cid = cluster_id as usize;
+        };
+        let idx = cid.as_usize();
         let count = if allele == 0 {
-            if cid < MAX_PBWT_CLUSTER_INTERVALS {
-                self.cluster_match_counts0[cid]
-            } else {
-                0
-            }
+            self.cluster_match_counts0[idx]
         } else {
-            if cid < MAX_PBWT_CLUSTER_INTERVALS {
-                self.cluster_match_counts1[cid]
-            } else {
-                0
-            }
+            self.cluster_match_counts1[idx]
         };
         count.max(1)
     }
