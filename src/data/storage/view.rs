@@ -108,7 +108,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                         // Map reference allele back to target encoding (handles strand flips)
                         alignment.reverse_map_allele(target_marker, ref_allele)
                     } else {
-                        255 // Marker not in reference - return missing
+                        crate::data::storage::AlleleCode::MISSING.raw() // Marker not in reference - return missing
                     }
                 }
             }
@@ -133,7 +133,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                         // Map reference allele back to target encoding (handles strand flips)
                         alignment.reverse_map_allele(orig_marker, ref_allele)
                     } else {
-                        255 // Marker not in reference - return missing
+                        crate::data::storage::AlleleCode::MISSING.raw() // Marker not in reference - return missing
                     }
                 }
             }
@@ -170,7 +170,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                         let ref_allele = reference.allele(ref_m, HapIdx::new(ref_hap as u32));
                         out[i] = alignment.reverse_map_allele(target_marker, ref_allele);
                     } else {
-                        out[i] = 255;
+                        out[i] = crate::data::storage::AlleleCode::MISSING.raw();
                     }
                 }
             }
@@ -192,7 +192,7 @@ impl<'a, TargetSpace, RefSpace> GenotypeView<'a, TargetSpace, RefSpace> {
                         let ref_allele = reference.allele(ref_m, HapIdx::new(ref_hap as u32));
                         out[i] = alignment.reverse_map_allele(orig_marker, ref_allele);
                     } else {
-                        out[i] = 255;
+                        out[i] = crate::data::storage::AlleleCode::MISSING.raw();
                     }
                 }
             }

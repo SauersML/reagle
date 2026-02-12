@@ -183,7 +183,7 @@ impl MutableGenotypes {
     /// Check if position is missing
     #[inline]
     pub fn is_missing(&self, marker: usize, hap: HapIdx) -> bool {
-        self.get(marker, hap) == 255
+        self.get(marker, hap) == crate::data::storage::AlleleCode::MISSING.raw()
     }
 
     /// Set allele at (marker, haplotype)

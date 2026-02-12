@@ -93,7 +93,7 @@ impl PbwtAllele {
     pub fn from_raw(allele: u8, alphabet: PbwtAlphabet) -> Self {
         if allele == 0 {
             Self::Ref
-        } else if allele == 255 || (allele as usize) >= alphabet.n_alleles() {
+        } else if allele == crate::data::storage::AlleleCode::MISSING.raw() || (allele as usize) >= alphabet.n_alleles() {
             Self::Missing
         } else {
             Self::Alt(allele)

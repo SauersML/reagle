@@ -33,7 +33,7 @@ impl PackedRefColumn {
 
     pub fn allele(&self, hap: usize) -> u8 {
         match self {
-            PackedRefColumn::Bytes { alleles } => alleles.get(hap).copied().unwrap_or(255),
+            PackedRefColumn::Bytes { alleles } => alleles.get(hap).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
             PackedRefColumn::Bits {
                 bits,
                 n_haps,
@@ -41,12 +41,12 @@ impl PackedRefColumn {
                 missing,
             } => {
                 if hap >= *n_haps {
-                    return 255;
+                    return crate::data::storage::AlleleCode::MISSING.raw();
                 }
                 let word_idx = hap / 64;
                 let bit_in_word = hap % 64;
                 if word_idx < missing.len() && ((missing[word_idx] >> bit_in_word) & 1) == 1 {
-                    return 255;
+                    return crate::data::storage::AlleleCode::MISSING.raw();
                 }
                 let bits = *bits as usize;
                 if bits == 0 {
@@ -79,7 +79,7 @@ impl PackedRefColumn {
                 let n = out.len().min(alleles.len());
                 out[..n].copy_from_slice(&alleles[..n]);
                 if out.len() > n {
-                    out[n..].fill(255);
+                    out[n..].fill(crate::data::storage::AlleleCode::MISSING.raw());
                 }
             }
             PackedRefColumn::Bits {
@@ -91,12 +91,12 @@ impl PackedRefColumn {
                 let n = out.len().min(*n_haps);
                 out[..n].fill(0);
                 if out.len() > n {
-                    out[n..].fill(255);
+                    out[n..].fill(crate::data::storage::AlleleCode::MISSING.raw());
                 }
                 if *bits == 0 {
                     for i in 0..n {
                         if is_missing_bit(missing, i) {
-                            out[i] = 255;
+                            out[i] = crate::data::storage::AlleleCode::MISSING.raw();
                         }
                     }
                     return;
@@ -107,7 +107,7 @@ impl PackedRefColumn {
                 }
                 for i in 0..n {
                     if is_missing_bit(missing, i) {
-                        out[i] = 255;
+                        out[i] = crate::data::storage::AlleleCode::MISSING.raw();
                     } else {
                         out[i] = unpack_bits(words, *bits as usize, i) as u8;
                     }
@@ -152,10 +152,12 @@ impl PackedRefColumn {
         let bits = bits_per_allele(n_alleles);
         let n_haps = col.n_haplotypes();
 
-        if n_alleles > 255 {
+        if n_alleles > crate::data::storage::AlleleCode::MISSING.raw() as usize {
             return Err(ReagleError::vcf(format!(
-                "marker has {} alleles; maximum supported is 255 because 255 is reserved for missing",
+                "marker has {} alleles; maximum supported is {} because that code is reserved for missing",
                 n_alleles
+                ,
+                crate::data::storage::AlleleCode::MISSING.raw()
             )));
         }
 
@@ -164,7 +166,7 @@ impl PackedRefColumn {
             let mut alleles = Vec::with_capacity(n_haps);
             for h in 0..n_haps {
                 let a = col.get(crate::data::haplotype::HapIdx::new(h as u32));
-                if a != 255 && (a as usize) >= n_alleles {
+                if a != crate::data::storage::AlleleCode::MISSING.raw() && (a as usize) >= n_alleles {
                     return Err(ReagleError::vcf(format!(
                         "invalid allele {} at marker {} (n_alleles={})",
                         a,
@@ -184,7 +186,7 @@ impl PackedRefColumn {
 
         for i in 0..n_haps {
             let a = col.get(crate::data::haplotype::HapIdx::new(i as u32));
-            if a != 255 && (a as usize) >= n_alleles {
+            if a != crate::data::storage::AlleleCode::MISSING.raw() && (a as usize) >= n_alleles {
                 return Err(ReagleError::vcf(format!(
                     "invalid allele {} at marker {} (n_alleles={})",
                     a,
@@ -192,7 +194,7 @@ impl PackedRefColumn {
                     n_alleles
                 )));
             }
-            if a == 255 {
+            if a == crate::data::storage::AlleleCode::MISSING.raw() {
                 set_missing_bit(&mut missing, i);
                 continue;
             }
@@ -615,7 +617,7 @@ fn fill_biallelic_bits(out: &mut [u8], n_haps: usize, words: &[u64], missing: &[
         for b in 0..limit {
             let idx = start + b;
             if ((miss >> b) & 1) == 1 {
-                out[idx] = 255;
+                out[idx] = crate::data::storage::AlleleCode::MISSING.raw();
             } else {
                 out[idx] = ((data >> b) & 1) as u8;
             }
@@ -679,7 +681,7 @@ mod tests {
         );
         markers.push(marker);
 
-        let alleles = vec![0u8, 1, 0, 1, 255];
+        let alleles = vec![0u8, 1, 0, 1, crate::data::storage::AlleleCode::MISSING.raw()];
         let col = GenotypeColumn::from_alleles(&alleles, 2);
         let packed = PackedRefColumn::pack_from_column(MarkerIdx::new(0), &markers, &col).unwrap();
 

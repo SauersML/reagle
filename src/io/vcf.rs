@@ -800,7 +800,7 @@ impl VcfReader {
             // Parse genotype (handle both phased | and unphased /)
             let (a1, a2, phased, is_haploid) = parse_genotype_bytes(gt_field)?;
 
-            let is_missing = a1 == 255 || a2 == 255;
+            let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw();
             if !phased {
                 is_phased = false;
             }
@@ -1053,7 +1053,7 @@ fn parse_genotype_bytes(gt: &[u8]) -> Result<(u8, u8, bool, bool)> {
     let a1 = parse_allele_bytes(left);
     let a2 = parse_allele_bytes(right);
 
-    if a1 == 255 || a2 == 255 {
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
         return Ok((255, 255, false, false));
     }
 
@@ -1063,7 +1063,7 @@ fn parse_genotype_bytes(gt: &[u8]) -> Result<(u8, u8, bool, bool)> {
 #[inline]
 fn parse_allele_bytes(s: &[u8]) -> u8 {
     if s.is_empty() || s == b"." {
-        return 255;
+        return crate::data::storage::AlleleCode::MISSING.raw();
     }
     if s.len() == 1 {
         let c = s[0];
@@ -1074,7 +1074,7 @@ fn parse_allele_bytes(s: &[u8]) -> u8 {
     let mut val: u16 = 0;
     for &b in s {
         if b < b'0' || b > b'9' {
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
         val = val.saturating_mul(10).saturating_add((b - b'0') as u16);
         if val > MAX_ALLELE_INDEX {
@@ -1083,7 +1083,7 @@ fn parse_allele_bytes(s: &[u8]) -> u8 {
                 val,
                 MAX_ALLELE_INDEX
             );
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
     }
     val as u8
@@ -1132,7 +1132,7 @@ pub fn compute_gl_confidence(gl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     // For biallelic: 0/0 -> 0, 0/1 -> 1, 1/1 -> 2
     // For multiallelic: use triangular number formula
     let (min_a, max_a) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
-    let gt_idx = if a1 == 255 || a2 == 255 {
+    let gt_idx = if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
         // Missing allele - can't compute confidence
         return None;
     } else {
@@ -1217,7 +1217,7 @@ pub fn compute_pl_confidence(pl_str: &str, a1: u8, a2: u8) -> Option<u8> {
     if pls.len() < 3 {
         return None;
     }
-    if a1 == 255 || a2 == 255 {
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
         return None;
     }
     let (min_a, max_a) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
@@ -1622,7 +1622,7 @@ impl VcfWriter {
                     };
 
                     line_buf.push('\t');
-                    if a1 == 255 {
+                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() {
                         line_buf.push('.');
                     } else if a1 < 10 {
                         line_buf.push((b'0' + a1) as char);
@@ -1631,7 +1631,7 @@ impl VcfWriter {
                         line_buf.push_str(buffer.format(a1));
                     }
                     line_buf.push('|');
-                    if a2 == 255 {
+                    if a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                         line_buf.push('.');
                     } else if a2 < 10 {
                         line_buf.push((b'0' + a2) as char);
@@ -1794,7 +1794,7 @@ mod tests {
         let a2 = parse_allele(right);
 
         // Java behavior: if one allele is missing, treat both as missing
-        if a1 == 255 || a2 == 255 {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
             return Ok((255, 255, false, false));
         }
 
@@ -1807,7 +1807,7 @@ mod tests {
     #[inline]
     fn parse_allele(s: &str) -> u8 {
         if s == "." || s.is_empty() {
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
 
         // Fast path for single digit alleles (most common case)

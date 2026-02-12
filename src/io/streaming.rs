@@ -602,7 +602,7 @@ impl StreamingVcfReader {
                     if let Some(conf) = &bm.confidences {
                         confidences.push(conf.clone());
                     } else {
-                        confidences.push(vec![255; self.samples.len()]);
+                        confidences.push(vec![u8::MAX; self.samples.len()]);
                     }
                 }
                 phase_masks.push(bm.phase_mask.clone());
@@ -819,7 +819,7 @@ impl StreamingVcfReader {
                 if let Some(conf) = &bm.confidences {
                     confidences.push(conf.clone());
                 } else {
-                    confidences.push(vec![255; self.samples.len()]);
+                    confidences.push(vec![u8::MAX; self.samples.len()]);
                 }
             }
             phase_masks.push(bm.phase_mask.clone());
@@ -1051,7 +1051,7 @@ impl StreamingVcfReader {
             }
 
             let (a1, a2) = parse_gt_bytes(gt_field);
-            let is_missing = a1 == 255 || a2 == 255;
+            let is_missing = a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw();
             let phased = gt_field.iter().any(|&b| b == b'|');
             phase_mask.push(if phased && !is_missing { 1 } else { 0 });
 
@@ -1089,7 +1089,7 @@ impl StreamingVcfReader {
                     let confidence = nth_colon_field(sample_field, gl_i)
                         .and_then(bytes_to_str)
                         .and_then(|gl_str| crate::io::vcf::compute_gl_confidence(gl_str, a1, a2))
-                        .unwrap_or(255);
+                        .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                     conf_vec.push(confidence);
                 }
             }
@@ -1225,7 +1225,10 @@ fn nth_colon_field<'a>(buf: &'a [u8], idx: usize) -> Option<&'a [u8]> {
 /// Parse genotype field to (allele1, allele2)
 fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
     if gt == b"." || gt == b"./." || gt == b".|." {
-        return (255, 255);
+        return (
+            crate::data::storage::AlleleCode::MISSING.raw(),
+            crate::data::storage::AlleleCode::MISSING.raw(),
+        );
     }
 
     let mut sep: Option<u8> = None;
@@ -1260,14 +1263,22 @@ fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
 
     let (left, right) = match (left, right) {
         (Some(l), Some(r)) => (l, r),
-        _ => return (255, 255),
+        _ => {
+            return (
+                crate::data::storage::AlleleCode::MISSING.raw(),
+                crate::data::storage::AlleleCode::MISSING.raw(),
+            )
+        }
     };
 
     let a1 = parse_allele_char_bytes(left);
     let a2 = parse_allele_char_bytes(right);
 
-    if a1 == 255 || a2 == 255 {
-        (255, 255)
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+        (
+            crate::data::storage::AlleleCode::MISSING.raw(),
+            crate::data::storage::AlleleCode::MISSING.raw(),
+        )
     } else {
         (a1, a2)
     }
@@ -1275,7 +1286,7 @@ fn parse_gt_bytes(gt: &[u8]) -> (u8, u8) {
 
 fn parse_allele_char_bytes(s: &[u8]) -> u8 {
     if s.is_empty() || s == b"." {
-        return 255;
+        return crate::data::storage::AlleleCode::MISSING.raw();
     }
     if s.len() == 1 {
         let c = s[0];
@@ -1286,12 +1297,12 @@ fn parse_allele_char_bytes(s: &[u8]) -> u8 {
     let mut val: u16 = 0;
     for &b in s {
         if b < b'0' || b > b'9' {
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
         val = val.saturating_mul(10).saturating_add((b - b'0') as u16);
     }
     if val > crate::io::vcf::MAX_ALLELE_INDEX {
-        255
+        crate::data::storage::AlleleCode::MISSING.raw()
     } else {
         val as u8
     }
@@ -1311,9 +1322,27 @@ mod tests {
         assert_eq!(parse_gt("0|1"), (0, 1));
         assert_eq!(parse_gt("1|0"), (1, 0));
         assert_eq!(parse_gt("0/1"), (0, 1));
-        assert_eq!(parse_gt("./."), (255, 255));
-        assert_eq!(parse_gt(".|."), (255, 255));
-        assert_eq!(parse_gt("."), (255, 255));
+        assert_eq!(
+            parse_gt("./."),
+            (
+                crate::data::storage::AlleleCode::MISSING.raw(),
+                crate::data::storage::AlleleCode::MISSING.raw()
+            )
+        );
+        assert_eq!(
+            parse_gt(".|."),
+            (
+                crate::data::storage::AlleleCode::MISSING.raw(),
+                crate::data::storage::AlleleCode::MISSING.raw()
+            )
+        );
+        assert_eq!(
+            parse_gt("."),
+            (
+                crate::data::storage::AlleleCode::MISSING.raw(),
+                crate::data::storage::AlleleCode::MISSING.raw()
+            )
+        );
     }
 
     #[test]

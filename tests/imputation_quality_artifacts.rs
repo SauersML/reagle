@@ -2,7 +2,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Stdio};
 
 use serde_json::Value;
 
@@ -16,7 +17,6 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     ensure_cmd_exists("bcftools");
     ensure_cmd_exists("java");
     ensure_cmd_exists("curl");
-    ensure_cmd_exists("cargo");
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let test_tmp_root = manifest_dir.join(".tmp").join("imputation_quality_artifacts");
@@ -39,11 +39,10 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     assert!(input_vcf.exists(), "missing input.vcf.gz after staging");
     assert!(truth_vcf.exists(), "missing truth.vcf.gz after staging");
 
-    run_in(&manifest_dir, "cargo", ["build", "--release"]);
     let reagle_bin = manifest_dir.join("target").join("release").join("reagle");
     assert!(
         reagle_bin.exists(),
-        "reagle binary missing after cargo build --release: {}",
+        "reagle binary missing at {} (build with `cargo test --release --test imputation_quality_artifacts` or `cargo build --release`)",
         reagle_bin.display()
     );
 
@@ -100,12 +99,8 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
 
     harmonize_sample_names(work_dir.path(), &[&truth_vcf, &reagle_vcf, &beagle_vcf]);
 
-    let truth_map = load_truth_sites(&truth_vcf);
-    let reagle_map = load_imputed_sites(&reagle_vcf);
-    let beagle_map = load_imputed_sites(&beagle_vcf);
-
-    let (reagle_r2, reagle_n) = compute_dosage_r2(&truth_map, &reagle_map);
-    let (beagle_r2, beagle_n) = compute_dosage_r2(&truth_map, &beagle_map);
+    let (reagle_r2, reagle_n) = compute_dosage_r2_streaming(&truth_vcf, &reagle_vcf);
+    let (beagle_r2, beagle_n) = compute_dosage_r2_streaming(&truth_vcf, &beagle_vcf);
 
     println!(
         "Native dosage r_squared | Reagle: {:.6} (n={}) | Beagle: {:.6} (n={})",
@@ -135,23 +130,6 @@ fn run(cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>>) {
     if !output.status.success() {
         panic!(
             "command failed: {}\nstdout:\n{}\nstderr:\n{}",
-            cmd,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-fn run_in(dir: &Path, cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>>) {
-    let output = Command::new(cmd)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to execute {cmd} in {}: {e}", dir.display()));
-    if !output.status.success() {
-        panic!(
-            "command failed in {}: {}\nstdout:\n{}\nstderr:\n{}",
-            dir.display(),
             cmd,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -443,6 +421,8 @@ fn find_file_recursive(root: &Path, filename: &str) -> Option<PathBuf> {
 
 #[derive(Clone)]
 struct TruthSite {
+    chrom: String,
+    pos: i64,
     ref_allele: String,
     alt_allele: String,
     gt: String,
@@ -450,6 +430,8 @@ struct TruthSite {
 
 #[derive(Clone)]
 struct ImputedSite {
+    chrom: String,
+    pos: i64,
     ref_allele: String,
     alt_allele: String,
     gt: String,
@@ -457,19 +439,15 @@ struct ImputedSite {
     gp: Option<Vec<f64>>,
 }
 
-fn load_truth_sites(vcf: &Path) -> HashMap<(String, i64), TruthSite> {
-    let out = run_capture(
-        "bcftools",
-        [
-            "query",
-            "-f",
-            "%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n",
-            vcf.to_str().expect("truth path utf8"),
-        ],
-    );
-    let mut map = HashMap::new();
-    for line in out.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
+fn next_truth_site(reader: &mut BufReader<std::process::ChildStdout>) -> Option<TruthSite> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read truth query output");
+        if n == 0 {
+            return None;
+        }
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
         if fields.len() < 5 {
             continue;
         }
@@ -477,31 +455,25 @@ fn load_truth_sites(vcf: &Path) -> HashMap<(String, i64), TruthSite> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        map.insert(
-            (fields[0].to_string(), pos),
-            TruthSite {
-                ref_allele: fields[2].to_string(),
-                alt_allele: fields[3].to_string(),
-                gt: fields[4].to_string(),
-            },
-        );
+        return Some(TruthSite {
+            chrom: fields[0].to_string(),
+            pos,
+            ref_allele: fields[2].to_string(),
+            alt_allele: fields[3].to_string(),
+            gt: fields[4].to_string(),
+        });
     }
-    map
 }
 
-fn load_imputed_sites(vcf: &Path) -> HashMap<(String, i64), ImputedSite> {
-    let out = run_capture(
-        "bcftools",
-        [
-            "query",
-            "-f",
-            "%CHROM\t%POS\t%REF\t%ALT[\t%GT:%DS:%GP]\n",
-            vcf.to_str().expect("imputed path utf8"),
-        ],
-    );
-    let mut map = HashMap::new();
-    for line in out.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
+fn next_imputed_site(reader: &mut BufReader<std::process::ChildStdout>) -> Option<ImputedSite> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read imputed query output");
+        if n == 0 {
+            return None;
+        }
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
         if fields.len() < 5 {
             continue;
         }
@@ -510,18 +482,16 @@ fn load_imputed_sites(vcf: &Path) -> HashMap<(String, i64), ImputedSite> {
             Err(_) => continue,
         };
         let (gt, ds, gp) = parse_imputed_sample(fields[4]);
-        map.insert(
-            (fields[0].to_string(), pos),
-            ImputedSite {
-                ref_allele: fields[2].to_string(),
-                alt_allele: fields[3].to_string(),
-                gt,
-                ds,
-                gp,
-            },
-        );
+        return Some(ImputedSite {
+            chrom: fields[0].to_string(),
+            pos,
+            ref_allele: fields[2].to_string(),
+            alt_allele: fields[3].to_string(),
+            gt,
+            ds,
+            gp,
+        });
     }
-    map
 }
 
 fn parse_imputed_sample(sample: &str) -> (String, Option<f64>, Option<Vec<f64>>) {
@@ -533,7 +503,7 @@ fn parse_imputed_sample(sample: &str) -> (String, Option<f64>, Option<Vec<f64>>)
 }
 
 fn parse_ds(v: &str) -> Option<f64> {
-    if v.is_empty() || *v == "." {
+    if v.is_empty() || v == "." {
         return None;
     }
     if v.contains(',') {
@@ -551,7 +521,7 @@ fn parse_ds(v: &str) -> Option<f64> {
 }
 
 fn parse_gp(v: &str) -> Option<Vec<f64>> {
-    if v.is_empty() || *v == "." {
+    if v.is_empty() || v == "." {
         return None;
     }
     let mut out = Vec::new();
@@ -596,10 +566,41 @@ fn ds_from_gp_biallelic(gp: &[f64]) -> Option<f64> {
     Some((p1 + 2.0 * p2) / sum)
 }
 
-fn compute_dosage_r2(
-    truth: &HashMap<(String, i64), TruthSite>,
-    imputed: &HashMap<(String, i64), ImputedSite>,
-) -> (f64, usize) {
+fn compare_site_key(t: &TruthSite, i: &ImputedSite) -> std::cmp::Ordering {
+    match t.chrom.cmp(&i.chrom) {
+        std::cmp::Ordering::Equal => t.pos.cmp(&i.pos),
+        other => other,
+    }
+}
+
+fn spawn_bcftools_query(vcf: &Path, format: &str) -> (Child, BufReader<std::process::ChildStdout>) {
+    let mut child = Command::new("bcftools")
+        .args(["query", "-f", format, vcf.to_str().expect("vcf path utf8")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bcftools query");
+    let stdout = child.stdout.take().expect("bcftools stdout missing");
+    (child, BufReader::new(stdout))
+}
+
+fn wait_child_ok(child: Child, label: &str) {
+    let output = child.wait_with_output().expect("wait on child process");
+    assert!(
+        output.status.success(),
+        "{} failed\nstdout:\n{}\nstderr:\n{}",
+        label,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn compute_dosage_r2_streaming(truth_vcf: &Path, imputed_vcf: &Path) -> (f64, usize) {
+    let (truth_child, mut truth_reader) =
+        spawn_bcftools_query(truth_vcf, "%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n");
+    let (imputed_child, mut imputed_reader) =
+        spawn_bcftools_query(imputed_vcf, "%CHROM\t%POS\t%REF\t%ALT[\t%GT:%DS:%GP]\n");
+
     let mut sum_t = 0.0_f64;
     let mut sum_i = 0.0_f64;
     let mut sum_ti = 0.0_f64;
@@ -607,44 +608,52 @@ fn compute_dosage_r2(
     let mut sum_ii = 0.0_f64;
     let mut n: usize = 0;
 
-    for (key, t_site) in truth {
-        let Some(i_site) = imputed.get(key) else {
-            continue;
-        };
+    let mut t_site = next_truth_site(&mut truth_reader);
+    let mut i_site = next_imputed_site(&mut imputed_reader);
 
-        let Some(t_dos) = gt_to_nonref_dosage(&t_site.gt) else {
-            continue;
-        };
+    while let (Some(t), Some(i)) = (&t_site, &i_site) {
+        match compare_site_key(t, i) {
+            std::cmp::Ordering::Less => t_site = next_truth_site(&mut truth_reader),
+            std::cmp::Ordering::Greater => i_site = next_imputed_site(&mut imputed_reader),
+            std::cmp::Ordering::Equal => {
+                let t_cur = t.clone();
+                let i_cur = i.clone();
 
-        let mut i_dos = i_site
-            .ds
-            .or_else(|| i_site.gp.as_ref().and_then(|g| ds_from_gp_biallelic(g)))
-            .or_else(|| gt_to_nonref_dosage(&i_site.gt));
-        let Some(mut i_dos_val) = i_dos.take() else {
-            continue;
-        };
-
-        if t_site.ref_allele != i_site.ref_allele || t_site.alt_allele != i_site.alt_allele {
-            let biallelic_truth = !t_site.alt_allele.contains(',');
-            let biallelic_imp = !i_site.alt_allele.contains(',');
-            let swapped = biallelic_truth
-                && biallelic_imp
-                && t_site.ref_allele == i_site.alt_allele
-                && t_site.alt_allele == i_site.ref_allele;
-            if swapped {
-                i_dos_val = 2.0 - i_dos_val;
-            } else {
-                continue;
+                let mut i_dos = i_cur
+                    .ds
+                    .or_else(|| i_cur.gp.as_ref().and_then(|g| ds_from_gp_biallelic(g)))
+                    .or_else(|| gt_to_nonref_dosage(&i_cur.gt));
+                if let (Some(t_dos), Some(mut i_dos_val)) = (gt_to_nonref_dosage(&t_cur.gt), i_dos.take()) {
+                    if t_cur.ref_allele != i_cur.ref_allele || t_cur.alt_allele != i_cur.alt_allele {
+                        let biallelic_truth = !t_cur.alt_allele.contains(',');
+                        let biallelic_imp = !i_cur.alt_allele.contains(',');
+                        let swapped = biallelic_truth
+                            && biallelic_imp
+                            && t_cur.ref_allele == i_cur.alt_allele
+                            && t_cur.alt_allele == i_cur.ref_allele;
+                        if swapped {
+                            i_dos_val = 2.0 - i_dos_val;
+                        } else {
+                            t_site = next_truth_site(&mut truth_reader);
+                            i_site = next_imputed_site(&mut imputed_reader);
+                            continue;
+                        }
+                    }
+                    sum_t += t_dos;
+                    sum_i += i_dos_val;
+                    sum_ti += t_dos * i_dos_val;
+                    sum_tt += t_dos * t_dos;
+                    sum_ii += i_dos_val * i_dos_val;
+                    n += 1;
+                }
+                t_site = next_truth_site(&mut truth_reader);
+                i_site = next_imputed_site(&mut imputed_reader);
             }
         }
-
-        sum_t += t_dos;
-        sum_i += i_dos_val;
-        sum_ti += t_dos * i_dos_val;
-        sum_tt += t_dos * t_dos;
-        sum_ii += i_dos_val * i_dos_val;
-        n += 1;
     }
+
+    wait_child_ok(truth_child, "bcftools truth query");
+    wait_child_ok(imputed_child, "bcftools imputed query");
 
     assert!(n > 1, "insufficient comparable points for r_squared (n={n})");
     let n_f = n as f64;

@@ -11,7 +11,7 @@
 //! ## Reference
 //! Li N, Stephens M. Genetics 2003 Dec;165(4):2213-33
 
-use crate::data::storage::GenotypeView;
+use crate::data::storage::{AlleleCode, GenotypeView};
 use crate::data::{HapIdx, MarkerIdx};
 #[cfg(test)]
 use crate::model::li_stephens::normalized_switch_scale_shift;
@@ -45,7 +45,7 @@ impl EmissionAffine {
     }
 }
 
-const MISSING_ALLELE: u8 = 255;
+const MISSING_ALLELE: u8 = AlleleCode::MISSING.raw();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefAllele {
@@ -56,7 +56,7 @@ enum RefAllele {
 impl RefAllele {
     #[inline]
     fn from_raw(raw: u8) -> Self {
-        if raw == MISSING_ALLELE {
+        if AlleleCode::from_raw(raw).is_missing() {
             Self::Missing
         } else {
             Self::Called(raw)
@@ -845,7 +845,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
         let mut ref_alleles_row = AVec::<u8, ConstAlign<64>>::from_iter(
             64,
-            std::iter::repeat(255u8).take(n_states_padded),
+            std::iter::repeat(MISSING_ALLELE).take(n_states_padded),
         );
         let mut cursor = MosaicCursor::from_threaded(threaded_haps);
         let mut cursor_history: Vec<StateSwitch<HapSpace>> = Vec::new();
@@ -859,7 +859,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             shift_by_marker[m] = shift;
         }
 
-        let mut req_allele = vec![255u8; n_markers];
+        let mut req_allele = vec![MISSING_ALLELE; n_markers];
         let mut p_match = vec![1.0f32; n_markers];
         let mut p_mismatch = vec![1.0f32; n_markers];
         let mut p_missing = vec![1.0f32; n_markers];
@@ -868,11 +868,11 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 .and_then(|c| c.get(m).copied())
                 .unwrap_or(1.0)
                 .clamp(0.0, 1.0);
-            let g1 = *geno_a1.get(m).unwrap_or(&255);
-            let g2 = *geno_a2.get(m).unwrap_or(&255);
-            let partner = partner_alleles.get(m).copied().unwrap_or(255);
-            let req = if g1 == 255 || g2 == 255 {
-                255
+            let g1 = *geno_a1.get(m).unwrap_or(&MISSING_ALLELE);
+            let g2 = *geno_a2.get(m).unwrap_or(&MISSING_ALLELE);
+            let partner = partner_alleles.get(m).copied().unwrap_or(MISSING_ALLELE);
+            let req = if g1 == MISSING_ALLELE || g2 == MISSING_ALLELE {
+                MISSING_ALLELE
             } else if g1 == g2 {
                 g1
             } else if partner == g1 {
@@ -880,10 +880,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             } else if partner == g2 {
                 g1
             } else {
-                255
+                MISSING_ALLELE
             };
             req_allele[m] = req;
-            if req != 255 {
+            if req != MISSING_ALLELE {
                 p_match[m] = p_no_err_base * conf + 0.5 * (1.0 - conf);
                 p_mismatch[m] = p_err_base * conf + 0.5 * (1.0 - conf);
                 let p_req = 0.5 * (1.0 + conf);
@@ -893,7 +893,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
         let fill_conf_emissions_fast = |m: usize, emissions: &mut [f32], ref_alleles: &[u8]| {
             let req = req_allele[m];
-            if req != 255 {
+            if req != MISSING_ALLELE {
                 let p_no_err = p_match[m];
                 let p_err = p_mismatch[m];
                 let p_miss = p_missing[m];
@@ -986,9 +986,9 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         // re-checking PLs/heterozygosity inside the hot loop.
         let mut marker_kinds = vec![MarkerKind::Generic; n_markers];
         for m in 0..n_markers {
-            let g1 = *geno_a1.get(m).unwrap_or(&255);
-            let g2 = *geno_a2.get(m).unwrap_or(&255);
-            if g1 == 255 || g2 == 255 {
+            let g1 = *geno_a1.get(m).unwrap_or(&MISSING_ALLELE);
+            let g2 = *geno_a2.get(m).unwrap_or(&MISSING_ALLELE);
+            if g1 == MISSING_ALLELE || g2 == MISSING_ALLELE {
                 marker_kinds[m] = MarkerKind::Missing;
                 continue;
             }
@@ -998,7 +998,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     continue;
                 }
             }
-            if g1 == g2 && req_allele[m] != 255 {
+            if g1 == g2 && req_allele[m] != MISSING_ALLELE {
                 marker_kinds[m] = MarkerKind::HomoSimple;
             } else {
                 marker_kinds[m] = MarkerKind::Generic;
@@ -1062,7 +1062,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     // Specialized homozygous path: no PLs, no partner disambiguation.
                     // Emissions depend only on a single required allele (req_allele[m]) and
                     // its confidence-derived p_match/p_mismatch.
-                    if req_allele[m] != 255 && m != 0 {
+                    if req_allele[m] != MISSING_ALLELE && m != 0 {
                         // For homozygous markers after the first, fuse emission generation
                         // with the transition update to avoid touching the emissions buffer.
                         // This is mathematically exact (emission is still applied per marker)
@@ -1073,7 +1073,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 }
                 MarkerKind::Generic => {
                     if let Some(plp) = pl_provider {
-                        let partner = partner_alleles.get(m).copied().unwrap_or(255);
+                        let partner = partner_alleles.get(m).copied().unwrap_or(MISSING_ALLELE);
                         let pl = plp.pl(m).filter(|v| !v.is_empty());
                         if let Some(pl) = pl {
                             let biallelic_freqs =
@@ -1084,7 +1084,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                         None
                                     }
                                 });
-                            let n = if partner != 255 {
+                            let n = if partner != MISSING_ALLELE {
                                 allele_probs_cond_from_pl(
                                     pl,
                                     partner,
@@ -1165,7 +1165,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                             }
                         }
                     } else {
-                        let partner = partner_alleles.get(m).copied().unwrap_or(255);
+                        let partner = partner_alleles.get(m).copied().unwrap_or(MISSING_ALLELE);
                         let used_pattern =
                             try_fill_pattern_emissions(m, partner, None, emissions_row, &[]);
                         if !used_pattern {
@@ -1199,7 +1199,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     fwd_aligned[row_offset + k] = val;
                     fwd_sum += val;
                 }
-            } else if kind == MarkerKind::HomoSimple && req_allele[m] != 255 {
+            } else if kind == MarkerKind::HomoSimple && req_allele[m] != MISSING_ALLELE {
                 let prev_row_offset = (m - 1) * n_states_padded;
                 let (before, curr_and_after) = fwd_aligned.split_at_mut(row_offset);
                 let prev_row = &before[prev_row_offset..prev_row_offset + n_states];
@@ -1329,7 +1329,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     }
                     MarkerKind::Generic => {
                         if let Some(plp) = pl_provider {
-                            let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
+                            let partner = partner_alleles.get(m_next).copied().unwrap_or(MISSING_ALLELE);
                             let pl = plp.pl(m_next).filter(|v| !v.is_empty());
                             if let Some(pl) = pl {
                                 let biallelic_freqs = allele_freqs
@@ -1341,7 +1341,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                             None
                                         }
                                     });
-                                let n = if partner != 255 {
+                                let n = if partner != MISSING_ALLELE {
                                     allele_probs_cond_from_pl(
                                         pl,
                                         partner,
@@ -1429,7 +1429,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 }
                             }
                         } else {
-                            let partner = partner_alleles.get(m_next).copied().unwrap_or(255);
+                            let partner = partner_alleles.get(m_next).copied().unwrap_or(MISSING_ALLELE);
                             let used_pattern = try_fill_pattern_emissions(
                                 m_next,
                                 partner,
@@ -1528,7 +1528,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
         let total_size = n_markers * n_states_padded;
         let mut state_haps = vec![HapIdx::new(0u32); n_states];
         let mut ref_alleles_flat =
-            AVec::<u8, ConstAlign<64>>::from_iter(64, std::iter::repeat(255u8).take(total_size));
+            AVec::<u8, ConstAlign<64>>::from_iter(
+                64,
+                std::iter::repeat(MISSING_ALLELE).take(total_size),
+            );
         let mut precompute_cursor = MosaicCursor::from_threaded(threaded_haps);
         for m in 0..n_markers {
             precompute_cursor.advance_to_marker(m, threaded_haps);
@@ -1895,7 +1898,7 @@ mod tests {
     fn test_fwd_homo_missing_ref_uses_marginalized_emission() {
         let mut fwd = vec![0.2f32, 0.4, 0.6, 0.8, 1.0];
         let original = fwd.clone();
-        let ref_alleles = vec![0u8, 255, 1, 255, 0];
+        let ref_alleles = vec![0u8, MISSING_ALLELE, 1, MISSING_ALLELE, 0];
         let req = 0u8;
         let p_match = 0.99f32;
         let p_mismatch = 0.01f32;
@@ -1935,6 +1938,44 @@ mod tests {
             assert!((fwd[i] - expected[i]).abs() < 1e-7);
         }
         assert!((sum - expected_sum).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_phase_missing_emission_not_above_best_plausible_called() {
+        let p_no_err = 0.99f32;
+        let p_err = 0.01f32;
+        for step in 0..=20 {
+            let conf = step as f32 / 20.0;
+            let p_match = p_no_err * conf + 0.5 * (1.0 - conf);
+            let p_mismatch = p_err * conf + 0.5 * (1.0 - conf);
+            let p_req = 0.5 * (1.0 + conf);
+            let p_missing = p_req * p_match + (1.0 - p_req) * p_mismatch;
+            assert!(p_missing <= p_match + 1e-8);
+            assert!(p_missing >= p_mismatch - 1e-8);
+        }
+
+        let p_no_err = 0.995f32;
+        let p_err_other = 0.0025f32;
+        let d = p_no_err - p_err_other;
+        let posterior_sets: [&[f32]; 4] = [
+            &[1.0, 0.0],
+            &[0.5, 0.5],
+            &[0.7, 0.2, 0.1],
+            &[0.34, 0.33, 0.33],
+        ];
+        for probs in posterior_sets {
+            let mut concentration = 0.0f32;
+            let mut max_p = 0.0f32;
+            for &p in probs {
+                concentration += p * p;
+                if p > max_p {
+                    max_p = p;
+                }
+            }
+            let p_missing = p_err_other + d * concentration;
+            let best_called = p_err_other + d * max_p;
+            assert!(p_missing <= best_called + 1e-8);
+        }
     }
 
     #[test]

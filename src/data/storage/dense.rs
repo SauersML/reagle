@@ -51,7 +51,7 @@ impl DenseColumn {
         let mut missing = bitvec![u64, Lsb0; 0; n_haplotypes];
 
         for (i, &allele) in alleles.iter().enumerate() {
-            if allele == 255 {
+            if allele == crate::data::storage::AlleleCode::MISSING.raw() {
                 missing.set(i, true);
                 continue;
             }
@@ -94,10 +94,10 @@ impl DenseColumn {
     #[inline]
     fn get_idx(&self, idx: usize) -> u8 {
         if idx >= self.n_haplotypes as usize {
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
         if self.missing[idx] {
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
         if self.bits_per_allele == 1 {
             return self.bits[idx] as u8;
@@ -138,9 +138,9 @@ impl DenseColumn {
             // bits.count_ones() includes bits that might have been set for missing data
             // if we didn't clear them. But our set/from_alleles clears them.
             // Still, it's safer and clearer to use the iter or bit-parallel logic that respects 'missing'.
-            self.iter().filter(|&a| a > 0 && a != 255).count()
+            self.iter().filter(|&a| a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw()).count()
         } else {
-            self.iter().filter(|&a| a > 0 && a != 255).count()
+            self.iter().filter(|&a| a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw()).count()
         }
     }
 
@@ -190,6 +190,9 @@ mod tests {
     #[test]
     fn test_out_of_range_get_returns_missing() {
         let col = DenseColumn::from_alleles([0u8, 1, 0].into_iter(), 2);
-        assert_eq!(col.get(HapIdx::new(9)), 255);
+        assert_eq!(
+            col.get(HapIdx::new(9)),
+            crate::data::storage::AlleleCode::MISSING.raw()
+        );
     }
 }

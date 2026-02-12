@@ -424,6 +424,40 @@ mod tests {
         let best_called = emissions[1].max(emissions[2]);
         assert!(emissions[0] <= best_called + 1e-6);
     }
+
+    #[test]
+    fn test_impute_missing_emission_not_above_best_called_property_grid() {
+        let prob_sets: [&[f32]; 5] = [
+            &[1.0, 0.0],
+            &[0.5, 0.5],
+            &[0.8, 0.2],
+            &[0.34, 0.33, 0.33],
+            &[0.7, 0.2, 0.1],
+        ];
+        let error_rates = [0.001f32, 0.01, 0.05];
+
+        for probs in prob_sets {
+            for &error_rate in &error_rates {
+                let target_probs = AlleleProbsView::from_trusted(probs);
+                let n_alleles = probs.len();
+                let mismatch_prob = if n_alleles > 1 {
+                    error_rate / (n_alleles as f32 - 1.0)
+                } else {
+                    error_rate
+                };
+                let match_prob = 1.0 - error_rate;
+                let miss = missing_emission_prob(target_probs, match_prob, mismatch_prob);
+                let mut best_called = mismatch_prob;
+                for &p in probs {
+                    let called = mismatch_prob + (match_prob - mismatch_prob) * p;
+                    if called > best_called {
+                        best_called = called;
+                    }
+                }
+                assert!(miss <= best_called + 1e-6);
+            }
+        }
+    }
 }
 
 /// Per-marker allele probability distributions for a single target haplotype.

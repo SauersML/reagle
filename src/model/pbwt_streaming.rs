@@ -353,7 +353,7 @@ impl<I: PbwtIndex> PbwtWavefrontImpl<I> {
 
         if pos > 0 {
             let nb = self.fwd_ppa[pos - 1].to_usize();
-            if alleles.get(nb).copied().unwrap_or(255) == allele {
+            if alleles.get(nb).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()) == allele {
                 let len = m - self.fwd_div[pos];
                 if len > best {
                     best = len;
@@ -363,7 +363,7 @@ impl<I: PbwtIndex> PbwtWavefrontImpl<I> {
 
         if pos + 1 < self.n_haps {
             let nb = self.fwd_ppa[pos + 1].to_usize();
-            if alleles.get(nb).copied().unwrap_or(255) == allele {
+            if alleles.get(nb).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()) == allele {
                 let len = m - self.fwd_div[pos + 1];
                 if len > best {
                     best = len;

@@ -464,7 +464,7 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
     /// Check if confidence scores are available
 
     /// Get confidence score for a sample at a marker (0-255 representing 0.0-1.0).
-    /// Returns 255 (full confidence) if confidence data is not available.
+    /// Returns `u8::MAX` (full confidence) if confidence data is not available.
     #[inline]
     pub fn sample_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
         let marker_idx = marker.as_usize();
@@ -496,13 +496,13 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
                 return 0;
             }
         }
-        255
+        u8::MAX
     }
 
     /// Get confidence score as f32 (0.0-1.0)
     #[inline]
     pub fn sample_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
-        self.sample_confidence(marker, sample_idx) as f32 / 255.0
+        self.sample_confidence(marker, sample_idx) as f32 / u8::MAX as f32
     }
 
     /// Clone the confidence data (for transferring to a new matrix)
@@ -511,7 +511,7 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
     }
 
     /// Get phase confidence score for a sample at a marker (0-255).
-    /// Returns 255 (full confidence) if phase confidence is not available.
+    /// Returns `u8::MAX` (full confidence) if phase confidence is not available.
     #[inline]
     pub fn sample_phase_confidence(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> u8 {
         let marker_idx = marker.as_usize();
@@ -530,13 +530,13 @@ impl<S: PhaseState, Space> GenotypeMatrix<S, Space> {
         self.phase_confidence
             .as_ref()
             .and_then(|c| c.get(marker_idx, sample_idx))
-            .unwrap_or(255)
+            .unwrap_or(u8::MAX)
     }
 
     /// Get phase confidence score as f32 (0.0-1.0).
     #[inline]
     pub fn sample_phase_confidence_f32(&self, marker: MarkerIdx<Space>, sample_idx: usize) -> f32 {
-        self.sample_phase_confidence(marker, sample_idx) as f32 / 255.0
+        self.sample_phase_confidence(marker, sample_idx) as f32 / u8::MAX as f32
     }
 
     /// Clone the phase confidence data (for transferring to a new matrix)
@@ -913,8 +913,8 @@ mod tests {
 
         // Create confidence scores: marker 0 has full confidence, marker 1 has 50% for sample 0
         let confidence = vec![
-            vec![255, 255], // marker 0: full confidence for both samples
-            vec![128, 255], // marker 1: 50% for sample 0, full for sample 1
+            vec![u8::MAX, u8::MAX], // marker 0: full confidence for both samples
+            vec![128, u8::MAX], // marker 1: 50% for sample 0, full for sample 1
         ];
 
         let matrix = GenotypeMatrix::new_unphased_with_confidence(
@@ -925,9 +925,9 @@ mod tests {
         );
 
         assert!(matrix.confidence_clone().is_some());
-        assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), u8::MAX);
         assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 0), 128);
-        assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 1), 255);
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(1), 1), u8::MAX);
 
         // Check f32 conversion
         assert!((matrix.sample_confidence_f32(MarkerIdx::new(0), 0) - 1.0).abs() < 0.01);
@@ -946,8 +946,8 @@ mod tests {
         // Without confidence data, has_confidence returns false
         assert!(matrix.confidence_clone().is_none());
 
-        // But sample_confidence defaults to 255 (full confidence)
-        assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), 255);
+        // But sample_confidence defaults to u8::MAX (full confidence)
+        assert_eq!(matrix.sample_confidence(MarkerIdx::new(0), 0), u8::MAX);
         assert!((matrix.sample_confidence_f32(MarkerIdx::new(0), 0) - 1.0).abs() < 0.01);
     }
 }

@@ -384,17 +384,19 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
     ///
     /// Returns the target allele index for a given reference allele,
     /// handling strand flips and swaps automatically.
-    /// Returns 255 (missing) if no valid mapping exists.
+    /// Returns missing if no valid mapping exists.
     pub fn reverse_map_allele(&self, target_marker: usize, ref_allele: u8) -> u8 {
-        if ref_allele == 255 {
-            return 255; // Missing stays missing
+        if ref_allele == crate::data::storage::AlleleCode::MISSING.raw() {
+            return crate::data::storage::AlleleCode::MISSING.raw(); // Missing stays missing
         }
 
         if let Some(Some(mapping)) = self.allele_mappings.get(target_marker) {
-            mapping.reverse_map_allele(ref_allele).unwrap_or(255)
+            mapping
+                .reverse_map_allele(ref_allele)
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
         } else {
             // Unaligned markers must not leak through as identity; treat as missing.
-            255
+            crate::data::storage::AlleleCode::MISSING.raw()
         }
     }
 

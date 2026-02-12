@@ -560,7 +560,7 @@ fn encode_bref3_marker_record(
     let mut allele_haps: Vec<Vec<i32>> = vec![Vec::new(); n_alleles];
     for hap in 0..column.n_haplotypes() {
         let allele = column.get(crate::data::HapIdx::new(hap as u32));
-        if allele == 255 {
+        if allele == crate::data::storage::AlleleCode::MISSING.raw() {
             bail!("Missing alleles are not supported in BREF3 conversion");
         }
         let idx = allele as usize;
@@ -1539,7 +1539,10 @@ impl StreamingRefVcfReader {
 
     fn parse_gt_local(&self, gt: &str) -> (u8, u8) {
         if gt == "." || gt == "./." || gt == ".|." {
-            return (255, 255);
+            return (
+                crate::data::storage::AlleleCode::MISSING.raw(),
+                crate::data::storage::AlleleCode::MISSING.raw(),
+            );
         }
         if let Some(idx) = gt.find('|') {
             let a1 = self.parse_allele_local(&gt[..idx]);
@@ -1557,7 +1560,7 @@ impl StreamingRefVcfReader {
 
     fn parse_allele_local(&self, s: &str) -> u8 {
         if s == "." || s.is_empty() {
-            return 255;
+            return crate::data::storage::AlleleCode::MISSING.raw();
         }
         if s.len() == 1 {
             let c = s.as_bytes()[0];
@@ -1565,7 +1568,7 @@ impl StreamingRefVcfReader {
                 return c - b'0';
             }
         }
-        lexical_parse::<u8>(s.as_bytes()).unwrap_or(255)
+        lexical_parse::<u8>(s.as_bytes()).unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
     }
 
     fn field_at_colon<'a>(&self, s: &'a str, idx: usize) -> Option<&'a str> {

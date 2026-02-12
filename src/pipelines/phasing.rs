@@ -783,7 +783,7 @@ fn compute_ref_freqs<TargetSpace, RefSpace>(
                 for rh in 0..n_ref_haps {
                     let ref_a = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
                     let mapped = alignment.reverse_map_allele(orig_m, ref_a);
-                    if mapped == 255 {
+                    if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
                         continue;
                     }
                     let idx = mapped as usize;
@@ -814,7 +814,7 @@ fn compute_ref_freqs<TargetSpace, RefSpace>(
             };
             for rh in 0..n_ref_haps {
                 let ref_a = ref_columns[ref_idx].get(HapIdx::new(rh as u32));
-                if ref_a == 255 {
+                if ref_a == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 let idx = ref_a as usize;
@@ -994,7 +994,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let hap2 = hap1 + 1;
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
                 let qa1 = PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
                 let qa2 = PbwtQueryAllele::allele(a2).unwrap_or_else(PbwtQueryAllele::missing);
                 let phased = phase_mask
@@ -1013,7 +1013,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         PbwtBiallelicQueryProb::uniform(),
                         PbwtBiallelicQueryProb::uniform(),
                     ];
-                } else if phased == 0 && a1 != 255 && a1 == a2 {
+                } else if phased == 0 && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
                     let phase_conf = target_gt
@@ -1045,7 +1045,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let ref_idx = if let Some(map) = ref_index_map {
                     let idx = map[ref_m.as_usize()];
                     if idx == usize::MAX {
-                        ref_alleles.fill(255);
+                        ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                         continue;
                     }
                     idx
@@ -1057,23 +1057,23 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
                 }
             } else {
-                ref_alleles.fill(255);
+                ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
             }
         } else {
             let ref_idx = if let Some(map) = ref_index_map {
                 if orig_m >= map.len() {
-                    ref_alleles.fill(255);
+                    ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                     continue;
                 }
                 let idx = map[orig_m];
                 if idx == usize::MAX {
-                    ref_alleles.fill(255);
+                    ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                     continue;
                 }
                 idx
             } else {
                 if orig_m >= ref_columns.len() {
-                    ref_alleles.fill(255);
+                    ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                     continue;
                 }
                 orig_m
@@ -1085,7 +1085,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
 
         let mut is_biallelic = true;
         for &a in ref_alleles.iter() {
-            if a >= 2 && a != 255 {
+            if a >= 2 && a != crate::data::storage::AlleleCode::MISSING.raw() {
                 is_biallelic = false;
                 break;
             }
@@ -1108,7 +1108,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
         } else {
             let mut max_allele = 1u8;
             for &a in ref_alleles.iter() {
-                if a != 255 && a > max_allele {
+                if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
                     max_allele = a;
                 }
             }
@@ -1155,7 +1155,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let hap2 = hap1 + 1;
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
                 let phased = phase_mask
                     .and_then(|mask| mask.get(orig_m, sample_idx))
                     .unwrap_or(0);
@@ -1169,7 +1169,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                             continue;
                         }
                         let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
+                        if ref_allele == crate::data::storage::AlleleCode::MISSING.raw() {
                             continue;
                         }
                         let p_match = if ref_allele <= 1 {
@@ -1210,7 +1210,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                             continue;
                         }
                         let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
+                        if ref_allele == crate::data::storage::AlleleCode::MISSING.raw() {
                             continue;
                         }
                         let p_match = if ref_allele <= 1 {
@@ -1266,7 +1266,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let hap2 = hap1 + 1;
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
                 let qa1 = PbwtQueryAllele::allele(a1).unwrap_or_else(PbwtQueryAllele::missing);
                 let qa2 = PbwtQueryAllele::allele(a2).unwrap_or_else(PbwtQueryAllele::missing);
                 let phased = phase_mask
@@ -1285,7 +1285,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         PbwtBiallelicQueryProb::uniform(),
                         PbwtBiallelicQueryProb::uniform(),
                     ];
-                } else if phased == 0 && a1 != 255 && a1 == a2 {
+                } else if phased == 0 && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a1 == a2 {
                     cached_query_pair = [qa1, qa2];
                 } else if phased != 0 && is_het {
                     let phase_conf = target_gt
@@ -1317,7 +1317,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let ref_idx = if let Some(map) = ref_index_map {
                     let idx = map[ref_m.as_usize()];
                     if idx == usize::MAX {
-                        ref_alleles.fill(255);
+                        ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                         continue;
                     }
                     idx
@@ -1329,23 +1329,23 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     ref_alleles[rh] = alignment.reverse_map_allele(orig_m, ref_a);
                 }
             } else {
-                ref_alleles.fill(255);
+                ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
             }
         } else {
             let ref_idx = if let Some(map) = ref_index_map {
                 if orig_m >= map.len() {
-                    ref_alleles.fill(255);
+                    ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                     continue;
                 }
                 let idx = map[orig_m];
                 if idx == usize::MAX {
-                    ref_alleles.fill(255);
+                    ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                     continue;
                 }
                 idx
             } else {
                 if orig_m >= ref_columns.len() {
-                    ref_alleles.fill(255);
+                    ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
                     continue;
                 }
                 orig_m
@@ -1357,7 +1357,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
 
         let mut is_biallelic = true;
         for &a in ref_alleles.iter() {
-            if a >= 2 && a != 255 {
+            if a >= 2 && a != crate::data::storage::AlleleCode::MISSING.raw() {
                 is_biallelic = false;
                 break;
             }
@@ -1380,7 +1380,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
         } else {
             let mut max_allele = 1u8;
             for &a in ref_alleles.iter() {
-                if a != 255 && a > max_allele {
+                if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
                     max_allele = a;
                 }
             }
@@ -1427,7 +1427,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let hap2 = hap1 + 1;
                 let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
                 let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
-                let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
                 let phased = phase_mask
                     .and_then(|mask| mask.get(orig_m, sample_idx))
                     .unwrap_or(0);
@@ -1440,7 +1440,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                             continue;
                         }
                         let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
+                        if ref_allele == crate::data::storage::AlleleCode::MISSING.raw() {
                             continue;
                         }
                         let p_match = if ref_allele <= 1 {
@@ -1481,7 +1481,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                             continue;
                         }
                         let ref_allele = ref_alleles[idx];
-                        if ref_allele == 255 {
+                        if ref_allele == crate::data::storage::AlleleCode::MISSING.raw() {
                             continue;
                         }
                         let p_match = if ref_allele <= 1 {
@@ -1800,7 +1800,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
         let anchor_count = anchor_hap1
             .iter()
             .zip(anchor_hap2.iter())
-            .filter(|(a1, a2)| **a1 != 255 || **a2 != 255)
+            .filter(|(a1, a2)| **a1 != crate::data::storage::AlleleCode::MISSING.raw() || **a2 != crate::data::storage::AlleleCode::MISSING.raw())
             .count();
         let anchor_frac = if n_markers > 0 {
             anchor_count as f32 / n_markers as f32
@@ -1942,9 +1942,9 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             // Partner allele is always the other haplotype's current reference allele.
             self.hap2_partner_allele[m] = ref_al;
             self.hap2_hard_match[m] = false;
-            if a1 == 255 && a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 self.hap2_use_combined[m] = true;
-                self.hap2_allele[m] = 255;
+                self.hap2_allele[m] = crate::data::storage::AlleleCode::MISSING.raw();
                 continue;
             }
             if a1 == a2 {
@@ -1964,7 +1964,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 // Fall back to unconstrained combined emission rather than creating
                 // an impossible hard wall in the state space.
                 self.hap2_use_combined[m] = true;
-                self.hap2_allele[m] = 255;
+                self.hap2_allele[m] = crate::data::storage::AlleleCode::MISSING.raw();
                 self.hap2_hard_match[m] = false;
             }
         }
@@ -1972,7 +1972,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             use rand::Rng;
             for m in 0..self.n_markers {
                 let a2 = self.anchor_hap2[m];
-                if a2 == 255 {
+                if a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob {
@@ -1981,8 +1981,8 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 self.hap2_use_combined[m] = false;
                 self.hap2_allele[m] = a2;
                 self.hap2_hard_match[m] = false;
-                let a1 = self.anchor_hap1.get(m).copied().unwrap_or(255);
-                if a1 != 255 {
+                let a1 = self.anchor_hap1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                if a1 != crate::data::storage::AlleleCode::MISSING.raw() {
                     self.hap2_partner_allele[m] = a1;
                 }
             }
@@ -2001,9 +2001,9 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             // Partner allele is always the other haplotype's current reference allele.
             self.hap1_partner_allele[m] = ref_al;
             self.hap1_hard_match[m] = false;
-            if a1 == 255 && a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 self.hap1_use_combined[m] = true;
-                self.hap1_allele[m] = 255;
+                self.hap1_allele[m] = crate::data::storage::AlleleCode::MISSING.raw();
                 continue;
             }
             if a1 == a2 {
@@ -2026,7 +2026,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 // Fall back to unconstrained combined emission rather than creating
                 // an impossible hard wall in the state space.
                 self.hap1_use_combined[m] = true;
-                self.hap1_allele[m] = 255;
+                self.hap1_allele[m] = crate::data::storage::AlleleCode::MISSING.raw();
                 self.hap1_hard_match[m] = false;
             }
         }
@@ -2034,7 +2034,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             use rand::Rng;
             for m in 0..self.n_markers {
                 let a1 = self.anchor_hap1[m];
-                if a1 == 255 {
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 if self.anchor_drop_prob > 0.0 && self.rng.random::<f32>() < self.anchor_drop_prob {
@@ -2043,8 +2043,8 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 self.hap1_use_combined[m] = false;
                 self.hap1_allele[m] = a1;
                 self.hap1_hard_match[m] = false;
-                let a2 = self.anchor_hap2.get(m).copied().unwrap_or(255);
-                if a2 != 255 {
+                let a2 = self.anchor_hap2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                if a2 != crate::data::storage::AlleleCode::MISSING.raw() {
                     self.hap1_partner_allele[m] = a2;
                 }
             }
@@ -2064,8 +2064,8 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
 
         if self.first_iteration {
             // Initialize: sample path1 from combined (marginal) distribution
-            let dummy_target = vec![255u8; self.n_markers];
-            let dummy_partner = vec![255u8; self.n_markers];
+            let dummy_target = vec![crate::data::storage::AlleleCode::MISSING.raw(); self.n_markers];
+            let dummy_partner = vec![crate::data::storage::AlleleCode::MISSING.raw(); self.n_markers];
             let dummy_combined = vec![true; self.n_markers];
             let dummy_hard = vec![false; self.n_markers];
 
@@ -2477,7 +2477,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             .collect();
         let has_missing = |m: usize| -> bool {
             let m_idx = MarkerIdx::new(m as u32);
-            (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == 255)
+            (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == crate::data::storage::AlleleCode::MISSING.raw())
         };
         let rare_markers: Vec<usize> = (0..n_markers)
             .filter(|&m| (maf[m] < rare_threshold && maf[m] > 0.0) || has_missing(m))
@@ -3723,7 +3723,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .map(|h| {
                 let bits: BitVec<u8, Lsb0> = (0..n_markers)
                     .map(|m| {
-                        target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)) == 255
+                        target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(h as u32)) == crate::data::storage::AlleleCode::MISSING.raw()
                     })
                     .collect();
                 bits.into_boxed_bitslice()
@@ -3788,7 +3788,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             .collect();
         let has_missing = |m: usize| -> bool {
             let m_idx = MarkerIdx::new(m as u32);
-            (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == 255)
+            (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == crate::data::storage::AlleleCode::MISSING.raw())
         };
         let rare_markers: Vec<usize> = (0..n_markers)
             .filter(|&m| (maf[m] < rare_threshold && maf[m] > 0.0) || has_missing(m))
@@ -4256,7 +4256,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     continue;
                 }
                 let allele = overlap.allele(m, h);
-                if allele != 255 {
+                if allele != crate::data::storage::AlleleCode::MISSING.raw() {
                     geno.set(m, h_idx, allele);
                 }
             }
@@ -4335,12 +4335,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                         let ov_a1 = overlap.allele(m, h1);
                         let ov_a2 = overlap.allele(m, h2);
-                        if ov_a1 == 255 || ov_a2 == 255 || ov_a1 == ov_a2 {
+                        if ov_a1 == crate::data::storage::AlleleCode::MISSING.raw() || ov_a2 == crate::data::storage::AlleleCode::MISSING.raw() || ov_a1 == ov_a2 {
                             continue;
                         }
                         let a1 = alleles1[m];
                         let a2 = alleles2[m];
-                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                             continue;
                         }
                         if ov_a1 != a1 || ov_a2 != a2 {
@@ -4396,7 +4396,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .filter(|&m| {
                         let a1 = alleles1[m];
                         let a2 = alleles2[m];
-                        if a1 == a2 || a1 == 255 || a2 == 255 {
+                        if a1 == a2 || a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                             return false;
                         }
                         match phase_mask.and_then(|mask| mask.get(m, s)) {
@@ -4473,7 +4473,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         };
         let haps: Vec<HapIdx> = (0..n_total_haps).map(|h| HapIdx::new(h as u32)).collect();
 
-        let mut alleles_flat = vec![255u8; n_subset.saturating_mul(n_total_haps)];
+        let mut alleles_flat = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_subset.saturating_mul(n_total_haps)];
         for i in 0..n_subset {
             let row_start = i.saturating_mul(n_total_haps);
             let row_end = row_start.saturating_add(n_total_haps);
@@ -4672,7 +4672,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
                     let a1 = target_geno.get(orig_m, HapIdx::new(hap1 as u32));
                     let a2 = target_geno.get(orig_m, HapIdx::new(hap2 as u32));
-                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                         continue;
                     }
                     anchors_by_hap[hap1].push((m, a1, a2));
@@ -4692,7 +4692,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
                 let a1 = target_geno.get(m, HapIdx::new((sample * 2) as u32));
                 let a2 = target_geno.get(m, HapIdx::new((sample * 2 + 1) as u32));
-                if phased == 0 && a1 != 255 && a2 != 255 && a1 != a2 {
+                if phased == 0 && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 {
                     unphased_hets += 1;
                 }
             }
@@ -4750,7 +4750,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
                     if !info {
                         let alleles = target_geno.marker_alleles(orig_m);
-                        if alleles.iter().any(|&a| a != 255) {
+                        if alleles.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw()) {
                             info = true;
                         }
                     }
@@ -4948,7 +4948,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let ref_al = ref_columns
                                     .get(ref_col_idx)
                                     .map(|c| c.get(hap_idx))
-                                    .unwrap_or(255);
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                                 if ref_al != 0 {
                                     ok0 = false;
                                 }
@@ -5041,7 +5041,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let ref_al = ref_columns
                                     .get(ref_col_idx)
                                     .map(|c| c.get(hap_idx))
-                                    .unwrap_or(255);
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                                 let emit =
                                     emit_prob(ref_al, *a1, 1.0, p_no_err_anchor, p_err_anchor);
                                 score += emit.max(1e-30).ln();
@@ -5540,8 +5540,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .filter(|&m| {
                                 let a1 = seq1[m];
                                 let a2 = seq2[m];
-                                a1 != 255
-                                    && a2 != 255
+                                a1 != crate::data::storage::AlleleCode::MISSING.raw()
+                                    && a2 != crate::data::storage::AlleleCode::MISSING.raw()
                                     && a1 != a2
                                     && sample_phase_view[s].is_unphased(m)
                             })
@@ -5764,7 +5764,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
                     let a1 = sp.allele1(m);
                     let a2 = sp.allele2(m);
-                    a1 != 255 && a2 != 255 && a1 != a2
+                    a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2
                 })
             })
             .collect();
@@ -5972,7 +5972,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                             let a1 = seq1[i];
                             let a2 = seq2[i];
-                            if a1 != 255 && a2 != 255 && a1 != a2 {
+                            if a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 {
                                 het_positions.push(i);
                             }
                         }
@@ -6009,7 +6009,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 }
                                 let a1 = sp.allele1(m);
                                 let a2 = sp.allele2(m);
-                                if a1 == 255 || a2 == 255 || a1 == a2 {
+                                if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                                     continue;
                                 }
                                 anchors.push((i, a1, a2));
@@ -6091,7 +6091,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         for i in 0..n_hi_freq {
                                             let a1 = seq1[i];
                                             let a2 = seq2[i];
-                                            if a1 == 255 && a2 == 255 {
+                                            if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                                                 continue;
                                             }
                                             let conf_m = sample_conf[i].clamp(0.0, 1.0);
@@ -6377,8 +6377,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     global_to_local_paths(gp, threaded_haps.as_ref(), n_hi_freq)
                                 });
                             let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
-                            let has_anchors = anchor_h1_full.iter().any(|&a| a != 255)
-                                || anchor_h2_full.iter().any(|&a| a != 255);
+                            let has_anchors = anchor_h1_full.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw())
+                                || anchor_h2_full.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw());
                             let local_prior = if has_anchors {
                                 None
                             } else {
@@ -6463,7 +6463,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     for &idx in &het_positions {
                                         let a1 = seq1[idx];
                                         let a2 = seq2[idx];
-                                        if a1 == 255 || a2 == 255 || a1 == a2 {
+                                        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                                             continue;
                                         }
                                         let h1 = paths
@@ -6484,7 +6484,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                         } else {
                                             let marker_idx = MarkerIdx::new(idx as u32);
                                             let haps = [HapIdx::new(h1), HapIdx::new(h2)];
-                                            let mut row = [255u8; 2];
+                                            let mut row = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
                                             subset_view.fill_batch(marker_idx, &haps, &mut row);
                                             let r1 = row[0];
                                             let r2 = row[1];
@@ -6532,7 +6532,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let m = hi_freq_to_orig[i];
                             let a1 = seq1[i];
                             let a2 = seq2[i];
-                            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
+                            let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
                             if is_het && !sp.is_unphased(m) {
                                 anchor_resets += 1;
                             }
@@ -6574,7 +6574,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             for i in 0..n_hi_freq {
                                 let a1 = seq1[i];
                                 let a2 = seq2[i];
-                                if a1 != 255 && a2 != 255 && a1 != a2 {
+                                if a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 {
                                     uncertainty_sum +=
                                         (1.0 - sample_phase_conf[i].clamp(0.0, 1.0)) as f64;
                                     uncertainty_count += 1;
@@ -6804,7 +6804,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             })
             .collect();
 
-        let mut phase_confidence = vec![vec![255u8; n_samples]; n_markers];
+        let mut phase_confidence = vec![vec![crate::data::storage::AlleleCode::MISSING.raw(); n_samples]; n_markers];
         for (s, sp) in sample_phases.iter().enumerate() {
             for m in 0..n_markers {
                 let p = sp.phase_confidence(m).clamp(0.0, 1.0);
@@ -6826,7 +6826,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             for &m in hi_freq_to_orig {
                 let a1 = sp.allele1(m);
                 let a2 = sp.allele2(m);
-                if a1 != 255 && a2 != 255 && a1 != a2 && sp.is_unphased(m) {
+                if a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 && sp.is_unphased(m) {
                     count += 1;
                 }
             }
@@ -7020,7 +7020,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
             let has_missing = |m: usize| -> bool {
                 let m_idx = MarkerIdx::new(m as u32);
-                (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == 255)
+                (0..n_haps).any(|h| target_gt.allele(m_idx, HapIdx::new(h as u32)) == crate::data::storage::AlleleCode::MISSING.raw())
             };
             let rare_markers: Vec<usize> = (0..n_markers)
                 .filter(|&m| (maf[m] < rare_threshold && maf[m] > 0.0) || has_missing(m))
@@ -7109,14 +7109,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     // define injected rare-donor support.
                     for h in n_haps..n_total_haps {
                         let allele = get_allele_global(m, h);
-                        if allele > 0 && allele != 255 {
+                        if allele > 0 && allele != crate::data::storage::AlleleCode::MISSING.raw() {
                             carriers.push(h as u32);
                         }
                     }
                 } else {
                     for h in 0..n_total_haps {
                         let allele = get_allele_global(m, h);
-                        if allele > 0 && allele != 255 {
+                        if allele > 0 && allele != crate::data::storage::AlleleCode::MISSING.raw() {
                             carriers.push(h as u32);
                         }
                     }
@@ -7416,7 +7416,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             for (&hap, &prob_state) in bridge_probs.iter() {
                                 let hap_allele = get_allele(m, hap as usize);
 
-                                if hap_allele != 255 {
+                                if hap_allele != crate::data::storage::AlleleCode::MISSING.raw() {
                                     let idx = hap_allele as usize;
                                     if idx < al_probs.len() {
                                         al_probs[idx] += prob_state;
@@ -7504,7 +7504,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         // Handle missing genotypes by imputation
-                        if sp.is_missing(m) || a1 == 255 || a2 == 255 {
+                        if sp.is_missing(m) || a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                             let imp_a1 = if let Some((h, top, second)) =
                                 top_bridge_haplotype(&bridge_probs1)
                             {
@@ -7514,7 +7514,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     second,
                                     self.params.p_mismatch,
                                     obs_conf,
-                                ) && al != 255
+                                ) && al != crate::data::storage::AlleleCode::MISSING.raw()
                                 {
                                     al
                                 } else {
@@ -7532,7 +7532,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     second,
                                     self.params.p_mismatch,
                                     obs_conf,
-                                ) && al != 255
+                                ) && al != crate::data::storage::AlleleCode::MISSING.raw()
                                 {
                                     al
                                 } else {
@@ -7932,7 +7932,7 @@ fn select_reduction_sparse_markers(seq1: &[u8], seq2: &[u8], sample_conf: &[f32]
     for m in 0..n_markers {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        if a1 == 255 || a2 == 255 {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
             continue;
         }
         informative_markers.push(m);
@@ -7993,7 +7993,7 @@ fn select_reduction_sparse_markers(seq1: &[u8], seq2: &[u8], sample_conf: &[f32]
                 let c = sample_conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
                 let a1 = seq1[m];
                 let a2 = seq2[m];
-                let het_bonus = if a1 != 255 && a2 != 255 && a1 != a2 {
+                let het_bonus = if a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 {
                     0.25f32
                 } else {
                     0.0
@@ -8048,15 +8048,15 @@ fn select_top_k_by_mass_two_sparse_fb(
 
 fn build_anchor_constraints(sample_phase: &SamplePhase) -> (Vec<u8>, Vec<u8>) {
     let n_markers = sample_phase.len();
-    let mut hap1 = vec![255u8; n_markers];
-    let mut hap2 = vec![255u8; n_markers];
+    let mut hap1 = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_markers];
+    let mut hap2 = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_markers];
     for m in 0..n_markers {
         if sample_phase.is_unphased(m) {
             continue;
         }
         let a1 = sample_phase.allele1(m);
         let a2 = sample_phase.allele2(m);
-        if a1 == 255 || a2 == 255 {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
             continue;
         }
         if a1 == a2 {
@@ -8138,7 +8138,7 @@ fn build_marker_emission_conf_scales(
             let sp = &sample_phases[s];
             let a1 = sp.allele1(m);
             let a2 = sp.allele2(m);
-            if a1 == 255 || a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 missing_count += 1;
                 continue;
             }
@@ -8196,7 +8196,7 @@ fn stage1_sample_phase_stability(sp: &SamplePhase, hi_freq_to_orig: &[usize]) ->
     for &m in hi_freq_to_orig {
         let a1 = sp.allele1(m);
         let a2 = sp.allele2(m);
-        if a1 == 255 || a2 == 255 || a1 == a2 {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
             continue;
         }
         sum += sp.phase_confidence(m).clamp(0.0, 1.0);
@@ -8235,7 +8235,7 @@ fn pl_confidence_from_posterior(pl: &[u16]) -> f32 {
 #[inline(always)]
 fn emit_prob(ref_al: u8, targ_al: u8, conf: f32, p_no_err: f32, p_err: f32) -> f32 {
     let neutral = 0.5 * (p_no_err + p_err);
-    let base = if ref_al == 255 || targ_al == 255 {
+    let base = if ref_al == crate::data::storage::AlleleCode::MISSING.raw() || targ_al == crate::data::storage::AlleleCode::MISSING.raw() {
         neutral
     } else if ref_al == targ_al {
         p_no_err
@@ -8254,11 +8254,11 @@ fn emit_prob_hard(
     p_err: f32,
     hard: bool,
 ) -> f32 {
-    if hard && targ_al != 255 {
+    if hard && targ_al != crate::data::storage::AlleleCode::MISSING.raw() {
         if targ_al == INVALID_ALLELE {
             return p_err.max(1e-8);
         }
-        if ref_al == 255 {
+        if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
             let neutral = 0.5 * (p_no_err + p_err);
             return neutral * conf + 0.5 * (1.0 - conf);
         }
@@ -8300,19 +8300,19 @@ fn subset_transition_params(r: f32, n_states: usize, panel_haps: usize) -> Trans
 /// Emission mode for combined diploid genotype
 #[derive(Clone, Copy)]
 enum CombinedEmitMode {
-    AllMissing,             // a1==255 && a2==255: always p_no_err
+    AllMissing,             // a1== crate::data::storage::AlleleCode::MISSING.raw() && a2== crate::data::storage::AlleleCode::MISSING.raw(): always p_no_err
     Het { a1: u8, a2: u8 }, // a1!=a2: match if ref in {a1,a2,255}
     HomOrHemi { obs: u8 },  // hom or one missing: match if ref==obs or missing
 }
 
 #[inline]
 fn classify_combined(a1: u8, a2: u8) -> CombinedEmitMode {
-    if a1 == 255 && a2 == 255 {
+    if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
         CombinedEmitMode::AllMissing
-    } else if a1 != 255 && a2 != 255 && a1 != a2 {
+    } else if a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 {
         CombinedEmitMode::Het { a1, a2 }
     } else {
-        let obs = if a1 != 255 { a1 } else { a2 };
+        let obs = if a1 != crate::data::storage::AlleleCode::MISSING.raw() { a1 } else { a2 };
         CombinedEmitMode::HomOrHemi { obs }
     }
 }
@@ -8327,7 +8327,7 @@ fn emit_combined_fast(
     p_err: f32,
 ) -> f32 {
     let neutral = 0.5 * (p_no_err + p_err);
-    if ref_al == 255 {
+    if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
         return neutral * conf + 0.5 * (1.0 - conf);
     }
     let base = match mode {
@@ -8340,7 +8340,7 @@ fn emit_combined_fast(
             }
         }
         CombinedEmitMode::HomOrHemi { obs } => {
-            if obs == 255 {
+            if obs == crate::data::storage::AlleleCode::MISSING.raw() {
                 neutral
             } else if ref_al == obs {
                 p_no_err
@@ -8386,17 +8386,17 @@ fn emit_haploid_constrained(
     p_err: f32,
 ) -> f32 {
     // Missing data: return neutral emission (no information)
-    if geno_a1 == 255 || geno_a2 == 255 {
+    if geno_a1 == crate::data::storage::AlleleCode::MISSING.raw() || geno_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
         return 1.0;
     }
 
     let neutral_emit = 0.5 * (p_no_err + p_err);
-    if ref_al == 255 {
+    if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
         return conf * neutral_emit + (1.0 - conf) * 0.5;
     }
 
     // Unphased heterozygote with no fixed partner: allow either allele.
-    if geno_a1 != geno_a2 && fixed_allele == 255 {
+    if geno_a1 != geno_a2 && fixed_allele == crate::data::storage::AlleleCode::MISSING.raw() {
         let matches = ref_al == geno_a1 || ref_al == geno_a2;
         let raw_emit = if matches { p_no_err } else { p_err };
         return conf * raw_emit + (1.0 - conf) * 0.5;
@@ -8409,10 +8409,10 @@ fn emit_haploid_constrained(
         return conf * raw_emit + (1.0 - conf) * 0.5;
     }
 
-    // At homozygous sites (fixed_allele == 255), both alleles are same
+    // At homozygous sites (fixed_allele == crate::data::storage::AlleleCode::MISSING.raw()), both alleles are same
     // so H1 must emit geno_a1
     // At heterozygous sites, H1 must emit the allele opposite to fixed_allele
-    let required_allele = if fixed_allele == 255 {
+    let required_allele = if fixed_allele == crate::data::storage::AlleleCode::MISSING.raw() {
         geno_a1 // Homozygous: H1 must emit the homozygous allele
     } else if fixed_allele == geno_a1 {
         geno_a2 // H2 has a1, so H1 must have a2
@@ -8440,7 +8440,7 @@ fn constrained_emission_confidence(
     phase_conf: f32,
 ) -> f32 {
     let g = geno_conf.clamp(0.0, 1.0);
-    if geno_a1 != geno_a2 && fixed_allele != 255 {
+    if geno_a1 != geno_a2 && fixed_allele != crate::data::storage::AlleleCode::MISSING.raw() {
         // At constrained heterozygotes, partner orientation uncertainty must
         // soften the emission even when genotype confidence is high.
         (g * phase_conf.clamp(0.0, 1.0)).clamp(0.0, 1.0)
@@ -9233,7 +9233,7 @@ fn ffbs_haploid_constrained(
     let fwd_prev = &mut workspace.ffbs_fwd_prev;
     let fwd_at_marker = &mut workspace.ffbs_fwd_at_marker;
     let weights = &mut workspace.ffbs_weights;
-    let mut neighbor_alleles = vec![255u8; actual_n_states];
+    let mut neighbor_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); actual_n_states];
     fwd_curr[..actual_n_states].fill(0.0);
     fwd_prev[..actual_n_states].fill(0.0);
 
@@ -9526,9 +9526,9 @@ fn sample_dynamic_mcmc(
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = (0..n_markers).any(|m| {
-        let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-        let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-        a1 != 255 || a2 != 255
+        let a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+        let a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+        a1 != crate::data::storage::AlleleCode::MISSING.raw() || a2 != crate::data::storage::AlleleCode::MISSING.raw()
     });
     let recipient_sample = SampleIdx::new(sample_idx);
     let recipient_stability = sample_phase_stability[sample_idx as usize].clamp(0.0, 1.0);
@@ -9584,16 +9584,16 @@ fn sample_dynamic_mcmc(
     for m in 0..n_markers {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-        let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-        if anchor_a1 != 255 || anchor_a2 != 255 {
+        let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+        let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+        if anchor_a1 != crate::data::storage::AlleleCode::MISSING.raw() || anchor_a2 != crate::data::storage::AlleleCode::MISSING.raw() {
             h1_alleles[m] = anchor_a1;
             h2_alleles[m] = anchor_a2;
             continue;
         }
-        if a1 == 255 && a2 == 255 {
-            h1_alleles[m] = 255;
-            h2_alleles[m] = 255;
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+            h1_alleles[m] = crate::data::storage::AlleleCode::MISSING.raw();
+            h2_alleles[m] = crate::data::storage::AlleleCode::MISSING.raw();
         } else if a1 == a2 {
             h1_alleles[m] = a1;
             h2_alleles[m] = a1;
@@ -9620,11 +9620,11 @@ fn sample_dynamic_mcmc(
     if let Some(paths) = initial_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             let mut pair_haps = [0u32; 2];
-            let mut pair_alleles = [255u8; 2];
+            let mut pair_alleles = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
             for m in 0..n_markers {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                     continue;
                 }
 
@@ -9713,7 +9713,7 @@ fn sample_dynamic_mcmc(
     let mut path2_ref = vec![0u32; n_markers];
     let mut path1_idx = vec![0u32; n_markers];
     let mut path2_idx = vec![0u32; n_markers];
-    let mut fixed_allele = vec![255u8; n_markers];
+    let mut fixed_allele = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_markers];
     let mut het_index = vec![usize::MAX; n_markers];
     for (i, &m) in het_positions.iter().enumerate() {
         if m < n_markers {
@@ -9739,17 +9739,17 @@ fn sample_dynamic_mcmc(
                 .unwrap_or(1)
                 .max(1);
             let mut scores = vec![0.0f32; limit * limit];
-            let mut neighbor_alleles = vec![255u8; limit];
+            let mut neighbor_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); limit];
             let mut informative = 0usize;
             for m in (0..n_markers).step_by(marker_stride) {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
-                if a1 == 255 && a2 == 255 {
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 informative += 1;
                 let conf_m = conf[m].clamp(0.0, 1.0);
-                let is_het = a1 != a2 && a1 != 255 && a2 != 255;
+                let is_het = a1 != a2 && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw();
                 phase_ibs.fill_alleles_for_haps(m, &neighbors[..limit], &mut neighbor_alleles);
                 for i in 0..limit {
                     let r1 = neighbor_alleles[i];
@@ -9762,7 +9762,7 @@ fn sample_dynamic_mcmc(
                                 * emit_prob(r2, a1, conf_m, p_no_err, p_err);
                             0.5 * (keep + swap)
                         } else {
-                            let obs = if a1 != 255 { a1 } else { a2 };
+                            let obs = if a1 != crate::data::storage::AlleleCode::MISSING.raw() { a1 } else { a2 };
                             emit_prob(r1, obs, conf_m, p_no_err, p_err)
                                 * emit_prob(r2, obs, conf_m, p_no_err, p_err)
                         };
@@ -9789,11 +9789,11 @@ fn sample_dynamic_mcmc(
                 path1_ref.fill(h1_best);
                 path2_ref.fill(h2_best);
                 let mut pair_haps = [h1_best, h2_best];
-                let mut pair_alleles = [255u8; 2];
+                let mut pair_alleles = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
                 for m in 0..n_markers {
                     let a1 = seq1[m];
                     let a2 = seq2[m];
-                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                         continue;
                     }
                     pair_haps[0] = h1_best;
@@ -9828,11 +9828,11 @@ fn sample_dynamic_mcmc(
             path1_ref.fill(h1_seed);
             path2_ref.fill(h2_seed);
             let mut pair_haps = [h1_seed, h2_seed];
-            let mut pair_alleles = [255u8; 2];
+            let mut pair_alleles = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
             for m in 0..n_markers {
                 let a1 = seq1[m];
                 let a2 = seq2[m];
-                if a1 == 255 || a2 == 255 || a1 == a2 {
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                     continue;
                 }
                 pair_haps[0] = h1_seed;
@@ -9998,7 +9998,7 @@ fn sample_dynamic_mcmc(
         for m in start..end {
             let a1 = seq1[m];
             let a2 = seq2[m];
-            if a1 == 255 && a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 continue;
             }
             let conf_score = conf[m].clamp(0.0, 1.0);
@@ -10147,13 +10147,13 @@ fn sample_dynamic_mcmc(
             };
             for &m in score_markers {
                 let obs = query_hap[m];
-                if obs == 255 {
+                if obs == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 phase_ibs.fill_alleles_for_haps(m, &candidates_buf, &mut donor_alleles_buf);
                 for i in 0..candidates_buf.len() {
                     let ref_al = donor_alleles_buf[i];
-                    if ref_al == 255 {
+                    if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
                         continue;
                     }
                     donor_scores_buf[i] += if ref_al == obs {
@@ -10251,11 +10251,11 @@ fn sample_dynamic_mcmc(
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
-            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                fixed_allele[m] = 255; // No constraint (hom/missing)
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let is_anchor = anchor_a1 != crate::data::storage::AlleleCode::MISSING.raw() || anchor_a2 != crate::data::storage::AlleleCode::MISSING.raw();
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
+                fixed_allele[m] = crate::data::storage::AlleleCode::MISSING.raw(); // No constraint (hom/missing)
             } else if is_anchor {
                 fixed_allele[m] = anchor_a2;
             } else {
@@ -10292,17 +10292,17 @@ fn sample_dynamic_mcmc(
             let state = path1_idx[m] as usize;
             let a1 = seq1[m];
             let a2 = seq2[m];
-            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let is_anchor = anchor_a1 != crate::data::storage::AlleleCode::MISSING.raw() || anchor_a2 != crate::data::storage::AlleleCode::MISSING.raw();
             if is_anchor {
                 h1_alleles[m] = anchor_a1;
                 h2_alleles[m] = anchor_a2;
                 continue;
             }
 
-            if a1 == 255 && a2 == 255 {
-                h1_alleles[m] = 255;
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+                h1_alleles[m] = crate::data::storage::AlleleCode::MISSING.raw();
             } else if a1 == a2 {
                 h1_alleles[m] = a1;
             } else if state < neighbors.len() {
@@ -10362,11 +10362,11 @@ fn sample_dynamic_mcmc(
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
-            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
-            if a1 == 255 || a2 == 255 || a1 == a2 {
-                fixed_allele[m] = 255;
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let is_anchor = anchor_a1 != crate::data::storage::AlleleCode::MISSING.raw() || anchor_a2 != crate::data::storage::AlleleCode::MISSING.raw();
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
+                fixed_allele[m] = crate::data::storage::AlleleCode::MISSING.raw();
             } else if is_anchor {
                 fixed_allele[m] = anchor_a1;
             } else {
@@ -10402,17 +10402,17 @@ fn sample_dynamic_mcmc(
         for m in 0..n_markers {
             let a1 = seq1[m];
             let a2 = seq2[m];
-            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            let is_anchor = anchor_a1 != 255 || anchor_a2 != 255;
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let is_anchor = anchor_a1 != crate::data::storage::AlleleCode::MISSING.raw() || anchor_a2 != crate::data::storage::AlleleCode::MISSING.raw();
             if is_anchor {
                 h1_alleles[m] = anchor_a1;
                 h2_alleles[m] = anchor_a2;
                 continue;
             }
 
-            if a1 == 255 && a2 == 255 {
-                h2_alleles[m] = 255;
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+                h2_alleles[m] = crate::data::storage::AlleleCode::MISSING.raw();
             } else if a1 == a2 {
                 h2_alleles[m] = a2;
             } else {
@@ -10465,9 +10465,9 @@ fn sample_dynamic_mcmc(
             {
                 swap_score += inertia_weight * w;
             }
-            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(255);
-            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(255);
-            if anchor_a1 != 255 && anchor_a2 != 255 {
+            let anchor_a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let anchor_a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            if anchor_a1 != crate::data::storage::AlleleCode::MISSING.raw() && anchor_a2 != crate::data::storage::AlleleCode::MISSING.raw() {
                 let mut anchor_keep = 0.0f32;
                 let mut anchor_swap = 0.0f32;
                 if h1_alleles[m] == anchor_a1 {
@@ -10500,7 +10500,7 @@ fn sample_dynamic_mcmc(
             }
             let a1 = seq1[m];
             let a2 = seq2[m];
-            if a1 == 255 || a2 == 255 || a1 == a2 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                 continue;
             }
             let swap = h1_alleles[m] != a1;
@@ -10518,7 +10518,7 @@ fn sample_dynamic_mcmc(
         let a1 = seq1[m];
         let a2 = seq2[m];
 
-        if a1 == 255 || a2 == 255 || a1 == a2 {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
             swap_bits.push(0);
             swap_lr.push(1.0);
             swap_probs.push(0.5);
@@ -10571,8 +10571,8 @@ fn sample_dynamic_mcmc(
                 path2_switches += 1;
             }
             let prev_is_het =
-                seq1[m - 1] != 255 && seq2[m - 1] != 255 && seq1[m - 1] != seq2[m - 1];
-            let curr_is_het = seq1[m] != 255 && seq2[m] != 255 && seq1[m] != seq2[m];
+                seq1[m - 1] != crate::data::storage::AlleleCode::MISSING.raw() && seq2[m - 1] != crate::data::storage::AlleleCode::MISSING.raw() && seq1[m - 1] != seq2[m - 1];
+            let curr_is_het = seq1[m] != crate::data::storage::AlleleCode::MISSING.raw() && seq2[m] != crate::data::storage::AlleleCode::MISSING.raw() && seq1[m] != seq2[m];
             if prev_is_het && curr_is_het && h1_alleles[m] != h1_alleles[m - 1] {
                 h1_transitions += 1;
             }
@@ -10711,13 +10711,13 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         .filter(|&m| {
             let a1 = seq1[m];
             let a2 = seq2[m];
-            !(a1 == 255 && a2 == 255)
+            !(a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw())
         })
         .collect();
     if sparse_markers.is_empty() {
         return None;
     }
-    let mut sparse_ref_rows = vec![255u8; sparse_markers.len() * n_states];
+    let mut sparse_ref_rows = vec![crate::data::storage::AlleleCode::MISSING.raw(); sparse_markers.len() * n_states];
     for (row_i, &m) in sparse_markers.iter().enumerate() {
         let dst = &mut sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
         if let Some(flat) = predecoded_ref_flat {
@@ -10740,8 +10740,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
         let a1 = seq1[m];
         let a2 = seq2[m];
         let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-        let obs = if a1 != 255 { a1 } else { a2 };
+        let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
+        let obs = if a1 != crate::data::storage::AlleleCode::MISSING.raw() { a1 } else { a2 };
         let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
         for i in 0..n_states {
             let r = ref_row[i];
@@ -10803,8 +10803,8 @@ fn find_best_constant_pair_with_buffer<RefSpace>(
             let a1 = seq1[m];
             let a2 = seq2[m];
             let conf_m = conf.get(m).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-            let is_het = a1 != 255 && a2 != 255 && a1 != a2;
-            let obs = if a1 != 255 { a1 } else { a2 };
+            let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2;
+            let obs = if a1 != crate::data::storage::AlleleCode::MISSING.raw() { a1 } else { a2 };
             let ref_row = &sparse_ref_rows[row_i * n_states..(row_i + 1) * n_states];
             let r_seed = ref_row[si];
 
@@ -10925,8 +10925,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
         workspace.dummy_combined.resize(n_markers, true);
         workspace.dummy_hard_match.resize(n_markers, false);
     } else {
-        workspace.dummy_target[..n_markers].fill(255);
-        workspace.dummy_partner[..n_markers].fill(255);
+        workspace.dummy_target[..n_markers].fill(crate::data::storage::AlleleCode::MISSING.raw());
+        workspace.dummy_partner[..n_markers].fill(crate::data::storage::AlleleCode::MISSING.raw());
         workspace.dummy_combined[..n_markers].fill(true);
         workspace.dummy_hard_match[..n_markers].fill(false);
     }
@@ -10966,7 +10966,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
 
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
-    let has_anchor = anchor_h1.iter().any(|&a| a != 255) || anchor_h2.iter().any(|&a| a != 255);
+    let has_anchor = anchor_h1.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw()) || anchor_h2.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw());
 
     let heuristic_paths = find_best_constant_pair_with_buffer(
         n_markers,
@@ -11078,8 +11078,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
     let anchor_indices: Vec<usize> = if has_anchor {
         (0..n_markers)
             .filter(|&m| {
-                anchor_h1.get(m).copied().unwrap_or(255) != 255
-                    || anchor_h2.get(m).copied().unwrap_or(255) != 255
+                anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()) != crate::data::storage::AlleleCode::MISSING.raw()
+                    || anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()) != crate::data::storage::AlleleCode::MISSING.raw()
             })
             .collect()
     } else {
@@ -11095,9 +11095,9 @@ fn sample_swap_bits_mosaic<RefSpace>(
             let mut flipped = 0.0f32;
             let mut evidence = 0usize;
             for &m in &anchor_indices {
-                let a1 = anchor_h1.get(m).copied().unwrap_or(255);
-                let a2 = anchor_h2.get(m).copied().unwrap_or(255);
-                if a1 == 255 && a2 == 255 {
+                let a1 = anchor_h1.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                let a2 = anchor_h2.get(m).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() && a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 let p1 = chain.path1[m] as usize;
@@ -11109,12 +11109,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 let r1 = ref_row[p1];
                 let r2 = ref_row[p2];
                 let conf_m = conf[m].clamp(0.0, 1.0);
-                if a1 != 255 {
+                if a1 != crate::data::storage::AlleleCode::MISSING.raw() {
                     direct += emit_prob(r1, a1, conf_m, p_no_err, p_err).max(1e-30).ln();
                     flipped += emit_prob(r2, a1, conf_m, p_no_err, p_err).max(1e-30).ln();
                     evidence += 1;
                 }
-                if a2 != 255 {
+                if a2 != crate::data::storage::AlleleCode::MISSING.raw() {
                     direct += emit_prob(r2, a2, conf_m, p_no_err, p_err).max(1e-30).ln();
                     flipped += emit_prob(r1, a2, conf_m, p_no_err, p_err).max(1e-30).ln();
                     evidence += 1;
@@ -11126,7 +11126,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
         for (i, &m) in het_positions.iter().enumerate() {
             let a1 = seq1[m];
             let a2 = seq2[m];
-            if a1 == 255 || a2 == 255 || a1 == a2 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                 continue;
             }
             let p1 = chain.path1[m] as usize;
@@ -11170,7 +11170,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     for (i, &m) in het_positions.iter().enumerate() {
         let a1 = seq1[m];
         let a2 = seq2[m];
-        if a1 == 255 || a2 == 255 || a1 == a2 || obs_counts[i] < 0.5 {
+        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 || obs_counts[i] < 0.5 {
             swap_bits.push(0);
             swap_lr.push(1.0);
             swap_probs.push(0.5);
@@ -11441,7 +11441,7 @@ impl Stage2Phaser {
         let mut al_probs = [0.0f32; 2];
         for (&hap, &prob) in bridge_probs.iter() {
             let ref_allele = get_allele(marker, hap as usize);
-            if ref_allele == 255 {
+            if ref_allele == crate::data::storage::AlleleCode::MISSING.raw() {
                 continue;
             }
             if ref_allele == a1 {
@@ -11679,7 +11679,7 @@ impl Stage2Phaser {
             for &ctx_m in context_markers {
                 let ta = get_allele(ctx_m, target_hap);
                 let ha = get_allele(ctx_m, hap as usize);
-                if ta == 255 || ha == 255 {
+                if ta == crate::data::storage::AlleleCode::MISSING.raw() || ha == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 n_info += 1;
@@ -11924,7 +11924,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 let curr_a2 = current_phased.allele(MarkerIdx::new(current_m as u32), hap2);
 
                 // Only fix heterozygotes
-                if curr_a1 == curr_a2 || curr_a1 == 255 || curr_a2 == 255 {
+                if curr_a1 == curr_a2 || curr_a1 == crate::data::storage::AlleleCode::MISSING.raw() || curr_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
 
@@ -11970,7 +11970,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             for m in 0..n_markers {
                 let a1 = current_phased.allele(MarkerIdx::new(m as u32), hap1);
                 let a2 = current_phased.allele(MarkerIdx::new(m as u32), hap2);
-                if a1 != a2 && a1 != 255 && a2 != 255 {
+                if a1 != a2 && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() {
                     mask.set(m, true);
                 }
             }
@@ -12569,8 +12569,8 @@ mod tests {
         let seq1: Vec<u8> = vec![0; n_markers];
         let seq2: Vec<u8> = vec![1; n_markers];
         let conf: Vec<f32> = vec![1.0; n_markers];
-        let mut anchor_h1 = vec![255u8; n_markers];
-        let mut anchor_h2 = vec![255u8; n_markers];
+        let mut anchor_h1 = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_markers];
+        let mut anchor_h2 = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_markers];
         for m in (0..n_markers).step_by(10) {
             anchor_h1[m] = hero_pattern[m];
             anchor_h2[m] = 1 - hero_pattern[m];
@@ -12776,7 +12776,7 @@ mod tests {
                     }
                     if !info {
                         let alleles = target_geno.marker_alleles(m);
-                        if alleles.iter().any(|&a| a != 255) {
+                        if alleles.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw()) {
                             info = true;
                         }
                     }
@@ -12977,7 +12977,7 @@ mod tests {
                     }
                     let a1 = target_geno.get(m, HapIdx::new(hap1 as u32));
                     let a2 = target_geno.get(m, HapIdx::new(hap2 as u32));
-                    if a1 == 255 || a2 == 255 || a1 == a2 {
+                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                         continue;
                     }
                     anchors_by_hap[hap1].push((m, a1, a2));
@@ -13001,8 +13001,8 @@ mod tests {
                     let hap_idx = HapIdx::new(h as u32);
                     let mut score = 0i32;
                     for (m, a1, _) in &window_anchors {
-                        let ref_al = ref_columns.get(*m).map(|c| c.get(hap_idx)).unwrap_or(255);
-                        if ref_al == 255 {
+                        let ref_al = ref_columns.get(*m).map(|c| c.get(hap_idx)).unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                        if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
                             continue;
                         }
                         if ref_al == *a1 {
@@ -13158,7 +13158,7 @@ mod tests {
         // Reference haps (2-9): all have allele 0
         let alleles: Vec<Vec<u8>> = (0..n_markers)
             .map(|_| {
-                let mut haps = vec![255u8; n_total_haps]; // Start with missing
+                let mut haps = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_total_haps]; // Start with missing
                 for h in n_target_haps..n_total_haps {
                     haps[h] = 0; // Reference haplotypes have allele 0
                 }
@@ -13255,7 +13255,7 @@ mod tests {
         // Reference haps (2-9): all have allele 1
         let alleles: Vec<Vec<u8>> = (0..n_markers)
             .map(|_| {
-                let mut haps = vec![255u8; n_total_haps];
+                let mut haps = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_total_haps];
                 for h in n_target_haps..n_total_haps {
                     haps[h] = 1; // Reference haplotypes have allele 1
                 }

@@ -178,16 +178,20 @@ impl ThreadWorkspace {
             self.path2.resize(n_markers, 0);
         }
         if self.hap1_allele.len() < n_markers {
-            self.hap1_allele.resize(n_markers, 255);
+            self.hap1_allele
+                .resize(n_markers, crate::data::storage::AlleleCode::MISSING.raw());
         }
         if self.hap2_allele.len() < n_markers {
-            self.hap2_allele.resize(n_markers, 255);
+            self.hap2_allele
+                .resize(n_markers, crate::data::storage::AlleleCode::MISSING.raw());
         }
         if self.hap1_partner_allele.len() < n_markers {
-            self.hap1_partner_allele.resize(n_markers, 255);
+            self.hap1_partner_allele
+                .resize(n_markers, crate::data::storage::AlleleCode::MISSING.raw());
         }
         if self.hap2_partner_allele.len() < n_markers {
-            self.hap2_partner_allele.resize(n_markers, 255);
+            self.hap2_partner_allele
+                .resize(n_markers, crate::data::storage::AlleleCode::MISSING.raw());
         }
         if self.hap1_use_combined.len() < n_markers {
             self.hap1_use_combined.resize(n_markers, true);

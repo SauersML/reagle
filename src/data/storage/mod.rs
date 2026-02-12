@@ -25,6 +25,44 @@ pub use view::GenotypeView;
 use crate::data::HapIdx;
 use std::sync::Arc;
 
+/// Zero-cost allele code wrapper used to avoid raw sentinel literals in logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct AlleleCode(u8);
+
+impl AlleleCode {
+    pub const MISSING: Self = Self(255);
+
+    #[inline]
+    pub const fn from_raw(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_missing(self) -> bool {
+        self.0 == Self::MISSING.0
+    }
+}
+
+impl From<u8> for AlleleCode {
+    #[inline]
+    fn from(value: u8) -> Self {
+        Self::from_raw(value)
+    }
+}
+
+impl From<AlleleCode> for u8 {
+    #[inline]
+    fn from(value: AlleleCode) -> Self {
+        value.raw()
+    }
+}
+
 /// The core genotype storage enum - replaces Java's class hierarchy
 #[derive(Clone, Debug)]
 pub enum GenotypeColumn {
@@ -48,11 +86,11 @@ pub enum GenotypeColumn {
 }
 
 impl GenotypeColumn {
-    pub const MISSING_ALLELE: u8 = 255;
+    pub const MISSING_ALLELE: u8 = AlleleCode::MISSING.raw();
 
     #[inline]
     pub fn is_missing_allele(allele: u8) -> bool {
-        allele == Self::MISSING_ALLELE
+        AlleleCode::from_raw(allele).is_missing()
     }
 
     /// Get allele for a specific haplotype (0 = REF, 1+ = ALT)
@@ -181,9 +219,15 @@ impl GenotypeColumn {
             return Self::Dense(DenseColumn::new(0, 1));
         }
 
-        // Count ALT carriers for MAF calculation (ignore missing = 255)
-        let alt_count = alleles.iter().filter(|&&a| a > 0 && a != 255).count();
-        let present_count = alleles.iter().filter(|&&a| a != 255).count();
+        // Count ALT carriers for MAF calculation (ignore missing sentinel).
+        let alt_count = alleles
+            .iter()
+            .filter(|&&a| a > 0 && !AlleleCode::from_raw(a).is_missing())
+            .count();
+        let present_count = alleles
+            .iter()
+            .filter(|&&a| !AlleleCode::from_raw(a).is_missing())
+            .count();
 
         let maf = if present_count > 0 {
             let freq = alt_count as f64 / present_count as f64;
@@ -197,7 +241,7 @@ impl GenotypeColumn {
         // so we only use it if there are no missing alleles or if we are okay
         // with missing being treated as REF/ALT in sparse storage (usually rare variants don't have many missing).
         // For correctness, if there's missing data, use Dense storage.
-        let has_missing = alleles.iter().any(|&a| a == 255);
+        let has_missing = alleles.iter().any(|&a| AlleleCode::from_raw(a).is_missing());
 
         if maf < 0.01 && n_alleles == 2 && !has_missing {
             // Determine if we should store ALT or REF carriers (whichever is fewer)

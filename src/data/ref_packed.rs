@@ -50,7 +50,7 @@ impl<RefSpace> PackedRefView<RefSpace> {
     pub fn ref_allele_targ(&self, marker: usize, hap: usize) -> Option<u8> {
         let col = self.columns.get(marker).and_then(|v| v.as_ref())?;
         let ref_al = col.allele(hap);
-        if ref_al == 255 {
+        if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
             return None;
         }
         self.map_ref_to_targ(marker, ref_al)

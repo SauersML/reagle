@@ -727,13 +727,13 @@ fn compute_target_freqs_packed<TargetSpace, RefSpace>(
             if let Some((zeros, ones, missing)) = col.counts_biallelic() {
                 let map0 = alignment.reverse_map_allele(m, 0);
                 let map1 = alignment.reverse_map_allele(m, 1);
-                if map0 != 255 {
+                if map0 != crate::data::storage::AlleleCode::MISSING.raw() {
                     let idx = map0 as usize;
                     if idx < counts.len() {
                         counts[idx] += zeros as u32;
                     }
                 }
-                if map1 != 255 {
+                if map1 != crate::data::storage::AlleleCode::MISSING.raw() {
                     let idx = map1 as usize;
                     if idx < counts.len() {
                         counts[idx] += ones as u32;
@@ -744,7 +744,7 @@ fn compute_target_freqs_packed<TargetSpace, RefSpace>(
                 for rh in 0..n_ref_haps {
                     let ref_a = col.allele(rh);
                     let mapped = alignment.reverse_map_allele(m, ref_a);
-                    if mapped == 255 {
+                    if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
                         continue;
                     }
                     let idx = mapped as usize;
@@ -858,12 +858,12 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
     let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
-    let mut query_alleles = vec![255u8; batch_haps.len()];
-    let mut ref_alleles = vec![255u8; n_ref_haps];
+    let mut query_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); batch_haps.len()];
+    let mut ref_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_ref_haps];
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
     let mut query_rows_by_allele: Vec<Vec<usize>> = Vec::new();
     let mut pending_updates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); batch_haps.len()];
-    let mut map_lut = [255u8; 256];
+    let mut map_lut = [crate::data::storage::AlleleCode::MISSING.raw(); 256];
     let mut map_lut_seen = [false; 256];
 
     for m in 0..n_markers {
@@ -888,7 +888,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             rows.clear();
         }
         for (i, &a) in query_alleles.iter().enumerate() {
-            if a == 255 {
+            if a == crate::data::storage::AlleleCode::MISSING.raw() {
                 continue;
             }
             let idx = a as usize;
@@ -908,7 +908,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
         col.fill_alleles(&mut ref_alleles);
         map_lut_seen.fill(false);
         for (rh, &ref_a) in ref_alleles.iter().enumerate() {
-            if ref_a == 255 {
+            if ref_a == crate::data::storage::AlleleCode::MISSING.raw() {
                 continue;
             }
             let lut_idx = ref_a as usize;
@@ -920,7 +920,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
                 map_lut_seen[lut_idx] = true;
                 v
             };
-            if mapped == 255 {
+            if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
                 continue;
             }
             let idx = mapped as usize;
@@ -1105,12 +1105,12 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
             }
         } else {
-            ref_alleles.fill(255);
+            ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
         }
 
         let mut max_allele = 1u8;
         for &a in ref_alleles.iter() {
-            if a != 255 && a > max_allele {
+            if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
                 max_allele = a;
             }
         }
@@ -1153,7 +1153,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     let idx = d as usize;
                     if idx < n_ref_haps {
                         let ref_a = ref_alleles[idx];
-                        if ref_a == 255 || ref_a != targ {
+                        if ref_a == crate::data::storage::AlleleCode::MISSING.raw() || ref_a != targ {
                             continue;
                         }
                         global_scores[i][idx] += weight;
@@ -1187,12 +1187,12 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
             }
         } else {
-            ref_alleles.fill(255);
+            ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
         }
 
         let mut max_allele = 1u8;
         for &a in ref_alleles.iter() {
-            if a != 255 && a > max_allele {
+            if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
                 max_allele = a;
             }
         }
@@ -1235,7 +1235,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     let idx = d as usize;
                     if idx < n_ref_haps {
                         let ref_a = ref_alleles[idx];
-                        if ref_a == 255 || ref_a != targ {
+                        if ref_a == crate::data::storage::AlleleCode::MISSING.raw() || ref_a != targ {
                             continue;
                         }
                         global_scores[i][idx] += weight;
@@ -4103,11 +4103,11 @@ impl crate::pipelines::ImputationPipeline {
                     let mut allele1 = raw_allele1;
                     let mut allele2 = raw_allele2;
                     if let Some(missing) = target_missing {
-                        if missing.allele(MarkerIdx::new(target_m as u32), hap1) == 255 {
-                            allele1 = 255;
+                        if missing.allele(MarkerIdx::new(target_m as u32), hap1) == crate::data::storage::AlleleCode::MISSING.raw() {
+                            allele1 = crate::data::storage::AlleleCode::MISSING.raw();
                         }
-                        if missing.allele(MarkerIdx::new(target_m as u32), hap2) == 255 {
-                            allele2 = 255;
+                        if missing.allele(MarkerIdx::new(target_m as u32), hap2) == crate::data::storage::AlleleCode::MISSING.raw() {
+                            allele2 = crate::data::storage::AlleleCode::MISSING.raw();
                         }
                     }
 
@@ -4134,9 +4134,9 @@ impl crate::pipelines::ImputationPipeline {
                     };
 
                     let is_diploid = target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
-                    let has_hard = mapped1 != 255
+                    let has_hard = mapped1 != crate::data::storage::AlleleCode::MISSING.raw()
                         && (mapped1 as usize) < n_alleles
-                        && (!is_diploid || (mapped2 != 255 && (mapped2 as usize) < n_alleles));
+                        && (!is_diploid || (mapped2 != crate::data::storage::AlleleCode::MISSING.raw() && (mapped2 as usize) < n_alleles));
                     let input_phased = target_win
                         .phase_mask()
                         .and_then(|mask| mask.get(target_m, sample_idx))
@@ -4189,7 +4189,7 @@ impl crate::pipelines::ImputationPipeline {
                                     if n_pl_alleles > 0 {
                                         let mut used_conditional = false;
                                         if local_phase_conf_valid
-                                            && partner_allele != 255
+                                            && partner_allele != crate::data::storage::AlleleCode::MISSING.raw()
                                             && (partner_allele as usize) < n_pl_alleles
                                         {
                                             let phase_conf = target_win
@@ -4308,7 +4308,7 @@ impl crate::pipelines::ImputationPipeline {
                                             let conf = conf_base.clamp(0.0, 1.0);
                                             weights_buf.clear();
                                             weights_buf.resize(n_pl_alleles, 0.0);
-                                            if partner_allele != 255
+                                            if partner_allele != crate::data::storage::AlleleCode::MISSING.raw()
                                                 && (partner_allele as usize) < n_pl_alleles
                                             {
                                                 let partner_idx = partner_allele as usize;
@@ -4410,7 +4410,7 @@ impl crate::pipelines::ImputationPipeline {
                             conf1 = conf1.min(1.0 - err_rate);
                         }
                         aligned1.resize(n_alleles, 0.0);
-                        if is_diploid && mapped2 != 255 && mapped2 != mapped1 {
+                        if is_diploid && mapped2 != crate::data::storage::AlleleCode::MISSING.raw() && mapped2 != mapped1 {
                             if local_phase_conf_valid {
                                 let phase_conf = target_win
                                     .sample_phase_confidence_f32(
@@ -4448,7 +4448,7 @@ impl crate::pipelines::ImputationPipeline {
                             conf2 = conf2.min(1.0 - err_rate);
                         }
                         aligned2.resize(n_alleles, 0.0);
-                        if is_diploid && mapped1 != 255 && mapped1 != mapped2 {
+                        if is_diploid && mapped1 != crate::data::storage::AlleleCode::MISSING.raw() && mapped1 != mapped2 {
                             if local_phase_conf_valid {
                                 let phase_conf = target_win
                                     .sample_phase_confidence_f32(
@@ -4479,11 +4479,11 @@ impl crate::pipelines::ImputationPipeline {
                         observed1_marker = true;
                         observed2_marker = true;
                     } else if has_hard {
-                        observed1_marker = mapped1 != 255;
+                        observed1_marker = mapped1 != crate::data::storage::AlleleCode::MISSING.raw();
                         observed2_marker = if is_diploid {
-                            mapped2 != 255
+                            mapped2 != crate::data::storage::AlleleCode::MISSING.raw()
                         } else {
-                            mapped1 != 255
+                            mapped1 != crate::data::storage::AlleleCode::MISSING.raw()
                         };
                     }
                 }
@@ -4621,7 +4621,7 @@ impl crate::pipelines::ImputationPipeline {
                             .and_then(|m| m.as_ref());
 
                         let mut cached_sample_idx = usize::MAX;
-                        let mut cached_query_pair = [255u8; 2];
+                        let mut cached_query_pair = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
                         let mut cached_wildcard_weight = 0.0f32;
                         let mut cached_allele_weight = 0.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
@@ -4638,16 +4638,16 @@ impl crate::pipelines::ImputationPipeline {
                                 let mut a1 = target_win.allele(target_marker, h1);
                                 let mut a2 = target_win.allele(target_marker, h2);
                                 if let Some(missing) = target_missing {
-                                    if missing.allele(target_marker, h1) == 255 {
-                                        a1 = 255;
+                                    if missing.allele(target_marker, h1) == crate::data::storage::AlleleCode::MISSING.raw() {
+                                        a1 = crate::data::storage::AlleleCode::MISSING.raw();
                                     }
-                                    if missing.allele(target_marker, h2) == 255 {
-                                        a2 = 255;
+                                    if missing.allele(target_marker, h2) == crate::data::storage::AlleleCode::MISSING.raw() {
+                                        a2 = crate::data::storage::AlleleCode::MISSING.raw();
                                     }
                                 }
                                 let map_to_ref = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
+                                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                                        return crate::data::storage::AlleleCode::MISSING.raw();
                                     }
                                     if let Some(mapping) = mapping {
                                         if (a as usize) < mapping.targ_to_ref.len() {
@@ -4663,13 +4663,16 @@ impl crate::pipelines::ImputationPipeline {
                                 };
                                 let mapped1 = map_to_ref(a1);
                                 let mapped2 = map_to_ref(a2);
-                                let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
+                                let is_het = mapped1 != crate::data::storage::AlleleCode::MISSING.raw() && mapped2 != crate::data::storage::AlleleCode::MISSING.raw() && mapped1 != mapped2;
                                 let input_phased = phase_mask
                                     .and_then(|mask| mask.get(target_idx, sample_idx))
                                     .map(|v| v != 0)
                                     .unwrap_or(true);
                                 if is_het && !input_phased {
-                                    cached_query_pair = [255, 255];
+                                    cached_query_pair = [
+                                        crate::data::storage::AlleleCode::MISSING.raw(),
+                                        crate::data::storage::AlleleCode::MISSING.raw(),
+                                    ];
                                 } else if is_het && input_phased {
                                     let qa1 = PbwtQueryAllele::allele(mapped1)
                                         .unwrap_or_else(PbwtQueryAllele::missing);
@@ -4713,7 +4716,10 @@ impl crate::pipelines::ImputationPipeline {
                                         phase_orientation_weight(phase_conf, err_limit);
                                     cached_allele_weight = orientation_weight;
                                     if phase_best_orientation_error(phase_conf) > err_limit {
-                                        cached_query_pair = [255, 255];
+                                        cached_query_pair = [
+                                            crate::data::storage::AlleleCode::MISSING.raw(),
+                                            crate::data::storage::AlleleCode::MISSING.raw(),
+                                        ];
                                         cached_wildcard_weight =
                                             uncertain_orientation_wildcard_info_weight();
                                     } else if phase_conf < 0.5 {
@@ -4728,9 +4734,9 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             let query = PbwtQueryAllele::allele(cached_query_pair[local])
                                 .unwrap_or_else(PbwtQueryAllele::wildcard);
-                            let target_allele = query.as_allele().unwrap_or(255);
+                            let target_allele = query.as_allele().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                             query_info_weight[i] =
-                                if target_allele != 255 && (target_allele as usize) < n_alleles {
+                                if target_allele != crate::data::storage::AlleleCode::MISSING.raw() && (target_allele as usize) < n_alleles {
                                     info_llr * cached_allele_weight
                                 } else if query.is_wildcard() {
                                     cached_wildcard_weight
@@ -5034,8 +5040,8 @@ impl crate::pipelines::ImputationPipeline {
                             let allele = ref_columns
                                 .get(ref_m)
                                 .map(|col| col.get(HapIdx::new(hap.as_u32())))
-                                .unwrap_or(255);
-                            if allele == 255 {
+                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                            if allele == crate::data::storage::AlleleCode::MISSING.raw() {
                                 continue;
                             }
                             let idx = allele as usize;
@@ -5268,8 +5274,8 @@ impl crate::pipelines::ImputationPipeline {
                                 let allele = ref_columns
                                     .get(ref_m)
                                     .map(|col| col.get(HapIdx::new(hap.as_u32())))
-                                    .unwrap_or(255);
-                                if allele == 255 {
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                                if allele == crate::data::storage::AlleleCode::MISSING.raw() {
                                     continue;
                                 }
                                 let idx = allele as usize;
@@ -5389,8 +5395,8 @@ impl crate::pipelines::ImputationPipeline {
                                 let allele = ref_columns
                                     .get(ref_m)
                                     .map(|col| col.get(hap))
-                                    .unwrap_or(255);
-                                if allele == 255 {
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                                if allele == crate::data::storage::AlleleCode::MISSING.raw() {
                                     continue;
                                 }
                                 let idx = allele as usize;
@@ -5833,7 +5839,7 @@ impl crate::pipelines::ImputationPipeline {
                             .and_then(|m| m.as_ref());
 
                         let mut cached_sample_idx = usize::MAX;
-                        let mut cached_query_pair = [255u8; 2];
+                        let mut cached_query_pair = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
                         let mut cached_wildcard_weight = 0.0f32;
                         let mut cached_allele_weight = 1.0f32;
                         for (i, &hap_idx) in haps.iter().enumerate() {
@@ -5849,16 +5855,16 @@ impl crate::pipelines::ImputationPipeline {
                                 let mut a1 = target_win.allele(target_marker, h1);
                                 let mut a2 = target_win.allele(target_marker, h2);
                                 if let Some(missing) = target_missing {
-                                    if missing.allele(target_marker, h1) == 255 {
-                                        a1 = 255;
+                                    if missing.allele(target_marker, h1) == crate::data::storage::AlleleCode::MISSING.raw() {
+                                        a1 = crate::data::storage::AlleleCode::MISSING.raw();
                                     }
-                                    if missing.allele(target_marker, h2) == 255 {
-                                        a2 = 255;
+                                    if missing.allele(target_marker, h2) == crate::data::storage::AlleleCode::MISSING.raw() {
+                                        a2 = crate::data::storage::AlleleCode::MISSING.raw();
                                     }
                                 }
                                 let map_to_ref = |a: u8| -> u8 {
-                                    if a == 255 {
-                                        return 255;
+                                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                                        return crate::data::storage::AlleleCode::MISSING.raw();
                                     }
                                     if let Some(mapping) = mapping {
                                         if (a as usize) < mapping.targ_to_ref.len() {
@@ -5874,13 +5880,16 @@ impl crate::pipelines::ImputationPipeline {
                                 };
                                 let mapped1 = map_to_ref(a1);
                                 let mapped2 = map_to_ref(a2);
-                                let is_het = mapped1 != 255 && mapped2 != 255 && mapped1 != mapped2;
+                                let is_het = mapped1 != crate::data::storage::AlleleCode::MISSING.raw() && mapped2 != crate::data::storage::AlleleCode::MISSING.raw() && mapped1 != mapped2;
                                 let input_phased = phase_mask
                                     .and_then(|mask| mask.get(target_idx, sample_idx))
                                     .map(|v| v != 0)
                                     .unwrap_or(true);
                                 if is_het && !input_phased {
-                                    cached_query_pair = [255, 255];
+                                    cached_query_pair = [
+                                        crate::data::storage::AlleleCode::MISSING.raw(),
+                                        crate::data::storage::AlleleCode::MISSING.raw(),
+                                    ];
                                     cached_allele_weight = 0.0;
                                 } else if is_het && input_phased {
                                     let qa1 = PbwtQueryAllele::allele(mapped1)
@@ -5924,7 +5933,10 @@ impl crate::pipelines::ImputationPipeline {
                                     cached_allele_weight =
                                         phase_orientation_weight(phase_conf, err_limit);
                                     if phase_best_orientation_error(phase_conf) > err_limit {
-                                        cached_query_pair = [255, 255];
+                                        cached_query_pair = [
+                                            crate::data::storage::AlleleCode::MISSING.raw(),
+                                            crate::data::storage::AlleleCode::MISSING.raw(),
+                                        ];
                                         cached_wildcard_weight =
                                             uncertain_orientation_wildcard_info_weight();
                                     } else if phase_conf < 0.5 {
@@ -5993,9 +6005,9 @@ impl crate::pipelines::ImputationPipeline {
                         let target_allele = query_alleles
                             .get(i)
                             .and_then(|qa| qa.as_allele())
-                            .unwrap_or(255);
+                            .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                         let orient_weight = query_allele_weight[i].clamp(0.0, 1.0);
-                        let p_alt = if target_allele == 255 {
+                        let p_alt = if target_allele == crate::data::storage::AlleleCode::MISSING.raw() {
                             let donor_alt = if donor_candidates.is_empty() {
                                 0.5
                             } else {
@@ -6049,7 +6061,7 @@ impl crate::pipelines::ImputationPipeline {
                                local_m: usize,
                                allele: u8|
          -> Option<f32> {
-            if allele == 255 {
+            if allele == crate::data::storage::AlleleCode::MISSING.raw() {
                 return None;
             }
             let post = if hap == 0 {
@@ -6094,13 +6106,13 @@ impl crate::pipelines::ImputationPipeline {
             let h1 = HapIdx::new((sample_idx * 2) as u32);
             let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
             if let Some(missing) = target_missing {
-                if missing.allele(target_m, h1) == 255 || missing.allele(target_m, h2) == 255 {
+                if missing.allele(target_m, h1) == crate::data::storage::AlleleCode::MISSING.raw() || missing.allele(target_m, h2) == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
             }
             let raw_a1 = target_win.allele(target_m, h1);
             let raw_a2 = target_win.allele(target_m, h2);
-            if raw_a1 == 255 || raw_a2 == 255 {
+            if raw_a1 == crate::data::storage::AlleleCode::MISSING.raw() || raw_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 return None;
             }
             let mapping = alignment
@@ -6108,8 +6120,8 @@ impl crate::pipelines::ImputationPipeline {
                 .get(target_idx)
                 .and_then(|m| m.as_ref());
             let map_allele = |a: u8| -> u8 {
-                if a == 255 {
-                    return 255;
+                if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                    return crate::data::storage::AlleleCode::MISSING.raw();
                 }
                 if let Some(m) = mapping {
                     if (a as usize) < m.targ_to_ref.len() {
@@ -6125,7 +6137,7 @@ impl crate::pipelines::ImputationPipeline {
             };
             let mut a1 = map_allele(raw_a1);
             let mut a2 = map_allele(raw_a2);
-            if a1 == 255 || a2 == 255 || a1 == a2 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
                 return None;
             }
             let mut conf = if phase_conf_valid {
@@ -6446,7 +6458,7 @@ impl crate::pipelines::ImputationPipeline {
         let start = output_end.saturating_sub(overlap_size);
         let end = output_end;
         let n_haps = target_win.n_haplotypes();
-        let mut alleles = vec![255u8; overlap_size * n_haps];
+        let mut alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); overlap_size * n_haps];
         let n_samples = target_win.n_samples();
         let mut result_by_sample: Vec<Option<&SampleImputationResult>> = vec![None; n_samples];
         for result in all_results {
@@ -6482,7 +6494,7 @@ impl crate::pipelines::ImputationPipeline {
                                         a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
                                     })
                                     .map(|(i, _)| i as u8)
-                                    .unwrap_or(255),
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
                             };
                             alleles[h * overlap_size + local_m] = allele;
                             continue;
@@ -6649,7 +6661,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let map_pos_fallback_allele =
             |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
-                if raw == 255 {
+                if raw == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
                 let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
@@ -6693,13 +6705,13 @@ impl crate::pipelines::ImputationPipeline {
                 if let Some(missing) = target_missing {
                     let miss_a1 = missing.allele(target_m, h1);
                     let miss_a2 = missing.allele(target_m, h2);
-                    if miss_a1 == 255 || miss_a2 == 255 {
+                    if miss_a1 == crate::data::storage::AlleleCode::MISSING.raw() || miss_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                         return None;
                     }
                 }
                 let raw_a1 = target_win.allele(target_m, h1);
                 let raw_a2 = target_win.allele(target_m, h2);
-                if raw_a1 == 255 || raw_a2 == 255 {
+                if raw_a1 == crate::data::storage::AlleleCode::MISSING.raw() || raw_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
                 let mapping = alignment
@@ -6707,8 +6719,8 @@ impl crate::pipelines::ImputationPipeline {
                     .get(target_m.as_usize())
                     .and_then(|m| m.as_ref());
                 let map_allele = |a: u8| -> u8 {
-                    if a == 255 {
-                        return 255;
+                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                        return crate::data::storage::AlleleCode::MISSING.raw();
                     }
                     if let Some(m) = mapping {
                         if (a as usize) < m.targ_to_ref.len() {
@@ -6723,7 +6735,7 @@ impl crate::pipelines::ImputationPipeline {
                 };
                 let a1 = map_allele(raw_a1);
                 let a2 = map_allele(raw_a2);
-                if a1 == 255 || a2 == 255 {
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
                 return Some((a1, a2));
@@ -6737,13 +6749,13 @@ impl crate::pipelines::ImputationPipeline {
             if let Some(missing) = target_missing {
                 let miss_a1 = missing.allele(target_m, h1);
                 let miss_a2 = missing.allele(target_m, h2);
-                if miss_a1 == 255 || miss_a2 == 255 {
+                if miss_a1 == crate::data::storage::AlleleCode::MISSING.raw() || miss_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
             }
             let raw_a1 = target_win.allele(target_m, h1);
             let raw_a2 = target_win.allele(target_m, h2);
-            if raw_a1 == 255 || raw_a2 == 255 {
+            if raw_a1 == crate::data::storage::AlleleCode::MISSING.raw() || raw_a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 return None;
             }
             let a1 = match map_pos_fallback_allele(marker_idx, target_idx, raw_a1) {
@@ -6780,14 +6792,14 @@ impl crate::pipelines::ImputationPipeline {
             };
 
             if let Some(missing) = target_missing {
-                if missing.allele(target_m, h1) == 255 || missing.allele(target_m, h2) == 255 {
+                if missing.allele(target_m, h1) == crate::data::storage::AlleleCode::MISSING.raw() || missing.allele(target_m, h2) == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
             }
 
             let a1 = target_win.allele(target_m, h1);
             let a2 = target_win.allele(target_m, h2);
-            if a1 == 255 || a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 return None;
             }
 
@@ -6797,8 +6809,8 @@ impl crate::pipelines::ImputationPipeline {
                     .get(tm.as_usize())
                     .and_then(|m| m.as_ref());
                 let map_allele = |a: u8| -> u8 {
-                    if a == 255 {
-                        return 255;
+                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                        return crate::data::storage::AlleleCode::MISSING.raw();
                     }
                     if let Some(m) = mapping {
                         if (a as usize) < m.targ_to_ref.len() {
@@ -6813,7 +6825,7 @@ impl crate::pipelines::ImputationPipeline {
                 };
                 let ra1 = map_allele(a1);
                 let ra2 = map_allele(a2);
-                if ra1 == 255 || ra2 == 255 {
+                if ra1 == crate::data::storage::AlleleCode::MISSING.raw() || ra2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
                 ((ra1 > 0) as u8 + (ra2 > 0) as u8) as f32
@@ -7545,13 +7557,13 @@ impl crate::pipelines::ImputationPipeline {
             let h2 = HapIdx::new((s * 2 + 1) as u32);
             let m = MarkerIdx::new(t_idx as u32);
             if let Some(missing) = target_missing {
-                if missing.allele(m, h1) == 255 || missing.allele(m, h2) == 255 {
+                if missing.allele(m, h1) == crate::data::storage::AlleleCode::MISSING.raw() || missing.allele(m, h2) == crate::data::storage::AlleleCode::MISSING.raw() {
                     return None;
                 }
             }
             let a1 = target_win.allele(m, h1);
             let a2 = target_win.allele(m, h2);
-            if a1 == 255 || a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 None
             } else {
                 Some((a1, a2))
@@ -7614,7 +7626,10 @@ impl crate::pipelines::ImputationPipeline {
                 match output_markers[out_idx] {
                     OutputMarker::Ref(ref_m) => get_best_gt(ref_m, s),
                     OutputMarker::Target(t_idx) => {
-                        get_target_alleles(t_idx, s).unwrap_or((255, 255))
+                        get_target_alleles(t_idx, s).unwrap_or((
+                            crate::data::storage::AlleleCode::MISSING.raw(),
+                            crate::data::storage::AlleleCode::MISSING.raw(),
+                        ))
                     }
                 }
             }
@@ -7783,7 +7798,7 @@ mod tests {
         let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
         let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
-        let mut query_alleles = vec![255u8; batch_haps.len()];
+        let mut query_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); batch_haps.len()];
         let mut ref_bins: Vec<Vec<u32>> = Vec::new();
 
         for m in 0..n_markers {
@@ -7811,11 +7826,11 @@ mod tests {
             let col = &ref_columns[ref_m.as_usize()];
             for rh in 0..n_ref_haps {
                 let ref_a = col.allele(rh);
-                if ref_a == 255 {
+                if ref_a == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 let mapped = alignment.reverse_map_allele(m, ref_a);
-                if mapped == 255 {
+                if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 let idx = mapped as usize;
@@ -7827,7 +7842,7 @@ mod tests {
 
             for (i, _) in batch_haps.iter().enumerate() {
                 let targ = query_alleles[i];
-                if targ == 255 {
+                if targ == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
                 let freq = freqs

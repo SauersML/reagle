@@ -86,7 +86,7 @@ impl DictionaryColumn {
                 for m in 0..n_markers {
                     let allele = get_allele(m, hap);
                     let start = m * bits_per_marker;
-                    if allele == 255 {
+                    if allele == crate::data::storage::AlleleCode::MISSING.raw() {
                         // Set the missing bit (the last bit of this marker's segment)
                         pattern.set(start + bits_per_marker - 1, true);
                     } else {
@@ -140,7 +140,7 @@ impl DictionaryColumn {
         if bits_per_marker == 2 {
             let bits = Self::extract_bits(words, start, 2);
             if (bits & 0b10) != 0 {
-                255
+                crate::data::storage::AlleleCode::MISSING.raw()
             } else {
                 (bits & 0b1) as u8
             }
@@ -148,7 +148,7 @@ impl DictionaryColumn {
             let packed = Self::extract_bits(words, start, bits_per_marker);
             let missing_bit = 1u64 << (bits_per_marker - 1);
             if (packed & missing_bit) != 0 {
-                return 255;
+                return crate::data::storage::AlleleCode::MISSING.raw();
             }
             (packed & (missing_bit - 1)) as u8
         }
@@ -176,7 +176,7 @@ impl DictionaryColumn {
         if bits_per_marker == 2 {
             let bits = Self::extract_bits(words, start, 2);
             if (bits & 0b10) != 0 {
-                255
+                crate::data::storage::AlleleCode::MISSING.raw()
             } else {
                 (bits & 0b1) as u8
             }
@@ -184,7 +184,7 @@ impl DictionaryColumn {
             let packed = Self::extract_bits(words, start, bits_per_marker);
             let missing_bit = 1u64 << (bits_per_marker - 1);
             if (packed & missing_bit) != 0 {
-                return 255;
+                return crate::data::storage::AlleleCode::MISSING.raw();
             }
             (packed & (missing_bit - 1)) as u8
         }
@@ -215,7 +215,7 @@ impl DictionaryColumn {
         let mut count = 0;
         for hap_idx in 0..self.hap_to_pattern.len() {
             let a = self.get(marker_offset, HapIdx::new(hap_idx as u32));
-            if a > 0 && a != 255 {
+            if a > 0 && a != crate::data::storage::AlleleCode::MISSING.raw() {
                 count += 1;
             }
         }

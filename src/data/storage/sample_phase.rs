@@ -105,13 +105,13 @@ impl SamplePhase {
             let a1 = hap1_alleles[m];
             let a2 = hap2_alleles[m];
 
-            if is_unphased && a1 != 255 && a2 != 255 && a1 != a2 && a1 > a2 && a1 <= 1 && a2 <= 1 {
+            if is_unphased && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 && a1 > a2 && a1 <= 1 && a2 <= 1 {
                 hap1[m] = a2;
                 hap2[m] = a1;
             }
 
             let st = Self::determine_status(is_missing, is_unphased, a1, a2);
-            if st == ClusterStatus::Phased && a1 != 255 && a2 != 255 && a1 != a2 {
+            if st == ClusterStatus::Phased && a1 != crate::data::storage::AlleleCode::MISSING.raw() && a2 != crate::data::storage::AlleleCode::MISSING.raw() && a1 != a2 {
                 has_input_phase_anchor = true;
                 input_phased_het[m] = true;
             }

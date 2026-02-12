@@ -139,7 +139,7 @@ impl PbwtQueryAllele {
     pub const WILDCARD_VALUE: u8 = 128;
 
     pub fn allele(a: u8) -> Option<Self> {
-        if a == Self::WILDCARD_VALUE || a == 255 {
+        if a == Self::WILDCARD_VALUE || a == crate::data::storage::AlleleCode::MISSING.raw() {
             None
         } else {
             Some(Self::Allele(a))
@@ -176,7 +176,7 @@ impl PbwtQueryAllele {
 
 impl PbwtStrictAllele {
     pub fn allele(a: u8) -> Option<Self> {
-        if a == 255 {
+        if a == crate::data::storage::AlleleCode::MISSING.raw() {
             None
         } else {
             Some(Self::Allele(a))

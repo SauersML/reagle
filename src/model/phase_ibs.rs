@@ -643,7 +643,7 @@ where
         let idx = marker
             .saturating_mul(self.n_haps)
             .saturating_add(hap as usize);
-        self.alleles_flat.get(idx).copied().unwrap_or(255)
+        self.alleles_flat.get(idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
     }
 
     #[inline]
@@ -652,7 +652,7 @@ where
         let base = marker.saturating_mul(self.n_haps);
         for i in 0..n {
             let idx = base.saturating_add(haps[i] as usize);
-            out[i] = self.alleles_flat.get(idx).copied().unwrap_or(255);
+            out[i] = self.alleles_flat.get(idx).copied().unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
         }
     }
 
@@ -1119,7 +1119,7 @@ impl BidirectionalPhaseIbs {
 fn normalize_pbwt_alleles(alleles: &mut [u8]) -> usize {
     let mut max_allele = 1u8;
     for &a in alleles.iter() {
-        if a != 255 && a > max_allele {
+        if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
             max_allele = a;
         }
     }

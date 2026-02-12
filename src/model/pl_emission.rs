@@ -348,7 +348,7 @@ pub fn allele_probs_cond_from_pl(
 
 #[inline]
 pub fn emit_from_allele_probs(ref_al: u8, probs: &[f32], p_no_err: f32, p_err_other: f32) -> f32 {
-    if ref_al == 255 {
+    if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
         return 1.0;
     }
     let a = ref_al as usize;

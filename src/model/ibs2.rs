@@ -381,10 +381,10 @@ impl Ibs2 {
 
         // A marker is informative if at least one comparable allele pair is observed
         // under either phase ordering.
-        let informative = (a1 != 255 && b1 != 255)
-            || (a2 != 255 && b2 != 255)
-            || (a1 != 255 && b2 != 255)
-            || (a2 != 255 && b1 != 255);
+        let informative = (a1 != crate::data::storage::AlleleCode::MISSING.raw() && b1 != crate::data::storage::AlleleCode::MISSING.raw())
+            || (a2 != crate::data::storage::AlleleCode::MISSING.raw() && b2 != crate::data::storage::AlleleCode::MISSING.raw())
+            || (a1 != crate::data::storage::AlleleCode::MISSING.raw() && b2 != crate::data::storage::AlleleCode::MISSING.raw())
+            || (a2 != crate::data::storage::AlleleCode::MISSING.raw() && b1 != crate::data::storage::AlleleCode::MISSING.raw());
         if !informative {
             return false;
         }
@@ -398,7 +398,7 @@ impl Ibs2 {
     /// Returns true if the alleles match or either is missing (255).
     /// This is a helper for is_ibs2_at to check one phase ordering.
     fn are_phase_consistent(a1: u8, a2: u8, b1: u8, b2: u8) -> bool {
-        (a1 == 255 || b1 == 255 || a1 == b1) && (a2 == 255 || b2 == 255 || a2 == b2)
+        (a1 == crate::data::storage::AlleleCode::MISSING.raw() || b1 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == b1) && (a2 == crate::data::storage::AlleleCode::MISSING.raw() || b2 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == b2)
     }
 
     pub fn n_samples(&self) -> usize {
@@ -456,7 +456,7 @@ impl PackedGenotypes {
                 let a2 = gt.allele(m_idx, sample.hap2());
                 let idx = s * blocks + block;
 
-                if a1 == 255 || a2 == 255 {
+                if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                     missing[idx] |= miss_bit;
                     continue;
                 }
@@ -588,7 +588,7 @@ impl Ibs2Markers {
                 let mut miss_cnt = 0;
                 let m_idx = MarkerIdx::new(m as u32);
                 for h in 0..gt.n_haplotypes() {
-                    if gt.allele(m_idx, HapIdx::new(h as u32)) == 255 {
+                    if gt.allele(m_idx, HapIdx::new(h as u32)) == crate::data::storage::AlleleCode::MISSING.raw() {
                         miss_cnt += 1;
                     }
                 }
@@ -689,8 +689,8 @@ impl Ibs2Sets {
                 for &m in &step_markers {
                     let m_idx = MarkerIdx::new(m as u32);
                     let sample = SampleIdx::new(s as u32);
-                    if gt.allele(m_idx, sample.hap1()) == 255
-                        || gt.allele(m_idx, sample.hap2()) == 255
+                    if gt.allele(m_idx, sample.hap1()) == crate::data::storage::AlleleCode::MISSING.raw()
+                        || gt.allele(m_idx, sample.hap2()) == crate::data::storage::AlleleCode::MISSING.raw()
                     {
                         miss_cnt += 1;
                     }
@@ -785,7 +785,7 @@ impl Ibs2Sets {
             let a1 = gt.allele(m_idx, sample.hap1());
             let a2 = gt.allele(m_idx, sample.hap2());
 
-            if a1 == 255 || a2 == 255 {
+            if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() {
                 missing.push(s);
                 for list in gt_to_list.iter_mut().flatten() {
                     list.push(s);
