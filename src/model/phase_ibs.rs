@@ -207,23 +207,19 @@ where
             self,
             marker_idx,
             |ppa, div| {
-                thread_local! {
-                    static FWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
-                        std::cell::RefCell::new((usize::MAX, Vec::new()));
-                }
-                FWD_POS_AT.with(|cell| {
-                    let mut cache = cell.borrow_mut();
-                    if cache.0 != marker_idx || cache.1.len() != ppa.len() {
-                        cache.1.clear();
-                        cache.1.resize(ppa.len(), 0u32);
-                        for (i, &h) in ppa.iter().enumerate() {
-                            cache.1[h.to_usize()] = i as u32;
-                        }
-                        cache.0 = marker_idx;
+                // Optimization: Linear scan instead of full inverse index construction.
+                // Building the O(N) inverse index vector requires random access writes,
+                // which is cache-inefficient and only pays off if we do >20 lookups at the same marker.
+                // In real usage (phasing), we typically do 1-2 lookups per marker before moving on.
+                // A linear scan is O(N) sequential read, which is extremely fast.
+                let mut pos = 0;
+                for (i, &h) in ppa.iter().enumerate() {
+                    if h.to_u32() == hap_idx {
+                        pos = i;
+                        break;
                     }
-                    let pos = cache.1[hap_idx as usize] as usize;
-                    f(ppa, div, pos)
-                })
+                }
+                f(ppa, div, pos)
             },
         )
     }
@@ -238,23 +234,14 @@ where
             self,
             marker_idx,
             |ppa, div| {
-                thread_local! {
-                    static BWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
-                        std::cell::RefCell::new((usize::MAX, Vec::new()));
-                }
-                BWD_POS_AT.with(|cell| {
-                    let mut cache = cell.borrow_mut();
-                    if cache.0 != marker_idx || cache.1.len() != ppa.len() {
-                        cache.1.clear();
-                        cache.1.resize(ppa.len(), 0u32);
-                        for (i, &h) in ppa.iter().enumerate() {
-                            cache.1[h.to_usize()] = i as u32;
-                        }
-                        cache.0 = marker_idx;
+                let mut pos = 0;
+                for (i, &h) in ppa.iter().enumerate() {
+                    if h.to_u32() == hap_idx {
+                        pos = i;
+                        break;
                     }
-                    let pos = cache.1[hap_idx as usize] as usize;
-                    f(ppa, div, pos)
-                })
+                }
+                f(ppa, div, pos)
             },
         )
     }
@@ -1006,6 +993,13 @@ impl BidirectionalPhaseIbs {
             Self::U32(inner) => {
                 inner.find_neighbors_of_state(ref_state, marker_idx, sample_idx, n_candidates)
             }
+        }
+    }
+
+    pub fn best_match_span(&self, hap_idx: u32, marker_idx: usize) -> usize {
+        match self {
+            Self::U16(inner) => inner.best_match_span(hap_idx, marker_idx),
+            Self::U32(inner) => inner.best_match_span(hap_idx, marker_idx),
         }
     }
 }
