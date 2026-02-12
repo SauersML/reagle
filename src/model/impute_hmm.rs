@@ -249,6 +249,8 @@ fn validate_reference_marker_count(
 #[cfg(test)]
 mod tests {
     use super::{BackwardAffine, ForwardAffine, subset_transition_params, transition_only_forward_update};
+    use super::{RefColumnLike, RefHapId};
+    use crate::data::storage::{DenseColumn, GenotypeColumn};
 
     #[test]
     fn test_recomb_mass_subset_sums_to_one() {
@@ -356,6 +358,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_dense_fill_ref_alleles_oob_maps_to_missing_biallelic() {
+        let col = DenseColumn::from_alleles([0u8, 1, 0, 1].into_iter(), 2);
+        let state_haps = vec![RefHapId::new(0), RefHapId::new(3), RefHapId::new(9)];
+        let mut out = vec![0u8; state_haps.len()];
+        let mut dict_pattern_alleles = Vec::new();
+
+        col.fill_ref_alleles(&state_haps, &mut out, &mut dict_pattern_alleles);
+
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 1);
+        assert_eq!(out[2], GenotypeColumn::MISSING_ALLELE);
+    }
+
+    #[test]
+    fn test_dense_fill_ref_alleles_oob_maps_to_missing_multiallelic() {
+        let col = DenseColumn::from_alleles([0u8, 2, 1].into_iter(), 3);
+        let state_haps = vec![RefHapId::new(1), RefHapId::new(7)];
+        let mut out = vec![0u8; state_haps.len()];
+        let mut dict_pattern_alleles = Vec::new();
+
+        col.fill_ref_alleles(&state_haps, &mut out, &mut dict_pattern_alleles);
+
+        assert_eq!(out[0], 2);
+        assert_eq!(out[1], GenotypeColumn::MISSING_ALLELE);
+    }
 }
 
 /// Per-marker allele probability distributions for a single target haplotype.
@@ -410,9 +439,11 @@ impl TargetAlleleProbs {
         &self.probs[start..end]
     }
 
+    /// Returns raw per-marker probabilities wrapped as trusted input.
+    /// This does not normalize.
     #[inline]
-    fn probs_for_marker_normalized(&self, marker_idx: usize) -> NormalizedAlleleProbs<'_> {
-        NormalizedAlleleProbs::from_trusted(self.probs_for_marker(marker_idx))
+    fn probs_for_marker_trusted(&self, marker_idx: usize) -> AlleleProbsView<'_> {
+        AlleleProbsView::from_trusted(self.probs_for_marker(marker_idx))
     }
 
     #[inline]
@@ -471,16 +502,33 @@ pub struct ImputeWorkspace {
     nearest_obs_fwd: Vec<f32>,
     nearest_obs_bwd: Vec<f32>,
     nearest_obs_lambda: Vec<f32>,
-    fwd_affine_a: Vec<f64>,
-    fwd_affine_b: Vec<f64>,
-    bwd_affine_a: Vec<f64>,
-    bwd_affine_b_coeff: Vec<f64>,
+    affine_window_cache: Option<AffineWindowCache>,
     pattern_sum_f: Vec<f32>,
     pattern_sum_b: Vec<f32>,
     pattern_sum_fb: Vec<f32>,
     pattern_state_count: Vec<f32>,
     active_states: usize,
     active_markers: usize,
+}
+
+#[derive(Clone)]
+struct AffineBlockCoeffs {
+    block_start: usize,
+    block_end: usize,
+    fwd_a: Vec<f64>,
+    fwd_b: Vec<f64>,
+    bwd_a: Vec<f64>,
+    bwd_b_coeff: Vec<f64>,
+}
+
+#[derive(Clone)]
+struct AffineWindowCache {
+    active_states: usize,
+    transition_haps: usize,
+    active_markers: usize,
+    recomb_hash: u64,
+    checkpoint_markers: Vec<usize>,
+    by_checkpoint: Vec<Option<Arc<AffineBlockCoeffs>>>,
 }
 
 struct RefAlleles<'a> {
@@ -522,11 +570,11 @@ impl RefAlleleFreqs {
 }
 
 #[derive(Clone, Copy)]
-struct NormalizedAlleleProbs<'a> {
+struct AlleleProbsView<'a> {
     probs: &'a [f32],
 }
 
-impl<'a> NormalizedAlleleProbs<'a> {
+impl<'a> AlleleProbsView<'a> {
     #[inline]
     fn as_slice(self) -> &'a [f32] {
         self.probs
@@ -555,6 +603,17 @@ impl<'a> NormalizedAlleleProbs<'a> {
 
 const SKIP_RETAIN_THRESHOLD: f32 = 0.005;
 
+#[inline]
+fn hash_recomb_slice(p_recomb: &[f32]) -> u64 {
+    // FNV-1a over exact float bit patterns.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &x in p_recomb {
+        h ^= x.to_bits() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 impl ImputeWorkspace {
     pub fn new(n_states: usize, n_markers: usize) -> Self {
         Self {
@@ -576,10 +635,7 @@ impl ImputeWorkspace {
             nearest_obs_fwd: Vec::new(),
             nearest_obs_bwd: Vec::new(),
             nearest_obs_lambda: Vec::new(),
-            fwd_affine_a: Vec::new(),
-            fwd_affine_b: Vec::new(),
-            bwd_affine_a: Vec::new(),
-            bwd_affine_b_coeff: Vec::new(),
+            affine_window_cache: None,
             pattern_sum_f: Vec::new(),
             pattern_sum_b: Vec::new(),
             pattern_sum_fb: Vec::new(),
@@ -631,19 +687,84 @@ impl ImputeWorkspace {
         self.fwd[..n_states].copy_from_slice(&self.fwd_checkpoints[off..off + n_states]);
     }
 
-    pub fn ensure_affine_scratch(&mut self, block_len: usize) {
-        if self.fwd_affine_a.len() < block_len {
-            self.fwd_affine_a.resize(block_len, 0.0);
+    fn ensure_affine_window_cache(
+        &mut self,
+        p_recomb: &[f32],
+        checkpoint_grid: &CheckpointGrid,
+        active_states: usize,
+        transition_haps: usize,
+        active_markers: usize,
+    ) {
+        let recomb_hash = hash_recomb_slice(p_recomb);
+        let checkpoint_markers: Vec<usize> = checkpoint_grid
+            .markers
+            .iter()
+            .map(|m| m.as_usize())
+            .collect();
+        let valid = self
+            .affine_window_cache
+            .as_ref()
+            .map(|cache| {
+                cache.active_states == active_states
+                    && cache.transition_haps == transition_haps
+                    && cache.active_markers == active_markers
+                    && cache.recomb_hash == recomb_hash
+                    && cache.checkpoint_markers == checkpoint_markers
+            })
+            .unwrap_or(false);
+        if valid {
+            return;
         }
-        if self.fwd_affine_b.len() < block_len {
-            self.fwd_affine_b.resize(block_len, 0.0);
+
+        let mut by_checkpoint: Vec<Option<Arc<AffineBlockCoeffs>>> =
+            vec![None; checkpoint_grid.len()];
+        for cp_idx in checkpoint_grid.rev_indices() {
+            let block = checkpoint_grid.block_view(cp_idx, active_markers);
+            let block_len = block.len();
+            if block_len <= 1 {
+                continue;
+            }
+            let block_start = block.start_usize();
+            let block_end = block.end_usize();
+            let mut fwd_a = vec![0.0f64; block_len];
+            let mut fwd_b = vec![0.0f64; block_len];
+            let mut bwd_a = vec![0.0f64; block_len];
+            let mut bwd_b_coeff = vec![0.0f64; block_len];
+            fill_fwd_affine_coeffs(
+                &mut fwd_a,
+                &mut fwd_b,
+                p_recomb,
+                block_start,
+                block_end,
+                active_states,
+                transition_haps,
+            );
+            fill_bwd_affine_coeffs(
+                &mut bwd_a,
+                &mut bwd_b_coeff,
+                p_recomb,
+                block_start,
+                block_end,
+                active_states,
+                transition_haps,
+            );
+            by_checkpoint[cp_idx.as_usize()] = Some(Arc::new(AffineBlockCoeffs {
+                block_start,
+                block_end,
+                fwd_a,
+                fwd_b,
+                bwd_a,
+                bwd_b_coeff,
+            }));
         }
-        if self.bwd_affine_a.len() < block_len {
-            self.bwd_affine_a.resize(block_len, 0.0);
-        }
-        if self.bwd_affine_b_coeff.len() < block_len {
-            self.bwd_affine_b_coeff.resize(block_len, 0.0);
-        }
+        self.affine_window_cache = Some(AffineWindowCache {
+            active_states,
+            transition_haps,
+            active_markers,
+            recomb_hash,
+            checkpoint_markers,
+            by_checkpoint,
+        });
     }
 
     #[inline]
@@ -727,7 +848,13 @@ impl RefColumnLike for DenseColumn {
             for (i, hap) in state_haps.iter().enumerate() {
                 let idx = hap.as_usize();
                 if idx >= n_haps {
-                    out[i] = 0;
+                    debug_assert!(
+                        idx < n_haps,
+                        "DenseColumn::fill_ref_alleles received out-of-range hap index {} (n_haps={})",
+                        idx,
+                        n_haps
+                    );
+                    out[i] = GenotypeColumn::MISSING_ALLELE;
                     continue;
                 }
                 let word_idx = idx >> 6;
@@ -752,7 +879,19 @@ impl RefColumnLike for DenseColumn {
                 out[i] = ((cached_bits_word >> bit_idx) & 1) as u8;
             }
         } else {
+            let n_haps = self.n_haplotypes();
             for (i, hap) in state_haps.iter().enumerate() {
+                let idx = hap.as_usize();
+                if idx >= n_haps {
+                    debug_assert!(
+                        idx < n_haps,
+                        "DenseColumn::fill_ref_alleles received out-of-range hap index {} (n_haps={})",
+                        idx,
+                        n_haps
+                    );
+                    out[i] = GenotypeColumn::MISSING_ALLELE;
+                    continue;
+                }
                 out[i] = self.get(HapIdx::new(hap.as_u32()));
             }
         }
@@ -931,7 +1070,7 @@ fn refresh_dict_patterns<'a>(
 #[inline]
 fn fill_emissions(
     ref_alleles: &RefAlleles<'_>,
-    target_probs: NormalizedAlleleProbs<'_>,
+    target_probs: AlleleProbsView<'_>,
     error_rate: f32,
     emission_by_allele: &mut Vec<f32>,
     emissions: &mut [f32],
@@ -976,7 +1115,7 @@ fn fill_emissions(
 #[inline]
 fn fill_pattern_emissions(
     pattern_alleles: &[u8],
-    target_probs: NormalizedAlleleProbs<'_>,
+    target_probs: AlleleProbsView<'_>,
     error_rate: f32,
     emission_by_allele: &mut Vec<f32>,
     pattern_emissions: &mut Vec<f32>,
@@ -1130,7 +1269,7 @@ fn compute_nearest_observed_lambda(
 #[inline]
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
-    subset_prior_probs: NormalizedAlleleProbs<'_>,
+    subset_prior_probs: AlleleProbsView<'_>,
     nearest_obs_lambda: f32,
     untyped_uniform_marker: bool,
 ) {
@@ -1279,7 +1418,7 @@ fn apply_marker_prior_smoothing(
         for v in smoothing_prior_counts.iter_mut() {
             *v *= inv;
         }
-        NormalizedAlleleProbs::from_trusted(smoothing_prior_counts)
+        AlleleProbsView::from_trusted(smoothing_prior_counts)
     } else {
         if !*warned_af_fallback {
             eprintln!(
@@ -1290,7 +1429,7 @@ fn apply_marker_prior_smoothing(
         }
         normalized_allele_prior(
             allele_prior_scratch,
-            NormalizedAlleleProbs::from_trusted(probs),
+            AlleleProbsView::from_trusted(probs),
         )
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
@@ -1478,8 +1617,8 @@ fn build_checkpoint_markers(
 #[inline]
 fn normalized_allele_prior<'a>(
     out: &'a mut Vec<f32>,
-    target_probs: NormalizedAlleleProbs<'_>,
-) -> NormalizedAlleleProbs<'a> {
+    target_probs: AlleleProbsView<'_>,
+) -> AlleleProbsView<'a> {
     let n = target_probs.len();
     if out.len() < n {
         out.resize(n, 0.0);
@@ -1497,13 +1636,13 @@ fn normalized_allele_prior<'a>(
     if sum <= 0.0 {
         let uniform = 1.0 / n.max(1) as f32;
         prior.fill(uniform);
-        return NormalizedAlleleProbs { probs: prior };
+        return AlleleProbsView { probs: prior };
     }
     let inv = 1.0 / sum;
     for p in prior.iter_mut() {
         *p *= inv;
     }
-    NormalizedAlleleProbs { probs: prior }
+    AlleleProbsView { probs: prior }
 }
 
 #[inline]
@@ -1906,7 +2045,7 @@ fn forward_update_impl<C: RefColumnLike>(
     active_states: usize,
     transition_haps: usize,
 ) -> f32 {
-    let probs = target_probs.probs_for_marker_normalized(m);
+    let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
 
@@ -1973,7 +2112,7 @@ fn forward_update_seqcoded(
     transition_haps: usize,
     last_hap_ptr: &mut *const u16,
 ) -> f32 {
-    let probs = target_probs.probs_for_marker_normalized(m);
+    let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
 
@@ -2041,7 +2180,7 @@ fn forward_update_dict(
     transition_haps: usize,
     last_dict_ptr: &mut *const DictionaryColumn,
 ) -> f32 {
-    let probs = target_probs.probs_for_marker_normalized(m);
+    let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
 
@@ -2591,6 +2730,13 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let panel_priors = target_probs.panel_priors();
     let checkpoint_grid = build_checkpoint_markers(&uniform_mask, prior_marker_idx, active_markers);
     ws.ensure_typed_checkpoints(active_states, checkpoint_grid.len());
+    ws.ensure_affine_window_cache(
+        p_recomb,
+        &checkpoint_grid,
+        active_states,
+        transition_haps,
+        active_markers,
+    );
 
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
@@ -2667,6 +2813,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 let block_start = block.start_usize();
                 let block_end = block.end_usize();
                 let block_len = block.len();
+                let cached_affine = ws
+                    .affine_window_cache
+                    .as_ref()
+                    .and_then(|cache| cache.by_checkpoint.get(cp_idx.as_usize()))
+                    .and_then(|entry| entry.as_ref().map(Arc::clone));
                 ws.load_checkpoint(cp_idx, active_states);
                 let mut fwd_sum_left = 0.0f32;
                 for v in &ws.fwd[..active_states] {
@@ -2686,25 +2837,35 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     // - We keep transition propagation in affine form across the block.
                     // - Distance-to-typed-anchor is used only by skip_untyped_mask to decide
                     //   whether to skip full posterior evaluation at a given interior marker.
-                    ws.ensure_affine_scratch(block_len);
-                    fill_fwd_affine_coeffs(
-                        &mut ws.fwd_affine_a[..block_len],
-                        &mut ws.fwd_affine_b[..block_len],
-                        p_recomb,
-                        block_start,
-                        block_end,
-                        active_states,
-                        transition_haps,
-                    );
-                    fill_bwd_affine_coeffs(
-                        &mut ws.bwd_affine_a[..block_len],
-                        &mut ws.bwd_affine_b_coeff[..block_len],
-                        p_recomb,
-                        block_start,
-                        block_end,
-                        active_states,
-                        transition_haps,
-                    );
+                    let coeffs = cached_affine.ok_or_else(|| {
+                        ReagleError::vcf(format!(
+                            "Missing affine cache block in imputation HMM ({}): window={} sample={} hap={} checkpoint={} block=[{}, {})",
+                            K::LABEL,
+                            context.window_idx,
+                            context.sample_idx,
+                            context.hap_idx,
+                            cp_idx.as_usize(),
+                            block_start,
+                            block_end
+                        ))
+                    })?;
+                    if coeffs.block_start != block_start
+                        || coeffs.block_end != block_end
+                        || coeffs.fwd_a.len() != block_len
+                    {
+                        return Err(ReagleError::vcf(format!(
+                            "Affine cache block mismatch in imputation HMM ({}): window={} sample={} hap={} checkpoint={} expected=[{}, {}) got=[{}, {})",
+                            K::LABEL,
+                            context.window_idx,
+                            context.sample_idx,
+                            context.hap_idx,
+                            cp_idx.as_usize(),
+                            block_start,
+                            block_end,
+                            coeffs.block_start,
+                            coeffs.block_end
+                        )));
+                    }
                     let bwd_sum_right = bwd_sum;
                     for m_ix in interior.iter() {
                         let m = m_ix.as_usize();
@@ -2722,8 +2883,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         // This preserves exact Li-Stephens transition-only inference
                         // inside the block while avoiding per-marker/state recomputation.
                         let fwd_slot = m - block_start;
-                        let a_fwd = ws.fwd_affine_a[fwd_slot] as f32;
-                        let b_fwd = ws.fwd_affine_b[fwd_slot] as f32;
+                        let a_fwd = coeffs.fwd_a[fwd_slot] as f32;
+                        let b_fwd = coeffs.fwd_b[fwd_slot] as f32;
                         let fwd_add = b_fwd * fwd_sum_left;
 
                         if is_final
@@ -2734,7 +2895,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             continue;
                         }
 
-                        let probs = target_probs.probs_for_marker_normalized(m);
+                        let probs = target_probs.probs_for_marker_trusted(m);
                         let n_alleles = probs.len();
                         if n_alleles > K::MAX_NON_MISSING_ALLELES {
                             return Err(ReagleError::vcf(format!(
@@ -2779,8 +2940,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             pattern_sum_key = K::marker_key(&prepared);
                         }
 
-                        let a_bwd_m = ws.bwd_affine_a[m - block_start] as f32;
-                        let b_bwd_m = ws.bwd_affine_b_coeff[m - block_start] as f32;
+                        let a_bwd_m = coeffs.bwd_a[m - block_start] as f32;
+                        let b_bwd_m = coeffs.bwd_b_coeff[m - block_start] as f32;
                         let forward_affine = ForwardAffine {
                             a: a_fwd,
                             b: fwd_add,
@@ -2966,7 +3127,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 }
 
                 let m_rev = block_start;
-                let probs = target_probs.probs_for_marker_normalized(m_rev);
+                let probs = target_probs.probs_for_marker_trusted(m_rev);
                 let recomb_rate = marker_recomb_rate(p_recomb, m_rev);
                 let n_alleles = probs.len();
                 if n_alleles > K::MAX_NON_MISSING_ALLELES {
