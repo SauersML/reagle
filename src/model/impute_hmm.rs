@@ -1404,6 +1404,9 @@ fn apply_marker_prior_smoothing(
     probs: &[f32],
     nearest_obs_lambda: f32,
     untyped_uniform_marker: bool,
+    subset_total: f32,
+    missing_ref_mass: f32,
+    missing_ood_mass: f32,
     active_states: usize,
     panel_haps: usize,
     min_prior_mix: f32,
@@ -1421,19 +1424,26 @@ fn apply_marker_prior_smoothing(
         return;
     }
 
-    // Heuristic: If we are using a subset of the panel (active_states < panel_haps),
-    // we should mix in the global prior to account for the possibility that the
-    // true donor is outside the selected subset.
-    //
-    // PBWT selection is highly effective, so we assume the "missing" mass is much
-    // less than the random-selection baseline of (1 - active/total).
-    // We use a power law to penalize sparse subsets while keeping dense subsets
-    // mostly untouched.
-    let missing_mass = if panel_haps > 0 && active_states < panel_haps {
+    // Prefer marker-local missing mass measured from the structural posterior
+    // decomposition (represented vs missing-ref vs out-of-domain). Fall back to
+    // the legacy active/panel sparsity proxy only if local mass accounting is
+    // unavailable at this call site.
+    let observed_total = subset_total.max(0.0) + missing_ref_mass.max(0.0) + missing_ood_mass.max(0.0);
+    let observed_missing_mass = if observed_total > 0.0 {
+        ((missing_ref_mass.max(0.0) + missing_ood_mass.max(0.0)) / observed_total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let fallback_missing_mass = if panel_haps > 0 && active_states < panel_haps {
         let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
         raw_ratio.powi(3)
     } else {
         0.0
+    };
+    let missing_mass = if observed_total > 0.0 {
+        observed_missing_mass
+    } else {
+        fallback_missing_mass
     };
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
     let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
@@ -3289,6 +3299,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                                 .copied()
                                                 .unwrap_or(f32::INFINITY),
                                             target_probs.is_untyped_uniform_marker(m),
+                                            subset_total,
+                                            missing_ref_mass,
+                                            missing_ood_mass,
                                             active_states,
                                             panel_haps,
                                             target_probs.min_untyped_prior_mix(),
@@ -3481,6 +3494,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
+                                        subset_total,
+                                        missing_ref_mass,
+                                        missing_ood_mass,
                                         active_states,
                                         panel_haps,
                                         target_probs.min_untyped_prior_mix(),
