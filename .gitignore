@@ -48,3 +48,8 @@ tests/data/
 # Local agent instructions
 AGENTS.md
 *.png
+
+# Local reference cache artifacts
+chr22.fa
+chr22.fa.fai
+chr22.fa.gz
