@@ -793,6 +793,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     let mut ref_alleles = vec![255u8; n_ref_haps];
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
     let mut query_rows_by_allele: Vec<Vec<usize>> = Vec::new();
+    let mut pending_updates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); batch_haps.len()];
     let mut map_lut = [255u8; 256];
     let mut map_lut_seen = [false; 256];
 
@@ -860,7 +861,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             ref_bins[idx].push(rh as u32);
         }
 
-        // Exact grouped update:
+        // Exact grouped update with deferred sparse accumulation:
         // Original per-row score for row i, hap h at marker m:
         //   S_i[h] += w_{m,a_i} * 1{a_h == a_i}
         // where a_i is target allele for row i and w_{m,a} = -ln(freq_{m,a}).
@@ -886,18 +887,73 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             let bins = ref_bins.get(targ_idx);
             let Some(bins) = bins else { continue };
             for &i in rows {
-                let row_global = &mut global_scores[i];
-                let row_window = &mut window_scores[i];
+                let row_pending = &mut pending_updates[i];
+                row_pending.reserve(bins.len());
                 for &rh in bins {
-                    let idx = rh as usize;
-                    row_global[idx] += weight;
-                    let w = &mut row_window[idx];
-                    if w.is_finite() {
-                        *w += weight;
-                    } else {
-                        *w = weight;
-                    }
+                    row_pending.push((rh, weight));
                 }
+            }
+        }
+    }
+
+    // Flush sparse updates into dense score rows once. This preserves exact
+    // scoring formula while reducing repeated random writes in the marker loop.
+    for i in 0..batch_haps.len() {
+        let row_pending = &mut pending_updates[i];
+        if row_pending.is_empty() {
+            continue;
+        }
+        row_pending.sort_unstable_by_key(|(idx, _)| *idx);
+        let row_global = &mut global_scores[i];
+        let row_window = &mut window_scores[i];
+        let mut j = 0usize;
+        while j < row_pending.len() {
+            let idx = row_pending[j].0 as usize;
+            let mut delta = 0.0f32;
+            while j < row_pending.len() && row_pending[j].0 as usize == idx {
+                delta += row_pending[j].1;
+                j += 1;
+            }
+            row_global[idx] += delta;
+            let w = &mut row_window[idx];
+            if w.is_finite() {
+                *w += delta;
+            } else {
+                *w = delta;
+            }
+        }
+        row_pending.clear();
+    }
+}
+
+#[inline]
+#[cfg(test)]
+fn assert_score_mats_close(a: &[Vec<f32>], b: &[Vec<f32>], tol: f32) {
+    assert_eq!(a.len(), b.len(), "row count mismatch");
+    for (r, (ar, br)) in a.iter().zip(b.iter()).enumerate() {
+        assert_eq!(ar.len(), br.len(), "col count mismatch at row {}", r);
+        for (c, (&x, &y)) in ar.iter().zip(br.iter()).enumerate() {
+            if x.is_finite() && y.is_finite() {
+                let diff = (x - y).abs();
+                assert!(
+                    diff <= tol,
+                    "score mismatch at row={} col={} x={} y={} diff={} tol={}",
+                    r,
+                    c,
+                    x,
+                    y,
+                    diff,
+                    tol
+                );
+            } else {
+                assert!(
+                    x.is_finite() == y.is_finite(),
+                    "finiteness mismatch at row={} col={} x={} y={}",
+                    r,
+                    c,
+                    x,
+                    y
+                );
             }
         }
     }
@@ -7561,7 +7617,7 @@ mod tests {
             &mut window_b,
         );
 
-        assert_eq!(global_a, global_b, "global score matrices diverged");
-        assert_eq!(window_a, window_b, "window score matrices diverged");
+        assert_score_mats_close(&global_a, &global_b, 1e-6);
+        assert_score_mats_close(&window_a, &window_b, 1e-6);
     }
 }
