@@ -16,10 +16,18 @@
 
 use std::time::Instant;
 
-use reagle::config::Config;
-use reagle::error::Result;
-use reagle::pipelines::{ImputationPipeline, PhasingPipeline};
-use reagle::utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+mod config;
+mod data;
+mod error;
+mod io;
+mod model;
+mod pipelines;
+mod utils;
+
+use config::Config;
+use error::Result;
+use pipelines::{ImputationPipeline, PhasingPipeline};
+use utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
 
 fn main() {
     if let Err(e) = run() {
