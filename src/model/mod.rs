@@ -43,12 +43,12 @@
 //! phasing and imputation.
 
 pub mod beam;
-pub mod li_stephens;
-pub mod phase_hmm;
 pub mod ibs2;
 pub mod impute_hmm;
+pub mod li_stephens;
 pub mod parameters;
 pub mod pbwt;
+pub mod phase_hmm;
 pub mod phase_ibs;
 pub mod phase_query;
 pub mod pl_emission;

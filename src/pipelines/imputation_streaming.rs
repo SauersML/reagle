@@ -4,6 +4,7 @@
 //! Uses a producer-consumer model with MPSC channel to pipe phased matrices
 //! directly to imputation in-memory.
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::BufRead;
@@ -132,6 +133,8 @@ const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
+const PBWT_MIN_MARKER_STEP: usize = 50;
+const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
 const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
@@ -200,6 +203,11 @@ fn estimate_per_state_bytes(window_markers: usize) -> usize {
     // - per-state vectors (fwd, bwd, emissions, weights): 4 * f32 = 16 bytes
     // - marker-scaled scratch upper bound (history/checkpoint + allele cache): 5 bytes/marker
     16usize.saturating_add(window_markers.saturating_mul(5))
+}
+
+#[inline]
+fn estimate_hmm_job_bytes(n_states: usize, window_markers: usize) -> u64 {
+    (estimate_per_state_bytes(window_markers) as u64).saturating_mul(n_states.max(1) as u64)
 }
 
 #[inline]
@@ -305,7 +313,11 @@ fn adaptive_untyped_prior_mix(
 
     // Unphased-target imputation has additional uncertainty from phase
     // transfer, so apply a mild boost.
-    let phase_factor = if phase_confidence_unavailable { 1.25 } else { 1.0 };
+    let phase_factor = if phase_confidence_unavailable {
+        1.25
+    } else {
+        1.0
+    };
 
     let floor = 0.01 + 0.22 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
@@ -578,23 +590,36 @@ fn estimate_scan_batch_size(
     batch.min(n_target_haps)
 }
 
-fn build_sampling_points(gen_positions: &[f64], step_cm: f64) -> Vec<bool> {
+fn build_sampling_points(gen_positions: &[f64], step_cm: f64, min_marker_step: usize) -> Vec<bool> {
     let n = gen_positions.len();
     let mut sampling = vec![false; n];
     if n == 0 {
         return sampling;
     }
+    let min_step = min_marker_step.min((n / PBWT_MIN_SAMPLE_POINTS).max(1));
     let step = step_cm.max(1e-6);
     let mut next_cm = gen_positions[0];
+    let mut next_marker = 0usize;
     for m in 0..n {
         let cm = gen_positions[m];
-        if cm >= next_cm {
+        if cm >= next_cm || m >= next_marker {
             sampling[m] = true;
             next_cm = cm + step;
+            next_marker = m.saturating_add(min_step);
         }
     }
     sampling[n - 1] = true;
     sampling
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PbwtPrescanWindowDiag {
+    sampled_markers: usize,
+    total_markers: usize,
+    min_gen_pos: f64,
+    max_gen_pos: f64,
+    distinct_gen_pos: usize,
+    non_finite_gen_pos: usize,
 }
 
 fn add_typed_anchor_sampling<SpaceA, SpaceB>(
@@ -1015,10 +1040,10 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     step_cm: f64,
     global_scores: &mut [Vec<f32>],
     window_scores: &mut [Vec<f32>],
-) {
+) -> PbwtPrescanWindowDiag {
     let n_markers = target_gt.n_markers();
     if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
-        return;
+        return PbwtPrescanWindowDiag::default();
     }
 
     let mut gen_positions = Vec::with_capacity(n_markers);
@@ -1028,8 +1053,33 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         let gen_pos = gen_maps.gen_pos_by_name(chrom_name, marker.pos);
         gen_positions.push(gen_pos);
     }
-    let mut sampling = build_sampling_points(&gen_positions, step_cm);
+    let mut sampling = build_sampling_points(&gen_positions, step_cm, PBWT_MIN_MARKER_STEP);
     add_typed_anchor_sampling(&mut sampling, &gen_positions, alignment, step_cm);
+    let sampled_markers = sampling.iter().filter(|&&b| b).count();
+    let mut min_gen_pos = f64::INFINITY;
+    let mut max_gen_pos = f64::NEG_INFINITY;
+    let mut distinct_gen_pos = 0usize;
+    let mut prev_bits: Option<u64> = None;
+    let mut non_finite_gen_pos = 0usize;
+    for &cm in &gen_positions {
+        if !cm.is_finite() {
+            non_finite_gen_pos += 1;
+            continue;
+        }
+        min_gen_pos = min_gen_pos.min(cm);
+        max_gen_pos = max_gen_pos.max(cm);
+        let bits = cm.to_bits();
+        if prev_bits != Some(bits) {
+            distinct_gen_pos += 1;
+            prev_bits = Some(bits);
+        }
+    }
+    if !min_gen_pos.is_finite() {
+        min_gen_pos = 0.0;
+    }
+    if !max_gen_pos.is_finite() {
+        max_gen_pos = 0.0;
+    }
     let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
 
     let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
@@ -1200,6 +1250,14 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 }
             }
         }
+    }
+    PbwtPrescanWindowDiag {
+        sampled_markers,
+        total_markers: n_markers,
+        min_gen_pos,
+        max_gen_pos,
+        distinct_gen_pos,
+        non_finite_gen_pos,
     }
 }
 
@@ -1444,14 +1502,20 @@ struct PrescanTargetEntry {
     alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
 }
 
+fn trim_alignment_for_prescan_cache(
+    mut alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
+) -> MarkerAlignment<AnyMarkerSpace, RefWindowSpace> {
+    // Prescan scoring only uses target_to_ref + reverse_map_allele (allele_mappings).
+    // Dropping ref_to_target avoids storing a second large mapping that is unused
+    // during prescan and materially increases cache memory.
+    alignment.ref_to_target.clear();
+    alignment.ref_to_target.shrink_to_fit();
+    alignment
+}
+
 fn estimate_target_entry_bytes(entry: &PrescanTargetEntry) -> u64 {
     let target_bytes = entry.phased_target.size_bytes() as u64;
-    let align_markers = entry
-        .alignment
-        .ref_to_target
-        .len()
-        .saturating_add(entry.alignment.target_to_ref.len());
-    let align_bytes = align_markers.saturating_mul(16) as u64
+    let align_bytes = (entry.alignment.target_to_ref.len().saturating_mul(16) as u64)
         + entry.alignment.allele_mappings.len().saturating_mul(32) as u64;
     target_bytes.saturating_add(align_bytes)
 }
@@ -1795,8 +1859,8 @@ fn build_imputation_plan(
         ));
     }
     plan.n_ref_haps = n_ref_haps;
-    let window_handoff = ref_data.window_handoff().to_vec();
-    let per_window_caps = ref_data.per_window_caps().to_vec();
+    let window_handoff = ref_data.window_handoff();
+    let per_window_caps = ref_data.per_window_caps();
     if avail == 0 {
         eprintln!(
             "Pre-scan: available memory unknown; using fallback={} MB for batching/cache",
@@ -1804,7 +1868,7 @@ fn build_imputation_plan(
         );
     }
     let batch_size =
-        estimate_scan_batch_size(prescan_avail, n_ref_haps, n_target_haps, &per_window_caps);
+        estimate_scan_batch_size(prescan_avail, n_ref_haps, n_target_haps, per_window_caps);
     let mut batch_start = 0usize;
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();
@@ -1830,7 +1894,7 @@ fn build_imputation_plan(
             bb.set_op("Imputation prescan: skipped (full panel)");
         }
         plan.per_window_cap = n_ref_haps.max(1);
-        plan.per_window_caps = per_window_caps;
+        plan.per_window_caps = per_window_caps.to_vec();
         plan.full_panel = true;
         for _ in 0..n_target_haps {
             plan.stats.update(n_ref_haps, 0, 0);
@@ -1848,7 +1912,7 @@ fn build_imputation_plan(
         ));
     }
 
-    plan.per_window_caps = per_window_caps.clone();
+    plan.per_window_caps = per_window_caps.to_vec();
 
     eprintln!(
         "Pre-scan: enabled (LMS allocation); target_haps={}, ref_haps={}, batch_size={}",
@@ -1908,10 +1972,10 @@ fn build_imputation_plan(
                             &target_window.genotypes,
                             &ref_window.markers,
                         );
-                        let phased_target = target_window.genotypes.clone().into_phased();
+                        let phased_target = target_window.genotypes.into_phased();
                         let entry = PrescanTargetEntry {
                             phased_target,
-                            alignment,
+                            alignment: trim_alignment_for_prescan_cache(alignment),
                         };
                         target_bytes =
                             target_bytes.saturating_add(estimate_target_entry_bytes(&entry));
@@ -1956,10 +2020,10 @@ fn build_imputation_plan(
                             &target_window.genotypes,
                             &ref_window.markers,
                         );
-                        let phased_target = target_window.genotypes.clone().into_phased();
+                        let phased_target = target_window.genotypes.into_phased();
                         let entry = PrescanTargetEntry {
                             phased_target,
-                            alignment,
+                            alignment: trim_alignment_for_prescan_cache(alignment),
                         };
                         target_bytes =
                             target_bytes.saturating_add(estimate_target_entry_bytes(&entry));
@@ -2007,6 +2071,15 @@ fn build_imputation_plan(
     let mut batch_idx = 0usize;
     let mut window_span_cm: Option<f64> = None;
     let mut window_span_bp: Option<u64> = None;
+    let mut exact_windows_total = 0usize;
+    let mut pbwt_windows_total = 0usize;
+    let mut pbwt_sampled_sum = 0usize;
+    let mut pbwt_markers_sum = 0usize;
+    let mut pbwt_sampled_min = usize::MAX;
+    let mut pbwt_sampled_max = 0usize;
+    let mut pbwt_flat_windows = 0usize;
+    let mut pbwt_low_sample_windows = 0usize;
+    let mut pbwt_non_finite_windows = 0usize;
     while batch_start < n_target_haps {
         batch_idx += 1;
         let batch_end = (batch_start + batch_size).min(n_target_haps);
@@ -2102,9 +2175,14 @@ fn build_imputation_plan(
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
 
-                    let (alignment, phased_target) = if let Some(cache) = target_cache.as_ref() {
+                    let (alignment_cow, phased_target_cow) = if let Some(cache) =
+                        target_cache.as_ref()
+                    {
                         if let Some(Some(entry)) = cache.get(idx) {
-                            (entry.alignment.clone(), entry.phased_target.clone())
+                            (
+                                Cow::Borrowed(&entry.alignment),
+                                Cow::Borrowed(&entry.phased_target),
+                            )
                         } else {
                             let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                             let ref_chrom = ref_window
@@ -2132,8 +2210,8 @@ fn build_imputation_plan(
                                 &target_window.genotypes,
                                 &ref_window.markers,
                             );
-                            let phased_target = target_window.genotypes.clone().into_phased();
-                            (alignment, phased_target)
+                            let phased_target = target_window.genotypes.into_phased();
+                            (Cow::Owned(alignment), Cow::Owned(phased_target))
                         }
                     } else {
                         let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
@@ -2159,9 +2237,11 @@ fn build_imputation_plan(
                             &target_window.genotypes,
                             &ref_window.markers,
                         );
-                        let phased_target = target_window.genotypes.clone().into_phased();
-                        (alignment, phased_target)
+                        let phased_target = target_window.genotypes.into_phased();
+                        (Cow::Owned(alignment), Cow::Owned(phased_target))
                     };
+                    let alignment = alignment_cow.as_ref();
+                    let phased_target = phased_target_cow.as_ref();
 
                     for w in window_scores.iter_mut() {
                         w.fill(f32::NEG_INFINITY);
@@ -2180,6 +2260,7 @@ fn build_imputation_plan(
                         phased_target.n_markers(),
                     );
                     if use_exact {
+                        exact_windows_total = exact_windows_total.saturating_add(1);
                         score_window_batch_exact_packed(
                             &batch_haps,
                             &phased_target,
@@ -2190,7 +2271,8 @@ fn build_imputation_plan(
                             &mut window_scores,
                         );
                     } else {
-                        score_window_batch_pbwt_packed(
+                        pbwt_windows_total = pbwt_windows_total.saturating_add(1);
+                        let diag = score_window_batch_pbwt_packed(
                             &batch_haps,
                             &phased_target,
                             ref_columns,
@@ -2202,6 +2284,21 @@ fn build_imputation_plan(
                             &mut global_scores,
                             &mut window_scores,
                         );
+                        pbwt_sampled_sum = pbwt_sampled_sum.saturating_add(diag.sampled_markers);
+                        pbwt_markers_sum = pbwt_markers_sum.saturating_add(diag.total_markers);
+                        pbwt_sampled_min = pbwt_sampled_min.min(diag.sampled_markers);
+                        pbwt_sampled_max = pbwt_sampled_max.max(diag.sampled_markers);
+                        if diag.distinct_gen_pos <= 1
+                            || (diag.max_gen_pos - diag.min_gen_pos).abs() <= 1e-12
+                        {
+                            pbwt_flat_windows = pbwt_flat_windows.saturating_add(1);
+                        }
+                        if diag.sampled_markers <= 2 {
+                            pbwt_low_sample_windows = pbwt_low_sample_windows.saturating_add(1);
+                        }
+                        if diag.non_finite_gen_pos > 0 {
+                            pbwt_non_finite_windows = pbwt_non_finite_windows.saturating_add(1);
+                        }
                     }
 
                     let abyss_rank_cutoff = compute_abyss_rank_cutoff(
@@ -2281,9 +2378,14 @@ fn build_imputation_plan(
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
 
-                    let (alignment, phased_target) = if let Some(cache) = target_cache.as_ref() {
+                    let (alignment_cow, phased_target_cow) = if let Some(cache) =
+                        target_cache.as_ref()
+                    {
                         if let Some(Some(entry)) = cache.get(idx) {
-                            (entry.alignment.clone(), entry.phased_target.clone())
+                            (
+                                Cow::Borrowed(&entry.alignment),
+                                Cow::Borrowed(&entry.phased_target),
+                            )
                         } else {
                             let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                             let ref_chrom = ref_window
@@ -2313,8 +2415,8 @@ fn build_imputation_plan(
                                 &target_window.genotypes,
                                 &ref_window.markers,
                             );
-                            let phased_target = target_window.genotypes.clone().into_phased();
-                            (alignment, phased_target)
+                            let phased_target = target_window.genotypes.into_phased();
+                            (Cow::Owned(alignment), Cow::Owned(phased_target))
                         }
                     } else {
                         let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
@@ -2342,9 +2444,11 @@ fn build_imputation_plan(
                             &target_window.genotypes,
                             &ref_window.markers,
                         );
-                        let phased_target = target_window.genotypes.clone().into_phased();
-                        (alignment, phased_target)
+                        let phased_target = target_window.genotypes.into_phased();
+                        (Cow::Owned(alignment), Cow::Owned(phased_target))
                     };
+                    let alignment = alignment_cow.as_ref();
+                    let phased_target = phased_target_cow.as_ref();
 
                     for w in window_scores.iter_mut() {
                         w.fill(f32::NEG_INFINITY);
@@ -2363,6 +2467,7 @@ fn build_imputation_plan(
                         phased_target.n_markers(),
                     );
                     if use_exact {
+                        exact_windows_total = exact_windows_total.saturating_add(1);
                         score_window_batch_exact_packed(
                             &batch_haps,
                             &phased_target,
@@ -2373,7 +2478,8 @@ fn build_imputation_plan(
                             &mut window_scores,
                         );
                     } else {
-                        score_window_batch_pbwt_packed(
+                        pbwt_windows_total = pbwt_windows_total.saturating_add(1);
+                        let diag = score_window_batch_pbwt_packed(
                             &batch_haps,
                             &phased_target,
                             &ref_window.columns,
@@ -2385,6 +2491,21 @@ fn build_imputation_plan(
                             &mut global_scores,
                             &mut window_scores,
                         );
+                        pbwt_sampled_sum = pbwt_sampled_sum.saturating_add(diag.sampled_markers);
+                        pbwt_markers_sum = pbwt_markers_sum.saturating_add(diag.total_markers);
+                        pbwt_sampled_min = pbwt_sampled_min.min(diag.sampled_markers);
+                        pbwt_sampled_max = pbwt_sampled_max.max(diag.sampled_markers);
+                        if diag.distinct_gen_pos <= 1
+                            || (diag.max_gen_pos - diag.min_gen_pos).abs() <= 1e-12
+                        {
+                            pbwt_flat_windows = pbwt_flat_windows.saturating_add(1);
+                        }
+                        if diag.sampled_markers <= 2 {
+                            pbwt_low_sample_windows = pbwt_low_sample_windows.saturating_add(1);
+                        }
+                        if diag.non_finite_gen_pos > 0 {
+                            pbwt_non_finite_windows = pbwt_non_finite_windows.saturating_add(1);
+                        }
                     }
 
                     let abyss_rank_cutoff = compute_abyss_rank_cutoff(
@@ -2627,6 +2748,31 @@ fn build_imputation_plan(
         cache_total,
         elapsed
     );
+    if pbwt_windows_total > 0 {
+        let sampled_avg = pbwt_sampled_sum as f64 / pbwt_windows_total as f64;
+        let sampled_frac = if pbwt_markers_sum > 0 {
+            pbwt_sampled_sum as f64 / pbwt_markers_sum as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "Pre-scan diagnostics: exact_windows={} pbwt_windows={} pbwt_sampled[min/avg/max]={}/{:.1}/{} pbwt_sampled_frac={:.4} pbwt_flat_windows={} pbwt_low_sample_windows={} pbwt_non_finite_windows={}",
+            exact_windows_total,
+            pbwt_windows_total,
+            pbwt_sampled_min.min(pbwt_sampled_max),
+            sampled_avg,
+            pbwt_sampled_max,
+            sampled_frac,
+            pbwt_flat_windows,
+            pbwt_low_sample_windows,
+            pbwt_non_finite_windows
+        );
+    } else {
+        eprintln!(
+            "Pre-scan diagnostics: exact_windows={} pbwt_windows=0",
+            exact_windows_total
+        );
+    }
 
     Ok(plan)
 }
@@ -2657,7 +2803,6 @@ impl crate::pipelines::ImputationPipeline {
             window_cm: self.config.window,
             overlap_cm: self.config.overlap,
             buffer_cm: 1.0,
-            max_markers: self.config.window_markers,
         };
 
         if let Some(bb) = &self.telemetry {
@@ -2817,11 +2962,7 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPrescan);
             bb.set_op("Imputation prescan: reference prep");
         }
-        let desired_cap = if self.config.imp_states > 0 {
-            Some(self.config.imp_states)
-        } else {
-            None
-        };
+        let desired_cap = None;
         let ref_data = prepare_reference_data(
             &ref_path,
             &streaming_config,
@@ -3237,10 +3378,6 @@ impl crate::pipelines::ImputationPipeline {
                             self.config.err.is_some(),
                         )?;
 
-                        // Drop heavy reference data after writing to reduce peak RSS.
-                        std::mem::take(&mut ref_window.ref_columns);
-                        ref_window.ref_genotypes = None;
-
                         if let Some(bb) = &self.telemetry {
                             let output_markers = ref_window
                                 .output_end
@@ -3542,10 +3679,6 @@ impl crate::pipelines::ImputationPipeline {
                             self.config.ap,
                             self.config.err.is_some(),
                         )?;
-
-                        // Drop heavy reference data after writing to reduce peak RSS.
-                        std::mem::take(&mut ref_window.ref_columns);
-                        ref_window.ref_genotypes = None;
 
                         if let Some(bb) = &self.telemetry {
                             let output_markers = ref_window
@@ -4741,10 +4874,44 @@ impl crate::pipelines::ImputationPipeline {
         let dbg_has_priors = AtomicUsize::new(0);
         let dbg_fallback_selected_priors = AtomicUsize::new(0);
 
-        let sample_results: Vec<ImputeResult> = sample_error_rates
-            .par_iter_mut()
-            .enumerate()
-            .map(|(s, prior_error_rate)| {
+        let requested_threads = self
+            .config
+            .nthreads
+            .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+            .unwrap_or(1)
+            .max(1);
+        let mut hmm_threads = requested_threads;
+        let avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
+        if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
+            let hmm_budget_bytes =
+                (avail_bytes as f64 * IMPUTE_RAM_FRACTION * STATE_BUDGET_SAFETY) as u64;
+            let per_job_bytes = estimate_hmm_job_bytes(per_window_cap_local, n_ref_markers);
+            if per_job_bytes > 0 {
+                let cap = (hmm_budget_bytes / per_job_bytes).max(1) as usize;
+                hmm_threads = hmm_threads.min(cap.max(1));
+            }
+        }
+        if should_log && hmm_threads < requested_threads {
+            eprintln!(
+                "    HMM parallelism capped by memory: threads {} -> {} (states={}, ref_markers={}, avail_mb={})",
+                requested_threads,
+                hmm_threads,
+                per_window_cap_local,
+                n_ref_markers,
+                avail_bytes / (1024 * 1024)
+            );
+        }
+        let hmm_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(hmm_threads.max(1))
+            .build()
+            .map_err(|e| {
+                ReagleError::vcf(format!("Failed to build HMM worker thread pool: {}", e))
+            })?;
+        let sample_results: Vec<ImputeResult> = hmm_pool.install(|| {
+            sample_error_rates
+                .par_iter_mut()
+                .enumerate()
+                .map(|(s, prior_error_rate)| {
                 let h1_idx = HapIdx::new((s * 2) as u32);
                 let h2_idx = HapIdx::new((s * 2 + 1) as u32);
 
@@ -5557,23 +5724,23 @@ impl crate::pipelines::ImputationPipeline {
                     sm_needed[h2_idx.as_usize()].store(true, Ordering::Relaxed);
                 }
 
-                Ok(ImputeResult {
-                    result: SampleImputationResult {
-                        sample_idx: s,
-                        hap_alt_probs: (None, None),
-                        hap_posteriors: (hap1_posts, hap2_posts),
-                    },
-                    priors: Some((p1_out, p2_out)),
-                    last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    },
-                }
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                    Ok(ImputeResult {
+                        result: SampleImputationResult {
+                            sample_idx: s,
+                            hap_alt_probs: (None, None),
+                            hap_posteriors: (hap1_posts, hap2_posts),
+                        },
+                        priors: Some((p1_out, p2_out)),
+                        last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
 
         if should_log {
             eprintln!(
@@ -5914,40 +6081,43 @@ impl crate::pipelines::ImputationPipeline {
         let mut scratch_bwd0: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_bwd1: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_swapped: Vec<bool> = vec![false; output_markers];
-        let get_result_prob =
-            |result: &SampleImputationResult, hap: usize, local_m: usize, allele: u8| -> Option<f32> {
-                if allele == 255 {
-                    return None;
-                }
-                let post = if hap == 0 {
-                    result.hap_posteriors.0.as_ref()
-                } else {
-                    result.hap_posteriors.1.as_ref()
-                };
-                if let Some(p) = post.and_then(|v| v.get(local_m)) {
-                    let q = p.prob(allele as usize);
-                    if q.is_finite() {
-                        return Some(q.clamp(0.0, 1.0));
-                    }
-                    return None;
-                }
-                if allele > 1 {
-                    return None;
-                }
-                let alt = if hap == 0 {
-                    result.hap_alt_probs.0.as_ref()
-                } else {
-                    result.hap_alt_probs.1.as_ref()
-                };
-                alt.and_then(|v| v.get(local_m)).map(|&p_alt| {
-                    let p_alt = if p_alt.is_finite() {
-                        p_alt.clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    };
-                    if allele == 1 { p_alt } else { 1.0 - p_alt }
-                })
+        let get_result_prob = |result: &SampleImputationResult,
+                               hap: usize,
+                               local_m: usize,
+                               allele: u8|
+         -> Option<f32> {
+            if allele == 255 {
+                return None;
+            }
+            let post = if hap == 0 {
+                result.hap_posteriors.0.as_ref()
+            } else {
+                result.hap_posteriors.1.as_ref()
             };
+            if let Some(p) = post.and_then(|v| v.get(local_m)) {
+                let q = p.prob(allele as usize);
+                if q.is_finite() {
+                    return Some(q.clamp(0.0, 1.0));
+                }
+                return None;
+            }
+            if allele > 1 {
+                return None;
+            }
+            let alt = if hap == 0 {
+                result.hap_alt_probs.0.as_ref()
+            } else {
+                result.hap_alt_probs.1.as_ref()
+            };
+            alt.and_then(|v| v.get(local_m)).map(|&p_alt| {
+                let p_alt = if p_alt.is_finite() {
+                    p_alt.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                if allele == 1 { p_alt } else { 1.0 - p_alt }
+            })
+        };
         let get_anchor_obs = |sample_idx: usize, ref_m: usize| -> Option<(u8, u8, f32)> {
             let target_m = alignment.target_marker(MarkerIdx::new(ref_m as u32))?;
             let target_idx = target_m.as_usize();
@@ -6060,15 +6230,19 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         0.5
                     };
-                    let swapped_prob = if (p1_right as f64).is_finite() && (p2_left as f64).is_finite()
-                    {
-                        (p1_right * p2_left).clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    };
+                    let swapped_prob =
+                        if (p1_right as f64).is_finite() && (p2_left as f64).is_finite() {
+                            (p1_right * p2_left).clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        };
                     let c = phase_conf as f64;
-                    let same_mix = (c * same as f64 + (1.0 - c) * swapped_prob as f64).max(eps).ln();
-                    let swap_mix = (c * swapped_prob as f64 + (1.0 - c) * same as f64).max(eps).ln();
+                    let same_mix = (c * same as f64 + (1.0 - c) * swapped_prob as f64)
+                        .max(eps)
+                        .ln();
+                    let swap_mix = (c * swapped_prob as f64 + (1.0 - c) * same as f64)
+                        .max(eps)
+                        .ln();
                     (
                         same_mix,
                         swap_mix,
@@ -6076,9 +6250,10 @@ impl crate::pipelines::ImputationPipeline {
                     )
                 } else {
                     let mut alpha = ORIENTATION_ALPHA_MIN;
-                    if let (Some(p1v), Some(p2v)) =
-                        (result.hap_posteriors.0.as_ref(), result.hap_posteriors.1.as_ref())
-                    {
+                    if let (Some(p1v), Some(p2v)) = (
+                        result.hap_posteriors.0.as_ref(),
+                        result.hap_posteriors.1.as_ref(),
+                    ) {
                         if let (Some(p1), Some(p2)) = (p1v.get(local_m), p2v.get(local_m)) {
                             let n_alleles = ref_markers
                                 .marker(MarkerIdx::new(ref_m as u32))
@@ -6146,10 +6321,10 @@ impl crate::pipelines::ImputationPipeline {
             for local_m in 1..n {
                 let prev0 = fwd0[local_m - 1];
                 let prev1 = fwd1[local_m - 1];
-                fwd0[local_m] =
-                    emit0[local_m] + logsumexp2(prev0 + log_stay[local_m], prev1 + log_flip[local_m]);
-                fwd1[local_m] =
-                    emit1[local_m] + logsumexp2(prev1 + log_stay[local_m], prev0 + log_flip[local_m]);
+                fwd0[local_m] = emit0[local_m]
+                    + logsumexp2(prev0 + log_stay[local_m], prev1 + log_flip[local_m]);
+                fwd1[local_m] = emit1[local_m]
+                    + logsumexp2(prev1 + log_stay[local_m], prev0 + log_flip[local_m]);
             }
 
             bwd0[n - 1] = 0.0;
@@ -6186,16 +6361,18 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 // Invariant: every hap-ordered field in SampleImputationResult must be
                 // swapped consistently if orientation is swapped.
-                if let (Some(p1), Some(p2)) =
-                    (result.hap_posteriors.0.as_mut(), result.hap_posteriors.1.as_mut())
-                {
+                if let (Some(p1), Some(p2)) = (
+                    result.hap_posteriors.0.as_mut(),
+                    result.hap_posteriors.1.as_mut(),
+                ) {
                     if local_m < p1.len() && local_m < p2.len() {
                         std::mem::swap(&mut p1[local_m], &mut p2[local_m]);
                     }
                 }
-                if let (Some(p1), Some(p2)) =
-                    (result.hap_alt_probs.0.as_mut(), result.hap_alt_probs.1.as_mut())
-                {
+                if let (Some(p1), Some(p2)) = (
+                    result.hap_alt_probs.0.as_mut(),
+                    result.hap_alt_probs.1.as_mut(),
+                ) {
                     if local_m < p1.len() && local_m < p2.len() {
                         std::mem::swap(&mut p1[local_m], &mut p2[local_m]);
                     }
@@ -6252,15 +6429,14 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
             let capture_ref_idx = item.last_info_idx.or(prior_marker_idx);
-            let handoff_swap_prob = smooth_sample_orientation(&mut item.result, capture_ref_idx)
-                .unwrap_or(0.5);
+            let handoff_swap_prob =
+                smooth_sample_orientation(&mut item.result, capture_ref_idx).unwrap_or(0.5);
             all_results.push(item.result);
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
                 if base + 1 < next_priors_vec.len() {
                     next_priors_vec[base] = blend_haplotype_priors(&p1, &p2, handoff_swap_prob);
-                    next_priors_vec[base + 1] =
-                        blend_haplotype_priors(&p2, &p1, handoff_swap_prob);
+                    next_priors_vec[base + 1] = blend_haplotype_priors(&p2, &p1, handoff_swap_prob);
                 }
             }
             if let Some(idx) = item.last_info_idx {

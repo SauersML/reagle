@@ -37,8 +37,6 @@ pub struct StreamingConfig {
     pub overlap_cm: f32,
     /// Buffer size in cM (extra overlap for HMM edge effects)
     pub buffer_cm: f32,
-    /// Maximum markers per window
-    pub max_markers: usize,
 }
 
 impl Default for StreamingConfig {
@@ -47,7 +45,6 @@ impl Default for StreamingConfig {
             window_cm: 40.0,
             overlap_cm: 2.0,
             buffer_cm: 1.0,
-            max_markers: 100_000,
         }
     }
 }

@@ -48,8 +48,8 @@ pub struct BeamConfig {
     pub inject_interval: usize,
     pub inject_k: usize,
     pub active_pool_ttl: u32,
-    pub collapse_gap: i32,
-    pub prune_tolerance: i32,
+    pub collapse_gap: i64,
+    pub prune_tolerance: i64,
 }
 
 impl Default for BeamConfig {
@@ -109,8 +109,8 @@ pub struct BeamPath {
     pub hap2: usize,
     pub cluster1: u16,
     pub cluster2: u16,
-    pub score: i32,
-    pub model_score: i32,
+    pub score: i64,
+    pub model_score: i64,
     pub last_swapped: bool,
     pub history_bits: u64,
     pub history_len: u8,
@@ -815,16 +815,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
 
             // Call site branching (phase decisions)
             let mut next: Vec<BeamPath> = Vec::with_capacity(self.config.beam_width * 2);
-            let mut best_score = i32::MAX;
+            let mut best_score = i64::MAX;
             for p in &beam {
                 if p.score < best_score {
                     best_score = p.score;
                 }
             }
             let cutoff = if self.config.prune_tolerance > 0 {
-                best_score.saturating_add(self.config.prune_tolerance)
+                best_score + self.config.prune_tolerance
             } else {
-                i32::MAX
+                i64::MAX
             };
             for (path_idx, path) in beam.iter().enumerate() {
                 self.expand_call_site(
@@ -1125,8 +1125,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                         hap2: *h2,
                         cluster1: u16::MAX,
                         cluster2: u16::MAX,
-                        score: path.score + *c1 + *c2,
-                        model_score: path.model_score + *c1 + *c2,
+                        score: path.score + i64::from(*c1) + i64::from(*c2),
+                        model_score: path.model_score + i64::from(*c1) + i64::from(*c2),
                         last_swapped: path.last_swapped,
                         history_bits: path.history_bits,
                         history_len: path.history_len,
@@ -1195,7 +1195,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         out: &mut Vec<BeamPath>,
         call_idx: usize,
-        cutoff: i32,
+        cutoff: i64,
         scratch: &mut BeamScratch,
     ) {
         let a1 = call.a1;
@@ -1284,7 +1284,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         out: &mut Vec<BeamPath>,
-        cutoff: i32,
+        cutoff: i64,
         scratch: &mut BeamScratch,
     ) {
         self.repair_hap_for_allele_into(
@@ -1335,27 +1335,25 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         );
         for (h1, c1_total, c1_model, e1) in scratch.hap1_allele.iter() {
             for (h2, c2_total, c2_model, e2) in scratch.hap2_allele.iter() {
-                let score_no_flip = path
-                    .score
-                    .saturating_add(*c1_total)
-                    .saturating_add(*c2_total)
-                    .saturating_add(*e1)
-                    .saturating_add(*e2);
-                let model_score_no_flip = path
-                    .model_score
-                    .saturating_add(*c1_model)
-                    .saturating_add(*c2_model)
-                    .saturating_add(*e1)
-                    .saturating_add(*e2);
+                let score_no_flip = path.score
+                    + i64::from(*c1_total)
+                    + i64::from(*c2_total)
+                    + i64::from(*e1)
+                    + i64::from(*e2);
+                let model_score_no_flip = path.model_score
+                    + i64::from(*c1_model)
+                    + i64::from(*c2_model)
+                    + i64::from(*e1)
+                    + i64::from(*e2);
                 let flip_penalty = if call_idx == 0 {
                     0
                 } else if swapped != path.last_swapped {
-                    flip_event_cost.saturating_add(call.flip_cost)
+                    i64::from(flip_event_cost) + i64::from(call.flip_cost)
                 } else {
                     0
                 };
-                let score = score_no_flip.saturating_add(flip_penalty);
-                let model_score = model_score_no_flip.saturating_add(flip_penalty);
+                let score = score_no_flip + flip_penalty;
+                let model_score = model_score_no_flip + flip_penalty;
                 let (history_bits, history_len) =
                     push_history_bits(path.history_bits, path.history_len, swapped);
                 if score <= cutoff {
@@ -1698,16 +1696,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return;
         }
         // Prune by tolerance relative to best score.
-        let mut best = i32::MAX;
+        let mut best = i64::MAX;
         for p in beam.iter() {
             if p.score < best {
                 best = p.score;
             }
         }
         let cutoff = if self.config.prune_tolerance > 0 {
-            best.saturating_add(self.config.prune_tolerance)
+            best + self.config.prune_tolerance
         } else {
-            i32::MAX
+            i64::MAX
         };
         beam.retain(|p| p.score <= cutoff);
         if beam.is_empty() {
@@ -1769,16 +1767,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             ptrs.resize(beam.len(), 0);
         }
         // Prune by tolerance relative to best score.
-        let mut best = i32::MAX;
+        let mut best = i64::MAX;
         for p in beam.iter() {
             if p.score < best {
                 best = p.score;
             }
         }
         let cutoff = if self.config.prune_tolerance > 0 {
-            best.saturating_add(self.config.prune_tolerance)
+            best + self.config.prune_tolerance
         } else {
-            i32::MAX
+            i64::MAX
         };
         let mut write = 0usize;
         for i in 0..beam.len() {
@@ -1857,8 +1855,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         if beam.len() < 2 {
             return true;
         }
-        let mut best = i32::MAX;
-        let mut worst = i32::MIN;
+        let mut best = i64::MAX;
+        let mut worst = i64::MIN;
         for p in beam {
             if p.score < best {
                 best = p.score;
@@ -1867,7 +1865,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 worst = p.score;
             }
         }
-        (worst - best) < self.config.collapse_gap
+        worst.saturating_sub(best) < self.config.collapse_gap
     }
 }
 
@@ -1968,7 +1966,7 @@ fn compute_swap_posteriors_retained(
         return out;
     }
 
-    let mut best_score = i32::MAX;
+    let mut best_score = i64::MAX;
     for p in final_beam {
         if p.model_score < best_score {
             best_score = p.model_score;
@@ -2050,4 +2048,76 @@ fn compute_swap_posteriors_retained(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beam_score_fields_are_i64() {
+        fn assert_i64(_: i64) {}
+
+        let cfg = BeamConfig::default();
+        assert_i64(cfg.collapse_gap);
+        assert_i64(cfg.prune_tolerance);
+
+        let path = BeamPath {
+            hap1: 0,
+            hap2: 0,
+            cluster1: u16::MAX,
+            cluster2: u16::MAX,
+            score: i64::MAX - 1,
+            model_score: i64::MAX - 1,
+            last_swapped: false,
+            history_bits: 0,
+            history_len: 0,
+            prev_idx: 0,
+            prev_swapped: false,
+        };
+        assert_i64(path.score);
+        assert_i64(path.model_score);
+    }
+
+    #[test]
+    fn swap_posteriors_keep_discrimination_beyond_i32_scale() {
+        let final_beam = vec![
+            BeamPath {
+                hap1: 0,
+                hap2: 1,
+                cluster1: u16::MAX,
+                cluster2: u16::MAX,
+                score: 3_000_000_000,
+                model_score: 3_000_000_000,
+                last_swapped: false,
+                history_bits: 0,
+                history_len: 0,
+                prev_idx: 0,
+                prev_swapped: false,
+            },
+            BeamPath {
+                hap1: 0,
+                hap2: 1,
+                cluster1: u16::MAX,
+                cluster2: u16::MAX,
+                score: 3_150_000_000,
+                model_score: 3_150_000_000,
+                last_swapped: true,
+                history_bits: 0,
+                history_len: 0,
+                prev_idx: 0,
+                prev_swapped: true,
+            },
+        ];
+        let backptrs = vec![vec![pack_backptr(0, false), pack_backptr(0, true)]];
+        let segment_ptrs = vec![Vec::<u32>::new()];
+        let p = compute_swap_posteriors_retained(&final_beam, None, &backptrs, &segment_ptrs, 1);
+        assert_eq!(p.len(), 1);
+        // 150 nats separation should produce near-certain mass on the best (unswapped) path.
+        assert!(
+            p[0] < 1e-6,
+            "expected strong posterior discrimination, got {}",
+            p[0]
+        );
+    }
 }

@@ -6,8 +6,8 @@
 use bitvec::prelude::*;
 
 use crate::data::HapIdx;
-use crate::model::types::RefHapId;
 use crate::data::marker::bits_per_allele;
+use crate::model::types::RefHapId;
 
 /// Dense bit-packed storage for genotype data
 #[derive(Clone, Debug)]

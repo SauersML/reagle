@@ -248,7 +248,9 @@ fn validate_reference_marker_count(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackwardAffine, ForwardAffine, subset_transition_params, transition_only_forward_update};
+    use super::{
+        BackwardAffine, ForwardAffine, subset_transition_params, transition_only_forward_update,
+    };
     use super::{RefColumnLike, RefHapId};
     use crate::data::storage::{DenseColumn, GenotypeColumn};
 
@@ -1415,10 +1417,7 @@ fn apply_marker_prior_smoothing(
             );
             *warned_af_fallback = true;
         }
-        normalized_allele_prior(
-            allele_prior_scratch,
-            AlleleProbsView::from_trusted(probs),
-        )
+        normalized_allele_prior(allele_prior_scratch, AlleleProbsView::from_trusted(probs))
     };
     smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
 }
@@ -1686,7 +1685,9 @@ fn subset_transition_params(
     // We keep this as a hard assert so any upstream transition regression
     // fails fast rather than silently biasing posteriors.
     assert!(
-        ((stay + shift * active_states as f32) - 1.0).abs() < 1e-4 || !stay.is_finite() || !shift.is_finite(),
+        ((stay + shift * active_states as f32) - 1.0).abs() < 1e-4
+            || !stay.is_finite()
+            || !shift.is_finite(),
         "subset transition mass drift: stay={} shift={} K={} stay+K*shift={}",
         stay,
         shift,
@@ -1954,7 +1955,8 @@ fn fill_fwd_affine_coeffs(
     for m in block_start + 1..block_end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate > 0.0 {
-            let (stay, shift) = subset_transition_params(recomb_rate, active_states, transition_haps);
+            let (stay, shift) =
+                subset_transition_params(recomb_rate, active_states, transition_haps);
             let stay = stay as f64;
             let shift = shift as f64;
             let a_new = stay * a;
@@ -2012,8 +2014,7 @@ struct ForwardAffine {
     b: f32,
 }
 
-impl ForwardAffine {
-}
+impl ForwardAffine {}
 
 #[derive(Clone, Copy, Debug)]
 struct BackwardAffine {
@@ -2029,7 +2030,6 @@ impl BackwardAffine {
             add: b_coeff * bwd_sum_right,
         }
     }
-
 }
 
 #[inline]
@@ -2296,10 +2296,7 @@ trait ImputeKernel {
 
     fn marker_key(ctx: &Self::MarkerCtx) -> usize;
     fn marker_group_count(ctx: &Self::MarkerCtx) -> usize;
-    fn group_alleles<'a>(
-        ctx: &Self::MarkerCtx,
-        dict_pattern_alleles: &'a [u8],
-    ) -> &'a [u8];
+    fn group_alleles<'a>(ctx: &Self::MarkerCtx, dict_pattern_alleles: &'a [u8]) -> &'a [u8];
 }
 
 #[derive(Default)]
@@ -2418,10 +2415,7 @@ impl ImputeKernel for DenseKernel {
     }
 
     #[inline]
-    fn group_alleles<'a>(
-        ctx: &Self::MarkerCtx,
-        dict_pattern_alleles: &'a [u8],
-    ) -> &'a [u8] {
+    fn group_alleles<'a>(ctx: &Self::MarkerCtx, dict_pattern_alleles: &'a [u8]) -> &'a [u8] {
         &dict_pattern_alleles[..ctx.n_groups]
     }
 }
@@ -2673,10 +2667,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
     }
 
     #[inline]
-    fn group_alleles<'a>(
-        ctx: &Self::MarkerCtx,
-        dict_pattern_alleles: &'a [u8],
-    ) -> &'a [u8] {
+    fn group_alleles<'a>(ctx: &Self::MarkerCtx, dict_pattern_alleles: &'a [u8]) -> &'a [u8] {
         if ctx.direct_alleles_ptr.is_null() {
             &dict_pattern_alleles[..ctx.n_groups]
         } else {
@@ -2837,14 +2828,15 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     fwd_sum_left += *v;
                 }
                 assert!(
-                    {
-                        (fwd_sum_left - 1.0).abs() < 1e-3 || active_states == 0
-                    },
+                    { (fwd_sum_left - 1.0).abs() < 1e-3 || active_states == 0 },
                     "checkpoint forward mass drift before interior affine block (S_u assumption)"
                 );
-                if let Some(interior) =
-                    UniformInteriorRange::from_block_checked(block, &uniform_mask, context, K::LABEL)?
-                {
+                if let Some(interior) = UniformInteriorRange::from_block_checked(
+                    block,
+                    &uniform_mask,
+                    context,
+                    K::LABEL,
+                )? {
                     // Affine interior path:
                     // - Enabled by marker kind (uniform/untyped interior), not by distance.
                     // - We keep transition propagation in affine form across the block.
@@ -3083,7 +3075,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             context,
                                         );
                                     }
-                                    write_posterior_from_probs(&mut posteriors[m], &ws.allele_probs);
+                                    write_posterior_from_probs(
+                                        &mut posteriors[m],
+                                        &ws.allele_probs,
+                                    );
                                 } else {
                                     if !warned_af_fallback {
                                         eprintln!(
@@ -3184,7 +3179,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         ws.allele_probs.clear();
                         if n_alleles > 0 {
                             ws.allele_probs.resize(n_alleles, 0.0f32);
-                            let smoothing_prior_counts = &mut ws.smoothing_prior_counts[..n_alleles];
+                            let smoothing_prior_counts =
+                                &mut ws.smoothing_prior_counts[..n_alleles];
                             smoothing_prior_counts.fill(0.0);
                             let mut subset_total = 0.0f32;
                             let mut smoothing_prior_total = 0.0f32;
@@ -3231,8 +3227,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         );
                                         warned_af_fallback = true;
                                     }
-                                    let prior =
-                                        normalized_allele_prior(&mut ws.allele_prior_scratch, probs);
+                                    let prior = normalized_allele_prior(
+                                        &mut ws.allele_prior_scratch,
+                                        probs,
+                                    );
                                     ws.allele_probs.copy_from_slice(prior.as_slice());
                                 }
                                 if use_prior_smoothing {
@@ -3256,7 +3254,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         context,
                                     );
                                 }
-                                write_posterior_from_probs(&mut posteriors[m_rev], &ws.allele_probs);
+                                write_posterior_from_probs(
+                                    &mut posteriors[m_rev],
+                                    &ws.allele_probs,
+                                );
                             } else {
                                 if !warned_af_fallback {
                                     eprintln!(
@@ -3270,7 +3271,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     );
                                     warned_af_fallback = true;
                                 }
-                                write_panel_freq_posterior(&mut posteriors[m_rev], panel_priors, m_rev);
+                                write_panel_freq_posterior(
+                                    &mut posteriors[m_rev],
+                                    panel_priors,
+                                    m_rev,
+                                );
                             }
                         } else {
                             return Err(ReagleError::vcf(format!(

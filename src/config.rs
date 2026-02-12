@@ -101,9 +101,6 @@ pub struct Config {
     /// Impute ungenotyped markers
     pub impute: bool,
 
-    /// Model states for imputation
-    pub imp_states: usize,
-
     /// Imputation segment length in cM
     pub imp_segment: f32,
 
@@ -175,7 +172,6 @@ struct TomlConfig {
 
     // Imputation parameters
     pub impute: Option<bool>,
-    pub imp_states: Option<usize>,
     pub imp_segment: Option<f32>,
     pub imp_step: Option<f32>,
     pub imp_nsteps: Option<usize>,
@@ -216,7 +212,6 @@ impl Default for Config {
             phase_states: 0,
             rare: 0.002,
             impute: true,
-            imp_states: 1600,
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
@@ -282,9 +277,6 @@ impl Config {
 
         if let Some(value) = cfg.impute {
             self.impute = value;
-        }
-        if let Some(value) = cfg.imp_states {
-            self.imp_states = value;
         }
         if let Some(value) = cfg.imp_segment {
             self.imp_segment = value;

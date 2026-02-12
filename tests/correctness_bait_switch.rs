@@ -201,7 +201,6 @@ fn test_state_index_stability_bait_and_switch() {
 
     config.err = Some(0.0001);
     config.ne = 10_000.0;
-    config.imp_states = 10;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -284,7 +283,6 @@ fn test_clean_constructed_reference_consistency() {
 
     config.err = Some(0.0001);
     config.ne = 10_000.0;
-    config.imp_states = 10;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);

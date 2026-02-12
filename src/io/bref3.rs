@@ -925,27 +925,15 @@ impl StreamingBref3WindowReader {
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
         let mut ref_columns: Vec<GenotypeColumn> = Vec::new();
         let mut next_overlap: VecDeque<Bref3BufferedMarker> = VecDeque::new();
-        let mut included_markers: Vec<Bref3BufferedMarker> = Vec::new();
-
         let mut window_start_gen: Option<f64> = None;
         let mut target_end_gen = 0.0;
         let mut full_window_gen = 0.0;
         let mut output_end: Option<usize> = None;
         let mut window_size = 0usize;
-        let mut truncated_by_marker_cap = false;
         let mut window_chrom_idx: Option<ChromIdx> = None;
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
 
         loop {
-            if window_size >= config.max_markers {
-                // Hard cap to avoid pathological marker-dense windows.
-                if output_end.is_none() {
-                    output_end = Some(window_size);
-                }
-                truncated_by_marker_cap = true;
-                break;
-            }
-
             let next_marker = if let Some(m) = carryover.pop_front() {
                 Some(m)
             } else if let Some(pending) = self.pending_marker.take() {
@@ -999,7 +987,6 @@ impl StreamingBref3WindowReader {
             if output_end.is_some() {
                 next_overlap.push_back(marker.clone());
             }
-            included_markers.push(marker);
 
             window_size += 1;
         }
@@ -1007,18 +994,6 @@ impl StreamingBref3WindowReader {
         if markers.len() == 0 && window_size == 0 {
             self.buffer = carryover;
             return Ok(None);
-        }
-
-        if truncated_by_marker_cap && next_overlap.is_empty() && window_size > 1 {
-            let last_gen = included_markers
-                .last()
-                .map(|m| m.gen_pos)
-                .unwrap_or(target_end_gen);
-            let cutoff = last_gen - config.overlap_cm as f64;
-            let mut split = included_markers.partition_point(|m| m.gen_pos < cutoff);
-            split = split.clamp(1, window_size - 1);
-            output_end = Some(split);
-            next_overlap.extend(included_markers.iter().skip(split).cloned());
         }
 
         let output_end = output_end.unwrap_or(window_size);
@@ -1321,27 +1296,15 @@ impl StreamingRefVcfReader {
         let mut phasing_columns: Vec<GenotypeColumn> = Vec::new();
         let mut ref_columns: Vec<GenotypeColumn> = Vec::new();
         let mut next_overlap: VecDeque<RefPanelMarker> = VecDeque::new();
-        let mut included_markers: Vec<RefPanelMarker> = Vec::new();
-
         let mut window_start_gen: Option<f64> = None;
         let mut target_end_gen = 0.0;
         let mut full_window_gen = 0.0;
         let mut output_end: Option<usize> = None;
         let mut window_size = 0usize;
-        let mut truncated_by_marker_cap = false;
         let mut window_chrom_idx: Option<ChromIdx> = None;
         let mut phasing_chrom_idx: Option<ChromIdx> = None;
 
         loop {
-            if window_size >= config.max_markers {
-                // Hard cap to avoid pathological marker-dense windows.
-                if output_end.is_none() {
-                    output_end = Some(window_size);
-                }
-                truncated_by_marker_cap = true;
-                break;
-            }
-
             let next_marker = if let Some(m) = carryover.pop_front() {
                 Some(m)
             } else if let Some(pending) = self.pending_marker.take() {
@@ -1414,7 +1377,6 @@ impl StreamingRefVcfReader {
             if output_end.is_some() {
                 next_overlap.push_back(marker.clone());
             }
-            included_markers.push(marker);
 
             window_size += 1;
         }
@@ -1422,18 +1384,6 @@ impl StreamingRefVcfReader {
         if markers.len() == 0 && window_size == 0 {
             self.buffer = carryover;
             return Ok(None);
-        }
-
-        if truncated_by_marker_cap && next_overlap.is_empty() && window_size > 1 {
-            let last_gen = included_markers
-                .last()
-                .map(|m| m.gen_pos)
-                .unwrap_or(target_end_gen);
-            let cutoff = last_gen - config.overlap_cm as f64;
-            let mut split = included_markers.partition_point(|m| m.gen_pos < cutoff);
-            split = split.clamp(1, window_size - 1);
-            output_end = Some(split);
-            next_overlap.extend(included_markers.iter().skip(split).cloned());
         }
 
         let output_end = output_end.unwrap_or(window_size);

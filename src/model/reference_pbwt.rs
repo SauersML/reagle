@@ -1086,7 +1086,6 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
                 .fwd_update(ref_alleles, n_alleles, marker, &mut self.ppa, &mut self.div);
         }
     }
-
 }
 
 pub enum ReferencePbwt {
@@ -1211,5 +1210,4 @@ impl ReferencePbwt {
             ),
         }
     }
-
 }

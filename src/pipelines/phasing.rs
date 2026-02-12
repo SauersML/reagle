@@ -68,10 +68,10 @@ use crate::data::alignment::{AlignmentStats, MarkerAlignment};
 use crate::data::condensed::CondensedTarget;
 use crate::data::ref_packed::PackedRefView;
 use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, PbwtInjector};
-use crate::model::phase_hmm::MosaicHmm;
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
-use crate::model::phase_ibs::BidirectionalPhaseIbs;
+use crate::model::phase_hmm::MosaicHmm;
+use crate::model::phase_ibs::{BidirectionalPhaseIbs, take_pbwt_cache_isolation_diag};
 use crate::model::reference_pbwt::{
     PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
 };
@@ -126,6 +126,40 @@ impl Stage1Timing {
             false
         }
     }
+}
+
+fn log_pbwt_cache_isolation_diag() {
+    let diag = take_pbwt_cache_isolation_diag();
+    let state_cached_lookups = diag
+        .state_lookups
+        .saturating_sub(diag.state_checkpoint_direct);
+    let state_cache_hits = state_cached_lookups.saturating_sub(diag.state_rebuilds);
+    let state_hit_rate = if state_cached_lookups > 0 {
+        state_cache_hits as f64 / state_cached_lookups as f64
+    } else {
+        0.0
+    };
+    let pos_cache_hits = diag.pos_lookups.saturating_sub(diag.pos_rebuilds);
+    let pos_hit_rate = if diag.pos_lookups > 0 {
+        pos_cache_hits as f64 / diag.pos_lookups as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "PBWT cache summary: state_lookups={} checkpoint_direct={} cached={} rebuilds={} hits={} hit_rate={:.2}% stale_blocked={} | pos_lookups={} rebuilds={} hits={} hit_rate={:.2}% stale_blocked={}",
+        diag.state_lookups,
+        diag.state_checkpoint_direct,
+        state_cached_lookups,
+        diag.state_rebuilds,
+        state_cache_hits,
+        state_hit_rate * 100.0,
+        diag.state_stale_hit_blocked,
+        diag.pos_lookups,
+        diag.pos_rebuilds,
+        pos_cache_hits,
+        pos_hit_rate * 100.0,
+        diag.pos_stale_hit_blocked
+    );
 }
 use mini_mcmc::core::{MarkovChain, Trace};
 
@@ -2231,6 +2265,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
     /// Run the phasing pipeline
     pub fn run(&mut self) -> Result<()> {
         THREAD_WORKSPACE.with(|ws| *ws.borrow_mut() = None);
+        take_pbwt_cache_isolation_diag();
         eprintln!("Loading VCF...");
 
         // Load exclusion lists
@@ -3304,6 +3339,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         writer.write_phased(&final_gt, 0, final_gt.n_markers())?;
         writer.flush()?;
 
+        log_pbwt_cache_isolation_diag();
         eprintln!("Phasing complete!");
         Ok(())
     }
@@ -3311,13 +3347,13 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
     /// Run the phasing pipeline in streaming mode for large datasets
     pub fn run_streaming(&mut self) -> Result<()> {
         THREAD_WORKSPACE.with(|ws| *ws.borrow_mut() = None);
+        take_pbwt_cache_isolation_diag();
         eprintln!("Opening VCF for streaming...");
 
         // Configure streaming (genetic maps loaded lazily by StreamingVcfReader)
         let streaming_config = StreamingConfig {
             window_cm: self.config.window,
             overlap_cm: self.config.overlap,
-            max_markers: self.config.window_markers,
             ..Default::default()
         };
 
@@ -3504,6 +3540,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             "Streaming phasing complete: {} windows, {} markers",
             window_count, total_markers
         );
+        log_pbwt_cache_isolation_diag();
         if align_stats.aligned > 0
             && (align_stats.strand_flipped > 0 || align_stats.allele_swapped > 0)
         {
@@ -7734,6 +7771,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 }
 
 const PRIOR_EXPORT_MIN_PROB: f32 = 1e-5;
+const PRIOR_PROJECTION_EPS: f32 = 1e-6;
 
 /// Project haplotype-identity priors onto the current window's local state set.
 fn project_haplotype_priors_to_states(
@@ -7754,11 +7792,20 @@ fn project_haplotype_priors_to_states(
         covered_mass += p;
     }
 
-    // Conditional projection onto the active set: renormalize covered mass.
-    // This is the exact projection under P(h | h in active_set).
-    if covered_mass > 1e-6 {
+    // Coverage-aware projection:
+    // - `covered_mass` is prior mass represented by current active states.
+    // - Pure conditional renormalization (p/covered) can become overconfident
+    //   when covered_mass is small.
+    // - We therefore mix conditional mass with uniform by lambda=covered_mass:
+    //     q = lambda * p(h|active) + (1-lambda) * Uniform(active)
+    //   This preserves exact behavior when coverage is high and defaults to
+    //   uniform when coverage collapses.
+    if covered_mass > PRIOR_PROJECTION_EPS {
+        let lambda = covered_mass.clamp(0.0, 1.0);
+        let uniform = 1.0f32 / n_states as f32;
         for p in &mut out {
-            *p /= covered_mass;
+            let conditional = *p / covered_mass;
+            *p = lambda * conditional + (1.0 - lambda) * uniform;
         }
     } else {
         let uniform = 1.0 / n_states as f32;
@@ -12039,7 +12086,6 @@ mod tests {
             phase_states: 280,
             rare: 0.002,
             impute: true,
-            imp_states: 1600,
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
@@ -12128,7 +12174,6 @@ mod tests {
             phase_states: 10,
             rare: 0.002,
             impute: true,
-            imp_states: 10,
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,

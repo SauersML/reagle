@@ -27,6 +27,7 @@
 use crate::data::haplotype::SampleIdx;
 use crate::model::ibs2::Ibs2;
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub trait PbwtStateCache<I: PbwtIndex> {
     fn with_fwd_state<R>(
@@ -46,6 +47,37 @@ pub trait PbwtStateCache<I: PbwtIndex> {
 /// This reduces memory from O(n_markers × n_haps × 24 bytes) to O(n_markers/INTERVAL × n_haps × 24 bytes).
 /// Checkpoints are used for storage, and exact states are recomputed per marker when queried.
 const PBWT_CHECKPOINT_INTERVAL: usize = 64;
+static NEXT_PBWT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static PBWT_STATE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static PBWT_STATE_CHECKPOINT_DIRECT: AtomicU64 = AtomicU64::new(0);
+static PBWT_STATE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+static PBWT_STATE_STALE_HIT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+static PBWT_POS_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static PBWT_POS_REBUILDS: AtomicU64 = AtomicU64::new(0);
+static PBWT_POS_STALE_HIT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PbwtCacheIsolationDiag {
+    pub state_lookups: u64,
+    pub state_checkpoint_direct: u64,
+    pub state_rebuilds: u64,
+    pub state_stale_hit_blocked: u64,
+    pub pos_lookups: u64,
+    pub pos_rebuilds: u64,
+    pub pos_stale_hit_blocked: u64,
+}
+
+pub fn take_pbwt_cache_isolation_diag() -> PbwtCacheIsolationDiag {
+    PbwtCacheIsolationDiag {
+        state_lookups: PBWT_STATE_LOOKUPS.swap(0, Ordering::Relaxed),
+        state_checkpoint_direct: PBWT_STATE_CHECKPOINT_DIRECT.swap(0, Ordering::Relaxed),
+        state_rebuilds: PBWT_STATE_REBUILDS.swap(0, Ordering::Relaxed),
+        state_stale_hit_blocked: PBWT_STATE_STALE_HIT_BLOCKED.swap(0, Ordering::Relaxed),
+        pos_lookups: PBWT_POS_LOOKUPS.swap(0, Ordering::Relaxed),
+        pos_rebuilds: PBWT_POS_REBUILDS.swap(0, Ordering::Relaxed),
+        pos_stale_hit_blocked: PBWT_POS_STALE_HIT_BLOCKED.swap(0, Ordering::Relaxed),
+    }
+}
 
 /// Manages bidirectional PBWT state for HMM state selection.
 ///
@@ -60,6 +92,7 @@ const PBWT_CHECKPOINT_INTERVAL: usize = 64;
 /// use global marker indices. The `subset_to_global` mapping handles this
 /// coordinate space conversion automatically in `find_neighbors`.
 pub struct BidirectionalPhaseIbsImpl<I: crate::model::pbwt::PbwtIndex> {
+    instance_id: u64,
     /// Forward divergence at checkpoints: `fwd_div[checkpoint_idx]` = divergence array after
     /// processing markers 0..=checkpoint_marker. For position i in the sorted order, `div[i]` is
     /// the marker where the match with the haplotype at position i-1 started.
@@ -178,6 +211,7 @@ where
         }
 
         Self {
+            instance_id: NEXT_PBWT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             fwd_div,
             fwd_ppa,
             bwd_div,
@@ -208,20 +242,32 @@ where
             marker_idx,
             |ppa, div| {
                 thread_local! {
-                    static FWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
-                        std::cell::RefCell::new((usize::MAX, Vec::new()));
+                    static FWD_POS_AT: std::cell::RefCell<(u64, usize, Vec<u32>)> =
+                        std::cell::RefCell::new((u64::MAX, usize::MAX, Vec::new()));
                 }
                 FWD_POS_AT.with(|cell| {
                     let mut cache = cell.borrow_mut();
-                    if cache.0 != marker_idx || cache.1.len() != ppa.len() {
-                        cache.1.clear();
-                        cache.1.resize(ppa.len(), 0u32);
-                        for (i, &h) in ppa.iter().enumerate() {
-                            cache.1[h.to_usize()] = i as u32;
-                        }
-                        cache.0 = marker_idx;
+                    PBWT_POS_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    if cache.0 != self.instance_id
+                        && cache.1 == marker_idx
+                        && cache.2.len() == ppa.len()
+                    {
+                        PBWT_POS_STALE_HIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
                     }
-                    let pos = cache.1[hap_idx as usize] as usize;
+                    if cache.0 != self.instance_id
+                        || cache.1 != marker_idx
+                        || cache.2.len() != ppa.len()
+                    {
+                        PBWT_POS_REBUILDS.fetch_add(1, Ordering::Relaxed);
+                        cache.2.clear();
+                        cache.2.resize(ppa.len(), 0u32);
+                        for (i, &h) in ppa.iter().enumerate() {
+                            cache.2[h.to_usize()] = i as u32;
+                        }
+                        cache.0 = self.instance_id;
+                        cache.1 = marker_idx;
+                    }
+                    let pos = cache.2[hap_idx as usize] as usize;
                     f(ppa, div, pos)
                 })
             },
@@ -239,20 +285,32 @@ where
             marker_idx,
             |ppa, div| {
                 thread_local! {
-                    static BWD_POS_AT: std::cell::RefCell<(usize, Vec<u32>)> =
-                        std::cell::RefCell::new((usize::MAX, Vec::new()));
+                    static BWD_POS_AT: std::cell::RefCell<(u64, usize, Vec<u32>)> =
+                        std::cell::RefCell::new((u64::MAX, usize::MAX, Vec::new()));
                 }
                 BWD_POS_AT.with(|cell| {
                     let mut cache = cell.borrow_mut();
-                    if cache.0 != marker_idx || cache.1.len() != ppa.len() {
-                        cache.1.clear();
-                        cache.1.resize(ppa.len(), 0u32);
-                        for (i, &h) in ppa.iter().enumerate() {
-                            cache.1[h.to_usize()] = i as u32;
-                        }
-                        cache.0 = marker_idx;
+                    PBWT_POS_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    if cache.0 != self.instance_id
+                        && cache.1 == marker_idx
+                        && cache.2.len() == ppa.len()
+                    {
+                        PBWT_POS_STALE_HIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
                     }
-                    let pos = cache.1[hap_idx as usize] as usize;
+                    if cache.0 != self.instance_id
+                        || cache.1 != marker_idx
+                        || cache.2.len() != ppa.len()
+                    {
+                        PBWT_POS_REBUILDS.fetch_add(1, Ordering::Relaxed);
+                        cache.2.clear();
+                        cache.2.resize(ppa.len(), 0u32);
+                        for (i, &h) in ppa.iter().enumerate() {
+                            cache.2[h.to_usize()] = i as u32;
+                        }
+                        cache.0 = self.instance_id;
+                        cache.1 = marker_idx;
+                    }
+                    let pos = cache.2[hap_idx as usize] as usize;
                     f(ppa, div, pos)
                 })
             },
@@ -379,7 +437,7 @@ where
 
         if ref_start.is_some() && neighbors.len() < n_candidates {
             for h in ibs2_fallback {
-                if h != hap_idx && h / 2 != sample.0 {
+                if h != hap_idx && h / 2 != sample.0 && ref_start.map_or(true, |start| h >= start) {
                     neighbors.push(h);
                 }
             }
@@ -706,15 +764,17 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
         marker_idx: usize,
         f: impl FnOnce(&[u16], &[i32]) -> R,
     ) -> R {
+        PBWT_STATE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
         let checkpoint_idx = this.marker_to_checkpoint_floor(marker_idx);
         let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
         if marker_idx == checkpoint_marker {
+            PBWT_STATE_CHECKPOINT_DIRECT.fetch_add(1, Ordering::Relaxed);
             return f(&this.fwd_ppa[checkpoint_idx], &this.fwd_div[checkpoint_idx]);
         }
 
         thread_local! {
-            static FWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u16>, Vec<i32>)> =
-                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static FWD_STATE_CACHE: std::cell::RefCell<(u64, usize, usize, Vec<u16>, Vec<i32>)> =
+                std::cell::RefCell::new((u64::MAX, usize::MAX, usize::MAX, Vec::new(), Vec::new()));
             static FWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u16>> =
                 std::cell::RefCell::new(PbwtDivUpdater::new(0));
         }
@@ -722,21 +782,31 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
         FWD_STATE_CACHE.with(|state_cell| {
             FWD_UPDATER.with(|upd_cell| {
                 let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx
-                    || state.1 != marker_idx
-                    || state.2.len() != this.n_haps
+                if state.0 != this.instance_id
+                    && state.1 == checkpoint_idx
+                    && state.2 == marker_idx
+                    && state.3.len() == this.n_haps
                 {
-                    state.0 = checkpoint_idx;
-                    state.1 = marker_idx;
-                    state.2 = this.fwd_ppa[checkpoint_idx].clone();
-                    state.3 = this.fwd_div[checkpoint_idx].clone();
+                    PBWT_STATE_STALE_HIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                }
+                if state.0 != this.instance_id
+                    || state.1 != checkpoint_idx
+                    || state.2 != marker_idx
+                    || state.3.len() != this.n_haps
+                {
+                    PBWT_STATE_REBUILDS.fetch_add(1, Ordering::Relaxed);
+                    state.0 = this.instance_id;
+                    state.1 = checkpoint_idx;
+                    state.2 = marker_idx;
+                    state.3 = this.fwd_ppa[checkpoint_idx].clone();
+                    state.4 = this.fwd_div[checkpoint_idx].clone();
 
                     let mut updater = upd_cell.borrow_mut();
                     if updater.n_haps() != this.n_haps {
                         *updater = PbwtDivUpdater::new(this.n_haps);
                     }
-                    let mut ppa = std::mem::take(&mut state.2);
-                    let mut div = std::mem::take(&mut state.3);
+                    let mut ppa = std::mem::take(&mut state.3);
+                    let mut div = std::mem::take(&mut state.4);
                     for m in (checkpoint_marker + 1)..=marker_idx {
                         let n_alleles = this.n_alleles_by_marker[m];
                         updater.fwd_update(
@@ -747,10 +817,10 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
                             &mut div,
                         );
                     }
-                    state.2 = ppa;
-                    state.3 = div;
+                    state.3 = ppa;
+                    state.4 = div;
                 }
-                f(&state.2, &state.3)
+                f(&state.3, &state.4)
             })
         })
     }
@@ -760,15 +830,17 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
         marker_idx: usize,
         f: impl FnOnce(&[u16], &[i32]) -> R,
     ) -> R {
+        PBWT_STATE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
         let checkpoint_idx = this.marker_to_checkpoint_ceil(marker_idx);
         let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
         if marker_idx == checkpoint_marker {
+            PBWT_STATE_CHECKPOINT_DIRECT.fetch_add(1, Ordering::Relaxed);
             return f(&this.bwd_ppa[checkpoint_idx], &this.bwd_div[checkpoint_idx]);
         }
 
         thread_local! {
-            static BWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u16>, Vec<i32>)> =
-                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static BWD_STATE_CACHE: std::cell::RefCell<(u64, usize, usize, Vec<u16>, Vec<i32>)> =
+                std::cell::RefCell::new((u64::MAX, usize::MAX, usize::MAX, Vec::new(), Vec::new()));
             static BWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u16>> =
                 std::cell::RefCell::new(PbwtDivUpdater::new(0));
         }
@@ -776,21 +848,31 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
         BWD_STATE_CACHE.with(|state_cell| {
             BWD_UPDATER.with(|upd_cell| {
                 let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx
-                    || state.1 != marker_idx
-                    || state.2.len() != this.n_haps
+                if state.0 != this.instance_id
+                    && state.1 == checkpoint_idx
+                    && state.2 == marker_idx
+                    && state.3.len() == this.n_haps
                 {
-                    state.0 = checkpoint_idx;
-                    state.1 = marker_idx;
-                    state.2 = this.bwd_ppa[checkpoint_idx].clone();
-                    state.3 = this.bwd_div[checkpoint_idx].clone();
+                    PBWT_STATE_STALE_HIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                }
+                if state.0 != this.instance_id
+                    || state.1 != checkpoint_idx
+                    || state.2 != marker_idx
+                    || state.3.len() != this.n_haps
+                {
+                    PBWT_STATE_REBUILDS.fetch_add(1, Ordering::Relaxed);
+                    state.0 = this.instance_id;
+                    state.1 = checkpoint_idx;
+                    state.2 = marker_idx;
+                    state.3 = this.bwd_ppa[checkpoint_idx].clone();
+                    state.4 = this.bwd_div[checkpoint_idx].clone();
 
                     let mut updater = upd_cell.borrow_mut();
                     if updater.n_haps() != this.n_haps {
                         *updater = PbwtDivUpdater::new(this.n_haps);
                     }
-                    let mut ppa = std::mem::take(&mut state.2);
-                    let mut div = std::mem::take(&mut state.3);
+                    let mut ppa = std::mem::take(&mut state.3);
+                    let mut div = std::mem::take(&mut state.4);
                     for m in (marker_idx..checkpoint_marker).rev() {
                         let n_alleles = this.n_alleles_by_marker[m];
                         updater.bwd_update(
@@ -801,10 +883,10 @@ impl PbwtStateCache<u16> for BidirectionalPhaseIbsImpl<u16> {
                             &mut div,
                         );
                     }
-                    state.2 = ppa;
-                    state.3 = div;
+                    state.3 = ppa;
+                    state.4 = div;
                 }
-                f(&state.2, &state.3)
+                f(&state.3, &state.4)
             })
         })
     }
@@ -816,15 +898,17 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
         marker_idx: usize,
         f: impl FnOnce(&[u32], &[i32]) -> R,
     ) -> R {
+        PBWT_STATE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
         let checkpoint_idx = this.marker_to_checkpoint_floor(marker_idx);
         let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
         if marker_idx == checkpoint_marker {
+            PBWT_STATE_CHECKPOINT_DIRECT.fetch_add(1, Ordering::Relaxed);
             return f(&this.fwd_ppa[checkpoint_idx], &this.fwd_div[checkpoint_idx]);
         }
 
         thread_local! {
-            static FWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
-                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static FWD_STATE_CACHE: std::cell::RefCell<(u64, usize, usize, Vec<u32>, Vec<i32>)> =
+                std::cell::RefCell::new((u64::MAX, usize::MAX, usize::MAX, Vec::new(), Vec::new()));
             static FWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u32>> =
                 std::cell::RefCell::new(PbwtDivUpdater::new(0));
         }
@@ -832,21 +916,31 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
         FWD_STATE_CACHE.with(|state_cell| {
             FWD_UPDATER.with(|upd_cell| {
                 let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx
-                    || state.1 != marker_idx
-                    || state.2.len() != this.n_haps
+                if state.0 != this.instance_id
+                    && state.1 == checkpoint_idx
+                    && state.2 == marker_idx
+                    && state.3.len() == this.n_haps
                 {
-                    state.0 = checkpoint_idx;
-                    state.1 = marker_idx;
-                    state.2 = this.fwd_ppa[checkpoint_idx].clone();
-                    state.3 = this.fwd_div[checkpoint_idx].clone();
+                    PBWT_STATE_STALE_HIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                }
+                if state.0 != this.instance_id
+                    || state.1 != checkpoint_idx
+                    || state.2 != marker_idx
+                    || state.3.len() != this.n_haps
+                {
+                    PBWT_STATE_REBUILDS.fetch_add(1, Ordering::Relaxed);
+                    state.0 = this.instance_id;
+                    state.1 = checkpoint_idx;
+                    state.2 = marker_idx;
+                    state.3 = this.fwd_ppa[checkpoint_idx].clone();
+                    state.4 = this.fwd_div[checkpoint_idx].clone();
 
                     let mut updater = upd_cell.borrow_mut();
                     if updater.n_haps() != this.n_haps {
                         *updater = PbwtDivUpdater::new(this.n_haps);
                     }
-                    let mut ppa = std::mem::take(&mut state.2);
-                    let mut div = std::mem::take(&mut state.3);
+                    let mut ppa = std::mem::take(&mut state.3);
+                    let mut div = std::mem::take(&mut state.4);
                     for m in (checkpoint_marker + 1)..=marker_idx {
                         let n_alleles = this.n_alleles_by_marker[m];
                         updater.fwd_update(
@@ -857,10 +951,10 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
                             &mut div,
                         );
                     }
-                    state.2 = ppa;
-                    state.3 = div;
+                    state.3 = ppa;
+                    state.4 = div;
                 }
-                f(&state.2, &state.3)
+                f(&state.3, &state.4)
             })
         })
     }
@@ -870,15 +964,17 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
         marker_idx: usize,
         f: impl FnOnce(&[u32], &[i32]) -> R,
     ) -> R {
+        PBWT_STATE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
         let checkpoint_idx = this.marker_to_checkpoint_ceil(marker_idx);
         let checkpoint_marker = this.checkpoint_markers[checkpoint_idx];
         if marker_idx == checkpoint_marker {
+            PBWT_STATE_CHECKPOINT_DIRECT.fetch_add(1, Ordering::Relaxed);
             return f(&this.bwd_ppa[checkpoint_idx], &this.bwd_div[checkpoint_idx]);
         }
 
         thread_local! {
-            static BWD_STATE_CACHE: std::cell::RefCell<(usize, usize, Vec<u32>, Vec<i32>)> =
-                std::cell::RefCell::new((usize::MAX, usize::MAX, Vec::new(), Vec::new()));
+            static BWD_STATE_CACHE: std::cell::RefCell<(u64, usize, usize, Vec<u32>, Vec<i32>)> =
+                std::cell::RefCell::new((u64::MAX, usize::MAX, usize::MAX, Vec::new(), Vec::new()));
             static BWD_UPDATER: std::cell::RefCell<PbwtDivUpdater<u32>> =
                 std::cell::RefCell::new(PbwtDivUpdater::new(0));
         }
@@ -886,21 +982,31 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
         BWD_STATE_CACHE.with(|state_cell| {
             BWD_UPDATER.with(|upd_cell| {
                 let mut state = state_cell.borrow_mut();
-                if state.0 != checkpoint_idx
-                    || state.1 != marker_idx
-                    || state.2.len() != this.n_haps
+                if state.0 != this.instance_id
+                    && state.1 == checkpoint_idx
+                    && state.2 == marker_idx
+                    && state.3.len() == this.n_haps
                 {
-                    state.0 = checkpoint_idx;
-                    state.1 = marker_idx;
-                    state.2 = this.bwd_ppa[checkpoint_idx].clone();
-                    state.3 = this.bwd_div[checkpoint_idx].clone();
+                    PBWT_STATE_STALE_HIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                }
+                if state.0 != this.instance_id
+                    || state.1 != checkpoint_idx
+                    || state.2 != marker_idx
+                    || state.3.len() != this.n_haps
+                {
+                    PBWT_STATE_REBUILDS.fetch_add(1, Ordering::Relaxed);
+                    state.0 = this.instance_id;
+                    state.1 = checkpoint_idx;
+                    state.2 = marker_idx;
+                    state.3 = this.bwd_ppa[checkpoint_idx].clone();
+                    state.4 = this.bwd_div[checkpoint_idx].clone();
 
                     let mut updater = upd_cell.borrow_mut();
                     if updater.n_haps() != this.n_haps {
                         *updater = PbwtDivUpdater::new(this.n_haps);
                     }
-                    let mut ppa = std::mem::take(&mut state.2);
-                    let mut div = std::mem::take(&mut state.3);
+                    let mut ppa = std::mem::take(&mut state.3);
+                    let mut div = std::mem::take(&mut state.4);
                     for m in (marker_idx..checkpoint_marker).rev() {
                         let n_alleles = this.n_alleles_by_marker[m];
                         updater.bwd_update(
@@ -911,10 +1017,10 @@ impl PbwtStateCache<u32> for BidirectionalPhaseIbsImpl<u32> {
                             &mut div,
                         );
                     }
-                    state.2 = ppa;
-                    state.3 = div;
+                    state.3 = ppa;
+                    state.4 = div;
                 }
-                f(&state.2, &state.3)
+                f(&state.3, &state.4)
             })
         })
     }
@@ -1018,4 +1124,89 @@ fn normalize_pbwt_alleles(alleles: &mut [u8]) -> usize {
         }
     }
     (max_allele as usize + 1).max(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ibs2::{Ibs2, Ibs2Segment};
+
+    fn flatten_rows(rows: &[&[u8]]) -> Vec<u8> {
+        rows.iter().flat_map(|r| r.iter().copied()).collect()
+    }
+
+    #[test]
+    fn pbwt_thread_local_cache_isolation_across_instances() {
+        let n_haps = 4usize;
+        let n_markers = 6usize;
+        let subset_to_global: Vec<usize> = (0..n_markers).collect();
+
+        let panel_a = flatten_rows(&[
+            &[0, 0, 1, 1],
+            &[0, 0, 1, 1],
+            &[0, 0, 1, 1],
+            &[0, 0, 1, 1],
+            &[0, 0, 1, 1],
+            &[0, 0, 1, 1],
+        ]);
+        let panel_b = flatten_rows(&[
+            &[0, 1, 0, 1],
+            &[0, 1, 0, 1],
+            &[0, 1, 0, 1],
+            &[0, 1, 0, 1],
+            &[0, 1, 0, 1],
+            &[0, 1, 0, 1],
+        ]);
+
+        let pbwt_a = BidirectionalPhaseIbsImpl::<u16>::build_for_subset_flat(
+            panel_a,
+            n_haps,
+            n_markers,
+            &subset_to_global,
+        );
+        let pbwt_b = BidirectionalPhaseIbsImpl::<u16>::build_for_subset_flat(
+            panel_b,
+            n_haps,
+            n_markers,
+            &subset_to_global,
+        );
+
+        let neigh_a = pbwt_a.find_neighbors_of_state(0, 3, u32::MAX, 1);
+        let neigh_b = pbwt_b.find_neighbors_of_state(0, 3, u32::MAX, 1);
+        assert_eq!(neigh_a, vec![1]);
+        assert_eq!(neigh_b, vec![2]);
+    }
+
+    #[test]
+    fn ibs2_fallback_respects_reference_start_filter() {
+        let n_haps = 6usize;
+        let n_markers = 1usize;
+        let subset_to_global = vec![0usize];
+        let alleles_flat = flatten_rows(&[&[0, 0, 0, 0, 0, 0]]);
+        let mut pbwt = BidirectionalPhaseIbsImpl::<u16>::build_for_subset_flat(
+            alleles_flat,
+            n_haps,
+            n_markers,
+            &subset_to_global,
+        );
+        pbwt.set_reference_start_hap(4);
+
+        // sample 0 (haps 0,1) has IBS2 segment with sample 1 (haps 2,3), which is below ref_start.
+        let ibs2 = Ibs2::from_sample_segments(vec![
+            vec![Ibs2Segment::new(
+                crate::data::haplotype::SampleIdx::new(1),
+                0,
+                0,
+            )],
+            Vec::new(),
+            Vec::new(),
+        ]);
+
+        let neigh = pbwt.find_neighbors(0, 0, &ibs2, 10);
+        assert!(
+            !neigh.iter().any(|&h| h < 4),
+            "neighbors must honor ref_start: {:?}",
+            neigh
+        );
+    }
 }

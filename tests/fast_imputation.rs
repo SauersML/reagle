@@ -572,7 +572,6 @@ fn test_synthetic_slam_dunk() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.imp_nsteps = 10;
     config.ne = 10000.0;
     config.err = Some(0.0001);
@@ -670,7 +669,6 @@ fn test_synthetic_recombination() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 100;
     config.ne = 10000.0;
     config.window = 10.0;
     config.overlap = 2.0;
@@ -775,7 +773,6 @@ fn test_private_variant_genotyped_not_imputed() {
     config.err = Some(0.0001);
     config.window = 0.1;
     config.overlap = 0.01;
-    config.imp_states = 50;
     config.imp_nsteps = 3;
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -881,7 +878,6 @@ fn test_simulated_chip_density() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 20.0; // Large window
     config.nthreads = Some(1);
@@ -958,7 +954,6 @@ fn test_population_structure() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 20.0;
     config.nthreads = Some(1);
@@ -1048,7 +1043,6 @@ fn test_hotspot_switching() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.map = Some(map_path);
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 100.0;
     config.nthreads = Some(1);
@@ -1120,7 +1114,6 @@ fn test_phase_switch_torture() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
@@ -1191,7 +1184,6 @@ fn test_error_injection() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
     config.err = Some(0.01);
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
@@ -1267,7 +1259,6 @@ fn test_rare_variant() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
@@ -1362,7 +1353,6 @@ fn test_dr2_validation() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.ne = 10000.0;
     config.window = 10.0;
     config.nthreads = Some(1);
@@ -1535,7 +1525,6 @@ fn test_singleton_imputation() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 50;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1611,7 +1600,6 @@ fn test_high_recombination_stress() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 30;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1688,7 +1676,6 @@ fn test_ultra_dense_markers() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 20;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1835,7 +1822,6 @@ fn test_diverse_reference_with_mismatch() {
     config.target = target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 20;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -1951,7 +1937,6 @@ fn test_microarray_vs_wgs_imputation() {
     config.target = masked_target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 100;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -2153,7 +2138,6 @@ fn test_imputation_polarity_consistency() {
     config.target = masked_target_file.path().to_path_buf();
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
-    config.imp_states = 80;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
@@ -2383,7 +2367,6 @@ fn test_phasing_confidence() {
         phase_states: 80,
         rare: 0.002,
         impute: false,
-        imp_states: 10,
         imp_segment: 6.0,
         imp_step: 0.1,
         imp_nsteps: 7,

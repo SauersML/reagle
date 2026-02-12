@@ -55,8 +55,8 @@
 //! A coarse grid search over mu is used to hit the budget without assuming
 //! monotonicity under the greedy outer loop.
 
-use crate::model::parameters::ModelParams;
 use crate::model::li_stephens::on_off_transition_log_odds;
+use crate::model::parameters::ModelParams;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 

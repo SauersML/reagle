@@ -108,6 +108,11 @@ impl Ibs2 {
         }
     }
 
+    #[cfg(test)]
+    pub fn from_sample_segments(sample_segs: Vec<Vec<Ibs2Segment>>) -> Self {
+        Self { sample_segs }
+    }
+
     /// Build IBS2 segments for a single sample.
     ///
     /// Pipeline:

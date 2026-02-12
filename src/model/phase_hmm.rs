@@ -13,9 +13,9 @@
 
 use crate::data::storage::GenotypeView;
 use crate::data::{HapIdx, MarkerIdx};
-use crate::model::li_stephens::subset_linear_exact_k;
 #[cfg(test)]
 use crate::model::li_stephens::normalized_switch_scale_shift;
+use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
 use aligned_vec::{AVec, ConstAlign};
 use std::sync::OnceLock;
@@ -217,7 +217,9 @@ impl HmmUpdater {
     ) -> f32 {
         if n_states >= Self::LOG8_SWITCH_STATES {
             for i in 0..n_states {
-                let em = if ref_alleles[i] == req {
+                let em = if ref_alleles[i] == MISSING_ALLELE {
+                    1.0
+                } else if ref_alleles[i] == req {
                     p_match
                 } else {
                     p_mismatch
@@ -235,8 +237,10 @@ impl HmmUpdater {
             {
                 unsafe {
                     let req_vec = _mm512_set1_epi8(req as i8);
+                    let missing_vec = _mm512_set1_epi8(MISSING_ALLELE as i8);
                     let match_vec = _mm512_set1_ps(p_match);
                     let mismatch_vec = _mm512_set1_ps(p_mismatch);
+                    let neutral_vec = _mm512_set1_ps(1.0);
                     let shift_vec = _mm512_set1_ps(shift);
                     let scale_vec = _mm512_set1_ps(scale);
                     let mut sum_vec = _mm512_setzero_ps();
@@ -246,20 +250,29 @@ impl HmmUpdater {
                     while k + 64 <= n_states {
                         let bytes = _mm512_loadu_si512(ref_ptr.add(k) as *const __m512i);
                         let mask = _mm512_cmpeq_epi8_mask(bytes, req_vec);
+                        let missing_mask = _mm512_cmpeq_epi8_mask(bytes, missing_vec);
                         let mask0 = (mask & 0xFFFF) as u16;
                         let mask1 = ((mask >> 16) & 0xFFFF) as u16;
                         let mask2 = ((mask >> 32) & 0xFFFF) as u16;
                         let mask3 = ((mask >> 48) & 0xFFFF) as u16;
+                        let miss0 = (missing_mask & 0xFFFF) as u16;
+                        let miss1 = ((missing_mask >> 16) & 0xFFFF) as u16;
+                        let miss2 = ((missing_mask >> 32) & 0xFFFF) as u16;
+                        let miss3 = ((missing_mask >> 48) & 0xFFFF) as u16;
 
                         let fwd0 = _mm512_loadu_ps(fwd_ptr.add(k));
                         let fwd1 = _mm512_loadu_ps(fwd_ptr.add(k + 16));
                         let fwd2 = _mm512_loadu_ps(fwd_ptr.add(k + 32));
                         let fwd3 = _mm512_loadu_ps(fwd_ptr.add(k + 48));
 
-                        let emit0 = _mm512_mask_blend_ps(mask0, mismatch_vec, match_vec);
-                        let emit1 = _mm512_mask_blend_ps(mask1, mismatch_vec, match_vec);
-                        let emit2 = _mm512_mask_blend_ps(mask2, mismatch_vec, match_vec);
-                        let emit3 = _mm512_mask_blend_ps(mask3, mismatch_vec, match_vec);
+                        let mut emit0 = _mm512_mask_blend_ps(mask0, mismatch_vec, match_vec);
+                        let mut emit1 = _mm512_mask_blend_ps(mask1, mismatch_vec, match_vec);
+                        let mut emit2 = _mm512_mask_blend_ps(mask2, mismatch_vec, match_vec);
+                        let mut emit3 = _mm512_mask_blend_ps(mask3, mismatch_vec, match_vec);
+                        emit0 = _mm512_mask_blend_ps(miss0, emit0, neutral_vec);
+                        emit1 = _mm512_mask_blend_ps(miss1, emit1, neutral_vec);
+                        emit2 = _mm512_mask_blend_ps(miss2, emit2, neutral_vec);
+                        emit3 = _mm512_mask_blend_ps(miss3, emit3, neutral_vec);
 
                         let scaled0 = _mm512_fmadd_ps(scale_vec, fwd0, shift_vec);
                         let scaled1 = _mm512_fmadd_ps(scale_vec, fwd1, shift_vec);
@@ -287,7 +300,10 @@ impl HmmUpdater {
                     let mut new_sum: f32 = sum_arr.iter().sum();
                     for i in k..n_states {
                         let f = *fwd_ptr.add(i);
-                        let em = if *ref_ptr.add(i) == req {
+                        let ra = *ref_ptr.add(i);
+                        let em = if ra == MISSING_ALLELE {
+                            1.0
+                        } else if ra == req {
                             p_match
                         } else {
                             p_mismatch
@@ -305,7 +321,9 @@ impl HmmUpdater {
         let mut new_sum = 0.0f32;
         for i in 0..n_states {
             let f = fwd[i];
-            let em = if ref_alleles[i] == req {
+            let em = if ref_alleles[i] == MISSING_ALLELE {
+                1.0
+            } else if ref_alleles[i] == req {
                 p_match
             } else {
                 p_mismatch
@@ -901,10 +919,14 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 let miss1 = ((missing_mask >> 16) & 0xFFFF) as u16;
                                 let miss2 = ((missing_mask >> 32) & 0xFFFF) as u16;
                                 let miss3 = ((missing_mask >> 48) & 0xFFFF) as u16;
-                                let mut res0 = _mm512_mask_blend_ps(match0, mismatch_vec, match_vec);
-                                let mut res1 = _mm512_mask_blend_ps(match1, mismatch_vec, match_vec);
-                                let mut res2 = _mm512_mask_blend_ps(match2, mismatch_vec, match_vec);
-                                let mut res3 = _mm512_mask_blend_ps(match3, mismatch_vec, match_vec);
+                                let mut res0 =
+                                    _mm512_mask_blend_ps(match0, mismatch_vec, match_vec);
+                                let mut res1 =
+                                    _mm512_mask_blend_ps(match1, mismatch_vec, match_vec);
+                                let mut res2 =
+                                    _mm512_mask_blend_ps(match2, mismatch_vec, match_vec);
+                                let mut res3 =
+                                    _mm512_mask_blend_ps(match3, mismatch_vec, match_vec);
                                 res0 = _mm512_mask_blend_ps(miss0, res0, neutral_vec);
                                 res1 = _mm512_mask_blend_ps(miss1, res1, neutral_vec);
                                 res2 = _mm512_mask_blend_ps(miss2, res2, neutral_vec);
@@ -1094,9 +1116,9 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 for a in 0..255usize {
                                     if a < n_alleles {
                                         let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
-                                        let emit =
-                                            (p_no_err * p_true + p_err_other * (1.0 - p_true))
-                                                .max(1e-30);
+                                        let emit = (p_no_err * p_true
+                                            + p_err_other * (1.0 - p_true))
+                                            .max(1e-30);
                                         lut.set_called_allele(a as u8, emit);
                                     }
                                 }
@@ -1110,7 +1132,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 );
                                 if !used_pattern {
                                     for k in 0..n_states {
-                                        emissions_row[k] = lut.emission(RefAllele::from_raw(ref_row[k]));
+                                        emissions_row[k] =
+                                            lut.emission(RefAllele::from_raw(ref_row[k]));
                                     }
                                 }
                             } else {
@@ -1707,8 +1730,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             }
 
             if m > 0 && state_sum > 0.0 {
-                let switch_prob =
-                    (h_factor * (1.0 - joint_state_sum / state_sum).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+                let switch_prob = (h_factor * (1.0 - joint_state_sum / state_sum).clamp(0.0, 1.0))
+                    .clamp(0.0, 1.0);
                 if switch_prob > 0.0 {
                     let gen_dist = gen_dists.get(m - 1).copied().unwrap_or(0.0);
                     estimates.add_switch(gen_dist, switch_prob as f64);
@@ -1837,6 +1860,50 @@ mod tests {
 
         let sum: f32 = bwd.iter().sum();
         assert!((sum - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_fwd_homo_missing_ref_is_neutral() {
+        let mut fwd = vec![0.2f32, 0.4, 0.6, 0.8, 1.0];
+        let original = fwd.clone();
+        let ref_alleles = vec![0u8, 255, 1, 255, 0];
+        let req = 0u8;
+        let p_match = 0.99f32;
+        let p_mismatch = 0.01f32;
+        let scale = 0.8f32;
+        let shift = 0.05f32;
+        let n_states = fwd.len();
+
+        let sum = HmmUpdater::fwd_update_homo_emissions_scale(
+            &mut fwd,
+            scale,
+            shift,
+            &ref_alleles,
+            req,
+            p_match,
+            p_mismatch,
+            n_states,
+        );
+
+        let mut expected = Vec::with_capacity(n_states);
+        let mut expected_sum = 0.0f32;
+        for i in 0..n_states {
+            let em = if ref_alleles[i] == MISSING_ALLELE {
+                1.0
+            } else if ref_alleles[i] == req {
+                p_match
+            } else {
+                p_mismatch
+            };
+            let v = em * scale.mul_add(original[i], shift);
+            expected.push(v);
+            expected_sum += v;
+        }
+
+        for i in 0..n_states {
+            assert!((fwd[i] - expected[i]).abs() < 1e-7);
+        }
+        assert!((sum - expected_sum).abs() < 1e-7);
     }
 
     #[test]
@@ -2204,5 +2271,4 @@ mod tests {
         let sum: f32 = bwd.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "Sum should be 1.0");
     }
-
 }
