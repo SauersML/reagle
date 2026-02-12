@@ -3723,14 +3723,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             })
             .collect();
 
-        // Apply overlap constraint: set alleles from previous window's phased overlap
-        // This seeds the phasing with the known phase from the overlap region
-        let overlap_markers = if let Some(overlap) = phased_overlap {
+        // Apply overlap alleles from previous window as initialization seed.
+        if let Some(overlap) = phased_overlap {
             self.apply_overlap_constraint(&mut geno, overlap, &missing_mask);
-            overlap.n_markers.min(n_markers)
-        } else {
-            0
-        };
+        }
 
         let chrom = target_gt.marker(MarkerIdx::new(0)).chrom;
 
@@ -3824,7 +3820,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             bb.set_current_iteration(1);
         }
 
-        // Create sample phases with overlap markers pre-phased
+        // Create sample phases from seeded genotypes (no hard overlap lock).
         let confidence_by_sample = build_sample_confidence(&target_gt);
         let phase_mask = target_gt.phase_mask();
         let has_input_phase = phase_mask
@@ -3834,8 +3830,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let mut sample_phases = self.create_sample_phases_with_overlap(
             &geno,
             &missing_mask,
-            overlap_markers,
-            phased_overlap,
             &confidence_by_sample,
             phase_mask,
         );
@@ -4263,14 +4257,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
     /// Create SamplePhase instances with overlap markers pre-phased
     ///
-    /// Markers in the overlap region (0..overlap_markers) are marked as already
-    /// phased since their phase comes from the previous window.
+    /// Overlap alleles are used to seed initialization, but we do not hard-lock
+    /// overlap heterozygotes; they remain re-phasable unless the input phase mask
+    /// itself marks them as fixed.
     fn create_sample_phases_with_overlap(
         &self,
         geno: &MutableGenotypes,
         missing_mask: &[BitBox<u8, Lsb0>],
-        overlap_markers: usize,
-        overlap: Option<&PhasedOverlap>,
         confidence_by_sample: &[Vec<f32>],
         phase_mask: Option<&crate::data::storage::matrix::BitMatrix>,
     ) -> Vec<SamplePhase> {
@@ -4293,8 +4286,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     })
                     .collect();
 
-                // Overlap is treated as a hard phase lock only when the current input
-                // actually observed both haplotypes and overlap provided concrete alleles.
                 let unphased: Vec<usize> = (0..n_markers)
                     .filter(|&m| {
                         let a1 = alleles1[m];
@@ -4304,16 +4295,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                         if missing_mask[hap1.as_usize()][m] || missing_mask[hap2.as_usize()][m] {
                             return false;
-                        }
-                        if m < overlap_markers {
-                            if let Some(ov) = overlap {
-                                if m < ov.n_markers
-                                    && ov.allele(m, hap1.as_usize()) != 255
-                                    && ov.allele(m, hap2.as_usize()) != 255
-                                {
-                                    return false;
-                                }
-                            }
                         }
                         match phase_mask.and_then(|mask| mask.get(m, s)) {
                             Some(0) => true,
@@ -6929,17 +6910,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Vec::new()
         };
 
-        // Determine Stage 1 markers involved in the PREVIOUS overlap region (for import/merge)
-        let n_stage1_in_prev_overlap = if let Some(overlap) = previous_overlap {
-            // Overlap markers are 0..overlap.n_markers
-            hi_freq_markers
-                .iter()
-                .take_while(|&&m| m < overlap.n_markers)
-                .count()
-        } else {
-            0
-        };
-
         // Build Stage 2 interpolation mappings
         let stage2_phaser = Stage2Phaser::new(
             hi_freq_markers,
@@ -7147,52 +7117,19 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         if let Some(overlap) = previous_overlap {
                             let h1_idx = s * 2;
                             let h2_idx = s * 2 + 1;
-                            let mut prior_stage1_idx = n_stage1_in_prev_overlap
-                                .saturating_sub(1)
-                                .min(n_stage1.saturating_sub(1));
-                            let mut anchor_source = "tail";
-                            if let Some(prior_marker) = overlap.prior_stage1_global_marker() {
-                                if let Some(idx) =
+                            let prior_stage1_idx = overlap
+                                .prior_stage1_global_marker()
+                                .and_then(|prior_marker| {
                                     hi_freq_markers.iter().position(|&m| m == prior_marker)
-                                {
-                                    prior_stage1_idx = idx;
-                                    anchor_source = "marker";
-                                }
-                            }
-                            if anchor_source == "tail" {
-                                if let Some(prior_gen_pos) = overlap.prior_stage1_gen_pos() {
-                                    if let Some((idx, _)) = hi_freq_gen_positions
-                                        .iter()
-                                        .enumerate()
-                                        .min_by(|(_, a), (_, b)| {
-                                            let da = (*a - prior_gen_pos).abs();
-                                            let db = (*b - prior_gen_pos).abs();
-                                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                                        })
-                                    {
-                                        prior_stage1_idx = idx;
-                                        anchor_source = "gen_pos";
-                                    }
-                                }
-                            }
-                            if s == 0 && n_stage1 <= 600 {
-                                eprintln!(
-                                    "[stage2 prior anchor] sample=0 source={} stage1_idx={}",
-                                    anchor_source, prior_stage1_idx
-                                );
-                            }
+                                });
 
-                            // Identity-aware handoff: project haplotype priors onto the
-                            // current window's local state set using state->hap mapping.
-                            if let Some(hap_priors) = overlap.hap_priors() {
-                                if prior_stage1_idx < n_stage1
-                                    && h1_idx < hap_priors.len()
-                                    && h2_idx < hap_priors.len()
-                                    && n_states > 0
-                                {
+                            // Use handoff priors only when they anchor exactly to the first
+                            // Stage 1 marker in this window. This avoids injecting priors at
+                            // a mismatched coordinate and double-counting emissions.
+                            if let (Some(hap_priors), Some(0)) = (overlap.hap_priors(), prior_stage1_idx) {
+                                if h1_idx < hap_priors.len() && h2_idx < hap_priors.len() && n_states > 0 {
                                     let mut state_haps = vec![CombinedHapId::new(0); n_states];
-                                    threaded_haps.materialize_at(prior_stage1_idx, &mut state_haps);
-
+                                    threaded_haps.materialize_at(0, &mut state_haps);
                                     (
                                         Some(project_haplotype_priors_to_states(
                                             &hap_priors[h1_idx],
@@ -7282,34 +7219,69 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let mut state_haps = vec![CombinedHapId::new(0); n_states];
                                 threaded_haps.materialize_at(stage1_idx, &mut state_haps);
 
-                                // Use fwd probabilities only (unidirectional priors) to avoid leakage
-                                // from future data in the overlap region.
-                                let row_start = stage1_idx * n_states;
-                                let fwd1_slice = &fwd1[row_start..row_start + n_states];
-                                let fwd1_sum: f32 = fwd1_slice.iter().sum();
-                                let norm_fwd1: Vec<f32> = if fwd1_sum > 0.0 {
-                                    fwd1_slice.iter().map(|&p| p / fwd1_sum).collect()
-                                } else {
-                                    vec![1.0 / n_states as f32; n_states]
+                                // Export predictive priors at the anchor marker (before that
+                                // marker's emission) so the next window does not double-count
+                                // boundary emissions.
+                                let build_predictive_prior = |fwd_row_major: &[f32]| -> Vec<f32> {
+                                    if stage1_idx == 0 {
+                                        // No previous marker in this window; use normalized
+                                        // forward mass as the best available anchor prior.
+                                        let row_start = 0usize;
+                                        let row = &fwd_row_major[row_start..row_start + n_states];
+                                        let sum: f32 = row.iter().sum();
+                                        if sum > 0.0 {
+                                            row.iter().map(|&p| p / sum).collect()
+                                        } else {
+                                            vec![1.0 / n_states as f32; n_states]
+                                        }
+                                    } else {
+                                        let prev_row_start = (stage1_idx - 1) * n_states;
+                                        let prev_row =
+                                            &fwd_row_major[prev_row_start..prev_row_start + n_states];
+                                        let prev_sum: f32 = prev_row.iter().sum();
+                                        let mut src = vec![0.0f32; n_states];
+                                        if prev_sum > 0.0 {
+                                            for k in 0..n_states {
+                                                src[k] = prev_row[k] / prev_sum;
+                                            }
+                                        } else {
+                                            let u = 1.0 / n_states as f32;
+                                            src.fill(u);
+                                        }
+                                        let p = stage1_p_recomb.get(stage1_idx).copied().unwrap_or(0.0);
+                                        let (stay, shift) =
+                                            subset_linear_exact_k(p, n_states as f32, n_total_haps.max(1));
+                                        let mut out = vec![0.0f32; n_states];
+                                        let mut out_sum = 0.0f32;
+                                        for k in 0..n_states {
+                                            let v = stay * src[k] + shift;
+                                            out[k] = v;
+                                            out_sum += v;
+                                        }
+                                        if out_sum > 0.0 {
+                                            for v in &mut out {
+                                                *v /= out_sum;
+                                            }
+                                        } else {
+                                            let u = 1.0 / n_states as f32;
+                                            out.fill(u);
+                                        }
+                                        out
+                                    }
                                 };
 
-                                let fwd2_slice = &fwd2[row_start..row_start + n_states];
-                                let fwd2_sum: f32 = fwd2_slice.iter().sum();
-                                let norm_fwd2: Vec<f32> = if fwd2_sum > 0.0 {
-                                    fwd2_slice.iter().map(|&p| p / fwd2_sum).collect()
-                                } else {
-                                    vec![1.0 / n_states as f32; n_states]
-                                };
+                                let norm_fwd1 = build_predictive_prior(&fwd1);
+                                let norm_fwd2 = build_predictive_prior(&fwd2);
 
                                 let prior1 = build_haplotype_priors_from_state_probs(
                                     &norm_fwd1,
                                     &state_haps,
-                                    PRIOR_EXPORT_MIN_PROB,
+                                    PRIOR_EXPORT_MAX_DROPPED_MASS,
                                 );
                                 let prior2 = build_haplotype_priors_from_state_probs(
                                     &norm_fwd2,
                                     &state_haps,
-                                    PRIOR_EXPORT_MIN_PROB,
+                                    PRIOR_EXPORT_MAX_DROPPED_MASS,
                                 );
                                 let marker = hi_freq_markers.get(stage1_idx).copied();
                                 let gen_pos = hi_freq_gen_positions.get(stage1_idx).copied();
@@ -7770,7 +7742,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     }
 }
 
-const PRIOR_EXPORT_MIN_PROB: f32 = 1e-5;
+const PRIOR_EXPORT_MAX_DROPPED_MASS: f32 = 1e-4;
 const PRIOR_PROJECTION_EPS: f32 = 1e-6;
 
 /// Project haplotype-identity priors onto the current window's local state set.
@@ -7792,20 +7764,11 @@ fn project_haplotype_priors_to_states(
         covered_mass += p;
     }
 
-    // Coverage-aware projection:
-    // - `covered_mass` is prior mass represented by current active states.
-    // - Pure conditional renormalization (p/covered) can become overconfident
-    //   when covered_mass is small.
-    // - We therefore mix conditional mass with uniform by lambda=covered_mass:
-    //     q = lambda * p(h|active) + (1-lambda) * Uniform(active)
-    //   This preserves exact behavior when coverage is high and defaults to
-    //   uniform when coverage collapses.
+    // Conditional projection onto the active set: renormalize covered mass.
+    // This preserves relative evidence among active states exactly.
     if covered_mass > PRIOR_PROJECTION_EPS {
-        let lambda = covered_mass.clamp(0.0, 1.0);
-        let uniform = 1.0f32 / n_states as f32;
         for p in &mut out {
-            let conditional = *p / covered_mass;
-            *p = lambda * conditional + (1.0 - lambda) * uniform;
+            *p /= covered_mass;
         }
     } else {
         let uniform = 1.0 / n_states as f32;
@@ -7819,7 +7782,7 @@ fn project_haplotype_priors_to_states(
 fn build_haplotype_priors_from_state_probs(
     state_probs: &[f32],
     state_haps: &[CombinedHapId],
-    min_prob: f32,
+    max_dropped_mass: f32,
 ) -> HaplotypePriors {
     let mut mass_by_hap: std::collections::HashMap<u32, f32> =
         std::collections::HashMap::with_capacity(state_haps.len());
@@ -7831,19 +7794,39 @@ fn build_haplotype_priors_from_state_probs(
         }
     }
 
-    let mut entries: Vec<(u32, f32)> = mass_by_hap
-        .into_iter()
-        .filter(|&(_, p)| p >= min_prob)
-        .collect();
+    let mut entries: Vec<(u32, f32)> = mass_by_hap.into_iter().collect();
 
     if entries.is_empty() {
         return HaplotypePriors::empty();
     }
 
-    entries.sort_unstable_by_key(|(hap, _)| *hap);
-    let mut hap_ids: Vec<GlobalHapId> = Vec::with_capacity(entries.len());
-    let mut probs: Vec<f32> = Vec::with_capacity(entries.len());
+    let total_mass: f32 = entries.iter().map(|(_, p)| *p).sum();
+    if !total_mass.is_finite() || total_mass <= 0.0 {
+        return HaplotypePriors::empty();
+    }
+
+    let target_mass = (1.0 - max_dropped_mass.clamp(0.0, 1.0)) * total_mass;
+    entries.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut kept: Vec<(u32, f32)> = Vec::with_capacity(entries.len());
+    let mut kept_mass = 0.0f32;
     for (hap, p) in entries {
+        if !(p.is_finite() && p > 0.0) {
+            continue;
+        }
+        kept.push((hap, p));
+        kept_mass += p;
+        if kept_mass >= target_mass && !kept.is_empty() {
+            break;
+        }
+    }
+    if kept.is_empty() {
+        return HaplotypePriors::empty();
+    }
+
+    kept.sort_unstable_by_key(|(hap, _)| *hap);
+    let mut hap_ids: Vec<GlobalHapId> = Vec::with_capacity(kept.len());
+    let mut probs: Vec<f32> = Vec::with_capacity(kept.len());
+    for (hap, p) in kept {
         hap_ids.push(GlobalHapId(hap));
         probs.push(p);
     }

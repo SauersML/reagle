@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,7 +18,12 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     ensure_cmd_exists("cargo");
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let work_dir = tempfile::tempdir().expect("create temp work dir");
+    let test_tmp_root = manifest_dir.join(".tmp").join("imputation_quality_artifacts");
+    fs::create_dir_all(&test_tmp_root).expect("create test tmp root");
+    let work_dir = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(&test_tmp_root)
+        .expect("create temp work dir");
     let dataset_dir = work_dir.path().join("dataset");
     fs::create_dir_all(&dataset_dir).expect("create dataset dir");
 
@@ -93,43 +97,42 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     assert!(reagle_vcf.exists(), "missing reagle output {}", reagle_vcf.display());
     assert!(beagle_vcf.exists(), "missing beagle output {}", beagle_vcf.display());
 
-    let input_sites = load_input_sites(&input_vcf);
-    let truth_dosage = load_truth_dosage(&truth_vcf, &input_sites);
-    let reagle_ds = load_ds_map(&reagle_vcf, &truth_dosage);
-    let beagle_ds = load_ds_map(&beagle_vcf, &truth_dosage);
-
-    let mut truth_vec = Vec::new();
-    let mut reagle_vec = Vec::new();
-    let mut beagle_vec = Vec::new();
-    for (site, truth_val) in &truth_dosage {
-        if let (Some(r), Some(b)) = (reagle_ds.get(site), beagle_ds.get(site)) {
-            truth_vec.push(*truth_val);
-            reagle_vec.push(*r);
-            beagle_vec.push(*b);
-        }
-    }
-
-    assert!(
-        truth_vec.len() >= 500,
-        "too few comparable imputed-only sites: {}",
-        truth_vec.len()
+    let reagle_metrics_prefix = work_dir.path().join("reagle_py");
+    let beagle_metrics_prefix = work_dir.path().join("beagle_py");
+    run_python_calculate_metrics(
+        &manifest_dir,
+        &truth_vcf,
+        &reagle_vcf,
+        &reagle_metrics_prefix,
+        &ref_vcf,
+    );
+    run_python_calculate_metrics(
+        &manifest_dir,
+        &truth_vcf,
+        &beagle_vcf,
+        &beagle_metrics_prefix,
+        &ref_vcf,
     );
 
-    let reagle_corr = pearson_corr(&truth_vec, &reagle_vec).expect("reagle corr");
-    let beagle_corr = pearson_corr(&truth_vec, &beagle_vec).expect("beagle corr");
+    let reagle_r2 = read_r_squared(&PathBuf::from(format!(
+        "{}_metrics.json",
+        reagle_metrics_prefix.display()
+    )));
+    let beagle_r2 = read_r_squared(&PathBuf::from(format!(
+        "{}_metrics.json",
+        beagle_metrics_prefix.display()
+    )));
 
     println!(
-        "Comparable sites: {} | Reagle corr: {:.6} | Beagle corr: {:.6}",
-        truth_vec.len(),
-        reagle_corr,
-        beagle_corr
+        "Reagle r_squared: {:.6} | Beagle r_squared: {:.6}",
+        reagle_r2, beagle_r2
     );
 
     assert!(
-        reagle_corr > beagle_corr,
-        "Expected Reagle dosage correlation > Beagle on imputed-only sites; reagle={:.6}, beagle={:.6}",
-        reagle_corr,
-        beagle_corr
+        reagle_r2 > beagle_r2,
+        "Expected Reagle r_squared > Beagle r_squared; reagle={:.6}, beagle={:.6}",
+        reagle_r2,
+        beagle_r2
     );
 }
 
@@ -455,141 +458,55 @@ fn find_file_recursive(root: &Path, filename: &str) -> Option<PathBuf> {
     None
 }
 
-fn load_input_sites(input_vcf: &Path) -> HashSet<String> {
-    let text = run_capture(
-        "bcftools",
-        [
-            "query",
-            "-f",
-            "%CHROM\t%POS\n",
-            input_vcf.to_str().expect("input path utf8"),
-        ],
-    );
-    let mut sites = HashSet::new();
-    for line in text.lines() {
-        let mut fields = line.split('\t');
-        let Some(chrom) = fields.next() else { continue };
-        let Some(pos) = fields.next() else { continue };
-        sites.insert(format!("{chrom}:{pos}"));
-    }
-    sites
-}
+fn run_python_calculate_metrics(
+    repo_root: &Path,
+    truth_vcf: &Path,
+    imputed_vcf: &Path,
+    output_prefix: &Path,
+    reference_vcf: &Path,
+) {
+    let script = r#"
+import importlib.util
+import pathlib
+import sys
 
-fn load_truth_dosage(truth_vcf: &Path, input_sites: &HashSet<String>) -> HashMap<String, f64> {
-    let text = run_capture(
-        "bcftools",
+module_path = pathlib.Path(sys.argv[1])
+truth_vcf = sys.argv[2]
+imputed_vcf = sys.argv[3]
+output_prefix = sys.argv[4]
+reference_vcf = sys.argv[5]
+
+spec = importlib.util.spec_from_file_location("integration_test_module", str(module_path))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.calculate_metrics(truth_vcf, imputed_vcf, output_prefix, reference_vcf=reference_vcf)
+"#;
+
+    run_in(
+        repo_root,
+        "python3",
         [
-            "query",
-            "-f",
-            "%CHROM\t%POS[\t%GT]\n",
+            "-c",
+            script,
+            "tests/integration_test.py",
             truth_vcf.to_str().expect("truth path utf8"),
-        ],
-    );
-    let mut truth = HashMap::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let site = format!("{}:{}", parts[0], parts[1]);
-        if input_sites.contains(&site) {
-            continue;
-        }
-        let Some(gt) = parts.get(2) else { continue };
-        let Some(dosage) = gt_to_nonref_dosage(gt) else {
-            continue;
-        };
-        truth.insert(site, dosage);
-    }
-    truth
-}
-
-fn load_ds_map(imputed_vcf: &Path, truth_sites: &HashMap<String, f64>) -> HashMap<String, f64> {
-    let text = run_capture(
-        "bcftools",
-        [
-            "query",
-            "-f",
-            "%CHROM\t%POS[\t%DS]\n",
             imputed_vcf.to_str().expect("imputed path utf8"),
+            output_prefix.to_str().expect("output prefix path utf8"),
+            reference_vcf.to_str().expect("reference path utf8"),
         ],
     );
-    let mut ds_map = HashMap::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let site = format!("{}:{}", parts[0], parts[1]);
-        if !truth_sites.contains_key(&site) {
-            continue;
-        }
-        let Some(ds_str) = parts.get(2) else { continue };
-        let Some(ds) = parse_ds(ds_str) else {
-            continue;
-        };
-        ds_map.insert(site, ds);
-    }
-    ds_map
 }
 
-fn gt_to_nonref_dosage(gt: &str) -> Option<f64> {
-    if gt == "." || gt == "./." || gt == ".|." {
-        return None;
-    }
-    let sep = if gt.contains('|') { '|' } else { '/' };
-    let mut it = gt.split(sep);
-    let a = it.next()?;
-    let b = it.next()?;
-    let av = a.parse::<i32>().ok()?;
-    let bv = b.parse::<i32>().ok()?;
-    let left = if av != 0 { 1.0 } else { 0.0 };
-    let right = if bv != 0 { 1.0 } else { 0.0 };
-    Some(left + right)
-}
-
-fn parse_ds(ds: &str) -> Option<f64> {
-    if ds.is_empty() || ds == "." {
-        return None;
-    }
-    if ds.contains(',') {
-        let mut sum = 0.0_f64;
-        for part in ds.split(',') {
-            if part.is_empty() || part == "." {
-                continue;
-            }
-            let val = part.parse::<f64>().ok()?;
-            sum += val;
-        }
-        return Some(sum);
-    }
-    ds.parse::<f64>().ok()
-}
-
-fn pearson_corr(x: &[f64], y: &[f64]) -> Option<f64> {
-    if x.len() != y.len() || x.len() < 2 {
-        return None;
-    }
-    let n = x.len() as f64;
-    let mut sum_x = 0.0_f64;
-    let mut sum_y = 0.0_f64;
-    let mut sum_xx = 0.0_f64;
-    let mut sum_yy = 0.0_f64;
-    let mut sum_xy = 0.0_f64;
-
-    for (&a, &b) in x.iter().zip(y.iter()) {
-        sum_x += a;
-        sum_y += b;
-        sum_xx += a * a;
-        sum_yy += b * b;
-        sum_xy += a * b;
-    }
-
-    let cov = sum_xy - (sum_x * sum_y / n);
-    let var_x = sum_xx - (sum_x * sum_x / n);
-    let var_y = sum_yy - (sum_y * sum_y / n);
-    if var_x <= 0.0 || var_y <= 0.0 {
-        return None;
-    }
-    Some(cov / (var_x.sqrt() * var_y.sqrt()))
+fn read_r_squared(metrics_json: &Path) -> f64 {
+    let raw = fs::read_to_string(metrics_json).unwrap_or_else(|e| {
+        panic!(
+            "failed reading metrics json {}: {e}",
+            metrics_json.display()
+        )
+    });
+    let parsed: Value = serde_json::from_str(&raw).expect("parse metrics json");
+    parsed
+        .get("r_squared")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("r_squared missing or non-numeric in {}", metrics_json.display()))
 }
