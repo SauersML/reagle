@@ -80,7 +80,13 @@ impl DenseColumn {
     pub fn get(&self, hap: HapIdx) -> u8 {
         let idx = hap.as_usize();
         if idx >= self.n_haplotypes as usize {
-            return 0;
+            debug_assert!(
+                idx < self.n_haplotypes as usize,
+                "DenseColumn::get received out-of-range hap index {} (n_haplotypes={})",
+                idx,
+                self.n_haplotypes
+            );
+            return 255;
         }
 
         if self.missing[idx] {
@@ -176,5 +182,11 @@ mod tests {
         for (i, &expected) in alleles.iter().enumerate() {
             assert_eq!(col.get(HapIdx::new(i as u32)), expected);
         }
+    }
+
+    #[test]
+    fn test_out_of_range_get_returns_missing() {
+        let col = DenseColumn::from_alleles([0u8, 1, 0].into_iter(), 2);
+        assert_eq!(col.get(HapIdx::new(9)), 255);
     }
 }

@@ -25,6 +25,82 @@ use std::arch::x86_64::*;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const PREFETCH_DISTANCE: usize = 16;
 
+#[derive(Clone, Copy)]
+struct EmissionAffine {
+    scale: f32,
+    shift: f32,
+}
+
+impl EmissionAffine {
+    #[inline]
+    fn new(scale: f32, shift: f32) -> Self {
+        Self { scale, shift }
+    }
+
+    #[inline]
+    fn forward(self, prior: f32, emission: f32) -> f32 {
+        emission * (self.scale * prior + self.shift)
+    }
+
+    #[inline]
+    fn invert_prior(self, posterior: f32, emission: f32) -> f32 {
+        debug_assert!(emission > 0.0);
+        debug_assert!(self.scale > 0.0);
+        ((posterior / emission) - self.shift) / self.scale
+    }
+}
+
+const MISSING_ALLELE: u8 = 255;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefAllele {
+    Missing,
+    Called(u8),
+}
+
+impl RefAllele {
+    #[inline]
+    fn from_raw(raw: u8) -> Self {
+        if raw == MISSING_ALLELE {
+            Self::Missing
+        } else {
+            Self::Called(raw)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RefEmissionLut {
+    vals: [f32; 256],
+}
+
+impl RefEmissionLut {
+    #[inline]
+    fn filled(value: f32) -> Self {
+        let mut vals = [0.0f32; 256];
+        vals.fill(value);
+        Self { vals }
+    }
+
+    #[inline]
+    fn set_called_allele(&mut self, allele: u8, value: f32) {
+        self.vals[allele as usize] = value;
+    }
+
+    #[inline]
+    fn set_missing_neutral(&mut self) {
+        self.vals[MISSING_ALLELE as usize] = 1.0;
+    }
+
+    #[inline]
+    fn emission(self, ref_allele: RefAllele) -> f32 {
+        match ref_allele {
+            RefAllele::Missing => 1.0,
+            RefAllele::Called(a) => self.vals[a as usize],
+        }
+    }
+}
+
 /// Static HMM update functions matching Java HmmUpdater
 pub struct HmmUpdater;
 
@@ -809,22 +885,33 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     {
                         unsafe {
                             let req_vec = _mm512_set1_epi8(req as i8);
+                            let missing_vec = _mm512_set1_epi8(MISSING_ALLELE as i8);
                             let match_vec = _mm512_set1_ps(p_no_err);
                             let mismatch_vec = _mm512_set1_ps(p_err);
+                            let neutral_vec = _mm512_set1_ps(1.0);
                             let mut k = 0usize;
                             let out_ptr = emissions.as_mut_ptr();
                             let in_ptr = ref_alleles.as_ptr();
                             while k + 64 <= ref_alleles.len() && k + 64 <= emissions.len() {
                                 let bytes = _mm512_load_si512(in_ptr.add(k) as *const __m512i);
-                                let mask = _mm512_cmpeq_epi8_mask(bytes, req_vec);
-                                let mask0 = (mask & 0xFFFF) as u16;
-                                let mask1 = ((mask >> 16) & 0xFFFF) as u16;
-                                let mask2 = ((mask >> 32) & 0xFFFF) as u16;
-                                let mask3 = ((mask >> 48) & 0xFFFF) as u16;
-                                let res0 = _mm512_mask_blend_ps(mask0, mismatch_vec, match_vec);
-                                let res1 = _mm512_mask_blend_ps(mask1, mismatch_vec, match_vec);
-                                let res2 = _mm512_mask_blend_ps(mask2, mismatch_vec, match_vec);
-                                let res3 = _mm512_mask_blend_ps(mask3, mismatch_vec, match_vec);
+                                let match_mask = _mm512_cmpeq_epi8_mask(bytes, req_vec);
+                                let missing_mask = _mm512_cmpeq_epi8_mask(bytes, missing_vec);
+                                let match0 = (match_mask & 0xFFFF) as u16;
+                                let match1 = ((match_mask >> 16) & 0xFFFF) as u16;
+                                let match2 = ((match_mask >> 32) & 0xFFFF) as u16;
+                                let match3 = ((match_mask >> 48) & 0xFFFF) as u16;
+                                let miss0 = (missing_mask & 0xFFFF) as u16;
+                                let miss1 = ((missing_mask >> 16) & 0xFFFF) as u16;
+                                let miss2 = ((missing_mask >> 32) & 0xFFFF) as u16;
+                                let miss3 = ((missing_mask >> 48) & 0xFFFF) as u16;
+                                let mut res0 = _mm512_mask_blend_ps(match0, mismatch_vec, match_vec);
+                                let mut res1 = _mm512_mask_blend_ps(match1, mismatch_vec, match_vec);
+                                let mut res2 = _mm512_mask_blend_ps(match2, mismatch_vec, match_vec);
+                                let mut res3 = _mm512_mask_blend_ps(match3, mismatch_vec, match_vec);
+                                res0 = _mm512_mask_blend_ps(miss0, res0, neutral_vec);
+                                res1 = _mm512_mask_blend_ps(miss1, res1, neutral_vec);
+                                res2 = _mm512_mask_blend_ps(miss2, res2, neutral_vec);
+                                res3 = _mm512_mask_blend_ps(miss3, res3, neutral_vec);
                                 _mm512_storeu_ps(out_ptr.add(k), res0);
                                 _mm512_storeu_ps(out_ptr.add(k + 16), res1);
                                 _mm512_storeu_ps(out_ptr.add(k + 32), res2);
@@ -833,18 +920,24 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                             }
                             for i in k..emissions.len() {
                                 let ra = *ref_alleles.get_unchecked(i);
-                                *emissions.get_unchecked_mut(i) =
-                                    if ra == req { p_no_err } else { p_err };
+                                let emit = if ra == req {
+                                    p_no_err
+                                } else if ra == MISSING_ALLELE {
+                                    1.0
+                                } else {
+                                    p_err
+                                };
+                                *emissions.get_unchecked_mut(i) = emit;
                             }
                         }
                         return;
                     }
                 }
-                let mut lut = [0.0f32; 256];
-                lut.fill(p_err);
-                lut[req as usize] = p_no_err;
+                let mut lut = RefEmissionLut::filled(p_err);
+                lut.set_called_allele(req, p_no_err);
+                lut.set_missing_neutral();
                 for (k, &ra) in ref_alleles.iter().enumerate() {
-                    emissions[k] = lut[ra as usize];
+                    emissions[k] = lut.emission(RefAllele::from_raw(ra));
                 }
             } else {
                 emissions.fill(1.0);
@@ -995,20 +1088,22 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 } else {
                                     0.0
                                 };
-                                let mut lut = [0.0f32; 256];
                                 let unknown_prob = if n_alleles > 1 {
                                     p_err_other.max(1e-30)
                                 } else {
                                     p_err_base.max(1e-30)
                                 };
-                                lut.fill(unknown_prob);
+                                let mut lut = RefEmissionLut::filled(unknown_prob);
                                 for a in 0..255usize {
                                     if a < n_alleles {
                                         let p_true = allele_probs.get(a).copied().unwrap_or(0.0);
-                                        lut[a] = (p_no_err * p_true + p_err_other * (1.0 - p_true))
-                                            .max(1e-30);
+                                        let emit =
+                                            (p_no_err * p_true + p_err_other * (1.0 - p_true))
+                                                .max(1e-30);
+                                        lut.set_called_allele(a as u8, emit);
                                     }
                                 }
+                                lut.set_missing_neutral();
                                 let used_pattern = try_fill_pattern_emissions(
                                     m,
                                     partner,
@@ -1018,7 +1113,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                 );
                                 if !used_pattern {
                                     for k in 0..n_states {
-                                        emissions_row[k] = lut[ref_row[k] as usize];
+                                        emissions_row[k] = lut.emission(RefAllele::from_raw(ref_row[k]));
                                     }
                                 }
                             } else {
@@ -1244,22 +1339,23 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     } else {
                                         0.0
                                     };
-                                    let mut lut = [0.0f32; 256];
                                     let unknown_prob = if n_alleles > 1 {
                                         p_err_other.max(1e-30)
                                     } else {
                                         p_err_base.max(1e-30)
                                     };
-                                    lut.fill(unknown_prob);
+                                    let mut lut = RefEmissionLut::filled(unknown_prob);
                                     for a in 0..255usize {
                                         if a < n_alleles {
                                             let p_true =
                                                 allele_probs.get(a).copied().unwrap_or(0.0);
-                                            lut[a] = (p_no_err * p_true
+                                            let emit = (p_no_err * p_true
                                                 + p_err_other * (1.0 - p_true))
                                                 .max(1e-30);
+                                            lut.set_called_allele(a as u8, emit);
                                         }
                                     }
+                                    lut.set_missing_neutral();
                                     let used_pattern = try_fill_pattern_emissions(
                                         m_next,
                                         partner,
@@ -1269,7 +1365,8 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                                     );
                                     if !used_pattern {
                                         for k in 0..n_states {
-                                            emissions_row[k] = lut[ref_row[k] as usize];
+                                            emissions_row[k] =
+                                                lut.emission(RefAllele::from_raw(ref_row[k]));
                                         }
                                     }
                                 } else {
@@ -1502,6 +1599,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let p_switch = self.p_recomb.get(recomp_m).copied().unwrap_or(0.0);
                 let (scale, shift) =
                     normalized_switch_scale_shift(p_switch, n_states, recomp_sum, 1e-30);
+                let transition = EmissionAffine::new(scale, shift);
                 let recomp_row_offset = recomp_m * n_states_padded;
                 let recomp_ref_row =
                     &ref_alleles_flat[recomp_row_offset..recomp_row_offset + n_states];
@@ -1511,7 +1609,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     let ref_al = recomp_ref_row[k];
                     let is_mismatch = ref_al != recomp_targ_al;
                     let em = if is_mismatch { p_err } else { p_no_err };
-                    fwd_recomp[k] = em * (scale * fwd_recomp[k] + shift);
+                    fwd_recomp[k] = transition.forward(fwd_recomp[k], em);
                     sum += fwd_recomp[k];
                 }
                 recomp_sum = sum.max(1e-30);
@@ -1523,6 +1621,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
             let last_sum = if m > 0 { fwd_sums[m - 1] } else { 1.0 };
             let (scale, shift) =
                 normalized_switch_scale_shift(p_switch, n_states, last_sum, 1e-30);
+            let transition = EmissionAffine::new(scale, shift);
             let no_switch_scale = ((1.0 - p_switch) + shift) / last_sum;
 
             let mut joint_state_sum = 0.0f32;
@@ -1536,7 +1635,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
                 // Use fwd values from before emission update for joint probability
                 let fwd_prior_k = if m > 0 {
-                    scale * fwd_recomp[k] / em + shift / em // Reverse the emission to get prior
+                    transition.invert_prior(fwd_recomp[k], em)
                 } else {
                     1.0 / n_states as f32
                 };
@@ -1626,6 +1725,24 @@ mod tests {
         }
 
         GenotypeMatrix::new_unphased(markers, columns, samples)
+    }
+
+    #[test]
+    fn test_ref_allele_missing_maps_to_missing_variant() {
+        assert_eq!(RefAllele::from_raw(MISSING_ALLELE), RefAllele::Missing);
+        assert_eq!(RefAllele::from_raw(0), RefAllele::Called(0));
+        assert_eq!(RefAllele::from_raw(2), RefAllele::Called(2));
+    }
+
+    #[test]
+    fn test_ref_emission_lut_missing_is_neutral() {
+        let mut lut = RefEmissionLut::filled(0.02);
+        lut.set_called_allele(1, 0.98);
+        lut.set_missing_neutral();
+
+        assert!((lut.emission(RefAllele::Called(1)) - 0.98).abs() < 1e-8);
+        assert!((lut.emission(RefAllele::Called(0)) - 0.02).abs() < 1e-8);
+        assert!((lut.emission(RefAllele::Missing) - 1.0).abs() < 1e-8);
     }
 
     #[test]
@@ -2020,5 +2137,32 @@ mod tests {
 
         let sum: f32 = bwd.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "Sum should be 1.0");
+    }
+
+    #[test]
+    fn test_invert_emission_affine_forward_round_trip() {
+        let cases = [
+            (0.01f32, 0.98f32, 0.25f32, 0.0025f32),
+            (0.05f32, 0.95f32, 0.5f32, 0.01f32),
+            (0.20f32, 0.80f32, 0.001f32, 0.0003f32),
+            (0.001f32, 0.999f32, 3.0f32, 0.0001f32),
+        ];
+        for (emission, one_minus_emission, prior, shift) in cases {
+            let scale = one_minus_emission.max(1e-6);
+            let affine = EmissionAffine::new(scale, shift);
+            let posterior = affine.forward(prior, emission);
+            let recovered = affine.invert_prior(posterior, emission);
+            let err = (recovered - prior).abs();
+            assert!(
+                err < 1e-5,
+                "inverse failed: prior={} recovered={} err={} emission={} scale={} shift={}",
+                prior,
+                recovered,
+                err,
+                emission,
+                scale,
+                shift
+            );
+        }
     }
 }

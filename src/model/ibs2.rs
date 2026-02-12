@@ -374,7 +374,12 @@ impl Ibs2 {
         let b1 = gt.allele(m_idx, s2.hap1());
         let b2 = gt.allele(m_idx, s2.hap2());
 
-        let informative = (a1 != 255 && b1 != 255) || (a2 != 255 && b2 != 255);
+        // A marker is informative if at least one comparable allele pair is observed
+        // under either phase ordering.
+        let informative = (a1 != 255 && b1 != 255)
+            || (a2 != 255 && b2 != 255)
+            || (a1 != 255 && b2 != 255)
+            || (a2 != 255 && b1 != 255);
         if !informative {
             return false;
         }
@@ -851,6 +856,26 @@ struct SampClust {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ChromIdx;
+    use crate::data::haplotype::Samples;
+    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
+    use crate::data::storage::GenotypeColumn;
+    use std::sync::Arc;
+
+    fn single_marker_gt(a1: u8, a2: u8, b1: u8, b2: u8) -> GenotypeMatrix {
+        let samples = Arc::new(Samples::from_ids(vec!["S1".to_string(), "S2".to_string()]));
+        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        markers.add_chrom("chr1");
+        markers.push(Marker::new(
+            ChromIdx::new(0),
+            100,
+            None,
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        let column = GenotypeColumn::from_alleles(&[a1, a2, b1, b2], 2);
+        GenotypeMatrix::new_unphased(markers, vec![column], samples)
+    }
 
     #[test]
     fn test_ibs2_segment() {
@@ -877,5 +902,18 @@ mod tests {
         // Missing data is always consistent
         assert!(Ibs2::are_phase_consistent(255, 1, 0, 1));
         assert!(Ibs2::are_phase_consistent(0, 255, 0, 1));
+    }
+
+    #[test]
+    fn test_is_ibs2_at_swapped_informative_with_missing() {
+        // Observed comparison exists only under swapped ordering: (a1,b2) = (0,0).
+        // Previous informative gate incorrectly rejected this case.
+        let gt = single_marker_gt(0, 255, 255, 0);
+        assert!(Ibs2::is_ibs2_at(
+            &gt,
+            0,
+            SampleIdx::new(0),
+            SampleIdx::new(1)
+        ));
     }
 }
