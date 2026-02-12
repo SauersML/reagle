@@ -1209,6 +1209,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             active_pool,
             &pool_alleles,
         );
+        let flip_event_cost = self.orientation_flip_event_cost(call.dist_morgans);
 
         if call.fixed {
             self.expand_orientation(
@@ -1216,6 +1217,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 parent_idx,
                 call,
                 call_idx,
+                flip_event_cost,
                 a1,
                 a2,
                 false,
@@ -1232,6 +1234,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 parent_idx,
                 call,
                 call_idx,
+                flip_event_cost,
                 a1,
                 a2,
                 false,
@@ -1247,6 +1250,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 parent_idx,
                 call,
                 call_idx,
+                flip_event_cost,
                 a2,
                 a1,
                 true,
@@ -1267,6 +1271,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         parent_idx: u32,
         call: &CallSite,
         call_idx: usize,
+        flip_event_cost: i32,
         hap1_al: u8,
         hap2_al: u8,
         swapped: bool,
@@ -1334,7 +1339,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 let flip_penalty = if call_idx == 0 {
                     0
                 } else if swapped != path.last_swapped {
-                    call.flip_cost
+                    flip_event_cost.saturating_add(call.flip_cost)
                 } else {
                     0
                 };
@@ -1577,6 +1582,16 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
         (stay_cost, switch_event_cost)
+    }
+
+    #[inline]
+    fn orientation_flip_event_cost(&self, dist_morgans: f32) -> i32 {
+        let d = dist_morgans.max(0.0) as f64;
+        let rho = self.costs.recomb_intensity.max(1e-12);
+        let p_stay = (-rho * d).exp().clamp(0.500001, 1.0 - 1e-6);
+        ((p_stay / (1.0 - p_stay)).ln() * 1_000_000.0)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
 
     #[inline]
