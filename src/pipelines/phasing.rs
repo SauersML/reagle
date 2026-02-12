@@ -69,6 +69,7 @@ use crate::data::condensed::CondensedTarget;
 use crate::data::ref_packed::PackedRefView;
 use crate::model::beam::{ActivePool, BeamConfig, BeamPhaser, PbwtBeamIndex, PbwtInjector};
 use crate::model::phase_hmm::MosaicHmm;
+use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
 use crate::model::phase_ibs::BidirectionalPhaseIbs;
 use crate::model::reference_pbwt::{
@@ -6908,6 +6909,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             gen_positions,
             n_markers,
             self.params.recomb_intensity,
+            n_haps
+                + self
+                    .reference_gt
+                    .as_ref()
+                    .map(|r| r.n_haplotypes())
+                    .unwrap_or(0),
         );
 
         // Result container for next window's state probs
@@ -8185,17 +8192,10 @@ fn subset_transition_params(r: f32, n_states: usize, panel_haps: usize) -> (f32,
     if n_states == 0 {
         return (0.0, 0.0, 1.0);
     }
-    let r = r.clamp(0.0, 1.0);
-    let k_raw = n_states as f32;
-    let n_total = panel_haps.max(1) as f32;
-    // Subset-space approximation: preserve recombination mass inside the tractable
-    // active set instead of suppressing switching by K/N_total when K << N_total.
-    let k = k_raw.clamp(1.0, n_total);
-    let switch_full = r / k.max(1.0);
-    let z = ((1.0 - r) + k * switch_full).max(1e-12);
-    let shift = switch_full / z;
-    let stay_gap = (1.0 - r) / z;
-    let stay = ((1.0 - r) + switch_full) / z;
+    // Canonical Li-Stephens subset conditioning:
+    // switch_full = r / N_total, then renormalize over the K active states.
+    let (stay_gap, shift) = subset_linear_exact_k(r, n_states as f32, panel_haps);
+    let stay = (stay_gap + shift).clamp(0.0, 1.0);
     (stay_gap, shift, stay)
 }
 
@@ -11276,6 +11276,8 @@ struct Stage2Phaser {
     gen_positions: Vec<f64>,
     /// Recombination intensity for bridge interpolation
     recomb_intensity: f32,
+    /// Donor-panel haplotype count for subset-conditioned transitions.
+    panel_haps: usize,
 }
 
 impl Stage2Phaser {
@@ -11293,6 +11295,7 @@ impl Stage2Phaser {
         gen_positions: &[f64],
         n_total_markers: usize,
         recomb_intensity: f32,
+        panel_haps: usize,
     ) -> Self {
         let n_stage1 = hi_freq_markers.len();
 
@@ -11322,6 +11325,7 @@ impl Stage2Phaser {
             stage1_markers: hi_freq_markers.to_vec(),
             gen_positions: gen_positions.to_vec(),
             recomb_intensity,
+            panel_haps: panel_haps.max(1),
         }
     }
 
@@ -11427,10 +11431,8 @@ impl Stage2Phaser {
         let r1 = self.p_recomb(d1);
         let r2 = self.p_recomb(d2);
 
-        let shift1 = r1 / n_states_a.max(1) as f32;
-        let shift2 = r2 / n_states_b.max(1) as f32;
-        let scale1 = 1.0 - r1;
-        let scale2 = 1.0 - r2;
+        let (scale1, shift1) = subset_linear_exact_k(r1, n_states_a.max(1) as f32, self.panel_haps);
+        let (scale2, shift2) = subset_linear_exact_k(r2, n_states_b.max(1) as f32, self.panel_haps);
 
         let denom = d1 + d2;
         let weight_a = if denom > 0.0 {
