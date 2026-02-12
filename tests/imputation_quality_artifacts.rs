@@ -97,6 +97,8 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
     assert!(reagle_vcf.exists(), "missing reagle output {}", reagle_vcf.display());
     assert!(beagle_vcf.exists(), "missing beagle output {}", beagle_vcf.display());
 
+    harmonize_sample_names(work_dir.path(), &[&truth_vcf, &reagle_vcf, &beagle_vcf]);
+
     let reagle_metrics_prefix = work_dir.path().join("reagle_py");
     let beagle_metrics_prefix = work_dir.path().join("beagle_py");
     run_python_calculate_metrics(
@@ -509,4 +511,34 @@ fn read_r_squared(metrics_json: &Path) -> f64 {
         .get("r_squared")
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("r_squared missing or non-numeric in {}", metrics_json.display()))
+}
+
+fn harmonize_sample_names(work_dir: &Path, vcfs: &[&Path]) {
+    let sample_file = work_dir.join("sample_name.txt");
+    fs::write(&sample_file, "SAMPLE\n").expect("write sample name mapping");
+    for vcf in vcfs {
+        let tmp = PathBuf::from(format!("{}.tmp", vcf.display()));
+        run(
+            "bcftools",
+            [
+                "reheader",
+                "-s",
+                sample_file.to_str().expect("sample file path utf8"),
+                vcf.to_str().expect("vcf path utf8"),
+                "-o",
+                tmp.to_str().expect("tmp path utf8"),
+            ],
+        );
+        fs::rename(&tmp, vcf).unwrap_or_else(|e| {
+            panic!(
+                "failed replacing reheadered file {} -> {}: {e}",
+                tmp.display(),
+                vcf.display()
+            )
+        });
+        run(
+            "bcftools",
+            ["index", "-f", vcf.to_str().expect("vcf path utf8")],
+        );
+    }
 }
