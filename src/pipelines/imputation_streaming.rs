@@ -151,6 +151,10 @@ const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
+const ORIENTATION_SWITCH_SCALE: f64 = 0.35;
+const ORIENTATION_HANDOFF_RADIUS_MARKERS: usize = 32;
+const ORIENTATION_ALPHA_MIN: f64 = 0.60;
+const ORIENTATION_ALPHA_MAX: f64 = 1.00;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
@@ -5830,6 +5834,33 @@ impl crate::pipelines::ImputationPipeline {
         let mut handoff_marker_idx: Option<usize> = None;
 
         let phase_mask = target_win.phase_mask();
+        let mut lambda_samples: Vec<f64> = Vec::new();
+        if output_end > output_start + 1 {
+            lambda_samples.reserve(output_end - output_start - 1);
+            for ref_m in (output_start + 1)..output_end {
+                let dist_cm = (gen_positions[ref_m] - gen_positions[ref_m - 1]).abs();
+                if dist_cm <= 0.0 || !dist_cm.is_finite() {
+                    continue;
+                }
+                let p = p_recomb
+                    .get(ref_m)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(1e-8, 0.49) as f64;
+                let lambda = (-(1.0 - p).ln()) / dist_cm;
+                if lambda.is_finite() && lambda > 0.0 {
+                    lambda_samples.push(lambda);
+                }
+            }
+        }
+        let orientation_lambda = if lambda_samples.is_empty() {
+            1e-6
+        } else {
+            lambda_samples
+                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = lambda_samples[lambda_samples.len() / 2];
+            (median * ORIENTATION_SWITCH_SCALE).clamp(1e-6, 10.0)
+        };
         let get_result_prob =
             |result: &SampleImputationResult, hap: usize, local_m: usize, allele: u8| -> Option<f32> {
                 if allele == 255 {
@@ -5924,15 +5955,23 @@ impl crate::pipelines::ImputationPipeline {
                 return None;
             }
 
-            let mut dp0 = 0.0f64;
-            let mut dp1 = 0.0f64;
-            let mut prev_to0_from1 = vec![false; n];
-            let mut prev_to1_from0 = vec![false; n];
+            let mut prefix_cm = vec![0.0f64; n];
+            for local_m in 1..n {
+                let ref_m = output_start + local_m;
+                let d = (gen_positions[ref_m] - gen_positions[ref_m - 1]).abs();
+                prefix_cm[local_m] = prefix_cm[local_m - 1] + if d.is_finite() { d } else { 0.0 };
+            }
+            let mut emit_strength = vec![0.0f64; n];
+            let mut orient_alpha = vec![ORIENTATION_ALPHA_MAX; n];
             let eps = 1e-30f64;
+            let informative_eps = 1e-6f64;
+            let mut event_idx: Vec<usize> = Vec::new();
+            let mut event_emit0: Vec<f64> = Vec::new();
+            let mut event_emit1: Vec<f64> = Vec::new();
 
             for local_m in 0..n {
                 let ref_m = output_start + local_m;
-                let (emit0, emit1) = if let Some((a_left, a_right, phase_conf)) =
+                let (emit0, emit1, anchored, alpha_local) = if let Some((a_left, a_right, phase_conf)) =
                     get_anchor_obs(result.sample_idx, ref_m)
                 {
                     let p1_left = get_result_prob(result, 0, local_m, a_left).unwrap_or(0.5);
@@ -5944,61 +5983,125 @@ impl crate::pipelines::ImputationPipeline {
                     let c = phase_conf as f64;
                     let same_mix = (c * same as f64 + (1.0 - c) * swapped as f64).max(eps).ln();
                     let swap_mix = (c * swapped as f64 + (1.0 - c) * same as f64).max(eps).ln();
-                    (same_mix, swap_mix)
+                    (same_mix, swap_mix, true, c.clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX))
                 } else {
-                    (0.0, 0.0)
+                    let mut alpha = ORIENTATION_ALPHA_MIN;
+                    if let (Some(p1v), Some(p2v)) =
+                        (result.hap_posteriors.0.as_ref(), result.hap_posteriors.1.as_ref())
+                    {
+                        if let (Some(p1), Some(p2)) = (p1v.get(local_m), p2v.get(local_m)) {
+                            let n_alleles = ref_markers
+                                .marker(MarkerIdx::new(ref_m as u32))
+                                .n_alleles()
+                                .max(1);
+                            let mut h1 = 0.0f64;
+                            let mut h2 = 0.0f64;
+                            for a in 0..n_alleles {
+                                let q1 = p1.prob(a).clamp(0.0, 1.0);
+                                let q2 = p2.prob(a).clamp(0.0, 1.0);
+                                if q1 > 0.0 {
+                                    h1 -= (q1 as f64) * (q1 as f64).ln();
+                                }
+                                if q2 > 0.0 {
+                                    h2 -= (q2 as f64) * (q2 as f64).ln();
+                                }
+                            }
+                            let hmax = (n_alleles as f64).max(2.0).ln();
+                            if hmax > 0.0 {
+                                let conf1 = (1.0 - (h1 / hmax)).clamp(0.0, 1.0);
+                                let conf2 = (1.0 - (h2 / hmax)).clamp(0.0, 1.0);
+                                alpha = ((conf1 + conf2) * 0.5)
+                                    .clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX);
+                            }
+                        }
+                    }
+                    // Unanchored marker-level orientation is unidentifiable from
+                    // independent haplotype posteriors alone; keep neutral emission.
+                    (0.0, 0.0, false, alpha)
                 };
-
-                if local_m == 0 {
-                    dp0 = emit0;
-                    dp1 = emit1;
-                    continue;
+                let e = emit0 - emit1;
+                let strength = e.abs();
+                emit_strength[local_m] = strength;
+                orient_alpha[local_m] = alpha_local;
+                if anchored || strength > informative_eps {
+                    event_idx.push(local_m);
+                    event_emit0.push(emit0);
+                    event_emit1.push(emit1);
                 }
-
-                let p_flip = p_recomb
-                    .get(ref_m)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(1e-8, 0.49) as f64;
-                let log_stay = (1.0 - p_flip).ln();
-                let log_flip = p_flip.ln();
-
-                let stay0 = dp0 + log_stay;
-                let flip_to0 = dp1 + log_flip;
-                let new0 = if flip_to0 > stay0 {
-                    prev_to0_from1[local_m] = true;
-                    flip_to0 + emit0
-                } else {
-                    stay0 + emit0
-                };
-
-                let stay1 = dp1 + log_stay;
-                let flip_to1 = dp0 + log_flip;
-                let new1 = if flip_to1 > stay1 {
-                    prev_to1_from0[local_m] = true;
-                    flip_to1 + emit1
-                } else {
-                    stay1 + emit1
-                };
-
-                dp0 = new0;
-                dp1 = new1;
             }
 
             let mut swapped = vec![false; n];
-            let mut state = if dp1 > dp0 { 1u8 } else { 0u8 };
-            for local_m in (0..n).rev() {
-                swapped[local_m] = state == 1;
-                if local_m == 0 {
-                    break;
+            if !event_idx.is_empty() {
+                let k = event_idx.len();
+                let mut prev_to0_from1 = vec![false; k];
+                let mut prev_to1_from0 = vec![false; k];
+                let mut dp0 = event_emit0[0];
+                let mut dp1 = event_emit1[0];
+
+                for eidx in 1..k {
+                    let prev_local = event_idx[eidx - 1];
+                    let local = event_idx[eidx];
+                    let gap_cm = (prefix_cm[local] - prefix_cm[prev_local]).max(0.0);
+                    let p_flip = if gap_cm > 0.0 && gap_cm.is_finite() {
+                        (1.0 - (-orientation_lambda * gap_cm).exp()).clamp(1e-8, 0.49)
+                    } else {
+                        1e-8
+                    };
+                    let alpha_gap = (orient_alpha[prev_local] + orient_alpha[local]) * 0.5;
+                    // Entropy-modulated transition odds:
+                    // odds' = odds^alpha, alpha in [alpha_min, 1]
+                    // so low-confidence regions (smaller alpha) allow easier switching.
+                    let odds = ((1.0 - p_flip) / p_flip).max(1e-8);
+                    let adj_odds = odds.powf(alpha_gap);
+                    let p_flip_adj = (1.0 / (1.0 + adj_odds)).clamp(1e-8, 0.49);
+                    let log_stay = (1.0 - p_flip_adj).ln();
+                    let log_flip = p_flip_adj.ln();
+
+                    let stay0 = dp0 + log_stay;
+                    let flip_to0 = dp1 + log_flip;
+                    let new0 = if flip_to0 > stay0 {
+                        prev_to0_from1[eidx] = true;
+                        flip_to0 + event_emit0[eidx]
+                    } else {
+                        stay0 + event_emit0[eidx]
+                    };
+                    let stay1 = dp1 + log_stay;
+                    let flip_to1 = dp0 + log_flip;
+                    let new1 = if flip_to1 > stay1 {
+                        prev_to1_from0[eidx] = true;
+                        flip_to1 + event_emit1[eidx]
+                    } else {
+                        stay1 + event_emit1[eidx]
+                    };
+                    dp0 = new0;
+                    dp1 = new1;
                 }
-                state = if state == 0 {
-                    if prev_to0_from1[local_m] { 1 } else { 0 }
-                } else if prev_to1_from0[local_m] {
-                    0
-                } else {
-                    1
-                };
+
+                let mut event_state = vec![false; k];
+                let mut state_swapped = dp1 > dp0;
+                for eidx in (0..k).rev() {
+                    event_state[eidx] = state_swapped;
+                    if eidx == 0 {
+                        break;
+                    }
+                    state_swapped = if !state_swapped {
+                        prev_to0_from1[eidx]
+                    } else {
+                        !prev_to1_from0[eidx]
+                    };
+                }
+
+                let first = event_idx[0];
+                for local_m in 0..first {
+                    swapped[local_m] = event_state[0];
+                }
+                for eidx in 0..k {
+                    let start = event_idx[eidx];
+                    let end = if eidx + 1 < k { event_idx[eidx + 1] } else { n };
+                    for local_m in start..end {
+                        swapped[local_m] = event_state[eidx];
+                    }
+                }
             }
 
             for (local_m, &is_swapped) in swapped.iter().enumerate() {
@@ -6030,7 +6133,18 @@ impl crate::pipelines::ImputationPipeline {
                     }
                 })
                 .unwrap_or(n.saturating_sub(1));
-            swapped.get(handoff_local).copied()
+            let vote_start = handoff_local.saturating_sub(ORIENTATION_HANDOFF_RADIUS_MARKERS);
+            let vote_end = (handoff_local + ORIENTATION_HANDOFF_RADIUS_MARKERS + 1).min(n);
+            let mut vote = 0.0f64;
+            for local_m in vote_start..vote_end {
+                let w = 1.0 + emit_strength[local_m];
+                if swapped[local_m] {
+                    vote += w;
+                } else {
+                    vote -= w;
+                }
+            }
+            Some(vote > 0.0)
         };
 
         for mut item in sample_results {
