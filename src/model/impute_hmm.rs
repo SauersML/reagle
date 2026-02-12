@@ -3210,6 +3210,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let mut missing_ood_mass = 0.0f32;
                                 let group_alleles =
                                     K::group_alleles(&prepared, &ws.dict_pattern_alleles);
+                                let missing_raw = AlleleCode::MISSING.raw();
+                                let allele_len = ws.allele_probs.len();
+                                debug_assert!(n_groups <= group_alleles.len());
                                 for pid in 0..n_groups {
                                     let mut state_prob = alpha_coeff * ws.pattern_sum_fb[pid]
                                         + beta_coeff * ws.pattern_sum_f[pid]
@@ -3223,15 +3226,13 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         };
                                     }
                                     total += state_prob;
-                                    let ref_allele = *group_alleles
-                                        .get(pid)
-                                        .unwrap_or(&AlleleCode::MISSING.raw());
-                                    if ref_allele == AlleleCode::MISSING.raw() {
+                                    let ref_allele = unsafe { *group_alleles.get_unchecked(pid) };
+                                    if ref_allele == missing_raw {
                                         missing_ref_mass += state_prob;
                                         continue;
                                     }
                                     let idx = ref_allele as usize;
-                                    if idx < ws.allele_probs.len() {
+                                    if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob;
                                         smoothing_prior_counts[idx] += ws.pattern_state_count[pid];
@@ -3407,19 +3408,25 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             let mut total = 0.0f32;
                             let mut missing_ref_mass = 0.0f32;
                             let mut missing_ood_mass = 0.0f32;
+                            let missing_raw = AlleleCode::MISSING.raw();
+                            let allele_len = ws.allele_probs.len();
+                            debug_assert!(active_states <= ws.state_patterns.len());
+                            debug_assert!(!group_alleles.is_empty() || active_states == 0);
                             for i in 0..active_states {
                                 let state_prob = fwd_slice[i] * ws.bwd[i];
                                 total += state_prob;
                                 let pid = ws.state_patterns[i] as usize;
-                                let ref_allele = *group_alleles
-                                    .get(pid)
-                                    .unwrap_or(&AlleleCode::MISSING.raw());
-                                if ref_allele == AlleleCode::MISSING.raw() {
+                                let ref_allele = if pid < group_alleles.len() {
+                                    unsafe { *group_alleles.get_unchecked(pid) }
+                                } else {
+                                    missing_raw
+                                };
+                                if ref_allele == missing_raw {
                                     missing_ref_mass += state_prob;
                                     continue;
                                 }
                                 let idx = ref_allele as usize;
-                                if idx < ws.allele_probs.len() {
+                                if idx < allele_len {
                                     ws.allele_probs[idx] += state_prob;
                                     subset_total += state_prob;
                                     smoothing_prior_counts[idx] += 1.0;
