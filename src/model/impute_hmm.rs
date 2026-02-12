@@ -1707,6 +1707,88 @@ fn normalized_allele_prior<'a>(
 }
 
 #[inline]
+fn structural_ood_dirichlet_alpha(prior_probs: &[f32]) -> f32 {
+    if prior_probs.is_empty() {
+        return 1.0;
+    }
+    // Structural concentration proxy: effective allele count n_eff = 1/sum(pi^2).
+    // This keeps alpha small when prior is concentrated and larger when diffuse.
+    let mut sum_sq = 0.0f64;
+    for &p in prior_probs {
+        let q = p.max(0.0) as f64;
+        sum_sq += q * q;
+    }
+    if sum_sq <= 0.0 || !sum_sq.is_finite() {
+        return 1.0;
+    }
+    let n_eff = (1.0 / sum_sq) as f32;
+    n_eff.clamp(1.0, prior_probs.len().max(1) as f32)
+}
+
+#[inline]
+fn scale_slice_in_place(values: &mut [f32], scale: f32) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if values.len() >= 8 && std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                #[cfg(target_arch = "x86")]
+                use std::arch::x86::*;
+                #[cfg(target_arch = "x86_64")]
+                use std::arch::x86_64::*;
+                let scale_v = _mm256_set1_ps(scale);
+                let mut i = 0usize;
+                while i + 8 <= values.len() {
+                    let v = _mm256_loadu_ps(values.as_ptr().add(i));
+                    let out = _mm256_mul_ps(v, scale_v);
+                    _mm256_storeu_ps(values.as_mut_ptr().add(i), out);
+                    i += 8;
+                }
+                for x in &mut values[i..] {
+                    *x *= scale;
+                }
+                return;
+            }
+        }
+    }
+    for x in values {
+        *x *= scale;
+    }
+}
+
+#[inline]
+fn affine_blend_with_prior_in_place(values: &mut [f32], prior: &[f32], q_coeff: f32, pi_coeff: f32) {
+    let n = values.len().min(prior.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if n >= 8 && std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                #[cfg(target_arch = "x86")]
+                use std::arch::x86::*;
+                #[cfg(target_arch = "x86_64")]
+                use std::arch::x86_64::*;
+                let qv = _mm256_set1_ps(q_coeff);
+                let piv = _mm256_set1_ps(pi_coeff);
+                let mut i = 0usize;
+                while i + 8 <= n {
+                    let q = _mm256_loadu_ps(values.as_ptr().add(i));
+                    let p = _mm256_loadu_ps(prior.as_ptr().add(i));
+                    let out = _mm256_add_ps(_mm256_mul_ps(q, qv), _mm256_mul_ps(p, piv));
+                    _mm256_storeu_ps(values.as_mut_ptr().add(i), out);
+                    i += 8;
+                }
+                for i in i..n {
+                    values[i] = values[i] * q_coeff + prior[i] * pi_coeff;
+                }
+                return;
+            }
+        }
+    }
+    for i in 0..n {
+        values[i] = values[i] * q_coeff + prior[i] * pi_coeff;
+    }
+}
+
+#[inline]
 fn normalize_allele_posterior_structural_missing(
     allele_probs: &mut [f32],
     subset_total: f32,
@@ -1753,23 +1835,20 @@ fn normalize_allele_posterior_structural_missing(
 
     let inv_total = 1.0 / total;
     if missing_ood > 0.0 {
-        // Fixed structural prior strength (Dirichlet alpha=1):
-        // rho_ood = (q + alpha*pi)/(Q + alpha), alpha = 1.
-        const OOD_DIRICHLET_ALPHA: f32 = 1.0;
+        // Structural Dirichlet concentration alpha is derived from prior
+        // concentration (effective allele count), not hand-tuned thresholds.
+        // rho_ood = (q + alpha*pi)/(Q + alpha).
         let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let ood_dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
         let inv_subset = 1.0 / subset;
-        let inv_rho = 1.0 / (subset + OOD_DIRICHLET_ALPHA);
+        let inv_rho = 1.0 / (subset + ood_dirichlet_alpha);
         let q_coeff = (1.0 + missing_ref * inv_subset + missing_ood * inv_rho) * inv_total;
-        let pi_coeff = (missing_ood * OOD_DIRICHLET_ALPHA * inv_rho) * inv_total;
-        for (p, &pi) in allele_probs.iter_mut().zip(prior.as_slice().iter()) {
-            *p = *p * q_coeff + pi * pi_coeff;
-        }
+        let pi_coeff = (missing_ood * ood_dirichlet_alpha * inv_rho) * inv_total;
+        affine_blend_with_prior_in_place(allele_probs, prior.as_slice(), q_coeff, pi_coeff);
     } else {
         // No OOD mass: exact MAR redistribution for reference-missing states.
         let q_coeff = (1.0 + missing_ref / subset) * inv_total;
-        for p in allele_probs.iter_mut() {
-            *p *= q_coeff;
-        }
+        scale_slice_in_place(allele_probs, q_coeff);
     }
 }
 
@@ -1833,6 +1912,31 @@ fn adaptive_transition_lambda_from_probs(probs: &[f32], sum: f32) -> f32 {
     let ess_norm = ((ess - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
     let confidence = 1.0 - ess_norm;
     (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX)
+}
+
+#[inline]
+fn sum_and_adaptive_lambda_from_probs(probs: &[f32]) -> (f32, f32) {
+    const LAMBDA_MAX: f32 = 0.98;
+    if probs.is_empty() {
+        return (0.0, 0.0);
+    }
+    if probs.len() == 1 {
+        return (probs[0].max(1e-30), LAMBDA_MAX);
+    }
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    for &v in probs {
+        sum += v;
+        sum_sq += v * v;
+    }
+    let sum = sum.max(1e-30);
+    let norm_sq = (sum_sq / (sum * sum)).max(1e-30);
+    let k = probs.len() as f32;
+    let ess = (1.0 / norm_sq).clamp(1.0, k);
+    let ess_norm = ((ess - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
+    let confidence = 1.0 - ess_norm;
+    let lambda = (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX);
+    (sum, lambda)
 }
 
 #[inline]
@@ -2270,8 +2374,7 @@ fn forward_update_impl<C: RefColumnLike>(
             &mut ws.emissions[..active_states],
         );
         if recomb_rate > 0.0 {
-            let fwd_sum = ws.fwd[..active_states].iter().copied().sum::<f32>().max(1e-30);
-            let lambda = adaptive_transition_lambda_from_probs(&ws.fwd[..active_states], fwd_sum);
+            let (fwd_sum, lambda) = sum_and_adaptive_lambda_from_probs(&ws.fwd[..active_states]);
             if lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
@@ -2357,8 +2460,7 @@ fn forward_update_seqcoded(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            let fwd_sum = ws.fwd[..active_states].iter().copied().sum::<f32>().max(1e-30);
-            let lambda = adaptive_transition_lambda_from_probs(&ws.fwd[..active_states], fwd_sum);
+            let (fwd_sum, lambda) = sum_and_adaptive_lambda_from_probs(&ws.fwd[..active_states]);
             if lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
@@ -2449,8 +2551,7 @@ fn forward_update_dict(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            let fwd_sum = ws.fwd[..active_states].iter().copied().sum::<f32>().max(1e-30);
-            let lambda = adaptive_transition_lambda_from_probs(&ws.fwd[..active_states], fwd_sum);
+            let (fwd_sum, lambda) = sum_and_adaptive_lambda_from_probs(&ws.fwd[..active_states]);
             if lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
@@ -2989,6 +3090,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let mut final_posteriors: Vec<AllelePosteriors> = Vec::new();
     let mut final_prior_state_post: Option<Vec<f32>> = None;
     let mut warned_af_fallback = false;
+    let mut warned_structural_invariant = false;
+    let mut structural_invariant_violations = 0usize;
     let current_error = error_rate;
 
     let final_pass = 0usize;
@@ -3231,22 +3334,40 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let smoothing_prior_counts =
                                     &mut ws.smoothing_prior_counts[..n_alleles];
                                 smoothing_prior_counts.fill(0.0);
-                                let mut subset_total = 0.0f32;
+                                let mut subset_total = 0.0f64;
                                 let mut smoothing_prior_total = 0.0f32;
-                                let mut total = 0.0f32;
-                                let mut missing_ref_mass = 0.0f32;
-                                let mut missing_ood_mass = 0.0f32;
+                                let mut total = 0.0f64;
+                                let mut missing_ref_mass = 0.0f64;
+                                let mut missing_ood_mass = 0.0f64;
                                 let group_alleles =
                                     K::group_alleles(&prepared, &ws.dict_pattern_alleles);
                                 let missing_raw = AlleleCode::MISSING.raw();
                                 let allele_len = ws.allele_probs.len();
-                                assert!(n_groups <= group_alleles.len());
+                                let groups_len = group_alleles.len();
+                                let group_limit = n_groups.min(groups_len);
+                                if n_groups > groups_len {
+                                    structural_invariant_violations = structural_invariant_violations
+                                        .saturating_add(n_groups - groups_len);
+                                    if !warned_structural_invariant {
+                                        eprintln!(
+                                            "[warn] impute_hmm structural group mismatch: window={} sample={} hap={} marker={} kernel={} groups={} alleles={}",
+                                            context.window_idx,
+                                            context.sample_idx,
+                                            context.hap_idx,
+                                            m,
+                                            K::LABEL,
+                                            n_groups,
+                                            groups_len
+                                        );
+                                        warned_structural_invariant = true;
+                                    }
+                                }
                                 // Partition marker mass into:
                                 //   subset_total    = represented allele mass Q
                                 //   missing_ref_mass= M_ref (ref allele code 255)
                                 //   missing_ood_mass= M_ood (allele index outside represented set)
                                 // These are fed to the structural posterior update above.
-                                for pid in 0..n_groups {
+                                for pid in 0..group_limit {
                                     let mut state_prob = alpha_coeff * ws.pattern_sum_fb[pid]
                                         + beta_coeff * ws.pattern_sum_f[pid]
                                         + gamma_coeff * ws.pattern_sum_b[pid]
@@ -3258,33 +3379,51 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             0.0
                                         };
                                     }
-                                    total += state_prob;
+                                    total += state_prob as f64;
                                     let ref_allele = unsafe { *group_alleles.get_unchecked(pid) };
                                     if ref_allele == missing_raw {
-                                        missing_ref_mass += state_prob;
+                                        missing_ref_mass += state_prob as f64;
                                         continue;
                                     }
                                     let idx = ref_allele as usize;
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
-                                        subset_total += state_prob;
+                                        subset_total += state_prob as f64;
                                         smoothing_prior_counts[idx] += ws.pattern_state_count[pid];
                                         smoothing_prior_total += ws.pattern_state_count[pid];
                                     } else {
                                         // Out-of-domain allele mass uses prior-shrunk redistribution.
-                                        missing_ood_mass += state_prob;
+                                        missing_ood_mass += state_prob as f64;
                                     }
                                 }
+                                for pid in group_limit..n_groups {
+                                    let mut state_prob = alpha_coeff * ws.pattern_sum_fb[pid]
+                                        + beta_coeff * ws.pattern_sum_f[pid]
+                                        + gamma_coeff * ws.pattern_sum_b[pid]
+                                        + delta_coeff * ws.pattern_state_count[pid];
+                                    if K::CLAMP_AFFINE_GROUP_MASS {
+                                        state_prob = if state_prob.is_finite() {
+                                            state_prob.max(0.0)
+                                        } else {
+                                            0.0
+                                        };
+                                    }
+                                    total += state_prob as f64;
+                                    missing_ref_mass += state_prob as f64;
+                                }
                                 if total > 0.0 {
-                                    if subset_total > 0.0
-                                        || missing_ref_mass > 0.0
-                                        || missing_ood_mass > 0.0
+                                    let subset_total_f32 = subset_total as f32;
+                                    let missing_ref_mass_f32 = missing_ref_mass as f32;
+                                    let missing_ood_mass_f32 = missing_ood_mass as f32;
+                                    if subset_total_f32 > 0.0
+                                        || missing_ref_mass_f32 > 0.0
+                                        || missing_ood_mass_f32 > 0.0
                                     {
                                         normalize_allele_posterior_structural_missing(
                                             &mut ws.allele_probs,
-                                            subset_total,
-                                            missing_ref_mass,
-                                            missing_ood_mass,
+                                            subset_total_f32,
+                                            missing_ref_mass_f32,
+                                            missing_ood_mass_f32,
                                             &mut ws.allele_prior_scratch,
                                             probs,
                                         );
@@ -3322,9 +3461,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                                 .copied()
                                                 .unwrap_or(f32::INFINITY),
                                             target_probs.is_untyped_uniform_marker(m),
-                                            subset_total,
-                                            missing_ref_mass,
-                                            missing_ood_mass,
+                                            subset_total_f32,
+                                            missing_ref_mass_f32,
+                                            missing_ood_mass_f32,
                                             active_states,
                                             panel_haps,
                                             target_probs.min_untyped_prior_mix(),
@@ -3439,52 +3578,125 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             let smoothing_prior_counts =
                                 &mut ws.smoothing_prior_counts[..n_alleles];
                             smoothing_prior_counts.fill(0.0);
-                            let mut subset_total = 0.0f32;
+                            let mut subset_total = 0.0f64;
                             let mut smoothing_prior_total = 0.0f32;
-                            let mut total = 0.0f32;
-                            let mut missing_ref_mass = 0.0f32;
-                            let mut missing_ood_mass = 0.0f32;
+                            let mut total = 0.0f64;
+                            let mut missing_ref_mass = 0.0f64;
+                            let mut missing_ood_mass = 0.0f64;
                             let missing_raw = AlleleCode::MISSING.raw();
                             let allele_len = ws.allele_probs.len();
-                            assert!(active_states <= ws.state_patterns.len());
-                            assert!(!group_alleles.is_empty() || active_states == 0);
-                            // Same Q/M_ref/M_ood partition as interior markers, but on the
-                            // explicit per-state boundary path (fwd*bwd state masses).
-                            for i in 0..active_states {
-                                let state_prob = fwd_slice[i] * ws.bwd[i];
-                                total += state_prob;
-                                let pid = ws.state_patterns[i] as usize;
-                                let ref_allele = if pid < group_alleles.len() {
-                                    unsafe { *group_alleles.get_unchecked(pid) }
-                                } else {
-                                    missing_raw
-                                };
-                                if ref_allele == missing_raw {
-                                    missing_ref_mass += state_prob;
-                                    continue;
-                                }
-                                let idx = ref_allele as usize;
-                                if idx < allele_len {
-                                    ws.allele_probs[idx] += state_prob;
-                                    subset_total += state_prob;
-                                    smoothing_prior_counts[idx] += 1.0;
-                                    smoothing_prior_total += 1.0;
-                                } else {
-                                    // Keep mass accounting consistent with interior path:
-                                    // out-of-domain mass is tracked separately.
-                                    missing_ood_mass += state_prob;
+                            let state_count = active_states.min(ws.state_patterns.len());
+                            let groups_len = group_alleles.len();
+                            let mut pid_oob = false;
+                            if state_count > 0 {
+                                for &pid_raw in &ws.state_patterns[..state_count] {
+                                    if (pid_raw as usize) >= groups_len {
+                                        pid_oob = true;
+                                        break;
+                                    }
                                 }
                             }
+                            if active_states > state_count {
+                                structural_invariant_violations = structural_invariant_violations
+                                    .saturating_add(active_states - state_count);
+                                if !warned_structural_invariant {
+                                    eprintln!(
+                                        "[warn] impute_hmm structural state-pattern shortfall: window={} sample={} hap={} marker={} kernel={} active_states={} state_patterns={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
+                                        m_rev,
+                                        K::LABEL,
+                                        active_states,
+                                        ws.state_patterns.len()
+                                    );
+                                    warned_structural_invariant = true;
+                                }
+                            }
+                            if pid_oob {
+                                structural_invariant_violations = structural_invariant_violations
+                                    .saturating_add(1);
+                                if !warned_structural_invariant {
+                                    eprintln!(
+                                        "[warn] impute_hmm structural group mismatch: window={} sample={} hap={} marker={} kernel={} active_states={} alleles={}",
+                                        context.window_idx,
+                                        context.sample_idx,
+                                        context.hap_idx,
+                                        m_rev,
+                                        K::LABEL,
+                                        active_states,
+                                        groups_len
+                                    );
+                                    warned_structural_invariant = true;
+                                }
+                            }
+                            // Same Q/M_ref/M_ood partition as interior markers, but on the
+                            // explicit per-state boundary path (fwd*bwd state masses).
+                            if !pid_oob {
+                                for i in 0..state_count {
+                                    let state_prob = fwd_slice[i] * ws.bwd[i];
+                                    total += state_prob as f64;
+                                    let pid = ws.state_patterns[i] as usize;
+                                    let ref_allele = unsafe { *group_alleles.get_unchecked(pid) };
+                                    if ref_allele == missing_raw {
+                                        missing_ref_mass += state_prob as f64;
+                                        continue;
+                                    }
+                                    let idx = ref_allele as usize;
+                                    if idx < allele_len {
+                                        ws.allele_probs[idx] += state_prob;
+                                        subset_total += state_prob as f64;
+                                        smoothing_prior_counts[idx] += 1.0;
+                                        smoothing_prior_total += 1.0;
+                                    } else {
+                                        missing_ood_mass += state_prob as f64;
+                                    }
+                                }
+                            } else {
+                                for i in 0..state_count {
+                                    let state_prob = fwd_slice[i] * ws.bwd[i];
+                                    total += state_prob as f64;
+                                    let pid = ws.state_patterns[i] as usize;
+                                    let ref_allele = if pid < groups_len {
+                                        unsafe { *group_alleles.get_unchecked(pid) }
+                                    } else {
+                                        missing_raw
+                                    };
+                                    if ref_allele == missing_raw {
+                                        missing_ref_mass += state_prob as f64;
+                                        continue;
+                                    }
+                                    let idx = ref_allele as usize;
+                                    if idx < allele_len {
+                                        ws.allele_probs[idx] += state_prob;
+                                        subset_total += state_prob as f64;
+                                        smoothing_prior_counts[idx] += 1.0;
+                                        smoothing_prior_total += 1.0;
+                                    } else {
+                                        // Keep mass accounting consistent with interior path:
+                                        // out-of-domain mass is tracked separately.
+                                        missing_ood_mass += state_prob as f64;
+                                    }
+                                }
+                            }
+                            for i in state_count..active_states {
+                                let state_prob = fwd_slice[i] * ws.bwd[i];
+                                total += state_prob as f64;
+                                missing_ref_mass += state_prob as f64;
+                            }
                             if total > 0.0 {
-                                if subset_total > 0.0
-                                    || missing_ref_mass > 0.0
-                                    || missing_ood_mass > 0.0
+                                let subset_total_f32 = subset_total as f32;
+                                let missing_ref_mass_f32 = missing_ref_mass as f32;
+                                let missing_ood_mass_f32 = missing_ood_mass as f32;
+                                if subset_total_f32 > 0.0
+                                    || missing_ref_mass_f32 > 0.0
+                                    || missing_ood_mass_f32 > 0.0
                                 {
                                     normalize_allele_posterior_structural_missing(
                                         &mut ws.allele_probs,
-                                        subset_total,
-                                        missing_ref_mass,
-                                        missing_ood_mass,
+                                        subset_total_f32,
+                                        missing_ref_mass_f32,
+                                        missing_ood_mass_f32,
                                         &mut ws.allele_prior_scratch,
                                         probs,
                                     );
@@ -3519,9 +3731,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             .copied()
                                             .unwrap_or(f32::INFINITY),
                                         target_probs.is_untyped_uniform_marker(m_rev),
-                                        subset_total,
-                                        missing_ref_mass,
-                                        missing_ood_mass,
+                                        subset_total_f32,
+                                        missing_ref_mass_f32,
+                                        missing_ood_mass_f32,
                                         active_states,
                                         panel_haps,
                                         target_probs.min_untyped_prior_mix(),
@@ -3612,6 +3824,12 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         if is_final {
             final_posteriors = posteriors;
         }
+    }
+    if structural_invariant_violations > 0 && !warned_structural_invariant {
+        eprintln!(
+            "[warn] impute_hmm structural invariant violations: window={} sample={} hap={} count={}",
+            context.window_idx, context.sample_idx, context.hap_idx, structural_invariant_violations
+        );
     }
     Ok((final_posteriors, final_prior_state_post))
 }
