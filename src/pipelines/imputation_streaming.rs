@@ -3128,11 +3128,9 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
-                        // Use phase confidence from the phased target haplotypes. If the
-                        // input was unphased, the phasing pipeline provides calibrated
-                        // phase confidence for heterozygotes, which we should leverage
-                        // to preserve LD signal in imputation emissions.
-                        true,
+                        // Phase-confidence-guided emissions are valid only when the
+                        // original target input was already phased.
+                        !target_was_unphased_for_impute,
                         &mut sample_error_rates,
                     )?;
 
@@ -3436,11 +3434,9 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
-                        // Use phase confidence from the phased target haplotypes. If the
-                        // input was unphased, the phasing pipeline provides calibrated
-                        // phase confidence for heterozygotes, which we should leverage
-                        // to preserve LD signal in imputation emissions.
-                        true,
+                        // Phase-confidence-guided emissions are valid only when the
+                        // original target input was already phased.
+                        !target_was_unphased_for_impute,
                         &mut sample_error_rates,
                     )?;
 
@@ -4364,13 +4360,13 @@ impl crate::pipelines::ImputationPipeline {
                 observed_ratio1,
                 smoothing_cluster_cm,
                 self.params.p_mismatch,
-                true,
+                !phase_conf_valid,
             );
             let min_untyped_prior_mix2 = adaptive_untyped_prior_mix(
                 observed_ratio2,
                 smoothing_cluster_cm,
                 self.params.p_mismatch,
-                true,
+                !phase_conf_valid,
             );
             (
                 TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1),
@@ -5833,6 +5829,210 @@ impl crate::pipelines::ImputationPipeline {
         let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
         let mut handoff_marker_idx: Option<usize> = None;
 
+        let phase_mask = target_win.phase_mask();
+        let get_result_prob =
+            |result: &SampleImputationResult, hap: usize, local_m: usize, allele: u8| -> Option<f32> {
+                if allele == 255 {
+                    return None;
+                }
+                let post = if hap == 0 {
+                    result.hap_posteriors.0.as_ref()
+                } else {
+                    result.hap_posteriors.1.as_ref()
+                };
+                if let Some(p) = post.and_then(|v| v.get(local_m)) {
+                    return Some(p.prob(allele as usize).clamp(0.0, 1.0));
+                }
+                if allele > 1 {
+                    return None;
+                }
+                let alt = if hap == 0 {
+                    result.hap_alt_probs.0.as_ref()
+                } else {
+                    result.hap_alt_probs.1.as_ref()
+                };
+                alt.and_then(|v| v.get(local_m)).map(|&p_alt| {
+                    let p_alt = p_alt.clamp(0.0, 1.0);
+                    if allele == 1 { p_alt } else { 1.0 - p_alt }
+                })
+            };
+        let get_anchor_obs = |sample_idx: usize, ref_m: usize| -> Option<(u8, u8, f32)> {
+            let target_m = alignment.target_marker(MarkerIdx::new(ref_m as u32))?;
+            let target_idx = target_m.as_usize();
+            let input_phased = phase_mask
+                .and_then(|mask| mask.get(target_idx, sample_idx))
+                .map(|v| v != 0)
+                .unwrap_or(true);
+            if !input_phased {
+                return None;
+            }
+            let h1 = HapIdx::new((sample_idx * 2) as u32);
+            let h2 = HapIdx::new((sample_idx * 2 + 1) as u32);
+            if let Some(missing) = target_missing {
+                if missing.allele(target_m, h1) == 255 || missing.allele(target_m, h2) == 255 {
+                    return None;
+                }
+            }
+            let raw_a1 = target_win.allele(target_m, h1);
+            let raw_a2 = target_win.allele(target_m, h2);
+            if raw_a1 == 255 || raw_a2 == 255 {
+                return None;
+            }
+            let mapping = alignment
+                .allele_mappings
+                .get(target_idx)
+                .and_then(|m| m.as_ref());
+            let map_allele = |a: u8| -> u8 {
+                if a == 255 {
+                    return 255;
+                }
+                if let Some(m) = mapping {
+                    if (a as usize) < m.targ_to_ref.len() {
+                        let r = m.targ_to_ref[a as usize];
+                        if r >= 0 {
+                            return r as u8;
+                        }
+                    }
+                    255
+                } else {
+                    a
+                }
+            };
+            let mut a1 = map_allele(raw_a1);
+            let mut a2 = map_allele(raw_a2);
+            if a1 == 255 || a2 == 255 || a1 == a2 {
+                return None;
+            }
+            let mut conf = if phase_conf_valid {
+                target_win
+                    .sample_phase_confidence_f32(target_m, sample_idx)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            if conf < 0.5 {
+                std::mem::swap(&mut a1, &mut a2);
+                conf = 1.0 - conf;
+            }
+            Some((a1, a2, conf.clamp(0.5, 1.0)))
+        };
+        let smooth_sample_orientation = |result: &mut SampleImputationResult,
+                                         capture_ref_idx: Option<usize>|
+         -> Option<bool> {
+            let n = output_end.saturating_sub(output_start);
+            if n == 0 {
+                return None;
+            }
+
+            let mut dp0 = 0.0f64;
+            let mut dp1 = 0.0f64;
+            let mut prev_to0_from1 = vec![false; n];
+            let mut prev_to1_from0 = vec![false; n];
+            let eps = 1e-30f64;
+
+            for local_m in 0..n {
+                let ref_m = output_start + local_m;
+                let (emit0, emit1) = if let Some((a_left, a_right, phase_conf)) =
+                    get_anchor_obs(result.sample_idx, ref_m)
+                {
+                    let p1_left = get_result_prob(result, 0, local_m, a_left).unwrap_or(0.5);
+                    let p1_right = get_result_prob(result, 0, local_m, a_right).unwrap_or(0.5);
+                    let p2_left = get_result_prob(result, 1, local_m, a_left).unwrap_or(0.5);
+                    let p2_right = get_result_prob(result, 1, local_m, a_right).unwrap_or(0.5);
+                    let same = (p1_left * p2_right).clamp(0.0, 1.0);
+                    let swapped = (p1_right * p2_left).clamp(0.0, 1.0);
+                    let c = phase_conf as f64;
+                    let same_mix = (c * same as f64 + (1.0 - c) * swapped as f64).max(eps).ln();
+                    let swap_mix = (c * swapped as f64 + (1.0 - c) * same as f64).max(eps).ln();
+                    (same_mix, swap_mix)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                if local_m == 0 {
+                    dp0 = emit0;
+                    dp1 = emit1;
+                    continue;
+                }
+
+                let p_flip = p_recomb
+                    .get(ref_m)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(1e-8, 0.49) as f64;
+                let log_stay = (1.0 - p_flip).ln();
+                let log_flip = p_flip.ln();
+
+                let stay0 = dp0 + log_stay;
+                let flip_to0 = dp1 + log_flip;
+                let new0 = if flip_to0 > stay0 {
+                    prev_to0_from1[local_m] = true;
+                    flip_to0 + emit0
+                } else {
+                    stay0 + emit0
+                };
+
+                let stay1 = dp1 + log_stay;
+                let flip_to1 = dp0 + log_flip;
+                let new1 = if flip_to1 > stay1 {
+                    prev_to1_from0[local_m] = true;
+                    flip_to1 + emit1
+                } else {
+                    stay1 + emit1
+                };
+
+                dp0 = new0;
+                dp1 = new1;
+            }
+
+            let mut swapped = vec![false; n];
+            let mut state = if dp1 > dp0 { 1u8 } else { 0u8 };
+            for local_m in (0..n).rev() {
+                swapped[local_m] = state == 1;
+                if local_m == 0 {
+                    break;
+                }
+                state = if state == 0 {
+                    if prev_to0_from1[local_m] { 1 } else { 0 }
+                } else if prev_to1_from0[local_m] {
+                    0
+                } else {
+                    1
+                };
+            }
+
+            for (local_m, &is_swapped) in swapped.iter().enumerate() {
+                if !is_swapped {
+                    continue;
+                }
+                if let (Some(p1), Some(p2)) =
+                    (result.hap_posteriors.0.as_mut(), result.hap_posteriors.1.as_mut())
+                {
+                    if local_m < p1.len() && local_m < p2.len() {
+                        std::mem::swap(&mut p1[local_m], &mut p2[local_m]);
+                    }
+                }
+                if let (Some(p1), Some(p2)) =
+                    (result.hap_alt_probs.0.as_mut(), result.hap_alt_probs.1.as_mut())
+                {
+                    if local_m < p1.len() && local_m < p2.len() {
+                        std::mem::swap(&mut p1[local_m], &mut p2[local_m]);
+                    }
+                }
+            }
+
+            let handoff_local = capture_ref_idx
+                .and_then(|idx| {
+                    if idx >= output_start && idx < output_end {
+                        Some(idx - output_start)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(n.saturating_sub(1));
+            swapped.get(handoff_local).copied()
+        };
+
         for mut item in sample_results {
             let sample_idx = item.result.sample_idx;
             let h1 = sample_idx * 2;
@@ -5861,12 +6061,20 @@ impl crate::pipelines::ImputationPipeline {
                     item.result.hap_alt_probs.1 = Some(p2);
                 }
             }
+            let capture_ref_idx = item.last_info_idx.or(prior_marker_idx);
+            let handoff_swapped = smooth_sample_orientation(&mut item.result, capture_ref_idx)
+                .unwrap_or(false);
             all_results.push(item.result);
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
                 if base + 1 < next_priors_vec.len() {
-                    next_priors_vec[base] = p1;
-                    next_priors_vec[base + 1] = p2;
+                    if handoff_swapped {
+                        next_priors_vec[base] = p2;
+                        next_priors_vec[base + 1] = p1;
+                    } else {
+                        next_priors_vec[base] = p1;
+                        next_priors_vec[base + 1] = p2;
+                    }
                 }
             }
             if let Some(idx) = item.last_info_idx {
