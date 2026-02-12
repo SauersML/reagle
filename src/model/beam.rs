@@ -1696,9 +1696,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     #[inline]
     fn fill_pool_alleles(&self, marker: usize, active_pool: &ActivePool, out: &mut Vec<u8>) {
         let list = active_pool.list();
-        if out.len() < list.len() {
-            out.resize(list.len(), u8::MAX);
-        }
+        out.resize(list.len(), u8::MAX);
         for (i, &h) in list.iter().enumerate() {
             out[i] = self.packed_ref.ref_allele_targ(marker, h).unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
         }
