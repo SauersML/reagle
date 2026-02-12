@@ -2331,10 +2331,17 @@ fn build_imputation_plan(
                         .max(1);
                     let top = select_top_k_allow_zero(&global_scores[i], keep);
                     if top.is_empty() {
-                        for h in 0..keep {
-                            abyss.set(h, false);
-                        }
-                        abyss_count = n_ref_haps.saturating_sub(keep);
+                        warn!(
+                            "Abyss prescan produced no finite global scores for target hap {} (batch_idx={}, n_ref_haps={}, keep={}); disabling abyss for this hap",
+                            hap_idx,
+                            i,
+                            n_ref_haps,
+                            keep
+                        );
+                        // No finite/global score signal to rank by; do not choose
+                        // arbitrary reference indices. Keep all haps eligible.
+                        abyss.fill(false);
+                        abyss_count = 0;
                     } else {
                         for (h, _) in top {
                             if *abyss.get(h).unwrap() {
@@ -2384,20 +2391,10 @@ fn build_imputation_plan(
                         }
                     }
                 }
-                // When the per-window budget can hold the entire reference
-                // panel, the abyss serves no memory purpose — it only removes
-                // haplotypes from the HMM state space, biasing allele posteriors
-                // at untyped markers (causing AF collapse at markers where all
-                // ALT carriers land in the abyss).  Clear it so every haplotype
-                // participates in the Li-Stephens HMM; irrelevant haplotypes
-                // naturally receive low posterior weight from emissions at typed
-                // markers, while per-state switching drops (ρ/K), improving IBD
-                // signal preservation.
-                if per_window_cap_min >= n_ref_haps {
-                    abyss.fill(false);
-                    abyss_count = 0;
-                }
                 let (intervals, core) = if per_window_cap_min >= n_ref_haps {
+                    // Keep abyss active even when we can fit the full panel:
+                    // here abyss is a denoising prior over candidate donors,
+                    // not only a memory-pruning mechanism.
                     let mut intervals = Vec::new();
                     let mut core = Vec::new();
                     let end = num_windows as u32;
@@ -3516,14 +3513,7 @@ impl crate::pipelines::ImputationPipeline {
         let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
         let should_log = should_log_impute_window(window_idx);
-        let genotyped_fraction = (alignment
-            .ref_to_target
-            .iter()
-            .filter(|v| v.is_some())
-            .count() as f32
-            / n_ref_markers.max(1) as f32)
-            .clamp(0.0, 1.0);
-        let use_abyss = genotyped_fraction >= 0.01;
+        let use_abyss = true;
         let output_markers = output_end.saturating_sub(output_start);
 
         if output_start >= output_end || n_ref_markers == 0 {
@@ -3716,34 +3706,8 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     state_haps = prioritized;
                 }
-                if state_haps.is_empty() {
-                    // Hard fallback: pick the first non-abyss haplotypes.
-                    if use_abyss && hap_idx < plan.abyss_mask.len() {
-                        let abyss = &plan.abyss_mask[hap_idx];
-                        for h in 0..plan.n_ref_haps {
-                            // BitVec::get returns Option<BitRef>, deref to bool
-                            if !abyss.get(h).map(|b| *b).unwrap_or(true) {
-                                state_haps.push(RefHapId::new(h as u32));
-                                if state_haps.len() >= per_window_cap_local {
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        for h in 0..plan.n_ref_haps {
-                            state_haps.push(RefHapId::new(h as u32));
-                            if state_haps.len() >= per_window_cap_local {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if state_haps.is_empty() {
-                    return Err(ReagleError::vcf(format!(
-                        "State selection produced empty haplotype set (window={}, hap={}, cap={})",
-                        window_idx, hap_idx, per_window_cap_local
-                    )));
-                }
+                // Keep empty here if no scored candidates survived; per-sample state
+                // assembly later combines priors/donors/core and applies final checks.
                 state_haps_by_hap.push(state_haps);
             }
         }
@@ -4968,29 +4932,6 @@ impl crate::pipelines::ImputationPipeline {
                         fill_from(&mut out, &mut seen, core_haps, remaining, k);
                         if out.len() == before {
                             break;
-                        }
-                    }
-
-                    if out.len() < k {
-                        // Deterministically complete the state set from the
-                        // reference panel. This prevents silent under-filled
-                        // state spaces when mixed sources do not cover `k`.
-                        let abyss = if use_abyss {
-                            plan.abyss_mask.get(hap_idx.as_usize())
-                        } else {
-                            None
-                        };
-                        for h in 0..plan.n_ref_haps {
-                            if out.len() >= k {
-                                break;
-                            }
-                            if abyss.and_then(|v| v.get(h).as_deref().copied()).unwrap_or(false) {
-                                continue;
-                            }
-                            let hap = RefHapId::new(h as u32);
-                            if seen.insert(hap) {
-                                out.push(hap);
-                            }
                         }
                     }
 

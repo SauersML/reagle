@@ -2604,6 +2604,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 if let Some(interior) =
                     UniformInteriorRange::from_block_checked(block, &uniform_mask, context, K::LABEL)?
                 {
+                    // Affine interior path:
+                    // - Enabled by marker kind (uniform/untyped interior), not by distance.
+                    // - We keep transition propagation in affine form across the block.
+                    // - Distance-to-typed-anchor is used only by skip_untyped_mask to decide
+                    //   whether to skip full posterior evaluation at a given interior marker.
                     ws.ensure_bwd_affine_scratch(block_len);
                     fill_bwd_affine_coeffs(
                         &mut ws.bwd_affine_a[..block_len],
