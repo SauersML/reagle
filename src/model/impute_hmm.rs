@@ -339,7 +339,9 @@ mod tests {
                 sum_b += b;
                 sum_fb += f * b;
                 count += 1.0;
-                direct += forward.apply(f) * backward.apply(b);
+                let f_aff = forward.a.mul_add(f, forward.b);
+                let b_aff = backward.a.mul_add(b, backward.add);
+                direct += f_aff * b_aff;
             }
             let fast = (forward.a * backward.a) * sum_fb
                 + (forward.a * backward.add) * sum_f
