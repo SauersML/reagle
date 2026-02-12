@@ -1215,6 +1215,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 path,
                 parent_idx,
                 call,
+                call_idx,
                 a1,
                 a2,
                 false,
@@ -1222,7 +1223,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 active_pool,
                 &pool_alleles,
                 out,
-                call_idx,
                 cutoff,
                 scratch,
             );
@@ -1231,6 +1231,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 path,
                 parent_idx,
                 call,
+                call_idx,
                 a1,
                 a2,
                 false,
@@ -1238,7 +1239,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 active_pool,
                 &pool_alleles,
                 out,
-                call_idx,
                 cutoff,
                 scratch,
             );
@@ -1246,6 +1246,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 path,
                 parent_idx,
                 call,
+                call_idx,
                 a2,
                 a1,
                 true,
@@ -1253,7 +1254,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 active_pool,
                 &pool_alleles,
                 out,
-                call_idx,
                 cutoff,
                 scratch,
             );
@@ -1266,6 +1266,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         path: &BeamPath,
         parent_idx: u32,
         call: &CallSite,
+        call_idx: usize,
         hap1_al: u8,
         hap2_al: u8,
         swapped: bool,
@@ -1273,7 +1274,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         out: &mut Vec<BeamPath>,
-        _call_idx: usize,
         cutoff: i32,
         scratch: &mut BeamScratch,
     ) {
@@ -1899,51 +1899,6 @@ fn hap_constraints_penalty<RefSpace>(
         }
     }
     (penalty, penalty == 0)
-}
-
-#[inline]
-fn logaddexp(a: f64, b: f64) -> f64 {
-    if a.is_infinite() && a.is_sign_negative() {
-        return b;
-    }
-    if b.is_infinite() && b.is_sign_negative() {
-        return a;
-    }
-    let m = if a > b { a } else { b };
-    m + ((a - m).exp() + (b - m).exp()).ln()
-}
-
-fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(logsum_swapped.len());
-    for i in 0..logsum_swapped.len() {
-        let ls = logsum_swapped[i];
-        let lu = logsum_unswapped
-            .get(i)
-            .copied()
-            .unwrap_or(f64::NEG_INFINITY);
-        if ls.is_infinite() && ls.is_sign_negative() {
-            if lu.is_infinite() && lu.is_sign_negative() {
-                out.push(0.5);
-            } else {
-                out.push(0.0);
-            }
-            continue;
-        }
-        if lu.is_infinite() && lu.is_sign_negative() {
-            out.push(1.0);
-            continue;
-        }
-        let m = if ls > lu { ls } else { lu };
-        let ps = (ls - m).exp();
-        let pu = (lu - m).exp();
-        let denom = ps + pu;
-        if denom <= 0.0 {
-            out.push(0.5);
-        } else {
-            out.push((ps / denom).clamp(0.0, 1.0) as f32);
-        }
-    }
-    out
 }
 
 fn compute_swap_posteriors_retained(
