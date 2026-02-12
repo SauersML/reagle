@@ -1542,8 +1542,13 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let is_mismatch = ref_al != targ_al;
-                    let em = if is_mismatch { p_err } else { p_no_err };
+                    let em = if targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                        1.0
+                    } else if ref_al == targ_al {
+                        p_no_err
+                    } else {
+                        p_err
+                    };
                     fwd[k] = em * (scale * fwd[k] + shift);
                     sum += fwd[k];
                 }
@@ -1554,8 +1559,13 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let is_mismatch = ref_al != targ_al;
-                    let em = if is_mismatch { p_err } else { p_no_err };
+                    let em = if targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                        1.0
+                    } else if ref_al == targ_al {
+                        p_no_err
+                    } else {
+                        p_err
+                    };
                     fwd[k] = em * prior;
                     sum += fwd[k];
                 }
@@ -1608,8 +1618,13 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = recomp_ref_row[k];
-                    let is_mismatch = ref_al != recomp_targ_al;
-                    let em = if is_mismatch { p_err } else { p_no_err };
+                    let em = if recomp_targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                        1.0
+                    } else if ref_al == recomp_targ_al {
+                        p_no_err
+                    } else {
+                        p_err
+                    };
                     fwd_recomp[k] = transition.forward(fwd_recomp[k], em);
                     sum += fwd_recomp[k];
                 }
@@ -1638,8 +1653,13 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     let mut sum = 0.0f32;
                     for k in 0..n_states {
                         let ref_al = recomp_ref_row[k];
-                        let is_mismatch = ref_al != recomp_targ_al;
-                        let em = if is_mismatch { p_err } else { p_no_err };
+                        let em = if recomp_targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                            1.0
+                        } else if ref_al == recomp_targ_al {
+                            p_no_err
+                        } else {
+                            p_err
+                        };
                         fwd_prev[k] = transition.forward(fwd_prev[k], em);
                         sum += fwd_prev[k];
                     }
@@ -1649,6 +1669,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
             let mut joint_state_sum = 0.0f32;
             let mut state_sum = 0.0f32;
+            let mut obs_state_sum = 0.0f32;
             let mut mismatch_sum = 0.0f32;
             let same_state_scale = if m > 0 {
                 stay_by_marker[m] / fwd_sums[m - 1].max(1e-30)
@@ -1658,8 +1679,15 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
             for k in 0..n_states {
                 let ref_al = ref_row[k];
-                let is_mismatch = ref_al != targ_al;
-                let em = if is_mismatch { p_err } else { p_no_err };
+                let observed = targ_al != MISSING_ALLELE && ref_al != MISSING_ALLELE;
+                let is_mismatch = observed && ref_al != targ_al;
+                let em = if !observed {
+                    1.0
+                } else if !is_mismatch {
+                    p_no_err
+                } else {
+                    p_err
+                };
 
                 if m > 0 {
                     joint_state_sum += bwd[k] * em * fwd_prev[k].max(0.0) * same_state_scale;
@@ -1667,15 +1695,18 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 
                 let state_prob = fwd_recomp[k] * bwd[k];
                 state_sum += state_prob;
-                if is_mismatch {
-                    mismatch_sum += state_prob;
+                if observed {
+                    obs_state_sum += state_prob;
+                    if is_mismatch {
+                        mismatch_sum += state_prob;
+                    }
                 }
             }
 
-            if state_sum > 0.0 {
+            if obs_state_sum > 0.0 {
                 estimates.add_emission(
-                    (1.0 - mismatch_sum / state_sum) as f64,
-                    (mismatch_sum / state_sum) as f64,
+                    (1.0 - mismatch_sum / obs_state_sum) as f64,
+                    (mismatch_sum / obs_state_sum) as f64,
                 );
             }
 
@@ -1696,7 +1727,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let stay = stay_by_marker[m_next];
                 let mut constant_term = 0.0f32;
                 for k in 0..n_states {
-                    let em = if ref_row[k] == targ_al_next {
+                    let ref_al = ref_row[k];
+                    let em = if targ_al_next == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+                        1.0
+                    } else if ref_al == targ_al_next {
                         p_no_err
                     } else {
                         p_err
