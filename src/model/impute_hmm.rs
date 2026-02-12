@@ -1723,26 +1723,24 @@ fn normalize_allele_posterior_structural_missing(
         return;
     }
 
-    let inv_subset = 1.0 / subset;
     let inv_total = 1.0 / total;
     if missing_ood > 0.0 {
         // Fixed structural prior strength (Dirichlet alpha=1):
         // rho_ood = (q + alpha*pi)/(Q + alpha), alpha = 1.
         const OOD_DIRICHLET_ALPHA: f32 = 1.0;
         let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let inv_subset = 1.0 / subset;
         let inv_rho = 1.0 / (subset + OOD_DIRICHLET_ALPHA);
+        let q_coeff = (1.0 + missing_ref * inv_subset + missing_ood * inv_rho) * inv_total;
+        let pi_coeff = (missing_ood * OOD_DIRICHLET_ALPHA * inv_rho) * inv_total;
         for (p, &pi) in allele_probs.iter_mut().zip(prior.as_slice().iter()) {
-            let q = *p;
-            let q_norm = q * inv_subset;
-            let rho_ood = (q + OOD_DIRICHLET_ALPHA * pi) * inv_rho;
-            *p = (q + missing_ref * q_norm + missing_ood * rho_ood) * inv_total;
+            *p = *p * q_coeff + pi * pi_coeff;
         }
     } else {
         // No OOD mass: exact MAR redistribution for reference-missing states.
+        let q_coeff = (1.0 + missing_ref / subset) * inv_total;
         for p in allele_probs.iter_mut() {
-            let q = *p;
-            let q_norm = q * inv_subset;
-            *p = (q + missing_ref * q_norm) * inv_total;
+            *p *= q_coeff;
         }
     }
 }
@@ -3228,7 +3226,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     let ref_allele = *group_alleles
                                         .get(pid)
                                         .unwrap_or(&AlleleCode::MISSING.raw());
-                                    if AlleleCode::from_raw(ref_allele).is_missing() {
+                                    if ref_allele == AlleleCode::MISSING.raw() {
                                         missing_ref_mass += state_prob;
                                         continue;
                                     }
@@ -3416,7 +3414,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                 let ref_allele = *group_alleles
                                     .get(pid)
                                     .unwrap_or(&AlleleCode::MISSING.raw());
-                                if AlleleCode::from_raw(ref_allele).is_missing() {
+                                if ref_allele == AlleleCode::MISSING.raw() {
                                     missing_ref_mass += state_prob;
                                     continue;
                                 }
