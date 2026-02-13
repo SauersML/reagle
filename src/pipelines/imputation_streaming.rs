@@ -4252,7 +4252,7 @@ impl crate::pipelines::ImputationPipeline {
         // state sets from prescan/LMS. This preserves ancestry-local donor sets
         // and avoids diluting sparse-target inference with globally irrelevant
         // haplotypes.
-        let full_states: Option<Vec<RefHapId>> = if plan.full_panel {
+        let full_states: Option<Vec<RefHapId>> = if plan.full_panel || n_target_samples <= 2 {
             Some(
                 (0..plan.n_ref_haps)
                     .map(|h| RefHapId::new(h as u32))
@@ -4289,15 +4289,7 @@ impl crate::pipelines::ImputationPipeline {
                     let abyss = &plan.abyss_mask[hap_idx];
                     state_haps.retain(|g| !abyss[g.as_usize()]);
                 }
-                let cap_local = if n_target_samples <= 2 {
-                    per_window_cap_local
-                        .saturating_mul(4)
-                        .min(plan.n_ref_haps.max(1))
-                        .max(per_window_cap_local)
-                } else {
-                    per_window_cap_local
-                };
-                if state_haps.len() > cap_local {
+                if state_haps.len() > per_window_cap_local {
                     let core_for_hap = plan
                         .core_states
                         .get(hap_idx)
@@ -4310,17 +4302,17 @@ impl crate::pipelines::ImputationPipeline {
                         .copied()
                         .filter(|h| core_set.contains(&h.as_u32()))
                         .collect();
-                    if prioritized.len() < cap_local {
+                    if prioritized.len() < per_window_cap_local {
                         for hap in state_haps.iter().copied() {
                             if !core_set.contains(&hap.as_u32()) {
                                 prioritized.push(hap);
-                                if prioritized.len() >= cap_local {
+                                if prioritized.len() >= per_window_cap_local {
                                     break;
                                 }
                             }
                         }
                     } else {
-                        prioritized.truncate(cap_local);
+                        prioritized.truncate(per_window_cap_local);
                     }
                     state_haps = prioritized;
                 }
