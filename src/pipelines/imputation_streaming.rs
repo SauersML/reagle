@@ -275,7 +275,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -321,7 +321,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.01 + 0.22 * missing_ramp;
+    let floor = 0.01 + 0.05 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
 }
 
@@ -942,7 +942,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
         // Exact grouped update with deferred sparse accumulation:
         // Original per-row score for row i, hap h at marker m:
         //   S_i[h] += w_{m,a_i} * 1{a_h == a_i}
-        // where a_i is target allele for row i and w_{m,a} = -ln(freq_{m,a}).
+        // where a_i is target allele for row i and w_{m,a} is the match weight.
         //
         // Grouping rows by a_i is algebraically identical:
         // for each allele a, all rows in group G_a share the same w_{m,a},
@@ -5860,6 +5860,7 @@ impl crate::pipelines::ImputationPipeline {
                     f32,
                 )> {
                     let n_markers = input_probs.n_markers();
+                    let input_prior_idx = output_start.saturating_sub(1);
                     let informative_n = (0..n_markers)
                         .filter(|&m| !input_probs.is_uniform_marker(m))
                         .count();
@@ -5967,6 +5968,7 @@ impl crate::pipelines::ImputationPipeline {
                             &p_recomb,
                             effective_error_rate,
                             prior_marker_idx,
+                            Some(input_prior_idx),
                             state_priors_slice.take(),
                             &ref_allele_freqs,
                             ImputeHmmContext {
@@ -8434,7 +8436,10 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = super::prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
