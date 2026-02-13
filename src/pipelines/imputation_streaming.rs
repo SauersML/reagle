@@ -4237,7 +4237,7 @@ impl crate::pipelines::ImputationPipeline {
         // state sets from prescan/LMS. This preserves ancestry-local donor sets
         // and avoids diluting sparse-target inference with globally irrelevant
         // haplotypes.
-        let full_states: Option<Vec<RefHapId>> = if plan.full_panel {
+        let full_states: Option<Vec<RefHapId>> = if plan.full_panel || n_target_samples <= 2 {
             Some(
                 (0..plan.n_ref_haps)
                     .map(|h| RefHapId::new(h as u32))
