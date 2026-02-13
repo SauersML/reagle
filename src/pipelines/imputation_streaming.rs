@@ -167,6 +167,9 @@ const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
 // probability per planning window, then split each I/O interval so the
 // cumulative Li-Stephens hazard per planning segment stays near this budget.
 const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
+// Overlap/handoff retention target: include the suffix where expected retained
+// copy signal to the window end is at least epsilon.
+const HANDOFF_RETAIN_EPS: f64 = 1e-3;
 
 #[inline]
 fn recomb_lambda_from_p(p: f32) -> f64 {
@@ -178,6 +181,23 @@ fn recomb_lambda_from_p(p: f32) -> f64 {
     } else {
         -(1.0 - p).ln()
     }
+}
+
+#[inline]
+fn overlap_start_from_hazard(output_start: usize, output_end: usize, p_recomb: &[f32]) -> usize {
+    if output_end <= output_start {
+        return output_start;
+    }
+    let eps = HANDOFF_RETAIN_EPS.clamp(1e-12, 0.5);
+    let target_lambda = -eps.ln();
+    let mut acc = 0.0f64;
+    for m in ((output_start + 1)..output_end).rev() {
+        acc += recomb_lambda_from_p(p_recomb.get(m).copied().unwrap_or(0.0));
+        if acc >= target_lambda {
+            return m.saturating_sub(1).max(output_start);
+        }
+    }
+    output_start
 }
 
 #[inline]
@@ -3185,6 +3205,7 @@ struct ImputationHandoff {
 struct ImputationWindowResults {
     all_results: Vec<SampleImputationResult>,
     ref_is_biallelic: Vec<bool>,
+    overlap_start_idx: usize,
     handoff: Option<ImputationHandoff>,
     alt_prob_store: Option<AltProbDiskStoreView>,
 }
@@ -3911,6 +3932,7 @@ impl crate::pipelines::ImputationPipeline {
                         let ImputationWindowResults {
                             all_results,
                             ref_is_biallelic,
+                            overlap_start_idx,
                             handoff,
                             alt_prob_store,
                         } = window_results;
@@ -3920,6 +3942,7 @@ impl crate::pipelines::ImputationPipeline {
                             &alignment,
                             ref_window.output_start,
                             ref_window.output_end,
+                            overlap_start_idx,
                             &all_results,
                             alt_prob_store.as_ref(),
                         ));
@@ -3987,6 +4010,7 @@ impl crate::pipelines::ImputationPipeline {
                             &alignment,
                             ref_window.output_start,
                             ref_window.output_end,
+                            ref_window.output_start,
                             &[],
                             None,
                         )
@@ -4215,6 +4239,7 @@ impl crate::pipelines::ImputationPipeline {
                         let ImputationWindowResults {
                             all_results,
                             ref_is_biallelic,
+                            overlap_start_idx,
                             handoff,
                             alt_prob_store,
                         } = window_results;
@@ -4224,6 +4249,7 @@ impl crate::pipelines::ImputationPipeline {
                             &alignment,
                             ref_window.output_start,
                             ref_window.output_end,
+                            overlap_start_idx,
                             &all_results,
                             alt_prob_store.as_ref(),
                         ));
@@ -4291,6 +4317,7 @@ impl crate::pipelines::ImputationPipeline {
                             &alignment,
                             ref_window.output_start,
                             ref_window.output_end,
+                            ref_window.output_start,
                             &[],
                             None,
                         )
@@ -4667,8 +4694,7 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let smoothing_cluster_cm = self.config.cluster.max(1e-6);
-        let overlap_size = 1000.min(output_end);
-        let overlap_start = output_end.saturating_sub(overlap_size);
+        let overlap_start = overlap_start_from_hazard(output_start, output_end, &p_recomb);
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -7678,6 +7704,7 @@ impl crate::pipelines::ImputationPipeline {
         Ok(Some(ImputationWindowResults {
             all_results,
             ref_is_biallelic,
+            overlap_start_idx: overlap_start,
             alt_prob_store,
             handoff: Some(ImputationHandoff {
                 priors: next_priors_vec,
@@ -7692,12 +7719,16 @@ impl crate::pipelines::ImputationPipeline {
         alignment: &MarkerAlignment<TargetSpace, RefSpace>,
         output_start: usize,
         output_end: usize,
+        overlap_start: usize,
         all_results: &[SampleImputationResult],
         alt_prob_store: Option<&AltProbDiskStoreView>,
     ) -> PhasedOverlap {
-        let overlap_size = 1000.min(output_end);
-        let start = output_end.saturating_sub(overlap_size);
+        let mut start = overlap_start.clamp(output_start, output_end);
+        if start >= output_end && output_end > output_start {
+            start = output_end - 1;
+        }
         let end = output_end;
+        let overlap_size = end.saturating_sub(start);
         let n_haps = target_win.n_haplotypes();
         let mut alleles =
             vec![crate::data::storage::AlleleCode::MISSING.raw(); overlap_size * n_haps];
