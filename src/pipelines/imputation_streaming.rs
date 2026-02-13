@@ -166,6 +166,8 @@ const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
 const BEAGLE_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
 const BEAGLE_TUNED_MIN_MARKERS: usize = 2000;
+const BEAGLE_TUNED_BURNIN: &str = "10";
+const BEAGLE_TUNED_ITERATIONS: &str = "20";
 
 fn command_available(cmd: &str) -> bool {
     Command::new(cmd)
@@ -3194,6 +3196,8 @@ impl crate::pipelines::ImputationPipeline {
         let out_prefix = self.config.out.to_str().ok_or_else(|| {
             ReagleError::vcf("Output prefix path is not valid UTF-8".to_string())
         })?;
+        let burnin_arg = format!("burnin={BEAGLE_TUNED_BURNIN}");
+        let iterations_arg = format!("iterations={BEAGLE_TUNED_ITERATIONS}");
         let status = Command::new("java")
             .args([
                 "-Xmx6g",
@@ -3206,8 +3210,8 @@ impl crate::pipelines::ImputationPipeline {
                 &format!("out={out_prefix}"),
                 "nthreads=4",
                 "gp=true",
-                "burnin=10",
-                "iterations=20",
+                burnin_arg.as_str(),
+                iterations_arg.as_str(),
             ])
             .status()?;
         if !status.success() {
