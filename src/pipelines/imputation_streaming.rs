@@ -4133,6 +4133,23 @@ impl crate::pipelines::ImputationPipeline {
                     == 1
             })
             .collect();
+        if should_log {
+            let n_multiallelic = ref_is_biallelic.iter().filter(|&&is_bi| !is_bi).count();
+            let dense_post_per_sample_bytes =
+                2u64.saturating_mul(output_markers as u64)
+                    .saturating_mul(std::mem::size_of::<AllelePosteriors>() as u64);
+            let dense_alt_per_sample_bytes = 2u64
+                .saturating_mul(output_markers as u64)
+                .saturating_mul(std::mem::size_of::<f32>() as u64);
+            eprintln!(
+                "    [window diag] output_markers={} biallelic={} multiallelic={} dense_post_per_sample_mb={} compact_alt_per_sample_mb={}",
+                output_markers,
+                output_markers.saturating_sub(n_multiallelic),
+                n_multiallelic,
+                dense_post_per_sample_bytes / (1024 * 1024),
+                dense_alt_per_sample_bytes / (1024 * 1024)
+            );
+        }
         let ref_allele_freqs = RefAlleleFreqs::new(ref_columns);
 
         let gen_positions: Vec<f64> = {
@@ -6783,6 +6800,10 @@ impl crate::pipelines::ImputationPipeline {
             Some(p1_handoff as f32)
         };
 
+        let mut buffered_alt_values: u64 = 0;
+        let mut buffered_sparse_entries: u64 = 0;
+        let mut buffered_sparse_haps: u64 = 0;
+        let mem_diag_interval = (n_target_samples / 8).clamp(1, 128);
         for _ in 0..n_target_samples {
             let mut item = result_rx.recv().map_err(|e| {
                 ReagleError::vcf(format!("Failed to receive sample imputation result: {}", e))
@@ -6843,7 +6864,50 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
 
+            if let Some(v) = item.result.hap_alt_probs.0.as_ref() {
+                buffered_alt_values = buffered_alt_values.saturating_add(v.len() as u64);
+            }
+            if let Some(v) = item.result.hap_alt_probs.1.as_ref() {
+                buffered_alt_values = buffered_alt_values.saturating_add(v.len() as u64);
+            }
+            if let Some(v) = item.result.hap_posteriors.0.as_ref() {
+                buffered_sparse_entries =
+                    buffered_sparse_entries.saturating_add(v.values.len() as u64);
+                buffered_sparse_haps = buffered_sparse_haps.saturating_add(1);
+            }
+            if let Some(v) = item.result.hap_posteriors.1.as_ref() {
+                buffered_sparse_entries =
+                    buffered_sparse_entries.saturating_add(v.values.len() as u64);
+                buffered_sparse_haps = buffered_sparse_haps.saturating_add(1);
+            }
             all_results.push(item.result);
+            if should_log
+                && (all_results.len() == 1
+                    || all_results.len() == n_target_samples
+                    || all_results.len() % mem_diag_interval == 0)
+            {
+                let alt_bytes =
+                    buffered_alt_values.saturating_mul(std::mem::size_of::<f32>() as u64);
+                let sparse_bytes = buffered_sparse_entries.saturating_mul(
+                    (std::mem::size_of::<usize>() + std::mem::size_of::<AllelePosteriors>())
+                        as u64,
+                );
+                let result_struct_bytes = (all_results.len() as u64)
+                    .saturating_mul(std::mem::size_of::<SampleImputationResult>() as u64);
+                let est_total_mb = (alt_bytes
+                    .saturating_add(sparse_bytes)
+                    .saturating_add(result_struct_bytes))
+                    / (1024 * 1024);
+                eprintln!(
+                    "    [mem diag] buffered_samples={}/{} alt_mb={} sparse_sites={} sparse_haps={} est_results_mb={} note=\"result buffers only\"",
+                    all_results.len(),
+                    n_target_samples,
+                    alt_bytes / (1024 * 1024),
+                    buffered_sparse_entries,
+                    buffered_sparse_haps,
+                    est_total_mb
+                );
+            }
             if let Some((p1, p2)) = item.priors {
                 let base = sample_idx * 2;
                 if base + 1 < next_priors_vec.len() {
