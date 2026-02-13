@@ -3210,7 +3210,7 @@ impl crate::pipelines::ImputationPipeline {
                 &format!("out={out_prefix}"),
                 "nthreads=4",
                 "gp=true",
-                "imp-states=3000",
+                "imp-states=2950",
                 burnin_arg.as_str(),
                 iterations_arg.as_str(),
             ])
