@@ -11,7 +11,6 @@ use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -164,45 +163,6 @@ const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
-const BEAGLE_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
-const BEAGLE_TUNED_MIN_MARKERS: usize = 2000;
-const BEAGLE_TUNED_BURNIN: &str = "10";
-const BEAGLE_TUNED_ITERATIONS: &str = "20";
-
-fn command_available(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-fn ensure_tuned_beagle_jar(jar_path: &Path) -> Result<()> {
-    if jar_path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = jar_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let status = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-L",
-            "-o",
-            jar_path
-                .to_str()
-                .ok_or_else(|| ReagleError::vcf("Non-UTF8 beagle jar path".to_string()))?,
-            BEAGLE_JAR_URL,
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(ReagleError::vcf(format!(
-            "Failed downloading Beagle jar from {BEAGLE_JAR_URL}"
-        )));
-    }
-    Ok(())
-}
 
 #[inline]
 fn compute_abyss_rank_cutoff(
@@ -3174,54 +3134,6 @@ fn split_hap_posteriors(
 }
 
 impl crate::pipelines::ImputationPipeline {
-    fn maybe_run_tuned_beagle_backend(
-        &self,
-        ref_path: &Path,
-        target_path: &Path,
-        target_marker_count: usize,
-    ) -> Result<bool> {
-        if target_marker_count < BEAGLE_TUNED_MIN_MARKERS {
-            return Ok(false);
-        }
-        if self.config.out.as_os_str() == "-" {
-            return Ok(false);
-        }
-        if !command_available("java") || !command_available("curl") {
-            return Ok(false);
-        }
-        let jar_dir = std::env::temp_dir().join("reagle_cache");
-        let jar_path = jar_dir.join("beagle.27Feb25.75f.jar");
-        ensure_tuned_beagle_jar(&jar_path)?;
-
-        let out_prefix = self.config.out.to_str().ok_or_else(|| {
-            ReagleError::vcf("Output prefix path is not valid UTF-8".to_string())
-        })?;
-        let burnin_arg = format!("burnin={BEAGLE_TUNED_BURNIN}");
-        let iterations_arg = format!("iterations={BEAGLE_TUNED_ITERATIONS}");
-        let status = Command::new("java")
-            .args([
-                "-Xmx6g",
-                "-jar",
-                jar_path
-                    .to_str()
-                    .ok_or_else(|| ReagleError::vcf("Non-UTF8 beagle jar path".to_string()))?,
-                &format!("ref={}", ref_path.display()),
-                &format!("gt={}", target_path.display()),
-                &format!("out={out_prefix}"),
-                "nthreads=4",
-                "gp=true",
-                "imp-states=2915",
-                burnin_arg.as_str(),
-                iterations_arg.as_str(),
-            ])
-            .status()?;
-        if !status.success() {
-            return Ok(false);
-        }
-        let out_vcf = self.config.out.with_extension("vcf.gz");
-        Ok(out_vcf.exists())
-    }
-
     /// Run streaming imputation pipeline
     #[instrument(name = "imputation_streaming", skip(self))]
     pub fn run_streaming(&mut self) -> Result<()> {
@@ -3311,18 +3223,6 @@ impl crate::pipelines::ImputationPipeline {
                 "Target VCF not found: {:?}",
                 input_target_path
             )));
-        }
-
-        if self.maybe_run_tuned_beagle_backend(
-            ref_path.as_path(),
-            input_target_path.as_path(),
-            target_marker_count,
-        )? {
-            eprintln!(
-                "Imputation backend: tuned Beagle shortcut (markers={})",
-                target_marker_count
-            );
-            return Ok(());
         }
 
         let mut phased_target_path = input_target_path.clone();
