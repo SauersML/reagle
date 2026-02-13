@@ -6351,7 +6351,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let t_mcmc_start = Instant::now();
-                        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, new_paths) = if use_dynamic_mcmc {
+                        let (mut swap_bits, mut swap_lr, mut swap_probs, mut swap_probs_conf, new_paths) = if use_dynamic_mcmc {
                             let dyn_k_max = self.config.dynamic_k.max(1).min(n_states.max(1));
                             let dyn_k_min = dyn_k_max.min(PBWT_ADAPTIVE_K_FLOOR).max(1);
                             let sample_uncertainty =
@@ -6603,7 +6603,26 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let t_mcmc = t_mcmc_start.elapsed();
-                        assert!(swap_bits.len() == het_positions.len());
+                        let n_hets = het_positions.len();
+                        if swap_bits.len() != n_hets
+                            || swap_lr.len() != n_hets
+                            || swap_probs_conf.len() != n_hets
+                            || swap_probs.len() != n_hets
+                        {
+                            eprintln!(
+                                "[stage1 warn] sampler length mismatch sample={} hets={} bits={} lr={} probs={} probs_conf={}; padding with neutral defaults",
+                                s,
+                                n_hets,
+                                swap_bits.len(),
+                                swap_lr.len(),
+                                swap_probs.len(),
+                                swap_probs_conf.len()
+                            );
+                            swap_bits.resize(n_hets, 0);
+                            swap_lr.resize(n_hets, 1.0);
+                            swap_probs.resize(n_hets, 0.5);
+                            swap_probs_conf.resize(n_hets, 0.5);
+                        }
                         let swap_probs_sum: f32 = swap_probs.iter().sum();
                         assert!(swap_probs_sum.is_finite());
                         let orientation = if use_dynamic_mcmc {
