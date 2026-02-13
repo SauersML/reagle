@@ -349,12 +349,6 @@ fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
 }
 
 #[inline]
-fn exact_match_weight(freq: f32, min_freq: f32) -> f32 {
-    let p = freq.max(min_freq);
-    -p.ln()
-}
-
-#[inline]
 fn blend_haplotype_priors(
     p_keep: &HaplotypePriors,
     p_swap: &HaplotypePriors,
@@ -967,7 +961,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             if freq <= 0.0 {
                 continue;
             }
-            let weight = exact_match_weight(freq, min_freq);
+            let weight = prescan_match_weight(freq, min_freq);
             if weight <= 0.0 {
                 continue;
             }
@@ -7637,7 +7631,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
                     return d;
                 }
@@ -7735,7 +7729,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(gt) = hard_call {
                     return gt;
                 }
@@ -7836,7 +7830,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                     return (a1 as f32, a2 as f32);
                 }
@@ -8440,7 +8434,10 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
