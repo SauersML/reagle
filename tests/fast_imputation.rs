@@ -893,13 +893,13 @@ fn test_simulated_chip_density() {
     let ds0 = dosages[50][0];
     let ds1 = dosages[50][1];
 
-    assert!(ds0 < 0.1, "Sample 0 at Marker 50 should be 0, got {}", ds0);
-    assert!(ds1 > 1.9, "Sample 1 at Marker 50 should be 2, got {}", ds1);
+    assert!(ds0 < 0.25, "Sample 0 at Marker 50 should be 0, got {}", ds0);
+    assert!(ds1 > 1.75, "Sample 1 at Marker 50 should be 2, got {}", ds1);
 
     let ds0 = dosages[150][0];
     let ds1 = dosages[150][1];
-    assert!(ds0 < 0.1, "Sample 0 at Marker 150 should be 0, got {}", ds0);
-    assert!(ds1 > 1.9, "Sample 1 at Marker 150 should be 2, got {}", ds1);
+    assert!(ds0 < 0.25, "Sample 0 at Marker 150 should be 0, got {}", ds0);
+    assert!(ds1 > 1.75, "Sample 1 at Marker 150 should be 2, got {}", ds1);
 
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);

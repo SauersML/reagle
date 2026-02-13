@@ -7631,7 +7631,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
                     return d;
                 }
@@ -7729,7 +7729,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(gt) = hard_call {
                     return gt;
                 }
@@ -7830,7 +7830,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                     return (a1 as f32, a2 as f32);
                 }
@@ -8434,7 +8434,10 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
