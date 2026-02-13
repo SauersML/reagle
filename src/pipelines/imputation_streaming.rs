@@ -6373,8 +6373,10 @@ impl crate::pipelines::ImputationPipeline {
 
                             let mut seg_state_priors: Option<Vec<f32>> = None;
                             let mut seg_boundary_mapped = false;
+                            let mut seg_had_nonempty_prior = false;
                             if let Some(p) = chained_priors.as_ref() {
                                 if !p.is_empty() {
+                                    seg_had_nonempty_prior = true;
                                     let has_entry_pi =
                                         build_entry_pi(&state_haps, donors, &mut mapped_entry_pi_buf);
                                     let entry_pi = if has_entry_pi {
@@ -6420,8 +6422,28 @@ impl crate::pipelines::ImputationPipeline {
                                         }
                                         seg_state_priors = Some(mapped_priors_buf.clone());
                                         seg_boundary_mapped = true;
+                                    } else {
+                                        return Err(ReagleError::vcf(format!(
+                                            "Piecewise boundary mapping collapsed: window={} sample={} hap={} segment=[{}..{}) next_states={}",
+                                            window_idx,
+                                            s,
+                                            hap_idx.as_usize(),
+                                            seg_start,
+                                            seg_end,
+                                            state_haps.len()
+                                        )));
                                     }
                                 }
+                            }
+                            if seg_had_nonempty_prior && seg_state_priors.is_none() {
+                                return Err(ReagleError::vcf(format!(
+                                    "Piecewise boundary mapping missing prior mass: window={} sample={} hap={} segment=[{}..{})",
+                                    window_idx,
+                                    s,
+                                    hap_idx.as_usize(),
+                                    seg_start,
+                                    seg_end
+                                )));
                             }
 
                             let mut seg_offsets: Vec<usize> = Vec::with_capacity(seg_len + 1);
