@@ -451,17 +451,12 @@ fn ensure_cmd_exists(cmd: &str) {
 }
 
 fn run(cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>>) {
-    let output = Command::new(cmd)
+    let status = Command::new(cmd)
         .args(args)
-        .output()
+        .status()
         .unwrap_or_else(|e| panic!("failed to execute {cmd}: {e}"));
-    if !output.status.success() {
-        panic!(
-            "command failed: {}\nstdout:\n{}\nstderr:\n{}",
-            cmd,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !status.success() {
+        panic!("command failed: {} (status: {})", cmd, status);
     }
 }
 

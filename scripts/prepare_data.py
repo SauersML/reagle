@@ -6,6 +6,13 @@ import shutil
 import shlex
 import gzip
 import tempfile
+import json
+import tarfile
+import zipfile
+import platform
+import stat
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from pathlib import Path
 
 PANEL_BCF_URL = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf"
@@ -167,8 +174,155 @@ def _clear_convert_genome_cache():
             shutil.rmtree(path)
 
 
+def _github_json(url: str, timeout: int = 30):
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "reagle-prepare-data",
+        },
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _platform_asset_tokens():
+    sysname = platform.system().lower()
+    machine = platform.machine().lower()
+    os_tokens = []
+    arch_tokens = []
+
+    if sysname.startswith("linux"):
+        os_tokens.extend(["linux"])
+    elif sysname.startswith("darwin"):
+        os_tokens.extend(["darwin", "mac", "macos", "osx"])
+    elif sysname.startswith("windows"):
+        os_tokens.extend(["windows", "win"])
+    else:
+        os_tokens.extend([sysname])
+
+    if machine in ("x86_64", "amd64"):
+        arch_tokens.extend(["x86_64", "amd64", "x64"])
+    elif machine in ("aarch64", "arm64"):
+        arch_tokens.extend(["aarch64", "arm64"])
+    else:
+        arch_tokens.extend([machine])
+
+    return os_tokens, arch_tokens
+
+
+def _select_convert_genome_asset(assets):
+    os_tokens, arch_tokens = _platform_asset_tokens()
+    scored = []
+    for asset in assets:
+        name = asset.get("name", "").lower()
+        if not name:
+            continue
+        if not any(tok in name for tok in os_tokens):
+            continue
+        if not any(tok in name for tok in arch_tokens):
+            continue
+        if not (name.endswith(".tar.gz") or name.endswith(".tgz") or name.endswith(".zip")):
+            continue
+        score = 0
+        if "convert_genome" in name:
+            score += 4
+        if name.endswith(".tar.gz") or name.endswith(".tgz"):
+            score += 2
+        if "musl" in name:
+            score += 1
+        scored.append((score, asset))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
+def _download_to(url: str, dest: Path):
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "reagle-prepare-data",
+        },
+    )
+    with urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
+        shutil.copyfileobj(resp, out)
+
+
+def _find_convert_genome_in_tree(root: Path):
+    candidates = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        base = path.name.lower()
+        if base == "convert_genome" or base == "convert_genome.exe":
+            candidates.append(path)
+    if candidates:
+        candidates.sort(key=lambda p: len(p.parts))
+        return candidates[0]
+    return None
+
+
+def _install_convert_genome_from_release():
+    release = _github_json("https://api.github.com/repos/SauersML/convert_genome/releases/latest")
+    assets = release.get("assets", [])
+    if not assets:
+        raise RuntimeError("No release assets found for convert_genome.")
+    asset = _select_convert_genome_asset(assets)
+    if asset is None:
+        names = ", ".join(a.get("name", "") for a in assets)
+        raise RuntimeError(f"No matching convert_genome asset for this platform. Assets: {names}")
+
+    asset_name = asset.get("name", "")
+    asset_url = asset.get("browser_download_url", "")
+    if not asset_name or not asset_url:
+        raise RuntimeError("Selected convert_genome asset is missing name or download URL.")
+
+    home = Path.home()
+    install_dir = home / ".local" / "bin"
+    install_dir.mkdir(parents=True, exist_ok=True)
+    target_bin = install_dir / ("convert_genome.exe" if platform.system().lower().startswith("windows") else "convert_genome")
+
+    with tempfile.TemporaryDirectory(prefix="convert_genome_install_") as td:
+        tmpdir = Path(td)
+        archive_path = tmpdir / asset_name
+        print(f"Downloading convert_genome release asset: {asset_name}")
+        _download_to(asset_url, archive_path)
+        if archive_path.stat().st_size == 0:
+            raise RuntimeError(f"Downloaded empty archive from {asset_url}")
+
+        unpack_dir = tmpdir / "unpack"
+        unpack_dir.mkdir(parents=True, exist_ok=True)
+
+        lower_name = asset_name.lower()
+        if lower_name.endswith(".zip"):
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extractall(unpack_dir)
+        else:
+            if not tarfile.is_tarfile(archive_path):
+                raise RuntimeError(
+                    f"Downloaded asset is not a valid tar archive: {archive_path}"
+                )
+            with tarfile.open(archive_path, "r:*") as tf:
+                tf.extractall(unpack_dir)
+
+        extracted_bin = _find_convert_genome_in_tree(unpack_dir)
+        if extracted_bin is None:
+            raise RuntimeError(
+                f"Could not find convert_genome binary after extracting {asset_name}"
+            )
+
+        shutil.copy2(extracted_bin, target_bin)
+        mode = target_bin.stat().st_mode
+        target_bin.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    os.environ["PATH"] = str(install_dir) + os.pathsep + os.environ["PATH"]
+    return str(target_bin)
+
+
 def install_convert_genome():
-    """Installs convert_genome using the official install script (pre-compiled binary)."""
+    """Installs convert_genome from GitHub release assets (no shell installer piping)."""
     existing = shutil.which("convert_genome")
     if existing:
         try:
@@ -185,13 +339,23 @@ def install_convert_genome():
     else:
         print("convert_genome not found; installing...")
 
-    install_script_url = "https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh"
-    subprocess.check_call(["bash", "-c", f"curl -fsSL {install_script_url} | bash"])
+    try:
+        installed = _install_convert_genome_from_release()
+    except (URLError, HTTPError, OSError, RuntimeError, zipfile.BadZipFile, tarfile.TarError) as e:
+        raise RuntimeError(f"Failed installing convert_genome from GitHub release assets: {e}") from e
 
-    home = os.path.expanduser("~")
-    local_bin = os.path.join(home, ".local", "bin")
-    if local_bin not in os.environ["PATH"]:
-        os.environ["PATH"] = local_bin + os.pathsep + os.environ["PATH"]
+    if shutil.which("convert_genome") is None:
+        home = os.path.expanduser("~")
+        local_bin = os.path.join(home, ".local", "bin")
+        if local_bin not in os.environ["PATH"]:
+            os.environ["PATH"] = local_bin + os.pathsep + os.environ["PATH"]
+
+    subprocess.check_call(
+        ["convert_genome", "--help"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"convert_genome installed: {installed}")
 
 
 def prepare_input_file(input_path):
