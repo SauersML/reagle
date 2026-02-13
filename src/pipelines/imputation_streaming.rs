@@ -349,6 +349,12 @@ fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
 }
 
 #[inline]
+fn exact_match_weight(freq: f32, min_freq: f32) -> f32 {
+    let p = freq.max(min_freq);
+    -p.ln()
+}
+
+#[inline]
 fn blend_haplotype_priors(
     p_keep: &HaplotypePriors,
     p_swap: &HaplotypePriors,
@@ -961,7 +967,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             if freq <= 0.0 {
                 continue;
             }
-            let weight = prescan_match_weight(freq, min_freq);
+            let weight = exact_match_weight(freq, min_freq);
             if weight <= 0.0 {
                 continue;
             }
