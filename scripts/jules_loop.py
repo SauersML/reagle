@@ -18,6 +18,8 @@ This should guide our decision-making. This happens through taking proper long-t
 Well, better phasing and imputation leads to downstream better, e.g., predictive power for disease prediction, disease associations, science, etc., which improve lives tangibly.
 This means we must always do what is best for real-world accuracy and performance.
 
+Do not edit tests, loosen thresholds, or edit constants.
+
 Large changes are not bad (bigness of change is orthogonal to goodness), and should not be avoided. We don’t care about backwards compatibility.
 Model changes or algorithm changes are not bad.
 Instead of having a bias towards the status quo, we should have a bias for what is most likely to be correct when reasoning from first principles.
