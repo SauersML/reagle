@@ -4257,6 +4257,7 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
         }
+        let handoff_recomb_rate = p_recomb.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
         // Only consume overlap priors when their anchor marker is physically
         // compatible with the current window. This prevents seam drift from
@@ -4391,7 +4392,12 @@ impl crate::pipelines::ImputationPipeline {
                         if next_states.is_empty() {
                             out.push(None);
                         } else {
-                            out.push(Some(TransitionMatrix::build(&prev_states, next_states)));
+                            out.push(Some(TransitionMatrix::build(
+                                &prev_states,
+                                next_states,
+                                handoff_recomb_rate,
+                                plan.n_ref_haps,
+                            )));
                         }
                     } else {
                         out.push(None);
@@ -5739,7 +5745,45 @@ impl crate::pipelines::ImputationPipeline {
                 };
 
                 let mut mapped_priors_buf: Vec<f32> = Vec::new();
+                let mut mapped_entry_pi_buf: Vec<f32> = Vec::new();
                 let mut prev_states_buf: Vec<RefHapId> = Vec::new();
+                let build_entry_pi =
+                    |state_haps: &[RefHapId],
+                     donors: &[(RefHapId, u32)],
+                     out: &mut Vec<f32>|
+                     -> bool {
+                        if state_haps.is_empty() {
+                            return false;
+                        }
+                        out.clear();
+                        out.resize(state_haps.len(), 0.0);
+                        let mut donor_weight: std::collections::HashMap<RefHapId, f32> =
+                            std::collections::HashMap::with_capacity(donors.len() * 2);
+                        for &(hap, c) in donors {
+                            let w = c as f32;
+                            if w > 0.0 && w.is_finite() {
+                                donor_weight
+                                    .entry(hap)
+                                    .and_modify(|v| *v += w)
+                                    .or_insert(w);
+                            }
+                        }
+                        let mut sum = 0.0f32;
+                        for (i, &hap) in state_haps.iter().enumerate() {
+                            let w = donor_weight.get(&hap).copied().unwrap_or(0.0);
+                            out[i] = w;
+                            sum += w;
+                        }
+                        if sum > 0.0 {
+                            let inv = 1.0 / sum;
+                            for v in out.iter_mut() {
+                                *v *= inv;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    };
                 let exact_no_info_posteriors =
                     |hap_idx: HapIdx,
                      donors: &[(RefHapId, u32)],
@@ -5978,20 +6022,40 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             None
                         } else {
+                            let has_entry_pi =
+                                build_entry_pi(&state_haps, donors, &mut mapped_entry_pi_buf);
+                            let entry_pi = if has_entry_pi {
+                                Some(mapped_entry_pi_buf.as_slice())
+                            } else {
+                                None
+                            };
                             let mapper = prior_mappers_by_hap
                                 .as_ref()
                                 .and_then(|v| v.get(hap_idx.as_usize()))
                                 .and_then(|m| m.as_ref());
                             if let Some(mapper) = mapper {
-                                mapper.map_into(p.probs(), &mut mapped_priors_buf);
+                                mapper.map_into_with_pi(
+                                    p.probs(),
+                                    entry_pi,
+                                    &mut mapped_priors_buf,
+                                );
                             } else {
                                 prev_states_buf.clear();
                                 prev_states_buf.reserve(p.ids().len());
                                 for id in p.ids() {
                                     prev_states_buf.push(RefHapId::new(id.0));
                                 }
-                                let mapper = TransitionMatrix::build(&prev_states_buf, &state_haps);
-                                mapper.map_into(p.probs(), &mut mapped_priors_buf);
+                                let mapper = TransitionMatrix::build(
+                                    &prev_states_buf,
+                                    &state_haps,
+                                    handoff_recomb_rate,
+                                    plan.n_ref_haps,
+                                );
+                                mapper.map_into_with_pi(
+                                    p.probs(),
+                                    entry_pi,
+                                    &mut mapped_priors_buf,
+                                );
                             }
                             let mut sum = 0.0f32;
                             for v in mapped_priors_buf.iter() {
