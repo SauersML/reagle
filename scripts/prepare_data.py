@@ -256,7 +256,7 @@ def _find_convert_genome_in_tree(root: Path):
         if not path.is_file():
             continue
         base = path.name.lower()
-        if base == "convert_genome" or base == "convert_genome.exe":
+        if base == "convert_genome" or base == "convert_genome.exe" or base.startswith("convert_genome"):
             candidates.append(path)
     if candidates:
         candidates.sort(key=lambda p: len(p.parts))
