@@ -321,7 +321,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.01 + 0.22 * missing_ramp;
+    let floor = 0.01 + 0.05 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
 }
 
@@ -340,12 +340,6 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
     (min_k as f32 + span * u)
         .round()
         .clamp(min_k as f32, max_k as f32) as usize
-}
-
-#[inline]
-fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
-    let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
 }
 
 #[inline]
@@ -1156,10 +1150,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
+                let weight = -(freq.max(min_freq)).ln();
                 pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
@@ -1242,10 +1233,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
+                let weight = -(freq.max(min_freq)).ln();
                 pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
@@ -7628,7 +7616,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed && !correct_errors {
+            if !is_imputed {
                 if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
                     return d;
                 }
@@ -7726,7 +7714,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed && !correct_errors {
+            if !is_imputed {
                 if let Some(gt) = hard_call {
                     return gt;
                 }
@@ -7827,7 +7815,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
-            if !is_imputed && !correct_errors {
+            if !is_imputed {
                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                     return (a1 as f32, a2 as f32);
                 }

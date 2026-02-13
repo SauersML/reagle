@@ -169,6 +169,7 @@ def _clear_convert_genome_cache():
 
 def install_convert_genome():
     """Installs convert_genome using the official install script (pre-compiled binary)."""
+    # Ensure fresh install to avoid stale/broken binaries
     existing = shutil.which("convert_genome")
     if existing:
         try:
