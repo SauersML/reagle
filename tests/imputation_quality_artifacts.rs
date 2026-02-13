@@ -1043,16 +1043,31 @@ fn stage_required_inputs(reference_dir: &Path, outputs_dir: &Path, work_dir: &Pa
 
     let ref_src = find_file_recursive(reference_dir, "ref.vcf.gz")
         .expect("ref.vcf.gz not found in downloaded artifacts");
-    copy_with_index(&ref_src, &dataset_dir.join("ref.vcf.gz"));
+    let ref_dst = dataset_dir.join("ref.vcf.gz");
+    copy_with_index(&ref_src, &ref_dst);
+    run(
+        "bcftools",
+        ["index", "-f", ref_dst.to_str().expect("ref path utf8")],
+    );
 
     let input_src = find_file_recursive(outputs_dir, "target.vcf.gz")
         .or_else(|| find_file_recursive(outputs_dir, "input.vcf.gz"))
         .expect("target.vcf.gz/input.vcf.gz not found in downloaded artifacts");
-    copy_with_index(&input_src, &dataset_dir.join("input.vcf.gz"));
+    let input_dst = dataset_dir.join("input.vcf.gz");
+    copy_with_index(&input_src, &input_dst);
+    run(
+        "bcftools",
+        ["index", "-f", input_dst.to_str().expect("input path utf8")],
+    );
 
     let truth_src = find_file_recursive(outputs_dir, "truth.vcf.gz")
         .expect("truth.vcf.gz not found in downloaded artifacts");
-    copy_with_index(&truth_src, &dataset_dir.join("truth.vcf.gz"));
+    let truth_dst = dataset_dir.join("truth.vcf.gz");
+    copy_with_index(&truth_src, &truth_dst);
+    run(
+        "bcftools",
+        ["index", "-f", truth_dst.to_str().expect("truth path utf8")],
+    );
 }
 
 fn copy_with_index(src_vcf: &Path, dst_vcf: &Path) {
