@@ -321,7 +321,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.01 + 0.22 * missing_ramp;
+    let floor = 0.01 + 0.01 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
 }
 
@@ -5947,24 +5947,34 @@ impl crate::pipelines::ImputationPipeline {
                 let mut hap_alt_probs = (hap1_alt_probs, hap2_alt_probs);
                 if let Some(writer) = alt_prob_store_writer.as_ref() {
                     if let Some(values) = hap_alt_probs.0.as_ref() {
+                        let slice = if values.len() == output_markers {
+                            values.as_slice()
+                        } else {
+                            &values[output_start..output_end]
+                        };
                         AltProbDiskStoreBuilder::write_hap_probs_at(
                             writer.as_ref(),
                             n_target_samples,
                             output_markers,
                             s,
                             0,
-                            values,
+                            slice,
                         )?;
                         hap_alt_probs.0 = None;
                     }
                     if let Some(values) = hap_alt_probs.1.as_ref() {
+                        let slice = if values.len() == output_markers {
+                            values.as_slice()
+                        } else {
+                            &values[output_start..output_end]
+                        };
                         AltProbDiskStoreBuilder::write_hap_probs_at(
                             writer.as_ref(),
                             n_target_samples,
                             output_markers,
                             s,
                             1,
-                            values,
+                            slice,
                         )?;
                         hap_alt_probs.1 = None;
                     }
@@ -6695,24 +6705,34 @@ impl crate::pipelines::ImputationPipeline {
 
             if let Some(writer) = alt_prob_store_writer.as_ref() {
                 if let Some(values) = item.result.hap_alt_probs.0.as_ref() {
+                    let slice = if values.len() == output_markers {
+                        values.as_slice()
+                    } else {
+                        &values[output_start..output_end]
+                    };
                     AltProbDiskStoreBuilder::write_hap_probs_at(
                         writer.as_ref(),
                         n_target_samples,
                         output_markers,
                         sample_idx,
                         0,
-                        values,
+                        slice,
                     )?;
                     item.result.hap_alt_probs.0 = None;
                 }
                 if let Some(values) = item.result.hap_alt_probs.1.as_ref() {
+                    let slice = if values.len() == output_markers {
+                        values.as_slice()
+                    } else {
+                        &values[output_start..output_end]
+                    };
                     AltProbDiskStoreBuilder::write_hap_probs_at(
                         writer.as_ref(),
                         n_target_samples,
                         output_markers,
                         sample_idx,
                         1,
-                        values,
+                        slice,
                     )?;
                     item.result.hap_alt_probs.1 = None;
                 }
