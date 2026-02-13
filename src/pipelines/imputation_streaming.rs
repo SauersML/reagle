@@ -708,7 +708,7 @@ fn add_typed_anchor_sampling<SpaceA, SpaceB>(
     }
 }
 
-fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> Vec<f64> {
+fn window_boundaries_from_handoff(handoff: &[(f64, f64)]) -> Vec<f64> {
     if handoff.len() < 2 {
         return Vec::new();
     }
@@ -716,9 +716,9 @@ fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> V
     for i in 0..handoff.len() - 1 {
         let (prev_start, _) = handoff[i];
         let (next_start, _) = handoff[i + 1];
-        // Use output-start step in cM so overlap geometry does not collapse
-        // distances to a clamped constant.
-        let dist = (next_start - prev_start).abs().max(min_step_cm);
+        // Preserve true planning-grid geometry for continuity penalties.
+        // Only apply epsilon flooring for numerical stability.
+        let dist = (next_start - prev_start).abs().max(1e-12);
         out.push(dist);
     }
     out
@@ -731,31 +731,75 @@ fn build_planning_grid_from_handoff(
     if io_handoff.is_empty() {
         return (Vec::new(), Vec::new());
     }
+    let mut min_start = f64::INFINITY;
+    let mut max_end = f64::NEG_INFINITY;
+    for &(s, e) in io_handoff {
+        if s.is_finite() && e.is_finite() {
+            min_start = min_start.min(s.min(e));
+            max_end = max_end.max(s.max(e));
+        }
+    }
+    if !min_start.is_finite() || !max_end.is_finite() || max_end <= min_start {
+        let mut fallback_windows = Vec::with_capacity(io_handoff.len());
+        let mut fallback_ranges = Vec::with_capacity(io_handoff.len());
+        for (i, &(s, e)) in io_handoff.iter().enumerate() {
+            fallback_windows.push((s, e));
+            fallback_ranges.push((i, i + 1));
+        }
+        return (fallback_windows, fallback_ranges);
+    }
+
     let mut planning = Vec::new();
     let mut io_to_plan = Vec::with_capacity(io_handoff.len());
     let lambda_target = recomb_lambda_from_p(PLANNING_TARGET_SWITCH_PROB as f32).max(1e-9);
+    let intensity = (params.recomb_intensity as f64).max(1e-12);
+    // lambda = intensity * dist_morgans = intensity * (dist_cm / 100)
+    let step_cm = (lambda_target * 100.0 / intensity).max(1e-9);
+    let mut cur = min_start;
+    while cur < max_end {
+        let next = (cur + step_cm).min(max_end);
+        planning.push((cur, next));
+        cur = next;
+    }
+    if planning.is_empty() {
+        planning.push((min_start, max_end));
+    }
 
     for &(start_raw, end_raw) in io_handoff {
-        let plan_start = planning.len();
         let s = start_raw.min(end_raw);
         let e = start_raw.max(end_raw);
-        let span_cm = e - s;
-        if !s.is_finite() || !e.is_finite() || span_cm <= 0.0 {
-            planning.push((start_raw, end_raw));
-            io_to_plan.push((plan_start, planning.len()));
+        if !s.is_finite() || !e.is_finite() || e <= s {
+            let fallback_idx = 0usize;
+            io_to_plan.push((fallback_idx, (fallback_idx + 1).min(planning.len())));
             continue;
         }
-        // Use the same Li-Stephens transition model as the HMM:
-        //   r = p_recomb(span_cm), lambda = -ln(1-r).
-        // This sizes planning windows by hazard budget instead of fixed cM.
-        let interval_lambda = recomb_lambda_from_p(params.p_recomb(span_cm));
-        let n_sub = ((interval_lambda / lambda_target).ceil() as usize).max(1);
-        for k in 0..n_sub {
-            let a = s + span_cm * (k as f64) / (n_sub as f64);
-            let b = s + span_cm * ((k + 1) as f64) / (n_sub as f64);
-            planning.push((a, b));
+        let mut first = usize::MAX;
+        let mut last_excl = 0usize;
+        for (pidx, &(ps, pe)) in planning.iter().enumerate() {
+            if pe <= s || ps >= e {
+                continue;
+            }
+            if first == usize::MAX {
+                first = pidx;
+            }
+            last_excl = pidx + 1;
         }
-        io_to_plan.push((plan_start, planning.len()));
+        if first == usize::MAX || last_excl <= first {
+            let io_mid = 0.5 * (s + e);
+            let mut best_idx = 0usize;
+            let mut best_dist = f64::INFINITY;
+            for (pidx, &(ps, pe)) in planning.iter().enumerate() {
+                let mid = 0.5 * (ps + pe);
+                let d = (mid - io_mid).abs();
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = pidx;
+                }
+            }
+            io_to_plan.push((best_idx, best_idx + 1));
+        } else {
+            io_to_plan.push((first, last_excl));
+        }
     }
 
     (planning, io_to_plan)
@@ -763,19 +807,48 @@ fn build_planning_grid_from_handoff(
 
 fn distribute_scores_to_planning_bins(
     per_io_scores: &[(usize, f32)],
+    io_start_raw: f64,
+    io_end_raw: f64,
     plan_start: usize,
     plan_end: usize,
+    planning_handoff: &[(f64, f64)],
     planning_scores: &mut [Vec<(usize, f32)>],
 ) {
     if plan_start >= plan_end || plan_end > planning_scores.len() || per_io_scores.is_empty() {
         return;
     }
-    let bins = (plan_end - plan_start) as f32;
-    if bins <= 0.0 {
+    if plan_end > planning_handoff.len() {
         return;
     }
-    let scale = 1.0 / bins;
+    let io_start = io_start_raw.min(io_end_raw);
+    let io_end = io_start_raw.max(io_end_raw);
+    let mut overlap_weights = vec![0.0f32; plan_end - plan_start];
+    let mut total_overlap = 0.0f32;
+    if io_start.is_finite() && io_end.is_finite() && io_end > io_start {
+        for p in plan_start..plan_end {
+            let (ps, pe) = planning_handoff[p];
+            let s = ps.min(pe);
+            let e = ps.max(pe);
+            let overlap = (io_end.min(e) - io_start.max(s)).max(0.0);
+            let w = overlap as f32;
+            overlap_weights[p - plan_start] = w;
+            total_overlap += w;
+        }
+    }
+    if total_overlap <= 0.0 {
+        let uniform = 1.0f32 / (plan_end - plan_start) as f32;
+        overlap_weights.fill(uniform);
+    } else {
+        let inv = 1.0 / total_overlap;
+        for w in overlap_weights.iter_mut() {
+            *w *= inv;
+        }
+    }
     for p in plan_start..plan_end {
+        let scale = overlap_weights[p - plan_start];
+        if scale <= 0.0 || !scale.is_finite() {
+            continue;
+        }
         for &(hap, score) in per_io_scores {
             let v = score * scale;
             if v.is_finite() && v > 0.0 {
@@ -2509,6 +2582,10 @@ fn build_imputation_plan(
                         .get(window_idx)
                         .copied()
                         .unwrap_or((0, planning_num_windows.min(1)));
+                    let (io_s, io_e) = window_handoff
+                        .get(window_idx)
+                        .copied()
+                        .unwrap_or((f64::NAN, f64::NAN));
                     for i in 0..batch_len {
                         let top_m = per_window_cap_window
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
@@ -2517,8 +2594,11 @@ fn build_imputation_plan(
                         let top = select_top_k(&window_scores[i], top_m);
                         distribute_scores_to_planning_bins(
                             &top,
+                            io_s,
+                            io_e,
                             plan_start,
                             plan_end,
+                            &planning_handoff,
                             &mut scores_by_window[i],
                         );
                     }
@@ -2726,6 +2806,10 @@ fn build_imputation_plan(
                         .get(window_idx)
                         .copied()
                         .unwrap_or((0, planning_num_windows.min(1)));
+                    let (io_s, io_e) = window_handoff
+                        .get(window_idx)
+                        .copied()
+                        .unwrap_or((f64::NAN, f64::NAN));
                     for i in 0..batch_len {
                         let top_m = per_window_cap_window
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
@@ -2734,8 +2818,11 @@ fn build_imputation_plan(
                         let top = select_top_k(&window_scores[i], top_m);
                         distribute_scores_to_planning_bins(
                             &top,
+                            io_s,
+                            io_e,
                             plan_start,
                             plan_end,
+                            &planning_handoff,
                             &mut scores_by_window[i],
                         );
                     }
@@ -2753,8 +2840,7 @@ fn build_imputation_plan(
             aggregate_window_sparse_scores(ws);
         }
 
-        let min_step_cm = (streaming_config.overlap_cm as f64).max(imp_step_cm).max(1e-6);
-        let boundary_cm = window_boundaries_from_handoff(&planning_handoff, min_step_cm);
+        let boundary_cm = window_boundaries_from_handoff(&planning_handoff);
         if !per_window_caps.is_empty() && per_window_caps.len() != window_handoff.len() {
             return Err(ReagleError::vcf(format!(
                 "Per-window cap length mismatch (caps={}, bounds={})",
