@@ -880,6 +880,10 @@ fn test_simulated_chip_density() {
     config.out = out_prefix.clone();
     config.ne = 10000.0;
     config.window = 20.0; // Large window
+    // Use larger cluster parameter to reduce smoothing for this sparse test case.
+    // Smoothing intensity scales with (BASE / cluster), so increasing cluster
+    // decreases the decay rate, allowing the model to bridge sparse markers.
+    config.cluster = 0.02;
     config.nthreads = Some(1);
 
     let mut pipeline = ImputationPipeline::new(config, None);
