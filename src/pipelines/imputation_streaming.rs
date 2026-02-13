@@ -163,6 +163,22 @@ const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
+// Planning-grid target in hazard space. We target ~1% recombination/switch
+// probability per planning window, then split each I/O interval so the
+// cumulative Li-Stephens hazard per planning segment stays near this budget.
+const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
+
+#[inline]
+fn recomb_lambda_from_p(p: f32) -> f64 {
+    let p = p as f64;
+    if p <= 0.0 {
+        0.0
+    } else if p >= 1.0 {
+        f64::INFINITY
+    } else {
+        -(1.0 - p).ln()
+    }
+}
 
 #[inline]
 fn compute_abyss_rank_cutoff(
@@ -710,71 +726,36 @@ fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> V
 
 fn build_planning_grid_from_handoff(
     io_handoff: &[(f64, f64)],
-    planning_step_cm: f64,
+    params: &ModelParams,
 ) -> (Vec<(f64, f64)>, Vec<(usize, usize)>) {
     if io_handoff.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    let mut min_start = f64::INFINITY;
-    let mut max_end = f64::NEG_INFINITY;
-    for &(s, e) in io_handoff {
-        if s.is_finite() && e.is_finite() {
-            min_start = min_start.min(s.min(e));
-            max_end = max_end.max(s.max(e));
-        }
-    }
-    if !min_start.is_finite() || !max_end.is_finite() || max_end <= min_start {
-        let mut fallback_ranges = Vec::with_capacity(io_handoff.len());
-        for i in 0..io_handoff.len() {
-            fallback_ranges.push((i, i + 1));
-        }
-        let fallback_windows: Vec<(f64, f64)> = io_handoff.to_vec();
-        return (fallback_windows, fallback_ranges);
-    }
-
-    let step = planning_step_cm.max(1e-6);
     let mut planning = Vec::new();
-    let mut cur = min_start;
-    while cur < max_end {
-        let next = (cur + step).min(max_end);
-        planning.push((cur, next));
-        cur = next;
-    }
-    if planning.is_empty() {
-        planning.push((min_start, max_end));
-    }
-
     let mut io_to_plan = Vec::with_capacity(io_handoff.len());
-    for &(io_s_raw, io_e_raw) in io_handoff {
-        let io_s = io_s_raw.min(io_e_raw);
-        let io_e = io_s_raw.max(io_e_raw);
-        let mut first = usize::MAX;
-        let mut last_excl = 0usize;
-        for (pidx, &(ps, pe)) in planning.iter().enumerate() {
-            if pe <= io_s || ps >= io_e {
-                continue;
-            }
-            if first == usize::MAX {
-                first = pidx;
-            }
-            last_excl = pidx + 1;
+    let lambda_target = recomb_lambda_from_p(PLANNING_TARGET_SWITCH_PROB as f32).max(1e-9);
+
+    for &(start_raw, end_raw) in io_handoff {
+        let plan_start = planning.len();
+        let s = start_raw.min(end_raw);
+        let e = start_raw.max(end_raw);
+        let span_cm = e - s;
+        if !s.is_finite() || !e.is_finite() || span_cm <= 0.0 {
+            planning.push((start_raw, end_raw));
+            io_to_plan.push((plan_start, planning.len()));
+            continue;
         }
-        if first == usize::MAX || last_excl <= first {
-            let io_mid = 0.5 * (io_s + io_e);
-            let mut best_idx = 0usize;
-            let mut best_dist = f64::INFINITY;
-            for (pidx, &(ps, pe)) in planning.iter().enumerate() {
-                let mid = 0.5 * (ps + pe);
-                let d = (mid - io_mid).abs();
-                if d < best_dist {
-                    best_dist = d;
-                    best_idx = pidx;
-                }
-            }
-            io_to_plan.push((best_idx, best_idx + 1));
-        } else {
-            io_to_plan.push((first, last_excl));
+        // Use the same Li-Stephens transition model as the HMM:
+        //   r = p_recomb(span_cm), lambda = -ln(1-r).
+        // This sizes planning windows by hazard budget instead of fixed cM.
+        let interval_lambda = recomb_lambda_from_p(params.p_recomb(span_cm));
+        let n_sub = ((interval_lambda / lambda_target).ceil() as usize).max(1);
+        for k in 0..n_sub {
+            let a = s + span_cm * (k as f64) / (n_sub as f64);
+            let b = s + span_cm * ((k + 1) as f64) / (n_sub as f64);
+            planning.push((a, b));
         }
+        io_to_plan.push((plan_start, planning.len()));
     }
 
     (planning, io_to_plan)
@@ -2037,9 +2018,8 @@ fn build_imputation_plan(
     plan.n_ref_haps = n_ref_haps;
     let window_handoff = ref_data.window_handoff();
     let per_window_caps = ref_data.per_window_caps();
-    let planning_step_cm = 1.0f64.max(imp_step_cm);
     let (planning_handoff, io_to_planning_ranges) =
-        build_planning_grid_from_handoff(window_handoff, planning_step_cm);
+        build_planning_grid_from_handoff(window_handoff, params);
     let planning_num_windows = planning_handoff.len();
     if planning_num_windows == 0 {
         return Err(ReagleError::vcf(
