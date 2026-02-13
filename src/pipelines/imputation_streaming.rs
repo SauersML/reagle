@@ -343,6 +343,12 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 }
 
 #[inline]
+fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
+    let p = freq.clamp(min_freq, 1.0 - min_freq);
+    ((1.0 - p) / p).ln().max(0.0)
+}
+
+#[inline]
 fn blend_haplotype_priors(
     p_keep: &HaplotypePriors,
     p_swap: &HaplotypePriors,
@@ -955,7 +961,10 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             if freq <= 0.0 {
                 continue;
             }
-            let weight = -(freq.max(min_freq)).ln();
+            let weight = prescan_match_weight(freq, min_freq);
+            if weight <= 0.0 {
+                continue;
+            }
             let bins = ref_bins.get(targ_idx);
             let Some(bins) = bins else { continue };
             for &i in rows {
@@ -1150,7 +1159,10 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
@@ -1233,7 +1245,10 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
