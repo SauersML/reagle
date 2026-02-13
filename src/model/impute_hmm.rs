@@ -575,7 +575,7 @@ pub struct ImputeWorkspace {
     emission_by_allele: Vec<f32>,
     nearest_obs_fwd: Vec<f32>,
     nearest_obs_bwd: Vec<f32>,
-    nearest_obs_lambda: Vec<f32>,
+    nearest_obs_retain: Vec<f32>,
     affine_window_cache: Option<AffineWindowCache>,
     pattern_sum_f: Vec<f32>,
     pattern_sum_b: Vec<f32>,
@@ -706,7 +706,7 @@ impl ImputeWorkspace {
             emission_by_allele: Vec::new(),
             nearest_obs_fwd: Vec::new(),
             nearest_obs_bwd: Vec::new(),
-            nearest_obs_lambda: Vec::new(),
+            nearest_obs_retain: Vec::new(),
             affine_window_cache: None,
             pattern_sum_f: Vec::new(),
             pattern_sum_b: Vec::new(),
@@ -1299,8 +1299,8 @@ fn compute_nearest_observed_lambda(
     if ws.nearest_obs_bwd.len() < n {
         ws.nearest_obs_bwd.resize(n, f32::INFINITY);
     }
-    if ws.nearest_obs_lambda.len() < n {
-        ws.nearest_obs_lambda.resize(n, 0.0);
+    if ws.nearest_obs_retain.len() < n {
+        ws.nearest_obs_retain.resize(n, 0.0);
     }
     ws.nearest_obs_fwd[..n].fill(f32::INFINITY);
     ws.nearest_obs_bwd[..n].fill(f32::INFINITY);
@@ -1329,28 +1329,68 @@ fn compute_nearest_observed_lambda(
         ws.nearest_obs_bwd[m_rev] = dist;
     }
 
-    // Larger cluster distance means slower information decay, so lambda should
-    // shrink (less smoothing pressure) as cluster grows.
+    // Map-distance retain used for output-regularization decisions.
+    //
+    // Interpretation:
+    // - nearest_obs_fwd/bwd accumulate recombination hazard lambda from typed
+    //   anchors to marker m using lambda = -ln(1-p_recomb).
+    // - side retain is r = exp(-lambda), i.e. probability-like survival of
+    //   anchor influence under a Poisson recombination intuition.
+    //
+    // This is not "approximation error"; it is physical map-distance decay.
+    // approximation/truncation diagnostics are handled separately downstream.
+    //
+    // cluster_scale is a global calibration term for map-distance hazard.
     let cluster_scale = (BASE_CLUSTER_CM / smoothing_cluster_cm.max(1e-6)).max(0.0);
     const MIN_SAME_POS_LAMBDA: f32 = 0.05;
     for m in 0..n {
         let left = ws.nearest_obs_fwd[m];
         let right = ws.nearest_obs_bwd[m];
-        let mut raw_lambda = if left.is_finite() && right.is_finite() {
-            // In an untyped interval bracketed by typed anchors, uncertainty is
-            // governed by the full bracket span rather than the nearest side.
-            left + right
+        let observed = target_probs.is_observed_marker(m);
+        let mut left_lambda = if left.is_finite() {
+            (left * cluster_scale).max(0.0)
         } else {
-            left.min(right)
+            f32::INFINITY
         };
-        if raw_lambda == 0.0 && !target_probs.is_observed_marker(m) {
-            raw_lambda = MIN_SAME_POS_LAMBDA;
+        let mut right_lambda = if right.is_finite() {
+            (right * cluster_scale).max(0.0)
+        } else {
+            f32::INFINITY
+        };
+
+        // Same-position untyped edge case:
+        // avoid literal retain=1.0 from zero hazard at untyped markers that are
+        // colocated with typed anchors.
+        if !observed {
+            if left_lambda == 0.0 {
+                left_lambda = MIN_SAME_POS_LAMBDA;
+            }
+            if right_lambda == 0.0 {
+                right_lambda = MIN_SAME_POS_LAMBDA;
+            }
         }
-        ws.nearest_obs_lambda[m] = raw_lambda * cluster_scale;
-        // When no typed marker is reachable in either direction, lambda stays
-        // Infinity. smooth_allele_posteriors_subset handles this correctly:
-        // exp(-Inf) = 0 -> maximum smoothing, which is
-        // the right behavior for markers with zero LD anchor.
+
+        let left_retain = if left_lambda.is_finite() {
+            (-left_lambda).exp()
+        } else {
+            0.0
+        };
+        let right_retain = if right_lambda.is_finite() {
+            (-right_lambda).exp()
+        } else {
+            0.0
+        };
+        // Two-sided anchor union model:
+        //   rL = exp(-lambdaL), rR = exp(-lambdaR)
+        //   retain = P(left survives OR right survives)
+        //          = 1 - (1-rL)(1-rR)
+        //          = rL + rR - rL*rR
+        //
+        // Boundary behavior:
+        // - at a typed anchor on one side, corresponding r=1 -> retain=1.
+        // - if one side has no anchor (r=0), retain reduces to one-sided retain.
+        ws.nearest_obs_retain[m] =
+            (left_retain + right_retain - left_retain * right_retain).clamp(0.0, 1.0);
     }
 }
 
@@ -1358,7 +1398,8 @@ fn compute_nearest_observed_lambda(
 fn smooth_allele_posteriors_subset(
     allele_probs: &mut [f32],
     subset_prior_probs: AlleleProbsView<'_>,
-    nearest_obs_lambda: f32,
+    nearest_obs_retain: f32,
+    approximation_error: f32,
     untyped_uniform_marker: bool,
 ) {
     const MIN_RETAIN: f32 = 1e-4;
@@ -1375,10 +1416,11 @@ fn smooth_allele_posteriors_subset(
     if !untyped_uniform_marker {
         return;
     }
-    // Bayesian shrinkage based on genetic-distance information decay.
-    // Estimate effective support from the smoothing prior, not the current
-    // posterior. Using the posterior here underweights smoothing precisely in
-    // collapse cases where the posterior has already degenerated.
+    // Bayesian shrinkage toward a local prior pi on untyped/uniform markers.
+    //
+    // We estimate effective support from pi (not from current posterior p),
+    // because p can be artificially collapsed by state truncation. Using p here
+    // would suppress regularization exactly when it is most needed.
     let mut prior_sq_sum = 0.0f32;
     for &p in subset_prior_probs.iter() {
         let q = p.max(0.0);
@@ -1389,12 +1431,17 @@ fn smooth_allele_posteriors_subset(
     }
     let max_effective = allele_probs.len().max(1) as f32;
     let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
-    // WARNING: Do NOT multiply nearest_obs_lambda by a gain factor here
-    // (e.g. `* 8.0`). Amplifying lambda causes exp(-lambda*8) to decay to
-    // near-zero even for short gaps, replacing posteriors with population
-    // frequencies and destroying local LD signal. Tested in PR #746:
-    // Hellinger +0.0037 (worst of all PRs), HET accuracy -0.0025.
-    let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(MIN_RETAIN, 1.0);
+    // Retain decomposition:
+    //   dist_retain   = map-distance retain from typed anchors
+    //   approx_retain = 1 - approximation_error
+    //   retain        = dist_retain * approx_retain
+    //
+    // Multiplication encodes "both conditions must hold to trust p strongly":
+    // even if distance retain is high, truncation/missing can still reduce trust.
+    // even if approximation diagnostics look good, deep map distance still reduces trust.
+    let dist_retain = nearest_obs_retain.clamp(MIN_RETAIN, 1.0);
+    let approx_retain = (1.0 - approximation_error.clamp(0.0, 0.9999)).clamp(MIN_RETAIN, 1.0);
+    let retain = (dist_retain * approx_retain).clamp(MIN_RETAIN, 1.0);
     // Entropy-aware confidence gating: when posterior entropy is much lower
     // than the local-prior entropy, the state subset is likely overconfident.
     // Increase smoothing in that regime to reduce sparse-subset collapse.
@@ -1414,6 +1461,21 @@ fn smooth_allele_posteriors_subset(
     let max_entropy = (allele_probs.len().max(2) as f32).ln().max(1e-6);
     let confidence_boost = (entropy_gap / max_entropy).clamp(0.0, 1.0);
 
+    // Dirichlet-style pseudocount update:
+    //   p'_a = (p_a + alpha * pi_a) / (1 + alpha)
+    // where pi is the local donor-conditional prior.
+    //
+    // If alpha=(1-retain)/retain, posterior mass weight would be exactly retain:
+    //   posterior coefficient = 1/(1+alpha) = retain.
+    //
+    // Here alpha is further scaled by:
+    // - effective_alleles (pi diffuseness proxy),
+    // - entropy-derived confidence_boost,
+    // to prevent brittle overconfidence under sparse subset support.
+    //
+    // Deviation form (p = pi + delta):
+    //   delta' = delta / (1 + alpha)
+    // so this step is explicit shrinkage of deviation from pi.
     let base_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
     let prior_mass = base_mass * (1.0 + 1.75 * confidence_boost);
     if prior_mass <= 0.0 {
@@ -1436,7 +1498,7 @@ fn apply_marker_prior_smoothing(
     smoothing_prior_total: f32,
     allele_prior_scratch: &mut Vec<f32>,
     probs: &[f32],
-    nearest_obs_lambda: f32,
+    nearest_obs_retain: f32,
     untyped_uniform_marker: bool,
     subset_total: f32,
     missing_ref_mass: f32,
@@ -1457,6 +1519,14 @@ fn apply_marker_prior_smoothing(
     if !untyped_uniform_marker {
         return;
     }
+
+    // Two-stage correction on untyped+uniform markers:
+    // 1) optional panel blend (calibration floor + adaptive convex pull)
+    // 2) local-prior pseudocount shrink (Dirichlet-style)
+    //
+    // This is intentionally NOT a single global convex mix:
+    // stage (1) addresses panel calibration under missing/truncation;
+    // stage (2) shrinks local posterior deviations using donor-conditional pi.
 
     // Prefer marker-local missing mass measured from the structural posterior
     // decomposition (represented vs missing-ref vs out-of-domain). Fall back to
@@ -1481,17 +1551,31 @@ fn apply_marker_prior_smoothing(
         fallback_missing_mass
     };
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
-    let retain = (-nearest_obs_lambda.max(0.0)).exp().clamp(0.0, 1.0);
-    // Only inject panel-frequency information when distance from typed anchors
-    // is sufficiently large. Near observed markers, let local LD dominate.
+    let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
+    let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
         (active_states as f32 / panel_haps as f32).clamp(0.0, 1.0)
     } else {
         1.0
     };
     let sparsity_boost = (1.0 - active_ratio).powi(2);
+    let truncation_error = (1.0 - active_ratio).clamp(0.0, 1.0);
+    // Approximation error combines structural-missingness and truncation:
+    //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
+    // This term captures model/subset limitations, not map distance.
+    let approximation_error = (1.0 - (1.0 - missing_mass) * (1.0 - truncation_error))
+        .clamp(0.0, 0.9999);
+    // Combine map and approximation uncertainty via independent-failure union:
+    //   combined_error = 1 - (1-dist_error)*(1-approx_error)
+    // so either axis can activate extra regularization.
+    //
+    // This keeps the decomposition explicit:
+    // - distance governs physical information decay
+    // - diagnostics govern approximation-risk inflation
+    let combined_error =
+        (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     let adaptive_panel_mix =
-        (missing_mass * (1.0 - retain) * (1.0 + 1.5 * sparsity_boost)).clamp(0.0, 0.85);
+        (missing_mass * combined_error * (1.0 + 1.5 * sparsity_boost)).clamp(0.0, 0.85);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1528,7 +1612,13 @@ fn apply_marker_prior_smoothing(
         }
         normalized_allele_prior(allele_prior_scratch, AlleleProbsView::from_trusted(probs))
     };
-    smooth_allele_posteriors_subset(allele_probs, prior_probs, nearest_obs_lambda, true);
+    smooth_allele_posteriors_subset(
+        allele_probs,
+        prior_probs,
+        nearest_obs_retain,
+        approximation_error,
+        true,
+    );
 }
 
 #[inline]
@@ -1543,7 +1633,8 @@ fn apply_adaptive_panel_blend(
     }
 
     if floor_mix > 0.0 {
-        // Keep a small non-zero panel floor only in deep untyped regions.
+        // Floor step: enforce a small allele floor from panel probabilities so
+        // extremely sparse subsets cannot assign hard zeros too early.
         let scaled_floor = floor_mix.clamp(0.0, 0.6);
         if scaled_floor > 0.0 {
             for (i, prob) in allele_probs.iter_mut().enumerate() {
@@ -1558,8 +1649,9 @@ fn apply_adaptive_panel_blend(
     }
 
     if adaptive_panel_mix > 0.0 {
-        // Jensen-Shannon disagreement between local subset posterior and
-        // panel prior controls how strongly to apply panel blending.
+        // Jensen-Shannon disagreement quantifies mismatch between local subset
+        // and panel prior. Larger mismatch increases blend strength, but blend
+        // remains bounded by adaptive_panel_mix cap.
         let mut m_entropy = 0.0f32;
         let mut p_entropy = 0.0f32;
         let mut q_entropy = 0.0f32;
@@ -1581,8 +1673,9 @@ fn apply_adaptive_panel_blend(
         let max_js = (2.0f32).ln();
         let disagreement = (js_div / max_js).clamp(0.0, 1.0);
 
-        // Symmetric blend toward panel frequencies. This avoids one-sided ALT
-        // inflation and improves calibration for high-missingness windows.
+        // Symmetric convex blend:
+        //   p <- (1-w) * p + w * panel
+        // applied after flooring to preserve calibration and normalization.
         let w = (adaptive_panel_mix * (1.0 + 1.25 * disagreement)).clamp(0.0, 0.9);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
@@ -1629,10 +1722,17 @@ fn build_uniform_mask(target_probs: &TargetAlleleProbs, n_markers: usize) -> Mar
 #[inline]
 fn build_skip_untyped_mask(
     target_probs: &TargetAlleleProbs,
-    nearest_obs_lambda: &[f32],
+    nearest_obs_retain: &[f32],
     uniform_mask: &MarkerMask<bool>,
     use_prior_smoothing: bool,
 ) -> MarkerMask<bool> {
+    // Skip mask behavior:
+    // - applies only on final output emission for untyped+uniform markers.
+    // - does NOT alter forward/backward recursion; state propagation is unchanged.
+    //
+    // So this is an output substitution optimization/calibration step:
+    //   if retain < threshold, write panel prior for that marker.
+    // It can change reported posterior at m, but does not break transition flow.
     let panel_priors = target_probs.panel_priors();
     let Some(panel) = panel_priors else {
         return MarkerMask(vec![false; uniform_mask.len()]);
@@ -1647,12 +1747,15 @@ fn build_skip_untyped_mask(
                 if m >= panel.len() {
                     return false;
                 }
-                let lambda = nearest_obs_lambda
+                let retain = nearest_obs_retain
                     .get(m)
                     .copied()
-                    .unwrap_or(f32::INFINITY)
-                    .max(0.0);
-                (-lambda).exp() < 0.005
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                // retain threshold:
+                //   retain < 0.005  <=>  "deep untyped" under current map model.
+                // lower threshold -> fewer substitutions; higher -> more.
+                retain < 0.005
             })
             .collect(),
     )
@@ -3090,6 +3193,16 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, K::LABEL)?;
     validate_reference_marker_count(ref_columns.len(), target_probs, context, K::LABEL)?;
+    if !smoothing_cluster_cm.is_finite() || smoothing_cluster_cm <= 0.0 {
+        return Err(ReagleError::vcf(format!(
+            "Invalid smoothing_cluster_cm in imputation HMM ({}): window={} sample={} hap={} value={}",
+            K::LABEL,
+            context.window_idx,
+            context.sample_idx,
+            context.hap_idx,
+            smoothing_cluster_cm
+        )));
+    }
 
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
@@ -3107,13 +3220,12 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     if use_prior_smoothing {
         compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
     } else {
-        ws.nearest_obs_lambda.clear();
+        ws.nearest_obs_retain.clear();
     }
-
     let uniform_mask = build_uniform_mask(target_probs, active_markers);
     let skip_untyped_mask = build_skip_untyped_mask(
         target_probs,
-        &ws.nearest_obs_lambda,
+        &ws.nearest_obs_retain,
         &uniform_mask,
         use_prior_smoothing,
     );
@@ -3228,8 +3340,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     // Affine interior path:
                     // - Enabled by marker kind (uniform/untyped interior), not by distance.
                     // - We keep transition propagation in affine form across the block.
-                    // - Distance-to-typed-anchor is used only by skip_untyped_mask to decide
-                    //   whether to skip full posterior evaluation at a given interior marker.
+                    // - Final-pass posterior emission may still short-circuit to panel priors
+                    //   at deep untyped markers based on distance-to-anchor lambda.
                     let coeffs = cached_affine.ok_or_else(|| {
                         ReagleError::vcf(format!(
                             "Missing affine cache block in imputation HMM ({}): window={} sample={} hap={} checkpoint={} block=[{}, {})",
@@ -3431,8 +3543,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += ws.pattern_state_count[pid];
-                                        smoothing_prior_total += ws.pattern_state_count[pid];
+                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
+                                        smoothing_prior_total += state_prob.max(0.0);
                                     } else {
                                         // Out-of-domain allele mass uses prior-shrunk redistribution.
                                         missing_ood_mass += state_prob as f64;
@@ -3498,10 +3610,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             smoothing_prior_total,
                                             &mut ws.allele_prior_scratch,
                                             probs.as_slice(),
-                                            ws.nearest_obs_lambda
+                                            ws.nearest_obs_retain
                                                 .get(m)
                                                 .copied()
-                                                .unwrap_or(f32::INFINITY),
+                                                .unwrap_or(0.0),
                                             target_probs.is_untyped_uniform_marker(m),
                                             subset_total_f32,
                                             missing_ref_mass_f32,
@@ -3688,8 +3800,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += 1.0;
-                                        smoothing_prior_total += 1.0;
+                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
+                                        smoothing_prior_total += state_prob.max(0.0);
                                     } else {
                                         missing_ood_mass += state_prob as f64;
                                     }
@@ -3712,8 +3824,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += 1.0;
-                                        smoothing_prior_total += 1.0;
+                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
+                                        smoothing_prior_total += state_prob.max(0.0);
                                     } else {
                                         // Keep mass accounting consistent with interior path:
                                         // out-of-domain mass is tracked separately.
@@ -3768,10 +3880,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         smoothing_prior_total,
                                         &mut ws.allele_prior_scratch,
                                         probs.as_slice(),
-                                        ws.nearest_obs_lambda
+                                        ws.nearest_obs_retain
                                             .get(m_rev)
                                             .copied()
-                                            .unwrap_or(f32::INFINITY),
+                                            .unwrap_or(0.0),
                                         target_probs.is_untyped_uniform_marker(m_rev),
                                         subset_total_f32,
                                         missing_ref_mass_f32,
