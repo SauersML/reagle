@@ -1293,7 +1293,7 @@ fn compute_nearest_observed_lambda(
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
 ) {
-    const BASE_CLUSTER_CM: f32 = 0.02;
+    const BASE_CLUSTER_CM: f32 = 0.005;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);

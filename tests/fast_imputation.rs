@@ -689,7 +689,7 @@ fn test_synthetic_recombination() {
     // Marker 50 (in 1-region, should be 2 for diploid 1|1)
     // Relaxed threshold due to increased smoothing
     assert!(
-        dosages[50][0] > 1.5,
+        dosages[50][0] > 1.75,
         "Marker 50 should be 2, got {}",
         dosages[50][0]
     );
@@ -894,13 +894,13 @@ fn test_simulated_chip_density() {
     let ds0 = dosages[50][0];
     let ds1 = dosages[50][1];
 
-    assert!(ds0 < 0.5, "Sample 0 at Marker 50 should be 0, got {}", ds0);
-    assert!(ds1 > 1.5, "Sample 1 at Marker 50 should be 2, got {}", ds1);
+    assert!(ds0 < 0.25, "Sample 0 at Marker 50 should be 0, got {}", ds0);
+    assert!(ds1 > 1.75, "Sample 1 at Marker 50 should be 2, got {}", ds1);
 
     let ds0 = dosages[150][0];
     let ds1 = dosages[150][1];
-    assert!(ds0 < 0.5, "Sample 0 at Marker 150 should be 0, got {}", ds0);
-    assert!(ds1 > 1.5, "Sample 1 at Marker 150 should be 2, got {}", ds1);
+    assert!(ds0 < 0.25, "Sample 0 at Marker 150 should be 0, got {}", ds0);
+    assert!(ds1 > 1.75, "Sample 1 at Marker 150 should be 2, got {}", ds1);
 
     // DR2 validation
     let dr2_values = inspect_dr2(&out_vcf);
@@ -1198,7 +1198,7 @@ fn test_error_injection() {
     // Marker 25 should be corrected toward 0
     // Relaxed threshold as correction is harder with higher base error
     assert!(
-        dosages[25][0] < 2.1,
+        dosages[25][0] < 1.5,
         "Error not corrected! Got {}",
         dosages[25][0]
     );
