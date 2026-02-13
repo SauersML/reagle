@@ -56,6 +56,10 @@ fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr_fast
 }
 
 fn run_imputation_quality_test(scope: TestScope) {
+    if std::env::var("GH_TOKEN").is_err() {
+        println!("GH_TOKEN not set, skipping imputation quality test");
+        return;
+    }
     ensure_cmd_exists("gh");
     ensure_cmd_exists("bcftools");
     ensure_cmd_exists("java");
