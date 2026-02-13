@@ -6005,6 +6005,22 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
+                    // Keep active state width stable across segments/windows for
+                    // SIMD/cache behavior and consistent subset-transition math.
+                    // If donor/core/prior pools are exhausted, fill deterministically
+                    // from the global panel universe.
+                    if out.len() < k {
+                        for h in 0..plan.n_ref_haps {
+                            if out.len() >= k {
+                                break;
+                            }
+                            let hap = RefHapId::new(h as u32);
+                            if seen.insert(hap) {
+                                out.push(hap);
+                            }
+                        }
+                    }
+
                     out
                 };
 
@@ -6330,6 +6346,7 @@ impl crate::pipelines::ImputationPipeline {
                             }
 
                             let mut seg_state_priors: Option<Vec<f32>> = None;
+                            let mut seg_boundary_mapped = false;
                             if let Some(p) = chained_priors.as_ref() {
                                 if !p.is_empty() {
                                     let has_entry_pi =
@@ -6376,6 +6393,7 @@ impl crate::pipelines::ImputationPipeline {
                                             };
                                         }
                                         seg_state_priors = Some(mapped_priors_buf.clone());
+                                        seg_boundary_mapped = true;
                                     }
                                 }
                             }
@@ -6403,7 +6421,13 @@ impl crate::pipelines::ImputationPipeline {
                                 seg_panel_priors,
                                 input_probs.min_untyped_prior_mix(),
                             );
-                            let seg_p_recomb: Vec<f32> = p_recomb[seg_start..seg_end].to_vec();
+                            let mut seg_p_recomb: Vec<f32> = p_recomb[seg_start..seg_end].to_vec();
+                            // After explicit boundary mapping of priors from the previous
+                            // segment, the first transition inside this segment must not
+                            // re-apply the same boundary recombination event.
+                            if seg_boundary_mapped && !seg_p_recomb.is_empty() {
+                                seg_p_recomb[0] = 0.0;
+                            }
                             let seg_ref_columns = &ref_columns[seg_start..seg_end];
                             let (seg_posteriors, seg_state_post) = LOCAL_WORKSPACE.with(|cell| {
                                 let mut ws_opt = cell.borrow_mut();
@@ -6438,6 +6462,18 @@ impl crate::pipelines::ImputationPipeline {
 
                             let mut next_priors_local = HaplotypePriors::empty();
                             if let Some(state_post) = seg_state_post.as_ref() {
+                                if state_post.len() != state_haps.len() {
+                                    return Err(ReagleError::vcf(format!(
+                                        "Piecewise state posterior/state mismatch: window={} sample={} hap={} segment=[{}..{}) post_len={} states={}",
+                                        window_idx,
+                                        s,
+                                        hap_idx.as_usize(),
+                                        seg_start,
+                                        seg_end,
+                                        state_post.len(),
+                                        state_haps.len()
+                                    )));
+                                }
                                 let pairs = state_posteriors_to_priors(&state_haps, state_post, 0.0);
                                 if !pairs.is_empty() {
                                     let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = pairs
