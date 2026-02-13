@@ -5824,7 +5824,8 @@ impl crate::pipelines::ImputationPipeline {
                 let build_state_haps = |hap_idx: HapIdx,
                                         priors: Option<&HaplotypePriors>,
                                         donors: &[(RefHapId, u32)],
-                                        informative_ratio: f32|
+                                        informative_ratio: f32,
+                                        planning_range: Option<(usize, usize)>|
                  -> Vec<RefHapId> {
                     let has_nonempty_priors = priors.map(|p| !p.is_empty()).unwrap_or(false);
                     if plan.full_panel {
@@ -5856,11 +5857,32 @@ impl crate::pipelines::ImputationPipeline {
                         prior_haps.extend(weighted.into_iter().map(|(hap, _)| hap));
                     }
 
+                    let mut local_window_haps: Vec<RefHapId> = Vec::new();
+                    if let Some((seg_plan_start, seg_plan_end)) = planning_range {
+                        if hap_idx.as_usize() < plan.window_intervals.len() {
+                            let mut ranked: Vec<(RefHapId, u32)> = Vec::new();
+                            for hi in plan.window_intervals[hap_idx.as_usize()].iter() {
+                                if let Some(span) =
+                                    interval_support_over_range(hi, seg_plan_start, seg_plan_end)
+                                {
+                                    ranked.push((hi.hap, span));
+                                }
+                            }
+                            ranked.sort_unstable_by(|a, b| {
+                                b.1.cmp(&a.1).then_with(|| a.0.as_u32().cmp(&b.0.as_u32()))
+                            });
+                            local_window_haps.extend(ranked.into_iter().map(|(hap, _)| hap));
+                        }
+                    }
                     let empty_haps: &[RefHapId] = &[];
-                    let window_haps: &[RefHapId] = state_haps_by_hap
-                        .get(hap_idx.as_usize())
-                        .map(|v| v.as_slice())
-                        .unwrap_or(empty_haps);
+                    let window_haps: &[RefHapId] = if local_window_haps.is_empty() {
+                        state_haps_by_hap
+                            .get(hap_idx.as_usize())
+                            .map(|v| v.as_slice())
+                            .unwrap_or(empty_haps)
+                    } else {
+                        local_window_haps.as_slice()
+                    };
                     let core_haps: &[RefHapId] = plan
                         .core_states
                         .get(hap_idx.as_usize())
@@ -6031,7 +6053,7 @@ impl crate::pipelines::ImputationPipeline {
                      donors: &[(RefHapId, u32)],
                      probs_buf: &mut Vec<f32>|
                      -> Result<(Vec<AllelePosteriors>, HaplotypePriors)> {
-                        let state_haps = build_state_haps(hap_idx, None, donors, 0.0);
+                        let state_haps = build_state_haps(hap_idx, None, donors, 0.0, None);
                         if state_haps.is_empty() {
                             return Err(ReagleError::vcf(format!(
                                 "State selection produced empty subset in no-info fast path: window={} sample={} hap={} donors={}",
@@ -6241,7 +6263,228 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         informative_n as f32 / n_markers as f32
                     };
-                    let state_haps = build_state_haps(hap_idx, priors, donors, informative_ratio);
+                    let use_piecewise_segments = n_markers > 0
+                        && plan_range_end > plan_range_start + 1
+                        && plan_range_end <= planning_handoff.len();
+                    if use_piecewise_segments {
+                        let mut marker_plan_idx = vec![plan_range_start; n_markers];
+                        let mut pidx = plan_range_start;
+                        for (m, slot) in marker_plan_idx.iter_mut().enumerate() {
+                            let gp = gen_positions.get(m).copied().unwrap_or(f64::NAN);
+                            if !gp.is_finite() {
+                                *slot = pidx;
+                                continue;
+                            }
+                            while pidx + 1 < plan_range_end && gp >= planning_handoff[pidx].1 {
+                                pidx += 1;
+                            }
+                            while pidx > plan_range_start && gp < planning_handoff[pidx].0 {
+                                pidx -= 1;
+                            }
+                            *slot = pidx;
+                        }
+
+                        let mut segments: Vec<(usize, usize, usize, usize)> = Vec::new();
+                        let mut seg_start = 0usize;
+                        while seg_start < n_markers {
+                            let seg_plan = marker_plan_idx[seg_start];
+                            let mut seg_end = seg_start + 1;
+                            while seg_end < n_markers && marker_plan_idx[seg_end] == seg_plan {
+                                seg_end += 1;
+                            }
+                            let seg_plan_start = seg_plan.min(plan_range_end.saturating_sub(1));
+                            let seg_plan_end = (seg_plan_start + 1).min(plan_range_end);
+                            segments.push((seg_start, seg_end, seg_plan_start, seg_plan_end));
+                            seg_start = seg_end;
+                        }
+
+                        let mut chained_priors = priors.cloned();
+                        let mut out_posts: Vec<AllelePosteriors> =
+                            Vec::with_capacity(output_markers);
+                        let mut subsetted_any = false;
+
+                        for (seg_start, seg_end, seg_plan_start, seg_plan_end) in segments {
+                            let seg_len = seg_end.saturating_sub(seg_start);
+                            if seg_len == 0 {
+                                continue;
+                            }
+                            let state_haps = build_state_haps(
+                                hap_idx,
+                                chained_priors.as_ref(),
+                                donors,
+                                informative_ratio,
+                                Some((seg_plan_start, seg_plan_end)),
+                            );
+                            if state_haps.is_empty() {
+                                return Err(ReagleError::vcf(format!(
+                                    "Piecewise state selection produced empty subset: window={} sample={} hap={} segment=[{}..{})",
+                                    window_idx,
+                                    s,
+                                    hap_idx.as_usize(),
+                                    seg_start,
+                                    seg_end
+                                )));
+                            }
+                            if state_haps.len() < plan.n_ref_haps {
+                                subsetted_any = true;
+                            }
+
+                            let mut seg_state_priors: Option<Vec<f32>> = None;
+                            if let Some(p) = chained_priors.as_ref() {
+                                if !p.is_empty() {
+                                    let has_entry_pi =
+                                        build_entry_pi(&state_haps, donors, &mut mapped_entry_pi_buf);
+                                    let entry_pi = if has_entry_pi {
+                                        Some(mapped_entry_pi_buf.as_slice())
+                                    } else {
+                                        None
+                                    };
+                                    prev_states_buf.clear();
+                                    prev_states_buf.reserve(p.ids().len());
+                                    for id in p.ids() {
+                                        prev_states_buf.push(RefHapId::new(id.0));
+                                    }
+                                    let recomb_boundary = p_recomb
+                                        .get(seg_start)
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        .clamp(0.0, 1.0);
+                                    let mapper = TransitionMatrix::build(
+                                        &prev_states_buf,
+                                        &state_haps,
+                                        recomb_boundary,
+                                        plan.n_ref_haps,
+                                    );
+                                    mapper.map_into_with_pi(
+                                        p.probs(),
+                                        entry_pi,
+                                        &mut mapped_priors_buf,
+                                    );
+                                    let mut sum = 0.0f32;
+                                    for v in mapped_priors_buf.iter() {
+                                        if v.is_finite() && *v > 0.0 {
+                                            sum += *v;
+                                        }
+                                    }
+                                    if sum > 0.0 {
+                                        let inv = 1.0 / sum;
+                                        for v in mapped_priors_buf.iter_mut() {
+                                            *v = if v.is_finite() && *v > 0.0 {
+                                                *v * inv
+                                            } else {
+                                                0.0
+                                            };
+                                        }
+                                        seg_state_priors = Some(mapped_priors_buf.clone());
+                                    }
+                                }
+                            }
+
+                            let mut seg_offsets: Vec<usize> = Vec::with_capacity(seg_len + 1);
+                            let mut seg_probs: Vec<f32> = Vec::new();
+                            let mut seg_observed: Vec<bool> = Vec::with_capacity(seg_len);
+                            seg_offsets.push(0);
+                            for m in seg_start..seg_end {
+                                seg_probs.extend_from_slice(input_probs.probs_for_marker(m));
+                                seg_offsets.push(seg_probs.len());
+                                seg_observed.push(input_probs.is_observed_marker(m));
+                            }
+                            let seg_panel_priors = input_probs.panel_priors().map(|panel| {
+                                let mut local = Vec::with_capacity(seg_len);
+                                for m in seg_start..seg_end {
+                                    local.push(panel[m].clone());
+                                }
+                                Arc::new(local)
+                            });
+                            let seg_input_probs = TargetAlleleProbs::new(
+                                seg_offsets,
+                                seg_probs,
+                                seg_observed,
+                                seg_panel_priors,
+                                input_probs.min_untyped_prior_mix(),
+                            );
+                            let seg_p_recomb: Vec<f32> = p_recomb[seg_start..seg_end].to_vec();
+                            let seg_ref_columns = &ref_columns[seg_start..seg_end];
+                            let (seg_posteriors, seg_state_post) = LOCAL_WORKSPACE.with(|cell| {
+                                let mut ws_opt = cell.borrow_mut();
+                                *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), seg_len));
+                                let ws = ws_opt.as_mut().unwrap();
+                                let effective_error_rate =
+                                    calibrated_emission_error(&seg_input_probs, error_rate);
+                                run_impute_hmm(
+                                    &state_haps,
+                                    seg_ref_columns,
+                                    &seg_input_probs,
+                                    &seg_p_recomb,
+                                    effective_error_rate,
+                                    Some(seg_len.saturating_sub(1)),
+                                    seg_state_priors.as_deref(),
+                                    &ref_allele_freqs,
+                                    ImputeHmmContext {
+                                        window_idx,
+                                        sample_idx: s,
+                                        hap_idx: hap_idx.as_usize(),
+                                    },
+                                    smoothing_cluster_cm,
+                                    ws,
+                                )
+                            })?;
+
+                            let take_start = seg_start.max(output_start);
+                            let take_end = seg_end.min(output_end);
+                            for gm in take_start..take_end {
+                                out_posts.push(seg_posteriors[gm - seg_start].clone());
+                            }
+
+                            let mut next_priors_local = HaplotypePriors::empty();
+                            if let Some(state_post) = seg_state_post.as_ref() {
+                                let pairs = state_posteriors_to_priors(&state_haps, state_post, 0.0);
+                                if !pairs.is_empty() {
+                                    let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = pairs
+                                        .into_iter()
+                                        .map(|(g, p)| (GlobalHapId(g.as_u32()), p))
+                                        .unzip();
+                                    next_priors_local = HaplotypePriors::new(ids, probs);
+                                }
+                            }
+                            chained_priors = if next_priors_local.is_empty() {
+                                None
+                            } else {
+                                Some(next_priors_local)
+                            };
+                        }
+
+                        if out_posts.len() != output_markers {
+                            return Err(ReagleError::vcf(format!(
+                                "Piecewise posterior length mismatch: window={} sample={} hap={} got={} expected={}",
+                                window_idx,
+                                s,
+                                hap_idx.as_usize(),
+                                out_posts.len(),
+                                output_markers
+                            )));
+                        }
+                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                            if !input_probs.is_observed_marker(ref_m) {
+                                continue;
+                            }
+                            let probs = input_probs.probs_for_marker(ref_m);
+                            if probs.is_empty() {
+                                continue;
+                            }
+                            out_posts[out_idx] = if probs.len() == 2 {
+                                AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
+                            } else {
+                                AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                    probs.to_vec(),
+                                ))
+                            };
+                        }
+                        let next_priors = chained_priors.unwrap_or_else(HaplotypePriors::empty);
+                        return Ok((out_posts, next_priors, subsetted_any, informative_ratio));
+                    }
+                    let state_haps =
+                        build_state_haps(hap_idx, priors, donors, informative_ratio, None);
                     if state_haps.is_empty() {
                         return Err(ReagleError::vcf(format!(
                             "State selection produced empty subset: window={} sample={} hap={} donors={} has_priors={}",
