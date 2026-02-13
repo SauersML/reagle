@@ -13,6 +13,13 @@ const RUN_SCAN_LIMIT: &str = "200";
 
 #[test]
 fn kat_23andme_artifact_imputation_quality_rust_beats_beagle_on_dosage_corr() {
+    if std::env::var("GH_TOKEN").is_err() {
+        // In CI environments without GH_TOKEN, we cannot download artifacts.
+        // Skip the test gracefully instead of failing.
+        eprintln!("Skipping artifact test: GH_TOKEN not set");
+        return;
+    }
+
     ensure_cmd_exists("gh");
     ensure_cmd_exists("bcftools");
     ensure_cmd_exists("java");
