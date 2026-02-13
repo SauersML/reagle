@@ -5455,37 +5455,15 @@ impl crate::pipelines::ImputationPipeline {
                                         informative_ratio: f32|
                  -> Vec<RefHapId> {
                     let has_nonempty_priors = priors.map(|p| !p.is_empty()).unwrap_or(false);
-                    let abyss_mask = if use_abyss {
-                        plan.abyss_mask.get(hap_idx.as_usize())
-                    } else {
-                        None
-                    };
                     if plan.full_panel {
                         // In explicit full-panel mode, keep the exact LS state universe.
                         // This avoids donor truncation and preserves rare-carrier support.
-                        let mut full: Vec<RefHapId> = Vec::with_capacity(plan.n_ref_haps);
-                        for h in 0..plan.n_ref_haps {
-                            let hap = RefHapId::new(h as u32);
-                            if abyss_mask
-                                .map(|mask| !mask[hap.as_usize()])
-                                .unwrap_or(true)
-                            {
-                                full.push(hap);
-                            }
-                        }
-                        return full;
+                        return (0..plan.n_ref_haps)
+                            .map(|h| RefHapId::new(h as u32))
+                            .collect();
                     }
                     if let Some(full) = full_states.as_ref() {
-                        let mut out_full: Vec<RefHapId> = Vec::with_capacity(full.len());
-                        for &hap in full {
-                            if abyss_mask
-                                .map(|mask| !mask[hap.as_usize()])
-                                .unwrap_or(true)
-                            {
-                                out_full.push(hap);
-                            }
-                        }
-                        return out_full;
+                        return full.clone();
                     }
                     let k = per_window_cap_local.max(1).min(plan.n_ref_haps.max(1));
                     let mut out: Vec<RefHapId> = Vec::with_capacity(k);
@@ -5503,16 +5481,7 @@ impl crate::pipelines::ImputationPipeline {
                         // Truncate to top-k priors so the state builder
                         // focuses capacity on high-posterior candidates.
                         keep_top_k_haps_by_prob(&mut weighted, k.saturating_mul(2).max(64));
-                        prior_haps.extend(weighted.into_iter().filter_map(|(hap, _)| {
-                            if abyss_mask
-                                .map(|mask| !mask[hap.as_usize()])
-                                .unwrap_or(true)
-                            {
-                                Some(hap)
-                            } else {
-                                None
-                            }
-                        }));
+                        prior_haps.extend(weighted.into_iter().map(|(hap, _)| hap));
                     }
 
                     let empty_haps: &[RefHapId] = &[];
@@ -5536,21 +5505,15 @@ impl crate::pipelines::ImputationPipeline {
                             return 0;
                         }
                         let mut added = 0usize;
-                            for &hap in source {
-                                if out.len() >= k || added >= want {
-                                    break;
-                                }
-                                if !abyss_mask
-                                    .map(|mask| !mask[hap.as_usize()])
-                                    .unwrap_or(true)
-                                {
-                                    continue;
-                                }
-                                if seen.insert(hap) {
-                                    out.push(hap);
-                                    added += 1;
-                                }
+                        for &hap in source {
+                            if out.len() >= k || added >= want {
+                                break;
                             }
+                            if seen.insert(hap) {
+                                out.push(hap);
+                                added += 1;
+                            }
+                        }
                         added
                     };
                     let fill_from_donors =
@@ -5567,12 +5530,6 @@ impl crate::pipelines::ImputationPipeline {
                             for &(hap, _) in source {
                                 if out.len() >= k || added >= want {
                                     break;
-                                }
-                                if !abyss_mask
-                                    .map(|mask| !mask[hap.as_usize()])
-                                    .unwrap_or(true)
-                                {
-                                    continue;
                                 }
                                 if seen.insert(hap) {
                                     out.push(hap);
