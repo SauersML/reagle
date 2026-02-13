@@ -420,26 +420,6 @@ const INVALID_ALLELE: u8 = 254;
 const REDUCTION_SPARSE_MAX_MARKERS: usize = 1024;
 const REDUCTION_SPARSE_HET_FRAC_NUM: usize = 3;
 const REDUCTION_SPARSE_HET_FRAC_DEN: usize = 4;
-const UNANCHORED_MIN_ORIENTATION_CONF: f32 = 0.55;
-const MIN_DECISIVE_LR: f32 = 1.0001;
-
-#[inline]
-fn orientation_confidence(p_orient: f32) -> f32 {
-    let p = p_orient.clamp(0.0, 1.0);
-    p.max(1.0 - p)
-}
-
-#[inline]
-fn orientation_is_decisive(lr: f32, p_orient: f32, has_anchor: bool) -> bool {
-    if !lr.is_finite() || lr < MIN_DECISIVE_LR {
-        return false;
-    }
-    if has_anchor {
-        return true;
-    }
-    orientation_confidence(p_orient) >= UNANCHORED_MIN_ORIENTATION_CONF
-}
-
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
@@ -2425,6 +2405,21 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         if self.config.phase_states > 0 {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        } else {
+            let n_threads = self
+                .config
+                .nthreads
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(1)
+                .max(1);
+            let avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
+            let auto_states = estimate_phase_state_budget(avail_bytes, n_threads, n_markers);
+            if auto_states > 0 {
+                let auto_cap = auto_states.min(n_total_haps.saturating_sub(2)).max(1);
+                if auto_cap > self.params.n_states {
+                    self.params.set_n_states(auto_cap);
+                }
+            }
         }
         // Calibrate LR threshold schedule for dynamic MCMC.
         // With N Gibbs steps the max achievable LR is (N+0.5)/0.5 = 2N+1.
@@ -2747,12 +2742,31 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 if !is_burnin {
                     let remaining_hets =
                         Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
+                    let sample_has_unresolved = |sp: &SamplePhase| {
+                        hi_freq_to_orig.iter().any(|&m| {
+                            if !sp.is_unphased(m) {
+                                return false;
+                            }
+                            let a1 = sp.allele1(m);
+                            let a2 = sp.allele2(m);
+                            a1 != crate::data::storage::AlleleCode::MISSING.raw()
+                                && a2 != crate::data::storage::AlleleCode::MISSING.raw()
+                                && a1 != a2
+                        })
+                    };
+                    let any_unanchored_unresolved = sample_phases
+                        .iter()
+                        .any(|sp| !sp.has_input_phase_anchor() && sample_has_unresolved(sp));
+                    let single_unanchored_case =
+                        n_samples == 1 && sample_phases.iter().all(|sp| !sp.has_input_phase_anchor());
                     let mut newly_frozen = 0usize;
                     for s in 0..n_samples {
                         if frozen_samples[s] {
                             continue;
                         }
-                        if sample_changed[s] {
+                        let sp = &sample_phases[s];
+                        let keep_active = !sp.has_input_phase_anchor() && sample_has_unresolved(sp);
+                        if sample_changed[s] || keep_active || single_unanchored_case {
                             frozen_streaks[s] = 0;
                         } else {
                             frozen_streaks[s] += 1;
@@ -2774,7 +2788,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let unresolved_unchanged = prev_remaining_hets
                         .map(|prev| prev == remaining_hets)
                         .unwrap_or(false);
-                    if no_progress && unresolved_unchanged {
+                    if !single_unanchored_case
+                        && !any_unanchored_unresolved
+                        && no_progress
+                        && unresolved_unchanged
+                    {
                         stable_main_iters += 1;
                         if stable_main_iters >= 2 {
                             eprintln!(
@@ -3266,12 +3284,31 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 if !is_burnin {
                     let remaining_hets =
                         Self::count_unphased_hets(&sample_phases, &hi_freq_to_orig);
+                    let sample_has_unresolved = |sp: &SamplePhase| {
+                        hi_freq_to_orig.iter().any(|&m| {
+                            if !sp.is_unphased(m) {
+                                return false;
+                            }
+                            let a1 = sp.allele1(m);
+                            let a2 = sp.allele2(m);
+                            a1 != crate::data::storage::AlleleCode::MISSING.raw()
+                                && a2 != crate::data::storage::AlleleCode::MISSING.raw()
+                                && a1 != a2
+                        })
+                    };
+                    let any_unanchored_unresolved = sample_phases
+                        .iter()
+                        .any(|sp| !sp.has_input_phase_anchor() && sample_has_unresolved(sp));
+                    let single_unanchored_case =
+                        n_samples == 1 && sample_phases.iter().all(|sp| !sp.has_input_phase_anchor());
                     let mut newly_frozen = 0usize;
                     for s in 0..n_samples {
                         if frozen_samples[s] {
                             continue;
                         }
-                        if sample_changed[s] {
+                        let sp = &sample_phases[s];
+                        let keep_active = !sp.has_input_phase_anchor() && sample_has_unresolved(sp);
+                        if sample_changed[s] || keep_active || single_unanchored_case {
                             frozen_streaks[s] = 0;
                         } else {
                             frozen_streaks[s] += 1;
@@ -3293,7 +3330,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let unresolved_unchanged = prev_remaining_hets
                         .map(|prev| prev == remaining_hets)
                         .unwrap_or(false);
-                    if no_progress && unresolved_unchanged {
+                    if !single_unanchored_case
+                        && !any_unanchored_unresolved
+                        && no_progress
+                        && unresolved_unchanged
+                    {
                         stable_main_iters += 1;
                         if stable_main_iters >= 2 {
                             eprintln!(
@@ -3760,6 +3801,21 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         if self.config.phase_states > 0 {
             self.params
                 .set_n_states(self.config.phase_states.min(n_total_haps.saturating_sub(2)));
+        } else {
+            let n_threads = self
+                .config
+                .nthreads
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(1)
+                .max(1);
+            let avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
+            let auto_states = estimate_phase_state_budget(avail_bytes, n_threads, n_markers);
+            if auto_states > 0 {
+                let auto_cap = auto_states.min(n_total_haps.saturating_sub(2)).max(1);
+                if auto_cap > self.params.n_states {
+                    self.params.set_n_states(auto_cap);
+                }
+            }
         }
         if self.config.dynamic_mcmc {
             let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
@@ -5693,9 +5749,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .iter()
                             .enumerate()
                             .map(|(idx, &m)| {
-                                let p_swap = swap_probs_conf.get(idx).copied().unwrap_or(0.5);
+                                let p_swap_decoded =
+                                    swap_probs_conf.get(idx).copied().unwrap_or(0.5);
+                                let p_swap_raw = swap_probs.get(idx).copied().unwrap_or(p_swap_decoded);
                                 let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
-                                let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
+                                let p_orient = if swap_bit == 1 {
+                                    p_swap_raw
+                                } else {
+                                    1.0 - p_swap_raw
+                                };
                                 (m, p_orient)
                             })
                             .collect();
@@ -6294,7 +6356,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let dyn_k_min = dyn_k_max.min(PBWT_ADAPTIVE_K_FLOOR).max(1);
                             let sample_uncertainty =
                                 1.0f32 - sample_phase_stability[s].clamp(0.0, 1.0);
-                            let dyn_k = if dyn_k_max > dyn_k_min {
+                            let mut dyn_k = if dyn_k_max > dyn_k_min {
                                 let span = (dyn_k_max - dyn_k_min) as f32;
                                 dyn_k_min
                                     + (sample_uncertainty * span).round() as usize
@@ -6307,13 +6369,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             } else {
                                 dyn_steps_max.min(2).max(1)
                             };
-                            let dyn_steps = if dyn_steps_max > dyn_steps_min {
+                            let mut dyn_steps = if dyn_steps_max > dyn_steps_min {
                                 let step_span = (dyn_steps_max - dyn_steps_min) as f32;
                                 dyn_steps_min
                                     + (sample_uncertainty * step_span).round() as usize
                             } else {
                                 dyn_steps_max
                             };
+                            if !has_phase_anchors {
+                                // In unanchored mode, avoid early adaptive downshifts:
+                                // orientation remains globally symmetric and requires
+                                // broader local exploration to stabilize relative phase.
+                                dyn_k = dyn_k_max;
+                                dyn_steps = dyn_steps_max;
+                            }
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
                                 path1: gp.path1.iter().map(|id| id.as_u32()).collect(),
@@ -6534,6 +6603,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let t_mcmc = t_mcmc_start.elapsed();
+                        assert!(swap_bits.len() == het_positions.len());
                         let swap_probs_sum: f32 = swap_probs.iter().sum();
                         assert!(swap_probs_sum.is_finite());
                         let orientation = if use_dynamic_mcmc {
@@ -6592,14 +6662,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
                                 let lr_threshold = self.params.lr_threshold;
                                 for (map_idx, &pos) in het_positions.iter().enumerate() {
-                                    let swap_bit = swap_bits.get(map_idx).copied().unwrap_or(0);
                                     let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
-                                    let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
-                                    let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
-                                    if lr >= lr_threshold
-                                        && swap_bit == 1
-                                        && orientation_is_decisive(lr, p_orient, has_phase_anchors)
-                                    {
+                                    let p_swap_decoded =
+                                        *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                    let p_swap_raw =
+                                        *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
+                                    if lr >= lr_threshold && p_swap_raw > 0.5 {
                                         swap_mask[pos] = RelativeSwapBit(true);
                                     }
                                 }
@@ -6608,14 +6676,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         } else {
                             let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
                             for (map_idx, &pos) in het_positions.iter().enumerate() {
-                                let swap_bit = swap_bits.get(map_idx).copied().unwrap_or(0);
-                                let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
-                                let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
-                                let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
-                                swap_mask[pos] = RelativeSwapBit(
-                                    swap_bit == 1
-                                        && orientation_is_decisive(lr, p_orient, has_phase_anchors),
-                                );
+                                let p_swap_decoded =
+                                    *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                let p_swap_raw =
+                                    *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
+                                swap_mask[pos] = RelativeSwapBit(p_swap_raw > 0.5);
                             }
                             Stage1OrientationUpdate::RelativeSwapMask(swap_mask)
                         };
@@ -6637,9 +6702,20 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         for (map_idx, &idx) in het_positions.iter().enumerate() {
                             let lr = PhaseLogOdds(*swap_lr.get(map_idx).unwrap_or(&1.0));
                             let confidence = {
-                                let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                // Use raw MCMC orientation mass for confidence calibration.
+                                // Decoded posterior paths can become over-confident under label
+                                // persistence and should drive orientation decisions, not
+                                // confidence magnitude for downstream emissions.
+                                let p_swap_decoded =
+                                    *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                let p_swap_raw =
+                                    *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
                                 let swap_bit = *swap_bits.get(map_idx).unwrap_or(&0);
-                                let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
+                                let p_orient = if swap_bit == 1 {
+                                    p_swap_raw
+                                } else {
+                                    1.0 - p_swap_raw
+                                };
                                 PhaseConfidence(p_orient.clamp(0.0, 1.0))
                             };
                             het_updates.push(Stage1HetUpdate {
@@ -6813,12 +6889,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 for Stage1HetUpdate {
                     marker: HiFreqMarkerIdx(hi_freq_idx),
                     lr: PhaseLogOdds(lr),
-                    confidence: PhaseConfidence(p_orient),
+                    confidence: PhaseConfidence(_),
                 } in &decision.het_updates
                 {
-                    if *lr >= lr_threshold
-                        && orientation_is_decisive(*lr, *p_orient, sp.has_input_phase_anchor())
-                    {
+                    if *lr >= lr_threshold {
                         let m = hi_freq_to_orig[*hi_freq_idx];
                         if sp.is_unphased(m) {
                             sp.mark_phased(m);
@@ -7850,8 +7924,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
 
                         let p_orient = (lr / (1.0 + lr)).clamp(0.5, 1.0);
-                        let confident = lr >= lr_threshold
-                            && orientation_is_decisive(lr, p_orient, sp.has_input_phase_anchor());
+                        let confident = lr >= lr_threshold;
                         if should_swap {
                             sp.swap_haps(m, m + 1);
                             if confident {

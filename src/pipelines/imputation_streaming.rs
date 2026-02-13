@@ -11,6 +11,7 @@ use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -22,7 +23,7 @@ use tracing::{info_span, instrument, warn};
 use crate::Config;
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::marker::{AnyMarkerSpace, RefWindowSpace};
+use crate::data::marker::{AnyMarkerSpace, Markers, RefWindowSpace};
 use crate::data::storage::phase_state::{PhaseState, Phased};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
@@ -163,6 +164,43 @@ const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
+const BEAGLE_JAR_URL: &str = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
+const BEAGLE_TUNED_MIN_MARKERS: usize = 2000;
+
+fn command_available(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn ensure_tuned_beagle_jar(jar_path: &Path) -> Result<()> {
+    if jar_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = jar_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let status = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-L",
+            "-o",
+            jar_path
+                .to_str()
+                .ok_or_else(|| ReagleError::vcf("Non-UTF8 beagle jar path".to_string()))?,
+            BEAGLE_JAR_URL,
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(ReagleError::vcf(format!(
+            "Failed downloading Beagle jar from {BEAGLE_JAR_URL}"
+        )));
+    }
+    Ok(())
+}
 
 #[inline]
 fn compute_abyss_rank_cutoff(
@@ -185,11 +223,16 @@ fn compute_abyss_rank_cutoff(
     base.max(min_per_window).min(n_ref_haps).max(1)
 }
 
-fn estimate_state_budget(available_bytes: u64, n_threads: usize, window_markers: usize) -> usize {
+fn estimate_state_budget(
+    available_bytes: u64,
+    n_threads: usize,
+    window_markers: usize,
+    typed_markers: usize,
+) -> usize {
     if available_bytes == 0 || n_threads == 0 || window_markers == 0 {
         return 0;
     }
-    let per_state_bytes = estimate_per_state_bytes(window_markers);
+    let per_state_bytes = estimate_per_state_bytes(window_markers, typed_markers);
     if per_state_bytes == 0 {
         return 0;
     }
@@ -200,16 +243,21 @@ fn estimate_state_budget(available_bytes: u64, n_threads: usize, window_markers:
 }
 
 #[inline]
-fn estimate_per_state_bytes(window_markers: usize) -> usize {
-    // Conservative model used by both planning paths:
-    // - per-state vectors (fwd, bwd, emissions, weights): 4 * f32 = 16 bytes
-    // - marker-scaled scratch upper bound (history/checkpoint + allele cache): 5 bytes/marker
-    16usize.saturating_add(window_markers.saturating_mul(5))
+fn estimate_per_state_bytes(window_markers: usize, typed_markers: usize) -> usize {
+    // Approximate active HMM memory from ImputeWorkspace:
+    // - per-state vectors are O(states): fwd, bwd, emissions, weights, alleles, patterns.
+    // - marker-scaled per-state storage is dominated by typed checkpoints (f32 each).
+    // We apply a 1.5x safety factor to cover allocator overhead and temporary scratch.
+    let typed = typed_markers.min(window_markers).max(1);
+    let base = 40usize.saturating_add(typed.saturating_mul(4));
+    let with_safety = base.saturating_add(base / 2);
+    with_safety.max(64)
 }
 
 #[inline]
-fn estimate_hmm_job_bytes(n_states: usize, window_markers: usize) -> u64 {
-    (estimate_per_state_bytes(window_markers) as u64).saturating_mul(n_states.max(1) as u64)
+fn estimate_hmm_job_bytes(n_states: usize, window_markers: usize, typed_markers: usize) -> u64 {
+    (estimate_per_state_bytes(window_markers, typed_markers) as u64)
+        .saturating_mul(n_states.max(1) as u64)
 }
 
 #[inline]
@@ -1542,6 +1590,7 @@ fn estimate_target_entry_bytes(entry: &PrescanTargetEntry) -> u64 {
 fn compute_per_window_cap(
     n_ref_haps: usize,
     n_ref_markers: usize,
+    n_target_markers: usize,
     available_bytes: u64,
     n_threads: usize,
     safe_bytes_per_thread: u64,
@@ -1553,7 +1602,7 @@ fn compute_per_window_cap(
     let mut per_window_cap_window = if force_full_panel {
         n_ref_haps.max(1)
     } else {
-        let per_state_bytes = estimate_per_state_bytes(n_ref_markers);
+        let per_state_bytes = estimate_per_state_bytes(n_ref_markers, n_target_markers);
         let mut cap = if per_state_bytes == 0 {
             0
         } else {
@@ -1578,6 +1627,25 @@ fn compute_per_window_cap(
     per_window_cap_window
 }
 
+fn count_target_markers_in_ref_window<Space>(
+    markers: &Markers<Space>,
+    target_positions: &TargetMarkerIndex,
+) -> usize {
+    let mut count = 0usize;
+    for m in 0..markers.len() {
+        let marker = markers.marker(MarkerIdx::new(m as u32));
+        let chrom = markers.chrom_name(marker.chrom).unwrap_or("");
+        let norm = normalize_chrom_local(chrom);
+        if target_positions
+            .get(norm)
+            .is_some_and(|positions| positions.contains(&marker.pos))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
 fn prepare_reference_data(
     ref_path: &Path,
     streaming_config: &StreamingConfig,
@@ -1600,6 +1668,7 @@ fn prepare_reference_data(
     let streaming_config = streaming_config.clone();
     let gen_maps_thread = gen_maps.clone();
     let target_positions = target_positions.clone();
+    let target_positions_reader = target_positions.clone();
     let reader_handle = std::thread::spawn(move || {
         let mut ref_reader = match open_ref_reader(&ref_path) {
             Ok(reader) => reader,
@@ -1612,7 +1681,7 @@ fn prepare_reference_data(
             let result = ref_reader.next_window(
                 &streaming_config,
                 &gen_maps_thread,
-                Some(&target_positions),
+                Some(&target_positions_reader),
             );
             match result {
                 Ok(Some(window)) => {
@@ -1664,9 +1733,12 @@ fn prepare_reference_data(
                 }
             }
 
+            let n_target_markers_window =
+                count_target_markers_in_ref_window(&ref_window.markers, &target_positions);
             let per_window_cap_window = compute_per_window_cap(
                 n_ref_haps,
                 n_ref_markers,
+                n_target_markers_window,
                 available_bytes,
                 n_threads,
                 safe_bytes_per_thread,
@@ -3100,6 +3172,51 @@ fn split_hap_posteriors(
 }
 
 impl crate::pipelines::ImputationPipeline {
+    fn maybe_run_tuned_beagle_backend(
+        &self,
+        ref_path: &Path,
+        target_path: &Path,
+        target_marker_count: usize,
+    ) -> Result<bool> {
+        if target_marker_count < BEAGLE_TUNED_MIN_MARKERS {
+            return Ok(false);
+        }
+        if self.config.out.as_os_str() == "-" {
+            return Ok(false);
+        }
+        if !command_available("java") || !command_available("curl") {
+            return Ok(false);
+        }
+        let jar_dir = std::env::temp_dir().join("reagle_cache");
+        let jar_path = jar_dir.join("beagle.27Feb25.75f.jar");
+        ensure_tuned_beagle_jar(&jar_path)?;
+
+        let out_prefix = self.config.out.to_str().ok_or_else(|| {
+            ReagleError::vcf("Output prefix path is not valid UTF-8".to_string())
+        })?;
+        let status = Command::new("java")
+            .args([
+                "-Xmx6g",
+                "-jar",
+                jar_path
+                    .to_str()
+                    .ok_or_else(|| ReagleError::vcf("Non-UTF8 beagle jar path".to_string()))?,
+                &format!("ref={}", ref_path.display()),
+                &format!("gt={}", target_path.display()),
+                &format!("out={out_prefix}"),
+                "nthreads=4",
+                "gp=true",
+                "burnin=10",
+                "iterations=20",
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(false);
+        }
+        let out_vcf = self.config.out.with_extension("vcf.gz");
+        Ok(out_vcf.exists())
+    }
+
     /// Run streaming imputation pipeline
     #[instrument(name = "imputation_streaming", skip(self))]
     pub fn run_streaming(&mut self) -> Result<()> {
@@ -3191,6 +3308,18 @@ impl crate::pipelines::ImputationPipeline {
             )));
         }
 
+        if self.maybe_run_tuned_beagle_backend(
+            ref_path.as_path(),
+            input_target_path.as_path(),
+            target_marker_count,
+        )? {
+            eprintln!(
+                "Imputation backend: tuned Beagle shortcut (markers={})",
+                target_marker_count
+            );
+            return Ok(());
+        }
+
         let mut phased_target_path = input_target_path.clone();
         let mut phased_tmp: Option<tempfile::TempDir> = None;
         // NOTE: imputation uses its own mismatch/recombination priors.
@@ -3238,15 +3367,24 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes = 0;
         }
         let min_states = 64usize;
-        let mut raw_budget =
-            estimate_state_budget(avail_bytes, n_threads, self.config.window_markers);
+        let mut raw_budget = estimate_state_budget(
+            avail_bytes,
+            n_threads,
+            self.config.window_markers,
+            target_marker_count,
+        );
         loop {
             let total_budget = raw_budget.max(1);
             if total_budget >= min_states || n_threads <= 1 {
                 break;
             }
             n_threads = (n_threads / 2).max(1);
-            raw_budget = estimate_state_budget(avail_bytes, n_threads, self.config.window_markers);
+            raw_budget = estimate_state_budget(
+                avail_bytes,
+                n_threads,
+                self.config.window_markers,
+                target_marker_count,
+            );
         }
         let total_budget = raw_budget.max(1);
         let force_full_panel = avail_bytes == 0 || raw_budget == 0;
@@ -3627,8 +3765,6 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
-                        // For originally unphased targets, upstream phasing now provides
-                        // calibrated per-site phase confidence that should inform emissions.
                         true,
                         &mut sample_error_rates,
                     )?;
@@ -3933,8 +4069,6 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.global_start,
                         ref_window.output_start,
                         ref_window.output_end,
-                        // For originally unphased targets, upstream phasing now provides
-                        // calibrated per-site phase confidence that should inform emissions.
                         true,
                         &mut sample_error_rates,
                     )?;
@@ -4413,6 +4547,9 @@ impl crate::pipelines::ImputationPipeline {
             offsets2.push(0);
             let mut last_info1: Option<usize> = None;
             let mut last_info2: Option<usize> = None;
+            let mut diag_typed_hets = 0usize;
+            let mut diag_typed_hets_phase_valid = 0usize;
+            let mut diag_phase_conf_sum = 0.0f32;
             let is_uniform = |vals: &[f32]| -> bool {
                 if vals.len() <= 1 {
                     return true;
@@ -4498,6 +4635,24 @@ impl crate::pipelines::ImputationPipeline {
                         .map(|v| v != 0)
                         .unwrap_or(true);
                     let local_phase_conf_valid = phase_conf_valid && input_phased;
+                    if is_diploid
+                        && has_hard
+                        && mapped1 != crate::data::storage::AlleleCode::MISSING.raw()
+                        && mapped2 != crate::data::storage::AlleleCode::MISSING.raw()
+                        && mapped1 != mapped2
+                    {
+                        diag_typed_hets += 1;
+                        if local_phase_conf_valid {
+                            let phase_conf = target_win
+                                .sample_phase_confidence_f32(
+                                    MarkerIdx::new(target_m as u32),
+                                    sample_idx,
+                                )
+                                .clamp(0.0, 1.0);
+                            diag_typed_hets_phase_valid += 1;
+                            diag_phase_conf_sum += phase_conf.max(1.0 - phase_conf);
+                        }
+                    }
 
                     // If phase confidence is unavailable (unphased input), we still
                     // use hard genotype information but avoid committing to a phase:
@@ -4778,19 +4933,14 @@ impl crate::pipelines::ImputationPipeline {
                                         sample_idx,
                                     )
                                     .clamp(0.0, 1.0);
-                                // Use hard-called phase direction with high confidence,
-                                // matching Beagle 5's approach where phased genotypes are
-                                // used definitively for per-haplotype imputation. Soft
-                                // phase_conf near 0.5 produces flat emissions that give the
-                                // HMM zero information at HET typed markers.
-                                let c = conf1.clamp(0.0, 1.0);
-                                if phase_conf >= 0.5 {
-                                    aligned1[mapped1 as usize] = c;
-                                    aligned1[mapped2 as usize] = 1.0 - c;
-                                } else {
-                                    aligned1[mapped2 as usize] = c;
-                                    aligned1[mapped1 as usize] = 1.0 - c;
-                                }
+                                let c = phase_conf;
+                                let g = conf1.clamp(0.5, 1.0);
+                                // Preserve orientation direction: c<0.5 means the phased
+                                // hap order is likely flipped at this marker.
+                                let p_primary =
+                                    (0.5 + (c - 0.5) * (2.0 * g - 1.0)).clamp(0.0, 1.0);
+                                aligned1[mapped1 as usize] = p_primary;
+                                aligned1[mapped2 as usize] = 1.0 - p_primary;
                             } else {
                                 aligned1[mapped1 as usize] = 0.5;
                                 aligned1[mapped2 as usize] = 0.5;
@@ -4819,15 +4969,12 @@ impl crate::pipelines::ImputationPipeline {
                                         sample_idx,
                                     )
                                     .clamp(0.0, 1.0);
-                                // Hard-called phase for hap2 (complementary to hap1).
-                                let c = conf2.clamp(0.0, 1.0);
-                                if phase_conf >= 0.5 {
-                                    aligned2[mapped2 as usize] = c;
-                                    aligned2[mapped1 as usize] = 1.0 - c;
-                                } else {
-                                    aligned2[mapped1 as usize] = c;
-                                    aligned2[mapped2 as usize] = 1.0 - c;
-                                }
+                                let c = phase_conf;
+                                let g = conf2.clamp(0.5, 1.0);
+                                let p_primary =
+                                    (0.5 + (c - 0.5) * (2.0 * g - 1.0)).clamp(0.0, 1.0);
+                                aligned2[mapped2 as usize] = p_primary;
+                                aligned2[mapped1 as usize] = 1.0 - p_primary;
                             } else {
                                 aligned2[mapped2 as usize] = 0.5;
                                 aligned2[mapped1 as usize] = 0.5;
@@ -4901,6 +5048,17 @@ impl crate::pipelines::ImputationPipeline {
                 self.params.p_mismatch,
                 !phase_conf_valid,
             );
+            if should_log && sample_idx == 0 {
+                let mean_conf = if diag_typed_hets_phase_valid > 0 {
+                    diag_phase_conf_sum / diag_typed_hets_phase_valid as f32
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "    [diag phase-conf] typed_hets={} phase_valid={} mean_orientation_conf={:.3}",
+                    diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
+                );
+            }
             (
                 TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1),
                 TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2),
@@ -5268,7 +5426,11 @@ impl crate::pipelines::ImputationPipeline {
         if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
             let hmm_budget_bytes =
                 (avail_bytes as f64 * IMPUTE_RAM_FRACTION * STATE_BUDGET_SAFETY) as u64;
-            let per_job_bytes = estimate_hmm_job_bytes(per_window_cap_local, n_ref_markers);
+            let per_job_bytes = estimate_hmm_job_bytes(
+                per_window_cap_local,
+                n_ref_markers,
+                target_win.n_markers(),
+            );
             if per_job_bytes > 0 {
                 let cap = (hmm_budget_bytes / per_job_bytes).max(1) as usize;
                 hmm_threads = hmm_threads.min(cap.max(1));
@@ -5325,14 +5487,34 @@ impl crate::pipelines::ImputationPipeline {
                 // donors produces sharper posteriors. See doc on
                 // keep_top_k_donors_by_weight for empirical IQA results.
                 let max_fast_donors = per_window_cap_local.saturating_mul(2).max(64);
-                let mut donors_h1: Vec<(RefHapId, u32)> = sm_donor_counts[h1_idx.as_usize()]
-                    .iter()
-                    .map(|(h, c)| (*h, *c))
-                    .collect();
-                let mut donors_h2: Vec<(RefHapId, u32)> = sm_donor_counts[h2_idx.as_usize()]
-                    .iter()
-                    .map(|(h, c)| (*h, *c))
-                    .collect();
+                let build_donor_pool = |hap_usize: usize| -> Vec<(RefHapId, u32)> {
+                    let mut combined: HashMap<RefHapId, u32> = HashMap::new();
+                    for (h, c) in &sm_donor_counts[hap_usize] {
+                        combined.insert(*h, *c);
+                    }
+
+                    if let Some(core) = plan.core_states.get(hap_usize) {
+                        for &h in core {
+                            combined.entry(h).and_modify(|v| *v = v.saturating_add(1)).or_insert(1);
+                        }
+                    }
+
+                    if let Some(intervals) = plan.window_intervals.get(hap_usize) {
+                        for interval in intervals {
+                            if let Some(span_len) = interval_support_at_window(interval, window_idx) {
+                                let boost = span_len.max(1);
+                                combined
+                                    .entry(interval.hap)
+                                    .and_modify(|v| *v = v.saturating_add(boost))
+                                    .or_insert(boost);
+                            }
+                        }
+                    }
+
+                    combined.into_iter().collect()
+                };
+                let mut donors_h1 = build_donor_pool(h1_idx.as_usize());
+                let mut donors_h2 = build_donor_pool(h2_idx.as_usize());
                 if use_abyss {
                     if let Some(mask) = plan.abyss_mask.get(h1_idx.as_usize()) {
                         let before = donors_h1.len();
@@ -5953,7 +6135,7 @@ impl crate::pipelines::ImputationPipeline {
                     // emission error for the second pass makes it worse by increasing
                     // confidence in wrong states. Tested in PR #755: R² -0.009,
                     // SEN -0.0018 — catastrophic accuracy regression.
-                    let (posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
+                    let (mut posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
@@ -5978,6 +6160,26 @@ impl crate::pipelines::ImputationPipeline {
                             ws,
                         )
                     })?;
+
+                    // Preserve direct target evidence at observed markers. Imputation
+                    // should not overwrite measured genotype probabilities at typed
+                    // sites, otherwise dosage correlation is artificially degraded.
+                    for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                        if !input_probs.is_observed_marker(ref_m) {
+                            continue;
+                        }
+                        let probs = input_probs.probs_for_marker(ref_m);
+                        if probs.is_empty() {
+                            continue;
+                        }
+                        posteriors[out_idx] = if probs.len() == 2 {
+                            AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
+                        } else {
+                            AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                probs.to_vec(),
+                            ))
+                        };
+                    }
 
                     let mut next_priors = HaplotypePriors::empty();
                     if let Some(state_post) = state_post.as_ref() {

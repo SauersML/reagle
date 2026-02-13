@@ -675,8 +675,6 @@ impl<'a> AlleleProbsView<'a> {
     }
 }
 
-const SKIP_RETAIN_THRESHOLD: f32 = 0.005;
-
 #[inline]
 fn hash_recomb_slice(p_recomb: &[f32]) -> u64 {
     // FNV-1a over exact float bit patterns.
@@ -1654,7 +1652,7 @@ fn build_skip_untyped_mask(
                     .copied()
                     .unwrap_or(f32::INFINITY)
                     .max(0.0);
-                (-lambda).exp() < SKIP_RETAIN_THRESHOLD
+                (-lambda).exp() < 0.005
             })
             .collect(),
     )
