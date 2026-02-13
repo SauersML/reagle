@@ -8777,6 +8777,14 @@ fn logsumexp2(a: f32, b: f32) -> f32 {
 /// Decode orientation states across heterozygotes with a two-state HMM.
 ///
 /// Returns `(map_states, posterior_p_swap, lr_for_map_state)`.
+fn orientation_is_decisive(lr: f32, prob: f32, anchored: bool) -> bool {
+    if anchored {
+        lr >= 1.5
+    } else {
+        prob >= 0.75
+    }
+}
+
 fn decode_orientation_hmm(
     raw_swap_probs: &[f32],
     transition_logs: &[(f32, f32)],
