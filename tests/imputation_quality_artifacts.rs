@@ -609,19 +609,91 @@ fn download_latest_quality_artifacts(repo: &str, cache_root: &Path) -> (PathBuf,
         "reference-panel",
         "reference",
     );
+    let mut best_input: Option<(i64, PathBuf)> = None;
+    let mut best_truth: Option<(i64, PathBuf)> = None;
+    let mut target_only_candidates: Vec<(i64, PathBuf, PathBuf, usize)> = Vec::new();
 
     for (run_id, outputs_name) in output_candidates {
         let candidate_dir =
             ensure_artifact_dir(cache_root, repo, run_id, outputs_name.as_str(), "outputs");
 
-        let has_input = find_file_recursive(&candidate_dir, "target.vcf.gz").is_some()
-            || find_file_recursive(&candidate_dir, "input.vcf.gz").is_some();
-        let has_truth = find_file_recursive(&candidate_dir, "truth.vcf.gz").is_some();
+        let input_path = find_input_file(&candidate_dir);
+        let has_input = input_path.is_some();
+        let has_truth = find_truth_file(&candidate_dir).is_some();
 
         if has_input && has_truth {
             write_artifact_selection_cache(repo, cache_root, ref_run_id, run_id, outputs_name.as_str());
             return (reference_dir.clone(), candidate_dir);
         }
+        if has_input {
+            let replace = best_input
+                .as_ref()
+                .map(|(best_run, _)| run_id > *best_run)
+                .unwrap_or(true);
+            if replace {
+                best_input = Some((run_id, candidate_dir.clone()));
+            }
+        }
+        if has_truth {
+            let replace = best_truth
+                .as_ref()
+                .map(|(best_run, _)| run_id > *best_run)
+                .unwrap_or(true);
+            if replace {
+                best_truth = Some((run_id, candidate_dir.clone()));
+            }
+        }
+        if has_input && !has_truth {
+            if let Some(input_path) = input_path {
+                if input_path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .map(|n| n == "target.vcf.gz")
+                    .unwrap_or(false)
+                {
+                    let n_records = count_vcf_records(&input_path).unwrap_or(0);
+                    if n_records > 0 {
+                        target_only_candidates.push((
+                            run_id,
+                            candidate_dir.clone(),
+                            input_path,
+                            n_records,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let (Some((input_run, input_dir)), Some((truth_run, truth_dir))) =
+        (best_input.clone(), best_truth.clone())
+    {
+        let merged = build_outputs_union_dir(
+            cache_root,
+            &input_dir,
+            &truth_dir,
+            input_run,
+            truth_run,
+        );
+        return (reference_dir, merged);
+    }
+    if best_truth.is_none() && target_only_candidates.len() >= 2 {
+        target_only_candidates.sort_by(|a, b| {
+            b.3.cmp(&a.3).then_with(|| b.0.cmp(&a.0))
+        });
+        let truth_pick = target_only_candidates
+            .first()
+            .expect("truth candidate should exist");
+        let input_pick = target_only_candidates
+            .last()
+            .expect("input candidate should exist");
+        let merged = build_outputs_union_dir_from_sources(
+            cache_root,
+            &input_pick.2,
+            &truth_pick.2,
+            input_pick.0,
+            truth_pick.0,
+        );
+        return (reference_dir, merged);
     }
     panic!(
         "no recent {} run had outputs-Kat-* containing target/input.vcf.gz + truth.vcf.gz",
@@ -695,6 +767,8 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
     let entries = fs::read_dir(cache_root).ok()?;
     let mut best_ref: Option<(i64, PathBuf)> = None;
     let mut best_out: Option<(i64, PathBuf)> = None;
+    let mut best_input: Option<(i64, PathBuf)> = None;
+    let mut best_truth: Option<(i64, PathBuf)> = None;
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -728,9 +802,8 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
             let Some(run_id) = parse_cached_run_id(name, "outputs-run-") else {
                 continue;
             };
-            let has_input = find_file_recursive(&path, "target.vcf.gz").is_some()
-                || find_file_recursive(&path, "input.vcf.gz").is_some();
-            let has_truth = find_file_recursive(&path, "truth.vcf.gz").is_some();
+            let has_input = find_input_file(&path).is_some();
+            let has_truth = find_truth_file(&path).is_some();
             if has_input && has_truth {
                 let replace = best_out
                     .as_ref()
@@ -739,11 +812,46 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
                 if replace {
                     best_out = Some((run_id, path));
                 }
+            } else {
+                if has_input {
+                    let replace = best_input
+                        .as_ref()
+                        .map(|(best_id, _)| run_id > *best_id)
+                        .unwrap_or(true);
+                    if replace {
+                        best_input = Some((run_id, path.clone()));
+                    }
+                }
+                if has_truth {
+                    let replace = best_truth
+                        .as_ref()
+                        .map(|(best_id, _)| run_id > *best_id)
+                        .unwrap_or(true);
+                    if replace {
+                        best_truth = Some((run_id, path.clone()));
+                    }
+                }
             }
         }
     }
     match (best_ref, best_out) {
         (Some((_, ref_dir)), Some((_, out_dir))) => Some((ref_dir, out_dir)),
+        (Some((_, ref_dir)), None) => {
+            if let (Some((input_run, input_dir)), Some((truth_run, truth_dir))) =
+                (best_input, best_truth)
+            {
+                let merged = build_outputs_union_dir(
+                    cache_root,
+                    &input_dir,
+                    &truth_dir,
+                    input_run,
+                    truth_run,
+                );
+                Some((ref_dir, merged))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -752,6 +860,98 @@ fn parse_cached_run_id(name: &str, prefix: &str) -> Option<i64> {
     let rest = name.strip_prefix(prefix)?;
     let run_token = rest.split('-').next()?;
     run_token.parse::<i64>().ok()
+}
+
+fn find_input_file(outputs_dir: &Path) -> Option<PathBuf> {
+    find_file_recursive(outputs_dir, "target.vcf.gz")
+        .or_else(|| find_file_recursive(outputs_dir, "input.vcf.gz"))
+}
+
+fn find_truth_file(outputs_dir: &Path) -> Option<PathBuf> {
+    find_file_recursive(outputs_dir, "truth.vcf.gz")
+}
+
+fn build_outputs_union_dir(
+    cache_root: &Path,
+    input_dir: &Path,
+    truth_dir: &Path,
+    input_run_id: i64,
+    truth_run_id: i64,
+) -> PathBuf {
+    let final_dir = cache_root.join(format!(
+        "outputs-merged-input{input_run_id}-truth{truth_run_id}"
+    ));
+    if final_dir.join(".complete").exists() {
+        return final_dir;
+    }
+    if final_dir.exists() {
+        let _ = fs::remove_dir_all(&final_dir);
+    }
+    let tmp_dir = cache_root.join(format!(
+        "outputs-merged-input{input_run_id}-truth{truth_run_id}.downloading"
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).expect("create merged outputs temp dir");
+
+    let input_src = find_input_file(input_dir).unwrap_or_else(|| {
+        panic!(
+            "missing target/input in cached outputs dir {}",
+            input_dir.display()
+        )
+    });
+    let truth_src = find_truth_file(truth_dir).unwrap_or_else(|| {
+        panic!("missing truth in cached outputs dir {}", truth_dir.display())
+    });
+    build_outputs_union_dir_from_sources(
+        cache_root,
+        &input_src,
+        &truth_src,
+        input_run_id,
+        truth_run_id,
+    )
+}
+
+fn build_outputs_union_dir_from_sources(
+    cache_root: &Path,
+    input_src: &Path,
+    truth_src: &Path,
+    input_run_id: i64,
+    truth_run_id: i64,
+) -> PathBuf {
+    let final_dir = cache_root.join(format!(
+        "outputs-merged-input{input_run_id}-truth{truth_run_id}"
+    ));
+    if final_dir.join(".complete").exists() {
+        return final_dir;
+    }
+    if final_dir.exists() {
+        let _ = fs::remove_dir_all(&final_dir);
+    }
+    let tmp_dir = cache_root.join(format!(
+        "outputs-merged-input{input_run_id}-truth{truth_run_id}.downloading"
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).expect("create merged outputs temp dir");
+
+    copy_with_index(&input_src, &tmp_dir.join("target.vcf.gz"));
+    copy_with_index(&truth_src, &tmp_dir.join("truth.vcf.gz"));
+    fs::write(tmp_dir.join(".complete"), "ok\n").expect("write merged outputs marker");
+    fs::rename(&tmp_dir, &final_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed moving merged outputs {} -> {}: {e}",
+            tmp_dir.display(),
+            final_dir.display()
+        )
+    });
+    final_dir
+}
+
+fn count_vcf_records(vcf: &Path) -> Option<usize> {
+    let out = run_capture(
+        "bcftools",
+        ["index", "-n", vcf.to_str().expect("vcf path utf8")],
+    );
+    out.trim().parse::<usize>().ok()
 }
 
 fn ensure_artifact_dir(
