@@ -406,7 +406,9 @@ struct ImputationPlan {
     window_intervals: Vec<Vec<HapIntervals>>, // per target hap (sparse)
     abyss_mask: Vec<BitVec<u64, Lsb0>>, // per target hap
     per_window_cap: usize,
-    per_window_caps: Vec<usize>, // per window (global, same for all target haps)
+    per_window_caps: Vec<usize>, // per I/O window (global, same for all target haps)
+    io_to_planning_ranges: Vec<(usize, usize)>, // per I/O window -> planning window range [start, end)
+    planning_num_windows: usize,
     full_panel: bool,
     stats: ImputationPlanStats,
 }
@@ -418,19 +420,28 @@ struct HapIntervals {
 }
 
 #[inline]
-fn interval_support_at_window(intervals: &HapIntervals, window_idx: usize) -> Option<u32> {
-    let mut best_span = 0u32;
-    let mut found = false;
-    for &span in intervals.intervals.iter() {
-        if span.contains(window_idx) {
-            found = true;
-            let len = span.len();
-            if len > best_span {
-                best_span = len;
+fn interval_support_over_range(
+    intervals: &HapIntervals,
+    range_start: usize,
+    range_end: usize,
+) -> Option<u32> {
+    if range_start >= range_end {
+        return None;
+    }
+    let mut total = 0u32;
+    for w in range_start..range_end {
+        let mut covered = false;
+        for &span in intervals.intervals.iter() {
+            if span.contains(w) {
+                covered = true;
+                break;
             }
         }
+        if covered {
+            total = total.saturating_add(1);
+        }
     }
-    if found { Some(best_span) } else { None }
+    if total > 0 { Some(total) } else { None }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -478,7 +489,8 @@ fn log_imputation_plan_summary(plan: &ImputationPlan) {
         eprintln!("Imputation plan: no target haplotypes");
         return;
     }
-    let n_windows = plan.per_window_caps.len();
+    let n_io_windows = plan.per_window_caps.len();
+    let n_windows = plan.planning_num_windows.max(1);
     let (
         core_min,
         core_avg,
@@ -555,8 +567,9 @@ fn log_imputation_plan_summary(plan: &ImputationPlan) {
     };
 
     eprintln!(
-        "Imputation plan hap counts (target_haps={}, windows={}): core_global[min/avg/max]={}/{:.1}/{}, dynamic_window[min/avg/max]={}/{:.1}/{}, abyss[min/avg/max]={}/{:.1}/{}",
+        "Imputation plan hap counts (target_haps={}, io_windows={}, planning_windows={}): core_global[min/avg/max]={}/{:.1}/{}, dynamic_window[min/avg/max]={}/{:.1}/{}, abyss[min/avg/max]={}/{:.1}/{}",
         n_target_haps,
+        n_io_windows,
         n_windows,
         core_min,
         core_avg,
@@ -693,6 +706,120 @@ fn window_boundaries_from_handoff(handoff: &[(f64, f64)], min_step_cm: f64) -> V
         out.push(dist);
     }
     out
+}
+
+fn build_planning_grid_from_handoff(
+    io_handoff: &[(f64, f64)],
+    planning_step_cm: f64,
+) -> (Vec<(f64, f64)>, Vec<(usize, usize)>) {
+    if io_handoff.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut min_start = f64::INFINITY;
+    let mut max_end = f64::NEG_INFINITY;
+    for &(s, e) in io_handoff {
+        if s.is_finite() && e.is_finite() {
+            min_start = min_start.min(s.min(e));
+            max_end = max_end.max(s.max(e));
+        }
+    }
+    if !min_start.is_finite() || !max_end.is_finite() || max_end <= min_start {
+        let mut fallback_ranges = Vec::with_capacity(io_handoff.len());
+        for i in 0..io_handoff.len() {
+            fallback_ranges.push((i, i + 1));
+        }
+        let fallback_windows: Vec<(f64, f64)> = io_handoff.to_vec();
+        return (fallback_windows, fallback_ranges);
+    }
+
+    let step = planning_step_cm.max(1e-6);
+    let mut planning = Vec::new();
+    let mut cur = min_start;
+    while cur < max_end {
+        let next = (cur + step).min(max_end);
+        planning.push((cur, next));
+        cur = next;
+    }
+    if planning.is_empty() {
+        planning.push((min_start, max_end));
+    }
+
+    let mut io_to_plan = Vec::with_capacity(io_handoff.len());
+    for &(io_s_raw, io_e_raw) in io_handoff {
+        let io_s = io_s_raw.min(io_e_raw);
+        let io_e = io_s_raw.max(io_e_raw);
+        let mut first = usize::MAX;
+        let mut last_excl = 0usize;
+        for (pidx, &(ps, pe)) in planning.iter().enumerate() {
+            if pe <= io_s || ps >= io_e {
+                continue;
+            }
+            if first == usize::MAX {
+                first = pidx;
+            }
+            last_excl = pidx + 1;
+        }
+        if first == usize::MAX || last_excl <= first {
+            let io_mid = 0.5 * (io_s + io_e);
+            let mut best_idx = 0usize;
+            let mut best_dist = f64::INFINITY;
+            for (pidx, &(ps, pe)) in planning.iter().enumerate() {
+                let mid = 0.5 * (ps + pe);
+                let d = (mid - io_mid).abs();
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = pidx;
+                }
+            }
+            io_to_plan.push((best_idx, best_idx + 1));
+        } else {
+            io_to_plan.push((first, last_excl));
+        }
+    }
+
+    (planning, io_to_plan)
+}
+
+fn distribute_scores_to_planning_bins(
+    per_io_scores: &[(usize, f32)],
+    plan_start: usize,
+    plan_end: usize,
+    planning_scores: &mut [Vec<(usize, f32)>],
+) {
+    if plan_start >= plan_end || plan_end > planning_scores.len() || per_io_scores.is_empty() {
+        return;
+    }
+    let bins = (plan_end - plan_start) as f32;
+    if bins <= 0.0 {
+        return;
+    }
+    let scale = 1.0 / bins;
+    for p in plan_start..plan_end {
+        for &(hap, score) in per_io_scores {
+            let v = score * scale;
+            if v.is_finite() && v > 0.0 {
+                planning_scores[p].push((hap, v));
+            }
+        }
+    }
+}
+
+fn aggregate_window_sparse_scores(window_scores: &mut [Vec<(usize, f32)>]) {
+    for ws in window_scores.iter_mut() {
+        if ws.len() <= 1 {
+            continue;
+        }
+        let mut acc: HashMap<usize, f32> = HashMap::with_capacity(ws.len() * 2);
+        for &(hap, score) in ws.iter() {
+            if score.is_finite() && score > 0.0 {
+                acc.entry(hap)
+                    .and_modify(|s| *s += score)
+                    .or_insert(score);
+            }
+        }
+        ws.clear();
+        ws.extend(acc.into_iter());
+    }
 }
 
 fn build_sparse_scores(
@@ -1889,6 +2016,8 @@ fn build_imputation_plan(
         abyss_mask: vec![BitVec::new(); n_target_haps],
         per_window_cap: per_window_cap.max(1),
         per_window_caps: Vec::new(),
+        io_to_planning_ranges: Vec::new(),
+        planning_num_windows: 0,
         full_panel: false,
         stats: ImputationPlanStats::default(),
     };
@@ -1908,6 +2037,17 @@ fn build_imputation_plan(
     plan.n_ref_haps = n_ref_haps;
     let window_handoff = ref_data.window_handoff();
     let per_window_caps = ref_data.per_window_caps();
+    let planning_step_cm = 1.0f64.max(imp_step_cm);
+    let (planning_handoff, io_to_planning_ranges) =
+        build_planning_grid_from_handoff(window_handoff, planning_step_cm);
+    let planning_num_windows = planning_handoff.len();
+    if planning_num_windows == 0 {
+        return Err(ReagleError::vcf(
+            "Pre-scan produced no planning windows for LMS allocation".to_string(),
+        ));
+    }
+    plan.io_to_planning_ranges = io_to_planning_ranges;
+    plan.planning_num_windows = planning_num_windows;
     if avail == 0 {
         eprintln!(
             "Pre-scan: available memory unknown; using fallback={} MB for batching/cache",
@@ -1960,6 +2100,19 @@ fn build_imputation_plan(
     }
 
     plan.per_window_caps = per_window_caps.to_vec();
+    let mut planning_window_caps = vec![per_window_cap.max(1); planning_num_windows];
+    for (io_idx, &(ps, pe)) in plan.io_to_planning_ranges.iter().enumerate() {
+        let io_cap = per_window_caps
+            .get(io_idx)
+            .copied()
+            .unwrap_or(per_window_cap.max(1))
+            .max(1);
+        let end = pe.min(planning_window_caps.len());
+        let start = ps.min(end);
+        for p in start..end {
+            planning_window_caps[p] = planning_window_caps[p].min(io_cap);
+        }
+    }
 
     eprintln!(
         "Pre-scan: enabled (LMS allocation); target_haps={}, ref_haps={}, batch_size={}",
@@ -2171,6 +2324,7 @@ fn build_imputation_plan(
         }
         for list in scores_by_window.iter_mut() {
             list.clear();
+            list.resize_with(planning_num_windows, Vec::new);
         }
         for i in 0..batch_len {
             if global_scores[i].len() != n_ref_haps {
@@ -2370,13 +2524,23 @@ fn build_imputation_plan(
                     }
 
                     // Persist per-window sparse scores for LMS allocator (top-M per window).
+                    let (plan_start, plan_end) = plan
+                        .io_to_planning_ranges
+                        .get(window_idx)
+                        .copied()
+                        .unwrap_or((0, planning_num_windows.min(1)));
                     for i in 0..batch_len {
                         let top_m = per_window_cap_window
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
                             .max(per_window_cap_window)
                             .min(n_ref_haps.max(1));
                         let top = select_top_k(&window_scores[i], top_m);
-                        scores_by_window[i].push(top);
+                        distribute_scores_to_planning_bins(
+                            &top,
+                            plan_start,
+                            plan_end,
+                            &mut scores_by_window[i],
+                        );
                     }
 
                     window_idx += 1;
@@ -2577,13 +2741,23 @@ fn build_imputation_plan(
                     }
 
                     // Persist per-window sparse scores for LMS allocator (top-M per window).
+                    let (plan_start, plan_end) = plan
+                        .io_to_planning_ranges
+                        .get(window_idx)
+                        .copied()
+                        .unwrap_or((0, planning_num_windows.min(1)));
                     for i in 0..batch_len {
                         let top_m = per_window_cap_window
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
                             .max(per_window_cap_window)
                             .min(n_ref_haps.max(1));
                         let top = select_top_k(&window_scores[i], top_m);
-                        scores_by_window[i].push(top);
+                        distribute_scores_to_planning_bins(
+                            &top,
+                            plan_start,
+                            plan_end,
+                            &mut scores_by_window[i],
+                        );
                     }
 
                     window_idx += 1;
@@ -2595,10 +2769,12 @@ fn build_imputation_plan(
             }
         }
 
-        let min_step_cm = (streaming_config.overlap_cm as f64)
-            .max(imp_step_cm)
-            .max(1e-6);
-        let boundary_cm = window_boundaries_from_handoff(&window_handoff, min_step_cm);
+        for ws in scores_by_window.iter_mut() {
+            aggregate_window_sparse_scores(ws);
+        }
+
+        let min_step_cm = (streaming_config.overlap_cm as f64).max(imp_step_cm).max(1e-6);
+        let boundary_cm = window_boundaries_from_handoff(&planning_handoff, min_step_cm);
         if !per_window_caps.is_empty() && per_window_caps.len() != window_handoff.len() {
             return Err(ReagleError::vcf(format!(
                 "Per-window cap length mismatch (caps={}, bounds={})",
@@ -2614,15 +2790,8 @@ fn build_imputation_plan(
             )));
         }
 
-        let num_windows = window_handoff.len();
-        let use_plan_caps =
-            !plan.per_window_caps.is_empty() && plan.per_window_caps.len() == num_windows;
-        let fallback_caps = if use_plan_caps {
-            None
-        } else {
-            Some(vec![per_window_cap.max(1); num_windows])
-        };
-        let plan_caps = plan.per_window_caps.clone();
+        let num_windows = planning_handoff.len();
+        let per_window_caps_used = planning_window_caps.as_slice();
         let batch_results: Vec<_> = batch_haps
             .par_iter()
             .enumerate()
@@ -2663,19 +2832,14 @@ fn build_imputation_plan(
                     }
                 }
                 let window_scores_matrix = &scores_by_window[i];
-                if window_scores_matrix.len() != window_handoff.len() {
+                if window_scores_matrix.len() != planning_handoff.len() {
                     return Err(ReagleError::vcf(format!(
                         "Pre-scan window count mismatch for hap {} (scores={}, bounds={})",
                         hap_idx,
                         window_scores_matrix.len(),
-                        window_handoff.len()
+                        planning_handoff.len()
                     )));
                 }
-                let per_window_caps_used = if use_plan_caps {
-                    plan_caps.as_slice()
-                } else {
-                    fallback_caps.as_ref().unwrap().as_slice()
-                };
                 let per_window_cap_min = per_window_caps_used
                     .iter()
                     .copied()
@@ -2788,9 +2952,10 @@ fn build_imputation_plan(
         .unwrap_or(0);
     let cache_total = target_cache.as_ref().map(|c| c.len()).unwrap_or(0);
     eprintln!(
-        "Pre-scan summary: batches={} windows={} cache_hits={}/{} elapsed={:.1}s",
+        "Pre-scan summary: batches={} io_windows={} planning_windows={} cache_hits={}/{} elapsed={:.1}s",
         batches_total.max(1),
         window_handoff.len(),
+        planning_handoff.len(),
         cache_hit,
         cache_total,
         elapsed
@@ -4288,6 +4453,11 @@ impl crate::pipelines::ImputationPipeline {
             .copied()
             .unwrap_or(plan.per_window_cap)
             .max(1);
+        let (plan_range_start, plan_range_end) = plan
+            .io_to_planning_ranges
+            .get(window_idx)
+            .copied()
+            .unwrap_or((window_idx, window_idx.saturating_add(1)));
         // Even when full-panel memory is available, keep sample/window-specific
         // state sets from prescan/LMS. This preserves ancestry-local donor sets
         // and avoids diluting sparse-target inference with globally irrelevant
@@ -4309,7 +4479,9 @@ impl crate::pipelines::ImputationPipeline {
                 if hap_idx < plan.window_intervals.len() {
                     let mut ranked: Vec<(RefHapId, u32)> = Vec::new();
                     for hi in plan.window_intervals[hap_idx].iter() {
-                        if let Some(span) = interval_support_at_window(hi, window_idx) {
+                        if let Some(span) =
+                            interval_support_over_range(hi, plan_range_start, plan_range_end)
+                        {
                             ranked.push((hi.hap, span));
                         }
                     }
@@ -5412,7 +5584,11 @@ impl crate::pipelines::ImputationPipeline {
 
                     if let Some(intervals) = plan.window_intervals.get(hap_usize) {
                         for interval in intervals {
-                            if let Some(span_len) = interval_support_at_window(interval, window_idx) {
+                            if let Some(span_len) = interval_support_over_range(
+                                interval,
+                                plan_range_start,
+                                plan_range_end,
+                            ) {
                                 let boost = span_len.max(1);
                                 combined
                                     .entry(interval.hap)
