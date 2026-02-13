@@ -2778,7 +2778,122 @@ fn build_imputation_plan(
 struct SampleImputationResult {
     sample_idx: usize,
     hap_alt_probs: (Option<Vec<f32>>, Option<Vec<f32>>),
-    hap_posteriors: (Option<Vec<AllelePosteriors>>, Option<Vec<AllelePosteriors>>),
+    hap_posteriors: (
+        Option<SparseHapPosteriors>,
+        Option<SparseHapPosteriors>,
+    ),
+}
+
+#[derive(Clone, Debug)]
+struct SparseHapPosteriors {
+    local_marker_indices: Vec<usize>,
+    values: Vec<AllelePosteriors>,
+}
+
+impl SparseHapPosteriors {
+    #[inline]
+    fn get(&self, local_m: usize) -> Option<&AllelePosteriors> {
+        let pos = self.local_marker_indices.binary_search(&local_m).ok()?;
+        self.values.get(pos)
+    }
+
+    #[inline]
+    fn take(&mut self, local_m: usize) -> Option<AllelePosteriors> {
+        let pos = self.local_marker_indices.binary_search(&local_m).ok()?;
+        self.local_marker_indices.remove(pos);
+        Some(self.values.remove(pos))
+    }
+
+    #[inline]
+    fn put(&mut self, local_m: usize, value: AllelePosteriors) {
+        match self.local_marker_indices.binary_search(&local_m) {
+            Ok(pos) => self.values[pos] = value,
+            Err(pos) => {
+                self.local_marker_indices.insert(pos, local_m);
+                self.values.insert(pos, value);
+            }
+        }
+    }
+}
+
+impl SampleImputationResult {
+    #[inline]
+    fn hap_posterior(&self, hap: usize, local_m: usize) -> Option<&AllelePosteriors> {
+        let post = if hap == 0 {
+            self.hap_posteriors.0.as_ref()
+        } else {
+            self.hap_posteriors.1.as_ref()
+        };
+        post.and_then(|p| p.get(local_m))
+    }
+
+    #[inline]
+    fn hap_alt_prob(&self, hap: usize, local_m: usize) -> Option<f32> {
+        let alt = if hap == 0 {
+            self.hap_alt_probs.0.as_ref()
+        } else {
+            self.hap_alt_probs.1.as_ref()
+        };
+        alt.and_then(|v| v.get(local_m)).copied()
+    }
+
+    #[inline]
+    fn hap_prob(&self, hap: usize, local_m: usize, allele: u8) -> Option<f32> {
+        if allele == crate::data::storage::AlleleCode::MISSING.raw() {
+            return None;
+        }
+        if let Some(post) = self.hap_posterior(hap, local_m) {
+            let q = post.prob(allele as usize);
+            if q.is_finite() {
+                return Some(q.clamp(0.0, 1.0));
+            }
+            return None;
+        }
+        if allele > 1 {
+            return None;
+        }
+        self.hap_alt_prob(hap, local_m).map(|p_alt| {
+            let p_alt = if p_alt.is_finite() {
+                p_alt.clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            if allele == 1 { p_alt } else { 1.0 - p_alt }
+        })
+    }
+
+    fn swap_hap_posteriors_at(&mut self, local_m: usize) {
+        let left = self
+            .hap_posteriors
+            .0
+            .as_mut()
+            .and_then(|s| s.take(local_m));
+        let right = self
+            .hap_posteriors
+            .1
+            .as_mut()
+            .and_then(|s| s.take(local_m));
+        if let Some(v) = left {
+            let slot = self
+                .hap_posteriors
+                .1
+                .get_or_insert_with(|| SparseHapPosteriors {
+                    local_marker_indices: Vec::new(),
+                    values: Vec::new(),
+                });
+            slot.put(local_m, v);
+        }
+        if let Some(v) = right {
+            let slot = self
+                .hap_posteriors
+                .0
+                .get_or_insert_with(|| SparseHapPosteriors {
+                    local_marker_indices: Vec::new(),
+                    values: Vec::new(),
+                });
+            slot.put(local_m, v);
+        }
+    }
 }
 
 struct ImputationHandoff {
@@ -2939,25 +3054,34 @@ impl AltProbDiskStoreView {
     }
 }
 
-fn take_biallelic_alt_probs(posts: &mut Option<Vec<AllelePosteriors>>) -> Option<Vec<f32>> {
+fn split_hap_posteriors(
+    posts: &mut Option<Vec<AllelePosteriors>>,
+) -> (Option<Vec<f32>>, Option<SparseHapPosteriors>) {
     let Some(values) = posts.take() else {
-        return None;
+        return (None, None);
     };
-    if values
-        .iter()
-        .all(|p| matches!(p, AllelePosteriors::Biallelic(_)))
-    {
-        let mut alt_probs = Vec::with_capacity(values.len());
-        for post in values {
-            if let AllelePosteriors::Biallelic(p_alt) = post {
-                alt_probs.push(p_alt);
+    let mut alt_probs = Vec::with_capacity(values.len());
+    let mut sparse_idx: Vec<usize> = Vec::new();
+    let mut sparse_vals: Vec<AllelePosteriors> = Vec::new();
+    for (local_m, post) in values.into_iter().enumerate() {
+        match post {
+            AllelePosteriors::Biallelic(p_alt) => alt_probs.push(p_alt),
+            other => {
+                alt_probs.push(f32::NAN);
+                sparse_idx.push(local_m);
+                sparse_vals.push(other);
             }
         }
-        Some(alt_probs)
-    } else {
-        *posts = Some(values);
-        None
     }
+    let sparse = if sparse_idx.is_empty() {
+        None
+    } else {
+        Some(SparseHapPosteriors {
+            local_marker_indices: sparse_idx,
+            values: sparse_vals,
+        })
+    };
+    (Some(alt_probs), sparse)
 }
 
 impl crate::pipelines::ImputationPipeline {
@@ -5986,8 +6110,8 @@ impl crate::pipelines::ImputationPipeline {
                     sm_needed[h2_idx.as_usize()].store(true, Ordering::Relaxed);
                 }
 
-                let hap1_alt_probs = take_biallelic_alt_probs(&mut hap1_posts);
-                let hap2_alt_probs = take_biallelic_alt_probs(&mut hap2_posts);
+                let (hap1_alt_probs, hap1_sparse_posts) = split_hap_posteriors(&mut hap1_posts);
+                let (hap2_alt_probs, hap2_sparse_posts) = split_hap_posteriors(&mut hap2_posts);
                 let mut hap_alt_probs = (hap1_alt_probs, hap2_alt_probs);
                 if let Some(writer) = alt_prob_store_writer.as_ref() {
                     if let Some(values) = hap_alt_probs.0.as_ref() {
@@ -6018,7 +6142,7 @@ impl crate::pipelines::ImputationPipeline {
                         result: SampleImputationResult {
                             sample_idx: s,
                             hap_alt_probs,
-                            hap_posteriors: (hap1_posts, hap2_posts),
+                            hap_posteriors: (hap1_sparse_posts, hap2_sparse_posts),
                         },
                         priors: Some((p1_out, p2_out)),
                         last_info_idx: match (handoff_capture_idx_h1, handoff_capture_idx_h2) {
@@ -6362,39 +6486,7 @@ impl crate::pipelines::ImputationPipeline {
                                hap: usize,
                                local_m: usize,
                                allele: u8|
-         -> Option<f32> {
-            if allele == crate::data::storage::AlleleCode::MISSING.raw() {
-                return None;
-            }
-            let post = if hap == 0 {
-                result.hap_posteriors.0.as_ref()
-            } else {
-                result.hap_posteriors.1.as_ref()
-            };
-            if let Some(p) = post.and_then(|v| v.get(local_m)) {
-                let q = p.prob(allele as usize);
-                if q.is_finite() {
-                    return Some(q.clamp(0.0, 1.0));
-                }
-                return None;
-            }
-            if allele > 1 {
-                return None;
-            }
-            let alt = if hap == 0 {
-                result.hap_alt_probs.0.as_ref()
-            } else {
-                result.hap_alt_probs.1.as_ref()
-            };
-            alt.and_then(|v| v.get(local_m)).map(|&p_alt| {
-                let p_alt = if p_alt.is_finite() {
-                    p_alt.clamp(0.0, 1.0)
-                } else {
-                    0.5
-                };
-                if allele == 1 { p_alt } else { 1.0 - p_alt }
-            })
-        };
+         -> Option<f32> { result.hap_prob(hap, local_m, allele) };
         let get_anchor_obs = |sample_idx: usize, ref_m: usize| -> Option<(u8, u8, f32)> {
             let target_m = alignment.target_marker(MarkerIdx::new(ref_m as u32))?;
             let target_idx = target_m.as_usize();
@@ -6527,41 +6619,37 @@ impl crate::pipelines::ImputationPipeline {
                     )
                 } else {
                     let mut alpha = ORIENTATION_ALPHA_MIN;
-                    if let (Some(p1v), Some(p2v)) = (
-                        result.hap_posteriors.0.as_ref(),
-                        result.hap_posteriors.1.as_ref(),
-                    ) {
-                        if let (Some(p1), Some(p2)) = (p1v.get(local_m), p2v.get(local_m)) {
-                            let n_alleles = ref_markers
-                                .marker(MarkerIdx::new(ref_m as u32))
-                                .n_alleles()
-                                .max(1);
-                            let mut h1 = 0.0f64;
-                            let mut h2 = 0.0f64;
-                            for a in 0..n_alleles {
-                                let q1 = p1.prob(a).clamp(0.0, 1.0);
-                                let q2 = p2.prob(a).clamp(0.0, 1.0);
-                                if q1 > 0.0 {
-                                    h1 -= (q1 as f64) * (q1 as f64).ln();
-                                }
-                                if q2 > 0.0 {
-                                    h2 -= (q2 as f64) * (q2 as f64).ln();
-                                }
+                    if let (Some(p1), Some(p2)) =
+                        (result.hap_posterior(0, local_m), result.hap_posterior(1, local_m))
+                    {
+                        let n_alleles = ref_markers
+                            .marker(MarkerIdx::new(ref_m as u32))
+                            .n_alleles()
+                            .max(1);
+                        let mut h1 = 0.0f64;
+                        let mut h2 = 0.0f64;
+                        for a in 0..n_alleles {
+                            let q1 = p1.prob(a).clamp(0.0, 1.0);
+                            let q2 = p2.prob(a).clamp(0.0, 1.0);
+                            if q1 > 0.0 {
+                                h1 -= (q1 as f64) * (q1 as f64).ln();
                             }
-                            let hmax = (n_alleles as f64).max(2.0).ln();
-                            if hmax > 0.0 {
-                                let conf1 = (1.0 - (h1 / hmax)).clamp(0.0, 1.0);
-                                let conf2 = (1.0 - (h2 / hmax)).clamp(0.0, 1.0);
-                                alpha = ((conf1 + conf2) * 0.5)
-                                    .clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX);
+                            if q2 > 0.0 {
+                                h2 -= (q2 as f64) * (q2 as f64).ln();
                             }
                         }
-                    } else if let (Some(p1_alt), Some(p2_alt)) = (
-                        result.hap_alt_probs.0.as_ref().and_then(|v| v.get(local_m)),
-                        result.hap_alt_probs.1.as_ref().and_then(|v| v.get(local_m)),
-                    ) {
-                        let q1 = (*p1_alt as f64).clamp(0.0, 1.0);
-                        let q2 = (*p2_alt as f64).clamp(0.0, 1.0);
+                        let hmax = (n_alleles as f64).max(2.0).ln();
+                        if hmax > 0.0 {
+                            let conf1 = (1.0 - (h1 / hmax)).clamp(0.0, 1.0);
+                            let conf2 = (1.0 - (h2 / hmax)).clamp(0.0, 1.0);
+                            alpha = ((conf1 + conf2) * 0.5)
+                                .clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX);
+                        }
+                    } else if let (Some(p1_alt), Some(p2_alt)) =
+                        (result.hap_alt_prob(0, local_m), result.hap_alt_prob(1, local_m))
+                    {
+                        let q1 = (p1_alt as f64).clamp(0.0, 1.0);
+                        let q2 = (p2_alt as f64).clamp(0.0, 1.0);
                         let h_bin = |q: f64| -> f64 {
                             let p0 = (1.0 - q).clamp(0.0, 1.0);
                             let p1 = q;
@@ -6663,14 +6751,7 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 // Invariant: every hap-ordered field in SampleImputationResult must be
                 // swapped consistently if orientation is swapped.
-                if let (Some(p1), Some(p2)) = (
-                    result.hap_posteriors.0.as_mut(),
-                    result.hap_posteriors.1.as_mut(),
-                ) {
-                    if local_m < p1.len() && local_m < p2.len() {
-                        std::mem::swap(&mut p1[local_m], &mut p2[local_m]);
-                    }
-                }
+                result.swap_hap_posteriors_at(local_m);
                 if let (Some(p1), Some(p2)) = (
                     result.hap_alt_probs.0.as_mut(),
                     result.hap_alt_probs.1.as_mut(),
@@ -6836,58 +6917,36 @@ impl crate::pipelines::ImputationPipeline {
         }
         let get_result_alt_prob =
             |result: &SampleImputationResult, hap: usize, local_m: usize| -> Option<f32> {
-                let direct = if hap == 0 {
-                    result
-                        .hap_alt_probs
-                        .0
-                        .as_ref()
-                        .and_then(|p| p.get(local_m))
-                        .copied()
-                } else {
-                    result
-                        .hap_alt_probs
-                        .1
-                        .as_ref()
-                        .and_then(|p| p.get(local_m))
-                        .copied()
-                };
-                direct.or_else(|| {
+                result.hap_alt_prob(hap, local_m).or_else(|| {
                     alt_prob_store.and_then(|store| store.get(result.sample_idx, hap, local_m))
                 })
             };
         for h in 0..n_haps {
             let sample_idx = h / 2;
             let hap_idx = h % 2;
-            let posteriors = result_by_sample
-                .get(sample_idx)
-                .and_then(|r| *r)
-                .map(|r| &r.hap_posteriors);
             for (local_m, ref_m) in (start..end).enumerate() {
                 let out_local = ref_m.saturating_sub(output_start);
-                if let Some((p1, p2)) = posteriors {
-                    let post = if hap_idx == 0 { p1 } else { p2 };
-                    if let Some(post) = post.as_ref() {
-                        if let Some(ap) = post.get(out_local) {
-                            let allele = match ap {
-                                AllelePosteriors::Biallelic(p_alt) => {
-                                    if *p_alt >= 0.5 {
-                                        1u8
-                                    } else {
-                                        0u8
-                                    }
+                if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
+                    if let Some(ap) = result.hap_posterior(hap_idx, out_local) {
+                        let allele = match ap {
+                            AllelePosteriors::Biallelic(p_alt) => {
+                                if *p_alt >= 0.5 {
+                                    1u8
+                                } else {
+                                    0u8
                                 }
-                                AllelePosteriors::Multiallelic(probs) => probs
-                                    .iter()
-                                    .enumerate()
-                                    .max_by(|a, b| {
-                                        a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
-                                    })
-                                    .map(|(i, _)| i as u8)
-                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
-                            };
-                            alleles[h * overlap_size + local_m] = allele;
-                            continue;
-                        }
+                            }
+                            AllelePosteriors::Multiallelic(probs) => probs
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| {
+                                    a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .map(|(i, _)| i as u8)
+                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
+                        };
+                        alleles[h * overlap_size + local_m] = allele;
+                        continue;
                     }
                 }
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
@@ -6964,22 +7023,7 @@ impl crate::pipelines::ImputationPipeline {
         }
         let get_result_alt_prob =
             |result: &SampleImputationResult, hap: usize, local_m: usize| -> Option<f32> {
-                let direct = if hap == 0 {
-                    result
-                        .hap_alt_probs
-                        .0
-                        .as_ref()
-                        .and_then(|p| p.get(local_m))
-                        .copied()
-                } else {
-                    result
-                        .hap_alt_probs
-                        .1
-                        .as_ref()
-                        .and_then(|p| p.get(local_m))
-                        .copied()
-                };
-                direct.or_else(|| {
+                result.hap_alt_prob(hap, local_m).or_else(|| {
                     alt_prob_store.and_then(|store| store.get(result.sample_idx, hap, local_m))
                 })
             };
@@ -7304,10 +7348,7 @@ impl crate::pipelines::ImputationPipeline {
                 if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                     let biallelic = ref_is_biallelic.get(marker_idx).copied().unwrap_or(false);
                     let post1 = result
-                        .hap_posteriors
-                        .0
-                        .as_ref()
-                        .and_then(|p1| p1.get(local_m))
+                        .hap_posterior(0, local_m)
                         .cloned()
                         .or_else(|| {
                             if biallelic {
@@ -7319,10 +7360,7 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .unwrap_or_else(|| default_posteriors(marker_idx).0);
                     let post2 = result
-                        .hap_posteriors
-                        .1
-                        .as_ref()
-                        .and_then(|p2| p2.get(local_m))
+                        .hap_posterior(1, local_m)
                         .cloned()
                         .or_else(|| {
                             if biallelic {
@@ -7540,16 +7578,14 @@ impl crate::pipelines::ImputationPipeline {
             let local_m = marker_idx.saturating_sub(output_start);
 
             let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
-                let hap_dosage = |hap: usize, posts: &Option<Vec<AllelePosteriors>>| -> f32 {
-                    if let Some(posts) = posts {
-                        if let Some(p) = posts.get(local_m) {
-                            return match p {
-                                AllelePosteriors::Biallelic(p_alt) => *p_alt,
-                                AllelePosteriors::Multiallelic(probs) => {
-                                    probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum()
-                                }
-                            };
-                        }
+                let hap_dosage = |hap: usize| -> f32 {
+                    if let Some(p) = result.hap_posterior(hap, local_m) {
+                        return match p {
+                            AllelePosteriors::Biallelic(p_alt) => *p_alt,
+                            AllelePosteriors::Multiallelic(probs) => {
+                                probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum()
+                            }
+                        };
                     }
                     if n_alleles <= 2 {
                         if let Some(alt) = get_result_alt_prob(result, hap, local_m) {
@@ -7565,8 +7601,8 @@ impl crate::pipelines::ImputationPipeline {
                 // donor carries the wrong allele (common at low-MAF sites),
                 // corrupting dosage calibration. Tested in PR #758: R² -0.0012,
                 // Hellinger +0.001, +97s slower.
-                let d1 = hap_dosage(0, &result.hap_posteriors.0);
-                let d2 = hap_dosage(1, &result.hap_posteriors.1);
+                let d1 = hap_dosage(0);
+                let d2 = hap_dosage(1);
                 d1 + d2
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
@@ -7619,17 +7655,11 @@ impl crate::pipelines::ImputationPipeline {
                     .n_alleles()
                     .max(1);
                 let p1_alt = result
-                    .hap_posteriors
-                    .0
-                    .as_ref()
-                    .and_then(|p1| p1.get(local_m))
+                    .hap_posterior(0, local_m)
                     .map(|p| p.prob(1))
                     .or_else(|| get_result_alt_prob(result, 0, local_m));
                 let p2_alt = result
-                    .hap_posteriors
-                    .1
-                    .as_ref()
-                    .and_then(|p2| p2.get(local_m))
+                    .hap_posterior(1, local_m)
                     .map(|p| p.prob(1))
                     .or_else(|| get_result_alt_prob(result, 1, local_m));
                 if n_alleles <= 2 {
@@ -7647,18 +7677,15 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         (0, 0)
                     }
-                } else if let (Some(p1), Some(p2)) = (
-                    result.hap_posteriors.0.as_ref(),
-                    result.hap_posteriors.1.as_ref(),
-                ) {
+                } else if result.hap_posteriors.0.is_some() || result.hap_posteriors.1.is_some() {
                     let mut best = (0u8, 0u8);
                     let mut best_prob = -1.0f32;
                     for i in 0..n_alleles {
                         for j in i..n_alleles {
-                            let p_i1 = p1.get(local_m).map(|p| p.prob(i)).unwrap_or(0.0);
-                            let p_i2 = p2.get(local_m).map(|p| p.prob(i)).unwrap_or(0.0);
-                            let p_j1 = p1.get(local_m).map(|p| p.prob(j)).unwrap_or(0.0);
-                            let p_j2 = p2.get(local_m).map(|p| p.prob(j)).unwrap_or(0.0);
+                            let p_i1 = result.hap_prob(0, local_m, i as u8).unwrap_or(0.0);
+                            let p_i2 = result.hap_prob(1, local_m, i as u8).unwrap_or(0.0);
+                            let p_j1 = result.hap_prob(0, local_m, j as u8).unwrap_or(0.0);
+                            let p_j2 = result.hap_prob(1, local_m, j as u8).unwrap_or(0.0);
                             let prob = if i == j {
                                 p_i1 * p_i2
                             } else {
@@ -7719,18 +7746,12 @@ impl crate::pipelines::ImputationPipeline {
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 let v1 = result
-                    .hap_posteriors
-                    .0
-                    .as_ref()
-                    .and_then(|p1| p1.get(local_m))
+                    .hap_posterior(0, local_m)
                     .map(|p| p.prob(1))
                     .or_else(|| get_result_alt_prob(result, 0, local_m))
                     .unwrap_or(0.0);
                 let v2 = result
-                    .hap_posteriors
-                    .1
-                    .as_ref()
-                    .and_then(|p2| p2.get(local_m))
+                    .hap_posterior(1, local_m)
                     .map(|p| p.prob(1))
                     .or_else(|| get_result_alt_prob(result, 1, local_m))
                     .unwrap_or(0.0);
@@ -7794,22 +7815,12 @@ impl crate::pipelines::ImputationPipeline {
                 }
             } else if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 let local_m = marker_idx.saturating_sub(output_start);
-                if let Some(p1) = result
-                    .hap_posteriors
-                    .0
-                    .as_ref()
-                    .and_then(|p1| p1.get(local_m))
-                {
+                if let Some(p1) = result.hap_posterior(0, local_m) {
                     for a in 0..n_alleles {
                         p1_buf[a] = p1.prob(a).clamp(0.0, 1.0);
                     }
                 }
-                if let Some(p2) = result
-                    .hap_posteriors
-                    .1
-                    .as_ref()
-                    .and_then(|p2| p2.get(local_m))
-                {
+                if let Some(p2) = result.hap_posterior(1, local_m) {
                     for a in 0..n_alleles {
                         p2_buf[a] = p2.prob(a).clamp(0.0, 1.0);
                     }
