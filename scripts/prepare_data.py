@@ -252,14 +252,38 @@ def _download_to(url: str, dest: Path):
 
 def _find_convert_genome_in_tree(root: Path):
     candidates = []
+    is_windows = platform.system().lower().startswith("windows")
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         base = path.name.lower()
-        if base == "convert_genome" or base == "convert_genome.exe":
-            candidates.append(path)
+        normalized = base[:-4] if base.endswith(".exe") else base
+        if not (
+            normalized == "convert_genome"
+            or normalized.startswith("convert_genome-")
+            or normalized.startswith("convert_genome_")
+            or normalized.startswith("convert-genome-")
+            or normalized.startswith("convert-genome_")
+        ):
+            continue
+        # Prefer executable-looking files. On Windows, allow .exe-only naming.
+        if is_windows:
+            if base.endswith(".exe") or normalized.startswith("convert_genome"):
+                candidates.append(path)
+        else:
+            mode = path.stat().st_mode
+            if mode & stat.S_IXUSR:
+                candidates.append(path)
+            else:
+                candidates.append(path)
     if candidates:
-        candidates.sort(key=lambda p: len(p.parts))
+        def _rank(p: Path):
+            base = p.name.lower()
+            normalized = base[:-4] if base.endswith(".exe") else base
+            exact = 0 if normalized == "convert_genome" else 1
+            return (exact, len(p.parts), len(base))
+
+        candidates.sort(key=_rank)
         return candidates[0]
     return None
 
