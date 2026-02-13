@@ -882,7 +882,16 @@ fn build_outputs_union_dir(
         "outputs-merged-input{input_run_id}-truth{truth_run_id}"
     ));
     if final_dir.join(".complete").exists() {
-        return final_dir;
+        let target = final_dir.join("target.vcf.gz");
+        let truth = final_dir.join("truth.vcf.gz");
+        let target_idx_ok = PathBuf::from(format!("{}.csi", target.display())).exists()
+            || PathBuf::from(format!("{}.tbi", target.display())).exists();
+        let truth_idx_ok = PathBuf::from(format!("{}.csi", truth.display())).exists()
+            || PathBuf::from(format!("{}.tbi", truth.display())).exists();
+        if target.exists() && truth.exists() && target_idx_ok && truth_idx_ok {
+            return final_dir;
+        }
+        let _ = fs::remove_dir_all(&final_dir);
     }
     if final_dir.exists() {
         let _ = fs::remove_dir_all(&final_dir);
@@ -1060,11 +1069,15 @@ fn copy_with_index(src_vcf: &Path, dst_vcf: &Path) {
                 .extension()
                 .and_then(OsStr::to_str)
                 .expect("index extension");
-            let dst = dst_vcf.with_extension(format!("vcf.gz.{ext}"));
+            let dst = PathBuf::from(format!("{}.{}", dst_vcf.display(), ext));
             link_or_copy_file(path, &dst);
             return;
         }
     }
+    run(
+        "bcftools",
+        ["index", "-f", dst_vcf.to_str().expect("dst vcf path utf8")],
+    );
 }
 
 fn link_or_copy_file(src: &Path, dst: &Path) {
