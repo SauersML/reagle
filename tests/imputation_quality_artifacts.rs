@@ -767,6 +767,7 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
     let entries = fs::read_dir(cache_root).ok()?;
     let mut best_ref: Option<(i64, PathBuf)> = None;
     let mut best_out: Option<(i64, PathBuf)> = None;
+    let mut best_merged_out: Option<PathBuf> = None;
     let mut best_input: Option<(i64, PathBuf)> = None;
     let mut best_truth: Option<(i64, PathBuf)> = None;
     for entry in entries {
@@ -810,7 +811,7 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
                     .map(|(best_id, _)| run_id > *best_id)
                     .unwrap_or(true);
                 if replace {
-                    best_out = Some((run_id, path));
+                    best_out = Some((run_id, path.clone()));
                 }
             } else {
                 if has_input {
@@ -833,9 +834,37 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
                 }
             }
         }
+        if name.starts_with("outputs-merged-input") {
+            let has_input = find_input_file(&path).is_some();
+            let has_truth = find_truth_file(&path).is_some();
+            if has_input && has_truth {
+                let replace = best_merged_out
+                    .as_ref()
+                    .map(|best| {
+                        let cur = fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        let prev = fs::metadata(best)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        match (cur, prev) {
+                            (Some(c), Some(p)) => c > p,
+                            (Some(_), None) => true,
+                            _ => false,
+                        }
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best_merged_out = Some(path.clone());
+                }
+            }
+        }
     }
     match (best_ref, best_out) {
         (Some((_, ref_dir)), Some((_, out_dir))) => Some((ref_dir, out_dir)),
+        (Some((_, ref_dir)), None) if best_merged_out.is_some() => {
+            Some((ref_dir, best_merged_out.expect("merged out exists")))
+        }
         (Some((_, ref_dir)), None) => {
             if let (Some((input_run, input_dir)), Some((truth_run, truth_dir))) =
                 (best_input, best_truth)
