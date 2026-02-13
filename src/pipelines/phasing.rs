@@ -420,6 +420,25 @@ const INVALID_ALLELE: u8 = 254;
 const REDUCTION_SPARSE_MAX_MARKERS: usize = 1024;
 const REDUCTION_SPARSE_HET_FRAC_NUM: usize = 3;
 const REDUCTION_SPARSE_HET_FRAC_DEN: usize = 4;
+const UNANCHORED_MIN_ORIENTATION_CONF: f32 = 0.55;
+const MIN_DECISIVE_LR: f32 = 1.0001;
+
+#[inline]
+fn orientation_confidence(p_orient: f32) -> f32 {
+    let p = p_orient.clamp(0.0, 1.0);
+    p.max(1.0 - p)
+}
+
+#[inline]
+fn orientation_is_decisive(lr: f32, p_orient: f32, has_anchor: bool) -> bool {
+    if !lr.is_finite() || lr < MIN_DECISIVE_LR {
+        return false;
+    }
+    if has_anchor {
+        return true;
+    }
+    orientation_confidence(p_orient) >= UNANCHORED_MIN_ORIENTATION_CONF
+}
 
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
@@ -6572,10 +6591,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             } else {
                                 let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
                                 let lr_threshold = self.params.lr_threshold;
-                                for (idx, &pos) in het_positions.iter().enumerate() {
-                                    let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
-                                    let lr = *swap_lr.get(idx).unwrap_or(&1.0);
-                                    if lr >= lr_threshold && swap_bit == 1 {
+                                for (map_idx, &pos) in het_positions.iter().enumerate() {
+                                    let swap_bit = swap_bits.get(map_idx).copied().unwrap_or(0);
+                                    let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
+                                    let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                    let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
+                                    if lr >= lr_threshold
+                                        && swap_bit == 1
+                                        && orientation_is_decisive(lr, p_orient, has_phase_anchors)
+                                    {
                                         swap_mask[pos] = RelativeSwapBit(true);
                                     }
                                 }
@@ -6583,9 +6607,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                         } else {
                             let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
-                            for (idx, &pos) in het_positions.iter().enumerate() {
-                                let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
-                                swap_mask[pos] = RelativeSwapBit(swap_bit == 1);
+                            for (map_idx, &pos) in het_positions.iter().enumerate() {
+                                let swap_bit = swap_bits.get(map_idx).copied().unwrap_or(0);
+                                let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
+                                let p_swap = *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
+                                let p_orient = if swap_bit == 1 { p_swap } else { 1.0 - p_swap };
+                                swap_mask[pos] = RelativeSwapBit(
+                                    swap_bit == 1
+                                        && orientation_is_decisive(lr, p_orient, has_phase_anchors),
+                                );
                             }
                             Stage1OrientationUpdate::RelativeSwapMask(swap_mask)
                         };
@@ -6778,15 +6808,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
 
-            // Mark hets as phased if LR exceeds threshold (independent of swap decision)
+            // Mark hets as phased only when orientation is decisive.
             if !is_burnin {
                 for Stage1HetUpdate {
                     marker: HiFreqMarkerIdx(hi_freq_idx),
                     lr: PhaseLogOdds(lr),
-                    ..
+                    confidence: PhaseConfidence(p_orient),
                 } in &decision.het_updates
                 {
-                    if *lr >= lr_threshold {
+                    if *lr >= lr_threshold
+                        && orientation_is_decisive(*lr, *p_orient, sp.has_input_phase_anchor())
+                    {
                         let m = hi_freq_to_orig[*hi_freq_idx];
                         if sp.is_unphased(m) {
                             sp.mark_phased(m);
@@ -7780,8 +7812,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let mut total_phased = 0;
         let mut total_imputed = 0;
 
-        // Stage 2 runs after all iterations, so lr_threshold is typically 1.0
-        // (all decisions pass). We still check for consistency with Stage 1.
+        // Stage 2 runs after all iterations, so lr_threshold is typically 1.0.
+        // We still require decisive orientation for anchor-free samples.
         let lr_threshold = self.params.lr_threshold;
 
         for (s, (decisions, _, next_hap_priors, prior_marker, prior_gen_pos)) in
@@ -7817,7 +7849,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             continue;
                         }
 
-                        let confident = lr >= lr_threshold;
+                        let p_orient = (lr / (1.0 + lr)).clamp(0.5, 1.0);
+                        let confident = lr >= lr_threshold
+                            && orientation_is_decisive(lr, p_orient, sp.has_input_phase_anchor());
                         if should_swap {
                             sp.swap_haps(m, m + 1);
                             if confident {
@@ -7825,12 +7859,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             }
                         }
 
-                        let phase_conf = if sp.has_input_phase_anchor() {
-                            lr / (1.0 + lr)
-                        } else {
-                            0.5
-                        };
-                        sp.set_phase_confidence(m, phase_conf);
+                        sp.set_phase_confidence(m, p_orient);
 
                         // Only mark as phased if likelihood ratio exceeds threshold
                         // (Stage 2 runs after iterations, so threshold is typically 1.0)
@@ -12389,6 +12418,7 @@ mod tests {
             overlap: 2.0,
             seed: 12345,
             nthreads: None,
+            phase_only: false,
             profile: false,
         };
 
@@ -12477,6 +12507,7 @@ mod tests {
             overlap: 2.0,
             seed: 12345,
             nthreads: Some(2),
+            phase_only: false,
             profile: false,
         };
 
@@ -13780,5 +13811,18 @@ mod tests {
         assert_eq!(&states[..3], &[0, 0, 0]);
         assert_eq!(&states[3..], &[1, 1, 1]);
         assert!(posterior[0] < 0.5 && posterior[5] > 0.5);
+    }
+
+    #[test]
+    fn test_orientation_decisive_rejects_ambiguous_unanchored() {
+        assert!(!orientation_is_decisive(1.0, 0.5, false));
+        assert!(!orientation_is_decisive(1.00001, 0.51, false));
+        assert!(orientation_is_decisive(1.5, 0.80, false));
+    }
+
+    #[test]
+    fn test_orientation_decisive_accepts_anchored_with_lr() {
+        assert!(!orientation_is_decisive(1.0, 0.5, true));
+        assert!(orientation_is_decisive(2.0, 0.5, true));
     }
 }

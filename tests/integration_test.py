@@ -1091,17 +1091,27 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         except Exception as e:
             print(f"    Range: Error - {e}")
 
-    def _truncate_line(line, limit=2000):
-        if len(line) <= limit:
+    def _format_example_record(line, max_sample_columns=1):
+        parts = line.split("\t")
+        if len(parts) <= 9:
             return line
-        return line[:limit] + "...[truncated]"
+        fixed = parts[:9]
+        sample_cols = parts[9:]
+        shown = sample_cols[:max_sample_columns]
+        remaining = len(sample_cols) - len(shown)
+        summary = "\t".join(fixed + shown)
+        if remaining > 0:
+            summary += f"\t...[{remaining} sample columns omitted]"
+        return summary
 
-    # Print example lines (raw records) from each file
-    print("\n🧾 Example Records (first 3 lines):")
-    for vcf_path, label in diag_vcfs:
+    # Print compact example lines (raw records) from truth/imputed only.
+    # Reference is excluded to keep logs concise in repeated metric runs.
+    example_vcfs = [(truth_vcf, "TRUTH"), (imputed_vcf, "IMPUTED")]
+    print("\n🧾 Example Records (first 1 line):")
+    for vcf_path, label in example_vcfs:
         try:
             ex_result = subprocess.run(
-                f"bcftools view -H {vcf_path} | head -3",
+                f"bcftools view -H {vcf_path} | head -1",
                 shell=True, capture_output=True, text=True
             )
             lines = [l for l in ex_result.stdout.strip().split("\n") if l]
@@ -1110,16 +1120,17 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 print("    (no records)")
             else:
                 for line in lines:
-                    print(f"    {_truncate_line(line)}")
+                    print(f"    {_format_example_record(line)}")
         except Exception as e:
             print(f"  {label}: Error - {e}")
     
-    # Sample first 10 sites from each VCF
-    print("\n📍 Sample Sites (first 10):")
+    # Sample first few sites from each VCF for quick sanity checks.
+    sample_site_limit = 3
+    print(f"\n📍 Sample Sites (first {sample_site_limit}):")
     for vcf_path, label in [(truth_vcf, "TRUTH"), (imputed_vcf, "IMPUTED")]:
         try:
             result = subprocess.run(
-                f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {vcf_path} | head -10",
+                f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {vcf_path} | head -{sample_site_limit}",
                 shell=True, capture_output=True, text=True
             )
             lines = [l for l in result.stdout.strip().split('\n') if l]
@@ -1153,10 +1164,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         else:
             print(f"  ⚠️  NO OVERLAP in first 100 sites (coordinate mismatch?)")
             print(f"\n  Sample truth sites:")
-            for site in list(truth_sites_sample)[:3]:
+            for site in sorted(truth_sites_sample)[:2]:
                 print(f"    {site}")
             print(f"\n  Sample imputed sites:")
-            for site in list(imputed_sites_sample)[:3]:
+            for site in sorted(imputed_sites_sample)[:2]:
                 print(f"    {site}")
 
         # Full overlap across all sites (exact CHROM/POS/REF/ALT)
@@ -1206,7 +1217,7 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
                 if len(parts) >= 4:
                     imputed_map[f"{parts[0]}\t{parts[1]}"] = (parts[2], parts[3])
             mismatch_examples = 0
-            for key in list(pos_overlap)[:10]:
+            for key in sorted(pos_overlap)[:3]:
                 t_vals = truth_map.get(key)
                 i_vals = imputed_map.get(key)
                 if t_vals and i_vals and t_vals != i_vals:
@@ -3207,7 +3218,7 @@ def _run_reagle_phasing(paths, input_vcf):
             chrom="22"
         )
         run(
-            f"{paths['reagle_bin']} --target {input_vcf} --ref {paths['ref_vcf']} "
+            f"{paths['reagle_bin']} --phase --target {input_vcf} --ref {paths['ref_vcf']} "
             f"--map {reagle_map} --out {reagle_prefix}"
         )
     ensure_index(reagle_vcf)
@@ -3378,6 +3389,51 @@ def stage_phasing_metrics():
         n50 = data.get("n50_phase_block", 0.0)
         phase_conc = data.get("phase_concordance", 0.0)
         print(f"{name.upper()}: SER={ser:.4f} PhaseConc={phase_conc:.4f} N50={n50:.0f} bp")
+
+    # Markdown summary for GitHub Actions job summary and artifacts.
+    summary_lines = []
+    summary_lines.append("## Phasing Compare Summary (chr22)")
+    summary_lines.append("")
+    summary_lines.append("| Tool | SER | Phase Concordance | N50 (bp) | Sites Compared | Truth Overlap |")
+    summary_lines.append("| :--- | ---: | ---: | ---: | ---: | ---: |")
+
+    for tool_name in ["reagle", "eagleimp", "truth"]:
+        data = metrics.get(tool_name)
+        if not data:
+            summary_lines.append(f"| {tool_name.upper()} | FAILED | FAILED | FAILED | FAILED | FAILED |")
+            continue
+        ser = data.get("switch_error_rate")
+        phase_conc = data.get("phase_concordance")
+        n50 = data.get("n50_phase_block")
+        sites_compared = data.get("sites_compared")
+        sites_truth_total = data.get("sites_truth_total")
+        sites_common = data.get("sites_common")
+        overlap_pct = None
+        if sites_truth_total:
+            overlap_pct = (sites_common / sites_truth_total) * 100.0
+        overlap_str = (
+            f"{sites_common:,}/{sites_truth_total:,} ({overlap_pct:.2f}%)"
+            if overlap_pct is not None
+            else "N/A"
+        )
+        summary_lines.append(
+            f"| {tool_name.upper()} | "
+            f"{ser:.4f} | "
+            f"{phase_conc:.4f} | "
+            f"{n50:.0f} | "
+            f"{sites_compared:,} | "
+            f"{overlap_str} |"
+        )
+
+    summary_lines.append("")
+    summary_lines.append(
+        "Note: Compare SER/PhaseConc primarily when site overlap is comparable."
+    )
+
+    phasing_summary_md = paths["data_dir"] / "phasing_compare_summary.md"
+    with open(phasing_summary_md, "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    print(f"Phasing markdown summary written to: {phasing_summary_md}")
 
     print("\nPhasing metrics stage completed successfully.")
 

@@ -2382,6 +2382,7 @@ fn test_phasing_confidence() {
         overlap: 2.0,
         seed: 12345,
         nthreads: Some(1),
+        phase_only: false,
         profile: false,
     };
 

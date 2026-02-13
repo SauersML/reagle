@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Compare REAGLE metrics across Imputation Quality Assessment runs vs a base run.
+"""Compare REAGLE metrics for currently open PRs vs dynamic per-PR main baselines.
 
-This script:
-1. Resolves a base run from an Actions run URL, run id, or run number (e.g. #1298).
-2. Reads REAGLE metrics from the four metrics-* artifacts in that base run.
-3. Scans every subsequent "Imputation Quality Assessment" run (including in-progress/queued).
-4. For any subsequent run artifact already available, computes deltas vs base.
-5. Prints emoji-coded improvement/worsening per metric and saves a 4-panel delta plot.
+Rules implemented:
+1. No required CLI args.
+2. Only currently open PRs are considered.
+3. Each open PR uses only its most recent IQA workflow run.
+4. The baseline for that PR is the most recent IQA run on main before PR creation time.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 
@@ -47,21 +47,12 @@ def run_cmd(command: list[str]) -> str:
     return proc.stdout.strip()
 
 
-def run_cmd_maybe(command: list[str]) -> str | None:
-    proc = subprocess.run(command, capture_output=True, text=True)
-    if proc.returncode != 0:
-        return None
-    out = proc.stdout.strip()
-    return out if out else None
-
-
 def detect_repo(default_repo: str) -> str:
     try:
         url = run_cmd(["git", "config", "--get", "remote.origin.url"])
     except Exception:
         return default_repo
 
-    # Handles: https://github.com/owner/repo(.git) and git@github.com:owner/repo(.git)
     m = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/.]+)(?:\.git)?$", url)
     if not m:
         return default_repo
@@ -75,7 +66,7 @@ class GitHubClient:
         if not self.token:
             raise RuntimeError("Could not get GitHub token from gh auth.")
 
-    def _request_json(self, url: str) -> tuple[dict, str | None]:
+    def _request_json(self, url: str) -> tuple[Any, str | None]:
         req = urllib.request.Request(url)
         req.add_header("Authorization", f"Bearer {self.token}")
         req.add_header("Accept", "application/vnd.github+json")
@@ -85,7 +76,7 @@ class GitHubClient:
             link = resp.headers.get("Link")
             return data, link
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         base = f"https://api.github.com{path}"
         if params:
             q = urllib.parse.urlencode(params)
@@ -93,7 +84,7 @@ class GitHubClient:
         data, _ = self._request_json(base)
         return data
 
-    def paginate(self, path: str, params: dict | None = None, list_key: str | None = None) -> list[dict]:
+    def paginate(self, path: str, params: dict[str, Any] | None = None, list_key: str | None = None) -> list[dict]:
         base = f"https://api.github.com{path}"
         if params:
             q = urllib.parse.urlencode(params)
@@ -114,6 +105,7 @@ class GitHubClient:
             next_url = parse_next_link(link)
         return items
 
+
 def parse_next_link(link_header: str | None) -> str | None:
     if not link_header:
         return None
@@ -126,107 +118,17 @@ def parse_next_link(link_header: str | None) -> str | None:
     return None
 
 
-def parse_run_input(raw: str) -> tuple[str, int]:
-    s = raw.strip()
-    m_url = re.search(r"/actions/runs/(\d+)", s)
-    if m_url:
-        return "id", int(m_url.group(1))
-
-    m_hash = re.match(r"#(\d+)$", s)
-    if m_hash:
-        return "run_number", int(m_hash.group(1))
-
-    if s.isdigit():
-        val = int(s)
-        # Heuristic: run ids are large; run_number is usually much smaller.
-        if val >= 1_000_000:
-            return "id", val
-        return "run_number", val
-
-    raise ValueError(f"Unrecognized run input: {raw}")
-
-
 def parse_iso_time(ts: str) -> dt.datetime:
     return dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
 
 
+def human_utc(ts: str) -> str:
+    t = parse_iso_time(ts)
+    return t.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
-
-
-def resolve_pr_for_run(
-    repo: str, run: dict, pr_cache: dict[str, tuple[int | None, str | None]]
-) -> tuple[int | None, str | None]:
-    if run.get("event") != "pull_request":
-        return None, None
-
-    head_branch = run.get("head_branch") or run.get("headBranch")
-    if not head_branch:
-        return None, None
-
-    if head_branch in pr_cache:
-        return pr_cache[head_branch]
-
-    pr_num: int | None = None
-    pr_state: str | None = None
-    q1 = run_cmd_maybe(
-        [
-            "gh",
-            "pr",
-            "list",
-            "-R",
-            repo,
-            "--state",
-            "all",
-            "--head",
-            str(head_branch),
-            "--json",
-            "number,state",
-            "--jq",
-            ".[0]",
-        ]
-    )
-    if q1:
-        obj1 = json.loads(q1)
-        if isinstance(obj1, dict):
-            num = obj1.get("number")
-            state = obj1.get("state")
-            if isinstance(num, int):
-                pr_num = num
-            if isinstance(state, str):
-                pr_state = state
-    else:
-        head_sha = run.get("head_sha") or run.get("headSha")
-        if head_sha:
-            q2 = run_cmd_maybe(
-                [
-                    "gh",
-                    "pr",
-                    "list",
-                    "-R",
-                    repo,
-                    "--state",
-                    "all",
-                    "--search",
-                    f"{head_sha} in:commits",
-                    "--json",
-                    "number,state",
-                    "--jq",
-                    ".[0]",
-                ]
-            )
-            if q2:
-                obj2 = json.loads(q2)
-                if isinstance(obj2, dict):
-                    num = obj2.get("number")
-                    state = obj2.get("state")
-                    if isinstance(num, int):
-                        pr_num = num
-                    if isinstance(state, str):
-                        pr_state = state
-
-    pr_cache[head_branch] = (pr_num, pr_state)
-    return pr_num, pr_state
 
 
 def read_reagle_metrics_from_artifact(
@@ -246,8 +148,6 @@ def read_reagle_metrics_from_artifact(
     run_dir.mkdir(parents=True, exist_ok=True)
     art_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use gh CLI for artifact download to rely on its auth/session handling.
-    # This extracts artifact contents under art_dir/<artifact-name>/...
     run_cmd(
         [
             "gh",
@@ -290,29 +190,6 @@ def fmt(v: float | None) -> str:
     if not math.isfinite(v):
         return "N/A"
     return f"{v:.6f}"
-
-
-def resolve_base_run(gh: GitHubClient, workflow_name: str, run_input: str) -> dict:
-    kind, val = parse_run_input(run_input)
-    if kind == "id":
-        run = gh.get(f"/repos/{gh.repo}/actions/runs/{val}")
-        if run.get("name") != workflow_name:
-            raise RuntimeError(
-                f"Base run {val} is workflow '{run.get('name')}', expected '{workflow_name}'."
-            )
-        return run
-
-    # run_number path
-    workflow_id = find_workflow_id(gh, workflow_name)
-    runs = gh.paginate(
-        f"/repos/{gh.repo}/actions/workflows/{workflow_id}/runs",
-        params={"per_page": 100},
-        list_key="workflow_runs",
-    )
-    for run in runs:
-        if run.get("run_number") == val:
-            return run
-    raise RuntimeError(f"Could not find workflow run number #{val} for '{workflow_name}'.")
 
 
 def find_workflow_id(gh: GitHubClient, workflow_name: str) -> int:
@@ -368,8 +245,6 @@ def read_job_log(gh: GitHubClient, run_id: int, job_id: int, cache_dir: Path) ->
 
 
 def _parse_ts_from_log_line(line: str) -> dt.datetime | None:
-    # Expected segment after second tab:
-    # 2026-02-10T08:42:01.2443380Z === Running Reagle ===
     parts = line.split("\t", 2)
     if len(parts) < 3:
         return None
@@ -378,10 +253,9 @@ def _parse_ts_from_log_line(line: str) -> dt.datetime | None:
     if not m:
         return None
     ts = m.group("ts")
-    # fromisoformat handles up to 6 digits; truncate fractional precision if needed.
     if "." in ts:
         base, frac_z = ts.split(".", 1)
-        frac = frac_z[:-1]  # strip Z
+        frac = frac_z[:-1]
         frac = frac[:6]
         ts = f"{base}.{frac}Z"
     return dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ" if "." in ts else "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -400,7 +274,6 @@ def parse_reagle_seconds_and_artifact(log_text: str) -> tuple[float | None, str 
         if "=== Running Beagle ===" in line and reagle_start is not None and beagle_start is None:
             beagle_start = _parse_ts_from_log_line(line)
 
-        # Prefer finalized upload line, fallback to any metrics-name line.
         m_art = re.search(r"Artifact (metrics-[A-Za-z0-9-]+)(?:\.zip)?", line)
         if m_art:
             artifact_name = m_art.group(1)
@@ -418,13 +291,6 @@ def parse_reagle_seconds_and_artifact(log_text: str) -> tuple[float | None, str 
 
 
 def parse_reagle_metrics_from_log(log_text: str) -> dict | None:
-    """Extract top-level reagle metrics from job log text.
-
-    The integration_test.py metrics stage prints lines like:
-      key: reagle=0.775865 beagle=0.890333 delta=-0.114468
-    We extract the reagle value for each known metric key.
-    Only top-level lines are matched (lines containing by_maf. are skipped).
-    """
     metric_keys = {m[0] for m in METRICS}
     result: dict[str, float] = {}
     pattern = re.compile(r"\s+(\S+):\s+reagle=([\d.eE+-]+)\s+beagle=")
@@ -447,7 +313,6 @@ def extract_metrics_from_logs(
     run: dict,
     cache_dir: Path,
 ) -> dict[str, dict]:
-    """Fallback: extract metrics from job logs when artifacts are unavailable."""
     run_id = int(run["id"])
     jobs = list_run_jobs(gh, run_id)
     out: dict[str, dict] = {}
@@ -465,7 +330,6 @@ def extract_metrics_from_logs(
         if metrics is not None:
             if seconds is not None:
                 metrics["reagle_step_seconds"] = seconds
-            # Use artifact name if detected, otherwise synthesize from job name.
             art_key = artifact_name or f"metrics-{safe_name(name)}"
             out[art_key] = metrics
     return out
@@ -519,7 +383,6 @@ def collect_run_metrics(
             print(f"WARN: Failed reading artifact '{name}' from run {run['id']}: {exc}")
             out[name] = None
 
-    # Fallback: if all target artifacts were missing, try extracting from logs.
     if all(v is None for v in out.values()):
         log_metrics = extract_metrics_from_logs(gh, run, cache_dir)
         if log_metrics:
@@ -527,50 +390,140 @@ def collect_run_metrics(
                 if name in log_metrics:
                     out[name] = log_metrics[name]
                 else:
-                    # Match by any available log-extracted key (single-job runs).
-                    for lk, lv in log_metrics.items():
+                    for lv in log_metrics.values():
                         if out.get(name) is None:
                             out[name] = lv
                             break
     return out
 
 
-def print_report(base_run: dict, base_metrics: dict[str, dict], comparisons: list[dict], artifact_names: list[str]) -> None:
-    print("=" * 110)
-    base_pr = base_run.get("pr_number")
-    base_pr_txt = f", pr=#{base_pr}" if base_pr is not None else ""
-    print(
-        f"BASE RUN: {base_run['id']} (run_number={base_run.get('run_number')}{base_pr_txt}, "
-        f"status={base_run.get('status')}, conclusion={base_run.get('conclusion')})"
+def list_open_prs(gh: GitHubClient) -> list[dict]:
+    return gh.paginate(
+        f"/repos/{gh.repo}/pulls",
+        params={"state": "open", "per_page": 100},
+        list_key=None,
     )
-    print(f"URL: {base_run.get('html_url')}")
-    print("=" * 110)
 
-    print("\nBASE REFERENCE (by artifact/job):")
-    for art in artifact_names:
-        print(f"\n  {art}")
-        b = base_metrics[art]
-        for key, label, _ in METRICS:
-            print(f"    {label}: {fmt(b.get(key))}")
 
-    print("\n" + "=" * 110)
-    print("SUBSEQUENT RUNS (job-level output)")
-    print("=" * 110)
+def resolve_run_pr_numbers(run: dict, open_prs_by_number: dict[int, dict], open_prs_by_head: dict[str, int]) -> list[int]:
+    nums: list[int] = []
+    for pr_stub in run.get("pull_requests", []):
+        num = pr_stub.get("number")
+        if isinstance(num, int) and num in open_prs_by_number:
+            nums.append(num)
+
+    if nums:
+        return sorted(set(nums))
+
+    head_branch = run.get("head_branch")
+    if isinstance(head_branch, str):
+        num = open_prs_by_head.get(head_branch)
+        if num is not None:
+            return [num]
+
+    return []
+
+
+def latest_pr_runs(
+    pr_runs: list[dict],
+    open_prs_by_number: dict[int, dict],
+    open_prs_by_head: dict[str, int],
+) -> dict[int, dict]:
+    latest: dict[int, dict] = {}
+    for run in pr_runs:
+        pr_nums = resolve_run_pr_numbers(run, open_prs_by_number, open_prs_by_head)
+        if not pr_nums:
+            continue
+        run_ts = parse_iso_time(run["created_at"])
+        for pr_num in pr_nums:
+            cur = latest.get(pr_num)
+            if cur is None or run_ts > parse_iso_time(cur["created_at"]):
+                latest[pr_num] = run
+    return latest
+
+
+def find_main_base_run_before(main_runs: list[dict], pr_created: dt.datetime) -> dict | None:
+    best: dict | None = None
+    best_ts: dt.datetime | None = None
+    for run in main_runs:
+        ts = parse_iso_time(run["created_at"])
+        if ts >= pr_created:
+            continue
+        if best is None or (best_ts is not None and ts > best_ts):
+            best = run
+            best_ts = ts
+    return best
+
+
+def load_base_metrics(
+    gh: GitHubClient,
+    base_run: dict,
+    cache_dir: Path,
+    base_cache: dict[int, tuple[list[str], dict[str, dict]]],
+) -> tuple[list[str], dict[str, dict]]:
+    run_id = int(base_run["id"])
+    if run_id in base_cache:
+        return base_cache[run_id]
+
+    base_arts = [
+        a
+        for a in list_run_artifacts(gh, run_id)
+        if a.get("name", "").startswith("metrics-") and not a.get("expired", False)
+    ]
+    base_artifact_names = sorted(a["name"] for a in base_arts)
+
+    if len(base_artifact_names) == 0:
+        log_metrics = extract_metrics_from_logs(gh, base_run, cache_dir)
+        if not log_metrics:
+            raise RuntimeError(f"No metrics found for base run {run_id}.")
+        base_artifact_names = sorted(log_metrics.keys())
+        base_metrics = {name: metrics for name, metrics in log_metrics.items()}
+    else:
+        base_metrics_raw = collect_run_metrics(gh, base_run, base_artifact_names, cache_dir)
+        missing_base = [name for name, m in base_metrics_raw.items() if m is None]
+        if missing_base:
+            raise RuntimeError(f"Base run {run_id} missing metrics in artifacts: {missing_base}")
+        base_metrics = {name: m for name, m in base_metrics_raw.items() if m is not None}
+
+    base_cache[run_id] = (base_artifact_names, base_metrics)
+    return base_artifact_names, base_metrics
+
+
+def print_pr_report(comparisons: list[dict]) -> None:
     for entry in comparisons:
-        run = entry["run"]
-        pr_txt = f", pr=#{run.get('pr_number')}" if run.get("pr_number") is not None else ""
+        pr = entry["pr"]
+        pr_run = entry["pr_run"]
+        base_run = entry["base_run"]
+        base_metrics = entry["base_metrics"]
+        pr_metrics = entry["pr_metrics"]
+        artifact_names = entry["artifact_names"]
+
+        print("=" * 110)
+        print(f"PR #{pr['number']}: {pr.get('title', '')}")
+        print(f"PR URL: {pr.get('html_url')}")
+        print(f"PR created_at: {pr.get('created_at')} ({human_utc(pr['created_at'])})")
         print(
-            f"\nRun {run['id']} (#{run.get('run_number')}, "
-            f"{run.get('status')}/{run.get('conclusion')}{pr_txt})"
+            f"PR run: {pr_run['id']} (#{pr_run.get('run_number')}, "
+            f"{pr_run.get('status')}/{pr_run.get('conclusion')})"
         )
-        # Run-level mean deltas across available artifact jobs.
+        print(
+            f"PR run created_at: {pr_run.get('created_at')} "
+            f"({human_utc(pr_run['created_at'])})"
+        )
+        print(f"PR run commit: {pr_run.get('head_sha', 'N/A')}")
+        print(
+            f"Base run: {base_run['id']} (#{base_run.get('run_number')}, "
+            f"created_at={base_run.get('created_at')} ({human_utc(base_run['created_at'])})"
+        )
+        print(f"Base run commit: {base_run.get('head_sha', 'N/A')}")
+
         print("  Mean delta across available metric jobs:")
         for key, label, direction in METRICS:
             deltas = []
             for art in artifact_names:
-                b = base_metrics[art]
-                m = entry["metrics"].get(art)
-                if not m:
+                b = base_metrics.get(art)
+                m = pr_metrics.get(art)
+                if not b or not m:
                     continue
                 _, delta = metric_delta_status(key, b.get(key), m.get(key))
                 if delta is not None:
@@ -590,12 +543,12 @@ def print_report(base_run: dict, base_metrics: dict[str, dict], comparisons: lis
 
         printed_any = False
         for art in artifact_names:
-            m = entry["metrics"].get(art)
-            if not m:
+            m = pr_metrics.get(art)
+            b = base_metrics.get(art)
+            if not m or not b:
                 continue
             printed_any = True
             print(f"  {art}")
-            b = base_metrics[art]
             for key, label, _ in METRICS:
                 base_val = b.get(key)
                 cur_val = m.get(key)
@@ -603,17 +556,22 @@ def print_report(base_run: dict, base_metrics: dict[str, dict], comparisons: lis
                 d = "N/A" if delta is None else f"{delta:+.6f}"
                 print(f"    {emoji} {label}: {fmt(cur_val)}   Δ {d}")
         if not printed_any:
-            print("  No matching metrics-* artifacts available yet for this run.")
+            print("  No matching metrics available for this PR run.")
 
 
-def build_plot(
-    base_metrics: dict[str, dict],
-    comparisons: list[dict],
-    artifact_names: list[str],
-    out_png: Path,
-) -> None:
+def build_plot(comparisons: list[dict], out_png: Path) -> None:
+    artifact_names = sorted(
+        {
+            art
+            for entry in comparisons
+            for art in entry["artifact_names"]
+        }
+    )
+    if not artifact_names:
+        return
+
     n_cols = len(artifact_names)
-    fig, axes = plt.subplots(1, n_cols, figsize=(34, 11), sharey=True)
+    fig, axes = plt.subplots(1, n_cols, figsize=(8 * n_cols, 11), sharey=True)
     if n_cols == 1:
         axes = [axes]
 
@@ -622,25 +580,24 @@ def build_plot(
 
     for i, art in enumerate(artifact_names):
         ax = axes[i]
-        base = base_metrics[art]
-
         plotted = 0
-        all_x = []
+        all_x: list[float] = []
 
-        for run_pos, entry in enumerate(comparisons):
-            run = entry["run"]
-            m = entry["metrics"].get(art)
-            if not m:
+        for pos, entry in enumerate(comparisons):
+            pr = entry["pr"]
+            base = entry["base_metrics"].get(art)
+            cur = entry["pr_metrics"].get(art)
+            pr_run = entry["pr_run"]
+            if not base or not cur:
                 continue
 
-            for j, (key, label, _) in enumerate(METRICS):
+            for j, (key, _, _) in enumerate(METRICS):
                 base_val = base.get(key)
-                cur_val = m.get(key)
+                cur_val = cur.get(key)
                 emoji, delta = metric_delta_status(key, base_val, cur_val)
                 if delta is None:
                     continue
 
-                # Plot speed as fractional percent change (0..1) instead of raw seconds delta.
                 plot_x = delta
                 if key == "reagle_step_seconds":
                     if base_val is None or cur_val is None or base_val <= 0:
@@ -648,10 +605,11 @@ def build_plot(
                     frac_change = abs((cur_val - base_val) / base_val)
                     plot_x = min(max(frac_change, 0.0), 1.0)
 
-                y = j + ((run_pos % 9) - 4) * 0.045
+                y = j + ((pos % 9) - 4) * 0.045
                 color = "#16a34a" if emoji == "🟢" else ("#dc2626" if emoji == "🔴" else "#6b7280")
-                marker = "o" if run.get("status") == "completed" else "^"
+                marker = "o" if pr_run.get("status") == "completed" else "^"
                 ax.scatter(plot_x, y, s=42, color=color, alpha=0.85, marker=marker, edgecolors="none")
+                ax.text(plot_x, y + 0.02, f"PR{pr['number']}", fontsize=7, alpha=0.65)
                 all_x.append(plot_x)
                 plotted += 1
 
@@ -662,8 +620,8 @@ def build_plot(
         short = art.replace("metrics-", "")
         if len(short) > 40:
             short = short[:37] + "..."
-        ax.set_title(f"{short}\n(points={plotted})", fontsize=10)
-        ax.set_xlabel("Delta vs base (speed shown as 0-1 fractional change)")
+        ax.set_title(f"{short}\\n(points={plotted})", fontsize=10)
+        ax.set_xlabel("Delta vs PR-specific main baseline (speed shown as 0-1 fractional change)")
 
         if all_x:
             max_abs = max(abs(x) for x in all_x)
@@ -681,7 +639,7 @@ def build_plot(
     ]
 
     fig.legend(handles=legend_handles, loc="upper center", ncol=5, frameon=False)
-    fig.suptitle("REAGLE metric deltas vs base run (Imputation Quality Assessment)", fontsize=14, y=0.98)
+    fig.suptitle("REAGLE metric deltas per open PR vs dynamic pre-PR main baseline", fontsize=14, y=0.98)
     fig.tight_layout(rect=[0.01, 0.04, 0.99, 0.93])
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=180)
@@ -689,106 +647,86 @@ def build_plot(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compare REAGLE metrics across IQA runs against a base run.")
-    parser.add_argument("base_run", help="Base run URL, run id, or run number (e.g. #1298).")
+    parser = argparse.ArgumentParser(description="Compare REAGLE metrics for open PRs vs dynamic pre-PR main baselines.")
     parser.add_argument("--repo", default="", help="GitHub repo slug owner/repo (auto-detected by default).")
     parser.add_argument("--workflow", default="Imputation Quality Assessment", help="Workflow name.")
     parser.add_argument(
         "--output",
         default="scripts/iqa_reagle_delta_report.png",
-        help="Output PNG path (single figure with four subplots).",
+        help="Output PNG path.",
     )
     parser.add_argument(
         "--cache-dir",
         default="/tmp/iqa_reagle_delta_cache",
         help="Directory used to cache downloaded artifact contents.",
     )
-    parser.add_argument(
-        "--max-subsequent",
-        type=int,
-        default=0,
-        help="Optional cap for number of subsequent runs to process (0 = all).",
-    )
-
     args = parser.parse_args()
 
     repo = args.repo or detect_repo("SauersML/reagle")
     cache_dir = Path(args.cache_dir)
     out_png = Path(args.output)
 
-    print(f"Repo: {repo}")
-    print(f"Workflow: {args.workflow}")
-
     gh = GitHubClient(repo)
-    base_run = resolve_base_run(gh, args.workflow, args.base_run)
-    pr_cache: dict[str, tuple[int | None, str | None]] = {}
-    base_pr_num, base_pr_state = resolve_pr_for_run(repo, base_run, pr_cache)
-    base_run["pr_number"] = base_pr_num
-    base_run["pr_state"] = base_pr_state
-    base_created = parse_iso_time(base_run["created_at"])
-
     workflow_id = find_workflow_id(gh, args.workflow)
-    all_runs = gh.paginate(
+
+    open_prs = list_open_prs(gh)
+    if not open_prs:
+        return 0
+
+    open_prs_by_number = {int(pr["number"]): pr for pr in open_prs}
+    open_prs_by_head = {str(pr.get("head", {}).get("ref", "")): int(pr["number"]) for pr in open_prs}
+
+    pr_runs = gh.paginate(
         f"/repos/{repo}/actions/workflows/{workflow_id}/runs",
-        params={"per_page": 100},
+        params={"per_page": 100, "event": "pull_request"},
+        list_key="workflow_runs",
+    )
+    latest_by_pr = latest_pr_runs(pr_runs, open_prs_by_number, open_prs_by_head)
+
+    main_runs = gh.paginate(
+        f"/repos/{repo}/actions/workflows/{workflow_id}/runs",
+        params={"per_page": 100, "branch": "main"},
         list_key="workflow_runs",
     )
 
-    # Base artifact names are the 4 metrics-* artifacts from this run.
-    base_arts = [
-        a for a in list_run_artifacts(gh, int(base_run["id"]))
-        if a.get("name", "").startswith("metrics-") and not a.get("expired", False)
-    ]
-    base_artifact_names = sorted(a["name"] for a in base_arts)
-
-    if len(base_artifact_names) == 0:
-        print("No metrics-* artifacts found in base run; falling back to log extraction...")
-        log_metrics = extract_metrics_from_logs(gh, base_run, cache_dir)
-        if not log_metrics:
-            raise RuntimeError(
-                "No metrics-* artifacts found in base run and could not extract metrics from logs."
-            )
-        base_artifact_names = sorted(log_metrics.keys())
-        base_metrics = {name: metrics for name, metrics in log_metrics.items()}
-        print(f"Extracted metrics from logs for {len(base_artifact_names)} job(s): {base_artifact_names}")
-    else:
-        if len(base_artifact_names) != 4:
-            print(f"WARN: Expected 4 metrics artifacts, found {len(base_artifact_names)}")
-        base_metrics = collect_run_metrics(gh, base_run, base_artifact_names, cache_dir)
-        missing_base = [name for name, m in base_metrics.items() if m is None]
-        if missing_base:
-            raise RuntimeError(f"Base run is missing REAGLE metrics in artifacts: {missing_base}")
-
-    subsequent = [
-        r for r in all_runs
-        if parse_iso_time(r["created_at"]) > base_created
-    ]
-    subsequent.sort(key=lambda r: parse_iso_time(r["created_at"]))
-    if args.max_subsequent > 0:
-        subsequent = subsequent[: args.max_subsequent]
-
-    print(f"Base run id: {base_run['id']} created_at={base_run['created_at']}")
-    print(f"Found {len(subsequent)} subsequent runs to inspect")
-
+    base_cache: dict[int, tuple[list[str], dict[str, dict]]] = {}
     comparisons: list[dict] = []
-    for idx, run in enumerate(subsequent, start=1):
-        run_pr_num, run_pr_state = resolve_pr_for_run(repo, run, pr_cache)
-        run["pr_number"] = run_pr_num
-        run["pr_state"] = run_pr_state
-        if run.get("event") == "pull_request" and run_pr_state != "OPEN":
+
+    for pr_num in sorted(open_prs_by_number.keys()):
+        pr = open_prs_by_number[pr_num]
+        pr_run = latest_by_pr.get(pr_num)
+        if pr_run is None:
             continue
-        pr_txt = f", pr=#{run.get('pr_number')}" if run.get("pr_number") is not None else ""
-        print(
-            f"[{idx}/{len(subsequent)}] run {run['id']} "
-            f"(#{run.get('run_number')}, {run.get('status')}/{run.get('conclusion')}{pr_txt})"
+
+        pr_created = parse_iso_time(pr["created_at"])
+        base_run = find_main_base_run_before(main_runs, pr_created)
+        if base_run is None:
+            continue
+
+        try:
+            artifact_names, base_metrics = load_base_metrics(gh, base_run, cache_dir, base_cache)
+        except Exception:
+            continue
+
+        pr_metrics = collect_run_metrics(gh, pr_run, artifact_names, cache_dir)
+
+        comparisons.append(
+            {
+                "pr": pr,
+                "pr_run": pr_run,
+                "base_run": base_run,
+                "artifact_names": artifact_names,
+                "base_metrics": base_metrics,
+                "pr_metrics": pr_metrics,
+            }
         )
-        metrics = collect_run_metrics(gh, run, base_artifact_names, cache_dir)
-        comparisons.append({"run": run, "metrics": metrics})
 
-    print_report(base_run, base_metrics, comparisons, base_artifact_names)
-    build_plot(base_metrics, comparisons, base_artifact_names, out_png)
+    if not comparisons:
+        return 0
+
+    print_pr_report(comparisons)
+    build_plot(comparisons, out_png)
     print(f"\nSaved plot: {out_png}")
-
     return 0
 
 

@@ -2964,11 +2964,22 @@ impl crate::pipelines::ImputationPipeline {
     /// Run streaming imputation pipeline
     #[instrument(name = "imputation_streaming", skip(self))]
     pub fn run_streaming(&mut self) -> Result<()> {
+        // Imputation benefits from shorter windows than phasing defaults.
+        // Use a segment-coupled window so each HMM run remains locally coherent
+        // when target density is sparse but reference density is very high.
+        let derived_window_cm = (self.config.imp_segment * 2.0).max(self.config.overlap * 2.0);
+        let effective_window_cm = self.config.window.min(derived_window_cm.max(1.0));
         let streaming_config = StreamingConfig {
-            window_cm: self.config.window,
+            window_cm: effective_window_cm,
             overlap_cm: self.config.overlap,
             buffer_cm: 1.0,
         };
+        if (effective_window_cm - self.config.window).abs() > f32::EPSILON {
+            eprintln!(
+                "Imputation window adjusted: configured={:.3}cM effective={:.3}cM (segment-coupled)",
+                self.config.window, effective_window_cm
+            );
+        }
 
         if let Some(bb) = &self.telemetry {
             bb.set_stage(crate::utils::telemetry::Stage::LoadingData);
@@ -4085,7 +4096,7 @@ impl crate::pipelines::ImputationPipeline {
         // state sets from prescan/LMS. This preserves ancestry-local donor sets
         // and avoids diluting sparse-target inference with globally irrelevant
         // haplotypes.
-        let full_states: Option<Vec<RefHapId>> = if plan.full_panel {
+        let full_states: Option<Vec<RefHapId>> = if plan.full_panel || n_target_samples <= 2 {
             Some(
                 (0..plan.n_ref_haps)
                     .map(|h| RefHapId::new(h as u32))
@@ -5933,6 +5944,39 @@ impl crate::pipelines::ImputationPipeline {
                     bb.add_samples(1);
                 }
 
+                let normalize_posteriors_to_output =
+                    |posts: &mut Option<Vec<AllelePosteriors>>, hap_idx: HapIdx| -> Result<()> {
+                        let Some(values) = posts.take() else {
+                            return Ok(());
+                        };
+                        let len = values.len();
+                        if len == output_markers {
+                            *posts = Some(values);
+                            return Ok(());
+                        }
+                        if output_end <= len && output_start <= output_end {
+                            let trimmed: Vec<AllelePosteriors> = values
+                                .into_iter()
+                                .skip(output_start)
+                                .take(output_markers)
+                                .collect();
+                            *posts = Some(trimmed);
+                            return Ok(());
+                        }
+                        Err(ReagleError::vcf(format!(
+                            "Posterior length incompatible with output span: window={} sample={} hap={} len={} output_start={} output_end={} output_markers={}",
+                            window_idx,
+                            s,
+                            hap_idx.as_usize(),
+                            len,
+                            output_start,
+                            output_end,
+                            output_markers
+                        )))
+                    };
+                normalize_posteriors_to_output(&mut hap1_posts, h1_idx)?;
+                normalize_posteriors_to_output(&mut hap2_posts, h2_idx)?;
+
                 let need_sm_h1 = hap1_posts.is_none();
                 let need_sm_h2 = hap2_posts.is_none();
                 if need_sm_h1 {
@@ -6998,7 +7042,7 @@ impl crate::pipelines::ImputationPipeline {
                 .push(t_idx);
         }
 
-        let pick_target_marker_by_alleles = |ref_marker_idx: usize| -> Option<usize> {
+        let resolve_target_marker_by_alleles = |ref_marker_idx: usize| -> Option<usize> {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
             if ref_marker.n_alleles() != 2 {
                 return None;
@@ -7032,6 +7076,13 @@ impl crate::pipelines::ImputationPipeline {
                 None
             }
         };
+        let mut target_marker_pos_cache: Vec<Option<usize>> = vec![None; ref_markers.len()];
+        for (ref_marker_idx, slot) in target_marker_pos_cache.iter_mut().enumerate() {
+            *slot = resolve_target_marker_by_alleles(ref_marker_idx);
+        }
+        let pick_target_marker_by_alleles =
+            |ref_marker_idx: usize| target_marker_pos_cache.get(ref_marker_idx).copied().flatten();
+        let marker_is_imputed: Vec<bool> = quality.marker_stats.iter().map(|s| s.is_imputed).collect();
 
         let map_pos_fallback_allele =
             |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
@@ -7439,6 +7490,33 @@ impl crate::pipelines::ImputationPipeline {
         // Dosages array is indexed from 0 for markers starting at output_start
         let get_dosage = |marker_idx: usize, sample_idx: usize| -> f32 {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
+            let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
+
+            if !is_imputed {
+                if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
+                    return d;
+                }
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(marker_idx as u32))
+                    .n_alleles()
+                    .max(1);
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let d = dosage_from_gp(n_alleles, &gp);
+                    return if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                        d
+                    } else {
+                        d * 0.5
+                    };
+                }
+                if let Some((a1, a2)) = hard_call {
+                    let d = (a1 + a2) as f32;
+                    return if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
+                        d
+                    } else {
+                        d * 0.5
+                    };
+                }
+            }
 
             // Prefer hard calls if error correction is disabled
             if !correct_errors {
@@ -7512,6 +7590,19 @@ impl crate::pipelines::ImputationPipeline {
         // Closure to get best genotype
         let get_best_gt = |marker_idx: usize, sample_idx: usize| -> (u8, u8) {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
+            let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
+
+            if !is_imputed {
+                if let Some(gt) = hard_call {
+                    return gt;
+                }
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let n_alleles = ref_markers
+                        .marker(MarkerIdx::new(marker_idx as u32))
+                        .n_alleles();
+                    return best_gt_from_gp(n_alleles, &gp);
+                }
+            }
 
             // Prefer hard calls if error correction is disabled
             if !correct_errors {
@@ -7610,6 +7701,21 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
+            let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
+            if !is_imputed {
+                if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
+                    return (a1 as f32, a2 as f32);
+                }
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(marker_idx as u32))
+                    .n_alleles()
+                    .max(1);
+                if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
+                    let dosage = dosage_from_gp(n_alleles, &gp);
+                    let p_alt = (dosage * 0.5).clamp(0.0, 1.0);
+                    return (p_alt, p_alt);
+                }
+            }
             let local_m = marker_idx.saturating_sub(output_start);
             if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 let v1 = result

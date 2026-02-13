@@ -39,6 +39,10 @@ pub struct CliArgs {
     #[arg(long, default_value = "false")]
     pub profile: bool,
 
+    /// Force phasing-only mode, even when a reference panel is provided
+    #[arg(long = "phase", default_value = "false")]
+    pub phase_only: bool,
+
     /// Random seed for reproducibility
     #[arg(long, value_name = "INT")]
     pub seed: Option<i64>,
@@ -149,6 +153,9 @@ pub struct Config {
 
     /// Enable profiling output (hierarchical timing tree)
     pub profile: bool,
+
+    /// Force phasing-only mode, even when a reference panel is provided
+    pub phase_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -228,6 +235,7 @@ impl Default for Config {
             seed: -99999,
             nthreads: None,
             profile: false,
+            phase_only: false,
         }
     }
 }
@@ -368,6 +376,9 @@ impl Config {
         if cli.profile {
             config.profile = true;
         }
+        if cli.phase_only {
+            config.phase_only = true;
+        }
         if let Some(seed) = cli.seed {
             config.seed = seed;
         }
@@ -495,7 +506,7 @@ impl Config {
 
     /// Check if imputation mode (reference panel provided)
     pub fn is_imputation_mode(&self) -> bool {
-        self.r#ref.is_some()
+        self.r#ref.is_some() && !self.phase_only
     }
 }
 

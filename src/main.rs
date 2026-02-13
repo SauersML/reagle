@@ -91,6 +91,9 @@ fn run() -> Result<()> {
     } else {
         eprintln!("Mode: Phasing");
         eprintln!("Input: {:?}", config.target);
+        if let Some(reference) = config.r#ref.as_ref() {
+            eprintln!("Reference: {:?}", reference);
+        }
 
         let mut pipeline = PhasingPipeline::new(config, Some(telemetry.clone()));
         pipeline.run_auto()?;

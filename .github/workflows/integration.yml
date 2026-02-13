@@ -452,6 +452,13 @@ jobs:
         working-directory: .
         run: python3 tests/integration_test.py phasing-metrics
 
+      - name: Summarize phasing comparison (full chr22)
+        working-directory: .
+        run: |
+          if [[ -f tests/data/phasing_compare_summary.md ]]; then
+            cat tests/data/phasing_compare_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload phasing metrics
         uses: actions/upload-artifact@v4
         if: always()
@@ -460,6 +467,7 @@ jobs:
           path: |
             tests/data/*_phasing_metrics.json
             tests/data/*_phasing_metrics.txt
+            tests/data/phasing_compare_summary.md
           retention-days: 1
 
 
