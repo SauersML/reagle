@@ -5318,6 +5318,28 @@ impl crate::pipelines::ImputationPipeline {
                     .iter()
                     .map(|(h, c)| (*h, *c))
                     .collect();
+                if use_abyss {
+                    if let Some(mask) = plan.abyss_mask.get(h1_idx.as_usize()) {
+                        let before = donors_h1.len();
+                        donors_h1.retain(|(h, _)| !mask[h.as_usize()]);
+                        if donors_h1.is_empty() && before > 0 {
+                            donors_h1 = sm_donor_counts[h1_idx.as_usize()]
+                                .iter()
+                                .map(|(h, c)| (*h, *c))
+                                .collect();
+                        }
+                    }
+                    if let Some(mask) = plan.abyss_mask.get(h2_idx.as_usize()) {
+                        let before = donors_h2.len();
+                        donors_h2.retain(|(h, _)| !mask[h.as_usize()]);
+                        if donors_h2.is_empty() && before > 0 {
+                            donors_h2 = sm_donor_counts[h2_idx.as_usize()]
+                                .iter()
+                                .map(|(h, c)| (*h, *c))
+                                .collect();
+                        }
+                    }
+                }
                 keep_top_k_donors_by_weight(&mut donors_h1, max_fast_donors);
                 keep_top_k_donors_by_weight(&mut donors_h2, max_fast_donors);
                 let tiny_panel = plan.n_ref_haps <= 32;
