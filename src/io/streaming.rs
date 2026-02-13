@@ -1309,11 +1309,12 @@ fn parse_allele_char_bytes(s: &[u8]) -> std::result::Result<u8, String> {
         val = val.saturating_mul(10).saturating_add((b - b'0') as u16);
     }
     if val > crate::io::vcf::MAX_ALLELE_INDEX {
-        Err(format!(
-            "allele index {} exceeds maximum supported value {}",
+        log::warn!(
+            "Allele index {} exceeds maximum supported value {}; treating as missing",
             val,
             crate::io::vcf::MAX_ALLELE_INDEX
-        ))
+        );
+        Ok(crate::data::storage::AlleleCode::MISSING.raw())
     } else {
         Ok(val as u8)
     }
