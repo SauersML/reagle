@@ -122,6 +122,7 @@ pub struct BeamPath {
 pub struct BeamPosteriors {
     pub decisions: Vec<bool>,
     pub p_swapped: Vec<f32>,
+    pub donor_mass: Vec<(usize, f32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -772,6 +773,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return BeamPosteriors {
                 decisions: Vec::new(),
                 p_swapped: Vec::new(),
+                donor_mass: Vec::new(),
             };
         }
         if active_pool.is_empty() {
@@ -939,14 +941,36 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     sample_phase.set_phase_confidence(m, 0.5);
                 }
             }
+
+            let mut donor_counts: std::collections::HashMap<usize, f32> =
+                std::collections::HashMap::new();
+            let mut total_mass = 0.0;
+            let min_score = beam.iter().map(|p| p.score).min().unwrap_or(0);
+
+            for p in &beam {
+                let prob = (-(p.score - min_score) as f64 / 1_000_000.0).exp() as f32;
+                *donor_counts.entry(p.hap1).or_insert(0.0) += prob;
+                *donor_counts.entry(p.hap2).or_insert(0.0) += prob;
+                total_mass += prob * 2.0;
+            }
+
+            let mut donor_mass: Vec<(usize, f32)> = Vec::with_capacity(donor_counts.len());
+            if total_mass > 0.0 {
+                for (hap, mass) in donor_counts {
+                    donor_mass.push((hap, mass / total_mass));
+                }
+            }
+
             return BeamPosteriors {
                 decisions: phases,
                 p_swapped,
+                donor_mass,
             };
         }
         BeamPosteriors {
             decisions: Vec::new(),
             p_swapped: vec![0.5; n_calls],
+            donor_mass: Vec::new(),
         }
     }
 
