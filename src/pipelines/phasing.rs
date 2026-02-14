@@ -2757,8 +2757,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let any_unanchored_unresolved = sample_phases
                         .iter()
                         .any(|sp| !sp.has_input_phase_anchor() && sample_has_unresolved(sp));
-                    let single_unanchored_case =
-                        n_samples == 1 && sample_phases.iter().all(|sp| !sp.has_input_phase_anchor());
+                    let single_unanchored_case = n_samples == 1
+                        && sample_phases.iter().all(|sp| !sp.has_input_phase_anchor());
                     let mut newly_frozen = 0usize;
                     for s in 0..n_samples {
                         if frozen_samples[s] {
@@ -3299,8 +3299,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let any_unanchored_unresolved = sample_phases
                         .iter()
                         .any(|sp| !sp.has_input_phase_anchor() && sample_has_unresolved(sp));
-                    let single_unanchored_case =
-                        n_samples == 1 && sample_phases.iter().all(|sp| !sp.has_input_phase_anchor());
+                    let single_unanchored_case = n_samples == 1
+                        && sample_phases.iter().all(|sp| !sp.has_input_phase_anchor());
                     let mut newly_frozen = 0usize;
                     for s in 0..n_samples {
                         if frozen_samples[s] {
@@ -5201,6 +5201,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
                 let allocation = allocate_lms_sparse(
                     &scores_by_hap,
+                    None,
                     &candidate_haps,
                     num_windows,
                     &boundary_cm,
@@ -5751,7 +5752,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             .map(|(idx, &m)| {
                                 let p_swap_decoded =
                                     swap_probs_conf.get(idx).copied().unwrap_or(0.5);
-                                let p_swap_raw = swap_probs.get(idx).copied().unwrap_or(p_swap_decoded);
+                                let p_swap_raw =
+                                    swap_probs.get(idx).copied().unwrap_or(p_swap_decoded);
                                 let swap_bit = swap_bits.get(idx).copied().unwrap_or(0);
                                 let p_orient = if swap_bit == 1 {
                                     p_swap_raw
@@ -7554,6 +7556,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                     // Lazy cache for state->hap mapping.
                     let mut hap_cache: Vec<Option<Vec<CombinedHapId>>> = vec![None; n_markers];
+                    let mut alpha_cache1: Vec<Option<Vec<f32>>> = vec![None; n_stage1];
+                    let mut beta_cache1: Vec<Option<Vec<f32>>> = vec![None; n_stage1];
+                    let mut alpha_cache2: Vec<Option<Vec<f32>>> = vec![None; n_stage1];
+                    let mut beta_cache2: Vec<Option<Vec<f32>>> = vec![None; n_stage1];
 
                     // Closure to get allele for any haplotype (target or reference)
                     let get_allele = |marker: usize, hap: usize| -> u8 {
@@ -7587,9 +7593,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     // Inline helper macro for imputing a single allele
                     // Matches Java Stage2Baum.imputeAllele()
                     macro_rules! impute_allele {
-                        ($m:expr, $probs:expr) => {{
+                        ($m:expr, $alpha:expr, $beta:expr) => {{
                             let m = $m;
-                            let probs = $probs;
+                            let alpha = $alpha;
+                            let beta = $beta;
                             let n_alleles = target_gt
                                 .markers()
                                 .marker(MarkerIdx::new(m as u32))
@@ -7613,7 +7620,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             let state_haps_b = hap_cache[mkr_b].as_deref().unwrap_or(&[]);
                             let bridge_probs = stage2_phaser.bridge_hap_probs(
                                 m,
-                                probs,
+                                alpha,
+                                beta,
                                 state_haps_a,
                                 state_haps_b,
                             );
@@ -7655,8 +7663,92 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             threaded_haps.materialize_at(mkr_b, &mut haps);
                             hap_cache[mkr_b] = Some(haps);
                         }
+                        if alpha_cache1[mkr_a].is_none() {
+                            let row_start = mkr_a * n_states;
+                            let row_end = row_start + n_states;
+                            let mut row = if row_end <= fwd1.len() {
+                                fwd1[row_start..row_end].to_vec()
+                            } else {
+                                vec![0.0f32; n_states]
+                            };
+                            let sum: f32 = row.iter().copied().sum();
+                            if sum > 0.0 {
+                                let inv = 1.0 / sum;
+                                for p in &mut row {
+                                    *p *= inv;
+                                }
+                            } else if !row.is_empty() {
+                                let u = 1.0 / row.len() as f32;
+                                row.fill(u);
+                            }
+                            alpha_cache1[mkr_a] = Some(row);
+                        }
+                        if beta_cache1[mkr_b].is_none() {
+                            let row_start = mkr_b * n_states;
+                            let row_end = row_start + n_states;
+                            let mut row = if row_end <= bwd1.len() {
+                                bwd1[row_start..row_end].to_vec()
+                            } else {
+                                vec![0.0f32; n_states]
+                            };
+                            let sum: f32 = row.iter().copied().sum();
+                            if sum > 0.0 {
+                                let inv = 1.0 / sum;
+                                for p in &mut row {
+                                    *p *= inv;
+                                }
+                            } else if !row.is_empty() {
+                                let u = 1.0 / row.len() as f32;
+                                row.fill(u);
+                            }
+                            beta_cache1[mkr_b] = Some(row);
+                        }
+                        if alpha_cache2[mkr_a].is_none() {
+                            let row_start = mkr_a * n_states;
+                            let row_end = row_start + n_states;
+                            let mut row = if row_end <= fwd2.len() {
+                                fwd2[row_start..row_end].to_vec()
+                            } else {
+                                vec![0.0f32; n_states]
+                            };
+                            let sum: f32 = row.iter().copied().sum();
+                            if sum > 0.0 {
+                                let inv = 1.0 / sum;
+                                for p in &mut row {
+                                    *p *= inv;
+                                }
+                            } else if !row.is_empty() {
+                                let u = 1.0 / row.len() as f32;
+                                row.fill(u);
+                            }
+                            alpha_cache2[mkr_a] = Some(row);
+                        }
+                        if beta_cache2[mkr_b].is_none() {
+                            let row_start = mkr_b * n_states;
+                            let row_end = row_start + n_states;
+                            let mut row = if row_end <= bwd2.len() {
+                                bwd2[row_start..row_end].to_vec()
+                            } else {
+                                vec![0.0f32; n_states]
+                            };
+                            let sum: f32 = row.iter().copied().sum();
+                            if sum > 0.0 {
+                                let inv = 1.0 / sum;
+                                for p in &mut row {
+                                    *p *= inv;
+                                }
+                            } else if !row.is_empty() {
+                                let u = 1.0 / row.len() as f32;
+                                row.fill(u);
+                            }
+                            beta_cache2[mkr_b] = Some(row);
+                        }
                         let state_haps_for_interp_a = hap_cache[mkr_a].as_deref().unwrap_or(&[]);
                         let state_haps_for_interp_b = hap_cache[mkr_b].as_deref().unwrap_or(&[]);
+                        let alpha_a1 = alpha_cache1[mkr_a].as_deref().unwrap_or(&[]);
+                        let beta_b1 = beta_cache1[mkr_b].as_deref().unwrap_or(&[]);
+                        let alpha_a2 = alpha_cache2[mkr_a].as_deref().unwrap_or(&[]);
+                        let beta_b2 = beta_cache2[mkr_b].as_deref().unwrap_or(&[]);
                         let marker_maf = maf[m];
                         let is_rare_marker = marker_maf < rare_threshold;
                         let carriers = &carrier_haps[m];
@@ -7666,7 +7758,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let bridge_probs1 = if is_rare_marker && !carriers.is_empty() {
                             stage2_phaser.carrier_injected_bridge_hap_probs(
                                 m,
-                                &probs1,
+                                alpha_a1,
+                                beta_b1,
                                 state_haps_for_interp_a,
                                 state_haps_for_interp_b,
                                 carriers,
@@ -7680,7 +7773,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         } else {
                             stage2_phaser.bridge_hap_probs(
                                 m,
-                                &probs1,
+                                alpha_a1,
+                                beta_b1,
                                 state_haps_for_interp_a,
                                 state_haps_for_interp_b,
                             )
@@ -7688,7 +7782,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         let bridge_probs2 = if is_rare_marker && !carriers.is_empty() {
                             stage2_phaser.carrier_injected_bridge_hap_probs(
                                 m,
-                                &probs2,
+                                alpha_a2,
+                                beta_b2,
                                 state_haps_for_interp_a,
                                 state_haps_for_interp_b,
                                 carriers,
@@ -7702,7 +7797,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         } else {
                             stage2_phaser.bridge_hap_probs(
                                 m,
-                                &probs2,
+                                alpha_a2,
+                                beta_b2,
                                 state_haps_for_interp_a,
                                 state_haps_for_interp_b,
                             )
@@ -7726,10 +7822,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 {
                                     al
                                 } else {
-                                    impute_allele!(m, &probs1)
+                                    impute_allele!(m, alpha_a1, beta_b1)
                                 }
                             } else {
-                                impute_allele!(m, &probs1)
+                                impute_allele!(m, alpha_a1, beta_b1)
                             };
                             let imp_a2 = if let Some((h, top, second)) =
                                 top_bridge_haplotype(&bridge_probs2)
@@ -7744,10 +7840,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 {
                                     al
                                 } else {
-                                    impute_allele!(m, &probs2)
+                                    impute_allele!(m, alpha_a2, beta_b2)
                                 }
                             } else {
-                                impute_allele!(m, &probs2)
+                                impute_allele!(m, alpha_a2, beta_b2)
                             };
                             decisions.push(Stage2Decision::Impute {
                                 marker: m,
@@ -8585,96 +8681,127 @@ enum EmissionMode {
     Hap,
 }
 
-/// Compute haploid emission probability with heterozygote constraint.
-///
-/// At heterozygous sites, the target haplotype (H1) must emit the allele that,
-/// when combined with the fixed haplotype (H2), produces the observed genotype.
-/// This is the core of SHAPEIT5-style constrained Gibbs sampling.
-///
-/// # Arguments
-/// * `ref_al` - Reference haplotype allele at this marker
-/// * `geno_a1` - First allele of genotype
-/// * `geno_a2` - Second allele of genotype
-/// * `fixed_allele` - The allele of the fixed haplotype (H2), or u8::MAX if homozygous
-/// * `conf` - Genotype confidence (0..1)
-/// * `p_no_err` - Probability of no error (e.g., 0.999)
-/// * `p_err` - Probability of error (e.g., 0.001)
-///
-/// # Returns
-/// Emission probability for this state
-#[inline]
-fn emit_haploid_constrained(
-    ref_al: u8,
-    geno_a1: u8,
-    geno_a2: u8,
-    fixed_allele: u8,
-    conf: f32,
-    p_no_err: f32,
-    p_err: f32,
-) -> f32 {
-    // Missing data: return neutral emission (no information)
-    if geno_a1 == crate::data::storage::AlleleCode::MISSING.raw()
-        || geno_a2 == crate::data::storage::AlleleCode::MISSING.raw()
-    {
-        return 1.0;
-    }
-
-    let neutral_emit = 0.5 * (p_no_err + p_err);
-    if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
-        return conf * neutral_emit + (1.0 - conf) * 0.5;
-    }
-
-    // Unphased heterozygote with no fixed partner: allow either allele.
-    if geno_a1 != geno_a2 && fixed_allele == crate::data::storage::AlleleCode::MISSING.raw() {
-        let matches = ref_al == geno_a1 || ref_al == geno_a2;
-        let raw_emit = if matches { p_no_err } else { p_err };
-        return conf * raw_emit + (1.0 - conf) * 0.5;
-    }
-
-    // Inconsistent fixed allele must not impose a hard opposite-allele constraint.
-    if geno_a1 != geno_a2 && fixed_allele != geno_a1 && fixed_allele != geno_a2 {
-        let matches = ref_al == geno_a1 || ref_al == geno_a2;
-        let raw_emit = if matches { p_no_err } else { p_err };
-        return conf * raw_emit + (1.0 - conf) * 0.5;
-    }
-
-    // At homozygous sites (fixed_allele == crate::data::storage::AlleleCode::MISSING.raw()), both alleles are same
-    // so H1 must emit geno_a1
-    // At heterozygous sites, H1 must emit the allele opposite to fixed_allele
-    let required_allele = if fixed_allele == crate::data::storage::AlleleCode::MISSING.raw() {
-        geno_a1 // Homozygous: H1 must emit the homozygous allele
-    } else if fixed_allele == geno_a1 {
-        geno_a2 // H2 has a1, so H1 must have a2
-    } else {
-        geno_a1 // H2 has a2, so H1 must have a1
-    };
-
-    // Emission: does ref_al match the required allele?
-    let raw_emit = if ref_al == required_allele {
-        p_no_err
-    } else {
-        p_err
-    };
-
-    // Blend with uniform based on confidence
-    conf * raw_emit + (1.0 - conf) * 0.5
+#[derive(Clone, Copy, Debug)]
+struct HaploidConstrainedEmitProfile {
+    all_one: bool,
+    primary_allele: u8,
+    secondary_allele: u8,
+    has_secondary: bool,
+    primary_emit: f32,
+    secondary_emit: f32,
+    other_emit: f32,
+    missing_emit: f32,
 }
 
-#[inline]
-fn constrained_emission_confidence(
+impl HaploidConstrainedEmitProfile {
+    #[inline(always)]
+    fn emit(self, ref_al: u8) -> f32 {
+        if self.all_one {
+            return 1.0;
+        }
+        if ref_al == crate::data::storage::AlleleCode::MISSING.raw() {
+            return self.missing_emit;
+        }
+        if ref_al == self.primary_allele {
+            return self.primary_emit;
+        }
+        if self.has_secondary && ref_al == self.secondary_allele {
+            return self.secondary_emit;
+        }
+        self.other_emit
+    }
+}
+
+#[inline(always)]
+fn blend_with_genotype_conf(raw_emit: f32, geno_conf: f32) -> f32 {
+    raw_emit * geno_conf + 0.5 * (1.0 - geno_conf)
+}
+
+#[inline(always)]
+fn build_haploid_constrained_emit_profile(
     geno_a1: u8,
     geno_a2: u8,
     fixed_allele: u8,
     geno_conf: f32,
     phase_conf: f32,
-) -> f32 {
+    p_no_err: f32,
+    p_err: f32,
+) -> HaploidConstrainedEmitProfile {
+    let missing = crate::data::storage::AlleleCode::MISSING.raw();
     let g = geno_conf.clamp(0.0, 1.0);
-    if geno_a1 != geno_a2 && fixed_allele != crate::data::storage::AlleleCode::MISSING.raw() {
-        // At constrained heterozygotes, partner orientation uncertainty must
-        // soften the emission even when genotype confidence is high.
-        (g * phase_conf.clamp(0.0, 1.0)).clamp(0.0, 1.0)
-    } else {
-        g
+    let q = phase_conf.clamp(0.0, 1.0);
+    let neutral_emit = 0.5 * (p_no_err + p_err);
+    let missing_emit = blend_with_genotype_conf(neutral_emit, g);
+    if geno_a1 == missing || geno_a2 == missing {
+        return HaploidConstrainedEmitProfile {
+            all_one: true,
+            primary_allele: missing,
+            secondary_allele: missing,
+            has_secondary: false,
+            primary_emit: 1.0,
+            secondary_emit: 1.0,
+            other_emit: 1.0,
+            missing_emit: 1.0,
+        };
+    }
+    if geno_a1 != geno_a2 && fixed_allele != missing {
+        if fixed_allele == geno_a1 || fixed_allele == geno_a2 {
+            let required = if fixed_allele == geno_a1 {
+                geno_a2
+            } else {
+                geno_a1
+            };
+            let opposite = if required == geno_a1 { geno_a2 } else { geno_a1 };
+            // Marginalize over partner orientation uncertainty:
+            // q = P(current fixed_allele assignment is correct).
+            let raw_required = q * p_no_err + (1.0 - q) * p_err;
+            let raw_opposite = q * p_err + (1.0 - q) * p_no_err;
+            return HaploidConstrainedEmitProfile {
+                all_one: false,
+                primary_allele: required,
+                secondary_allele: opposite,
+                has_secondary: true,
+                primary_emit: blend_with_genotype_conf(raw_required, g),
+                secondary_emit: blend_with_genotype_conf(raw_opposite, g),
+                other_emit: blend_with_genotype_conf(p_err, g),
+                missing_emit,
+            };
+        }
+        // Inconsistent fixed partner allele: fall back to unconstrained het.
+        return HaploidConstrainedEmitProfile {
+            all_one: false,
+            primary_allele: geno_a1,
+            secondary_allele: geno_a2,
+            has_secondary: true,
+            primary_emit: blend_with_genotype_conf(p_no_err, g),
+            secondary_emit: blend_with_genotype_conf(p_no_err, g),
+            other_emit: blend_with_genotype_conf(p_err, g),
+            missing_emit,
+        };
+    }
+    if geno_a1 != geno_a2 {
+        // Unconstrained heterozygote.
+        return HaploidConstrainedEmitProfile {
+            all_one: false,
+            primary_allele: geno_a1,
+            secondary_allele: geno_a2,
+            has_secondary: true,
+            primary_emit: blend_with_genotype_conf(p_no_err, g),
+            secondary_emit: blend_with_genotype_conf(p_no_err, g),
+            other_emit: blend_with_genotype_conf(p_err, g),
+            missing_emit,
+        };
+    }
+    // Homozygous or hemizygous.
+    HaploidConstrainedEmitProfile {
+        all_one: false,
+        primary_allele: geno_a1,
+        secondary_allele: missing,
+        has_secondary: false,
+        primary_emit: blend_with_genotype_conf(p_no_err, g),
+        secondary_emit: blend_with_genotype_conf(p_err, g),
+        other_emit: blend_with_genotype_conf(p_err, g),
+        missing_emit,
     }
 }
 
@@ -9470,25 +9597,18 @@ fn ffbs_haploid_constrained(
 
     // Initialize at marker 0
     let init = 1.0f32 / actual_n_states as f32;
-    let conf0 = constrained_emission_confidence(
+    let profile0 = build_haploid_constrained_emit_profile(
         geno_a1[0],
         geno_a2[0],
         fixed_allele[0],
         conf[0],
         phase_conf[0],
+        p_no_err,
+        p_err,
     );
     phase_ibs.fill_alleles_for_haps(0, &neighbors[..actual_n_states], &mut neighbor_alleles);
     for k in 0..actual_n_states {
-        let ref_al = neighbor_alleles[k];
-        let emit = emit_haploid_constrained(
-            ref_al,
-            geno_a1[0],
-            geno_a2[0],
-            fixed_allele[0],
-            conf0,
-            p_no_err,
-            p_err,
-        );
+        let emit = profile0.emit(neighbor_alleles[k]);
         fwd_curr[k] = init * emit;
     }
     let mut fwd_sum: f32 = fwd_curr.iter().sum();
@@ -9505,12 +9625,14 @@ fn ffbs_haploid_constrained(
         let stay_gap = params.stay_gap;
         let shift = params.shift;
         let scale = stay_gap / fwd_sum;
-        let conf_m = constrained_emission_confidence(
+        let profile_m = build_haploid_constrained_emit_profile(
             geno_a1[m],
             geno_a2[m],
             fixed_allele[m],
             conf[m],
             phase_conf[m],
+            p_no_err,
+            p_err,
         );
         phase_ibs.fill_alleles_for_haps(m, &neighbors[..actual_n_states], &mut neighbor_alleles);
 
@@ -9527,78 +9649,14 @@ fn ffbs_haploid_constrained(
 
             // Compute emissions
             let emit_arr = [
-                emit_haploid_constrained(
-                    neighbor_alleles[k],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 1],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 2],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 3],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 4],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 5],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 6],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
-                emit_haploid_constrained(
-                    neighbor_alleles[k + 7],
-                    geno_a1[m],
-                    geno_a2[m],
-                    fixed_allele[m],
-                    conf_m,
-                    p_no_err,
-                    p_err,
-                ),
+                profile_m.emit(neighbor_alleles[k]),
+                profile_m.emit(neighbor_alleles[k + 1]),
+                profile_m.emit(neighbor_alleles[k + 2]),
+                profile_m.emit(neighbor_alleles[k + 3]),
+                profile_m.emit(neighbor_alleles[k + 4]),
+                profile_m.emit(neighbor_alleles[k + 5]),
+                profile_m.emit(neighbor_alleles[k + 6]),
+                profile_m.emit(neighbor_alleles[k + 7]),
             ];
             let emit_vec = f32x8::from(emit_arr);
 
@@ -9613,15 +9671,7 @@ fn ffbs_haploid_constrained(
         fwd_sum = sum_vec.reduce_add();
         for i in k..actual_n_states {
             let prior = scale * fwd_prev[i] + shift;
-            let emit = emit_haploid_constrained(
-                neighbor_alleles[i],
-                geno_a1[m],
-                geno_a2[m],
-                fixed_allele[m],
-                conf_m,
-                p_no_err,
-                p_err,
-            );
+            let emit = profile_m.emit(neighbor_alleles[i]);
             fwd_curr[i] = prior * emit;
             fwd_sum += fwd_curr[i];
         }
@@ -11826,23 +11876,22 @@ impl Stage2Phaser {
     fn bridge_hap_probs(
         &self,
         marker: usize,
-        state_probs: &[Vec<f32>],
+        alpha_a: &[f32],
+        beta_b: &[f32],
         haps_at_mkr_a: &[CombinedHapId],
         haps_at_mkr_b: &[CombinedHapId],
     ) -> std::collections::HashMap<u32, f32> {
         let mkr_a = self.prev_stage1_marker[marker];
         let mkr_b = (mkr_a + 1).min(self.n_stage1 - 1);
 
-        let probs_a = &state_probs[mkr_a];
-        let probs_b = &state_probs[mkr_b];
-        let n_states_a = probs_a.len().min(haps_at_mkr_a.len());
-        let n_states_b = probs_b.len().min(haps_at_mkr_b.len());
+        let n_states_a = alpha_a.len().min(haps_at_mkr_a.len());
+        let n_states_b = beta_b.len().min(haps_at_mkr_b.len());
         let mut hap_probs: std::collections::HashMap<u32, f32> =
             std::collections::HashMap::with_capacity((n_states_a + n_states_b).max(1));
 
         if mkr_a == mkr_b || self.stage1_markers.is_empty() {
             for (k, hap) in haps_at_mkr_a.iter().take(n_states_a).enumerate() {
-                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += probs_a[k];
+                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += alpha_a[k];
             }
             let sum: f32 = hap_probs.values().copied().sum();
             if sum > 0.0 {
@@ -11863,7 +11912,7 @@ impl Stage2Phaser {
 
         if pos_b <= pos_a || pos_m <= pos_a {
             for (k, hap) in haps_at_mkr_a.iter().take(n_states_a).enumerate() {
-                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += probs_a[k];
+                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += alpha_a[k];
             }
             let sum: f32 = hap_probs.values().copied().sum();
             if sum > 0.0 {
@@ -11876,7 +11925,7 @@ impl Stage2Phaser {
         }
         if pos_m >= pos_b {
             for (k, hap) in haps_at_mkr_b.iter().take(n_states_b).enumerate() {
-                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += probs_b[k];
+                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += beta_b[k];
             }
             let sum: f32 = hap_probs.values().copied().sum();
             if sum > 0.0 {
@@ -11896,24 +11945,29 @@ impl Stage2Phaser {
         let (scale1, shift1) = subset_linear_exact_k(r1, n_states_a.max(1) as f32, self.panel_haps);
         let (scale2, shift2) = subset_linear_exact_k(r2, n_states_b.max(1) as f32, self.panel_haps);
 
-        let denom = d1 + d2;
-        let weight_a = if denom > 0.0 {
-            (d2 / denom) as f32
-        } else {
-            0.5
-        };
-        let weight_b = 1.0 - weight_a;
+        let mut pi_a: std::collections::HashMap<u32, f32> =
+            std::collections::HashMap::with_capacity(n_states_a.max(1));
+        let mut rho_b: std::collections::HashMap<u32, f32> =
+            std::collections::HashMap::with_capacity(n_states_b.max(1));
+        for k in 0..n_states_a {
+            *pi_a.entry(haps_at_mkr_a[k].as_u32()).or_insert(0.0) += alpha_a[k];
+        }
+        for k in 0..n_states_b {
+            *rho_b.entry(haps_at_mkr_b[k].as_u32()).or_insert(0.0) += beta_b[k];
+        }
 
         let mut sum = 0.0f32;
-        for k in 0..n_states_a {
-            let hap = haps_at_mkr_a[k].as_u32();
-            let w = weight_a * (scale1 * probs_a[k] + shift1);
+        for (&hap, &left) in &pi_a {
+            let right = rho_b.get(&hap).copied().unwrap_or(0.0);
+            let w = (scale1 * left + shift1) * (scale2 * right + shift2);
             *hap_probs.entry(hap).or_insert(0.0) += w;
             sum += w;
         }
-        for k in 0..n_states_b {
-            let hap = haps_at_mkr_b[k].as_u32();
-            let w = weight_b * (scale2 * probs_b[k] + shift2);
+        for (&hap, &right) in &rho_b {
+            if pi_a.contains_key(&hap) {
+                continue;
+            }
+            let w = shift1 * (scale2 * right + shift2);
             *hap_probs.entry(hap).or_insert(0.0) += w;
             sum += w;
         }
@@ -11926,7 +11980,7 @@ impl Stage2Phaser {
         } else {
             hap_probs.clear();
             for (k, hap) in haps_at_mkr_a.iter().take(n_states_a).enumerate() {
-                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += probs_a[k];
+                *hap_probs.entry(hap.as_u32()).or_insert(0.0) += alpha_a[k];
             }
             let fallback_sum: f32 = hap_probs.values().copied().sum();
             if fallback_sum > 0.0 {
@@ -11939,60 +11993,11 @@ impl Stage2Phaser {
         hap_probs
     }
 
-    fn blend_base_with_carriers(
-        mut base: std::collections::HashMap<u32, f32>,
-        carriers: &[u32],
-        panel_haps: usize,
-        obs_conf: f32,
-    ) -> std::collections::HashMap<u32, f32> {
-        if carriers.is_empty() || panel_haps == 0 {
-            return base;
-        }
-
-        let carrier_frac = (carriers.len() as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        let rarity_boost = (1.0 - carrier_frac.sqrt()).clamp(0.0, 1.0);
-        let lambda = (0.12 + 0.38 * rarity_boost + 0.10 * obs_conf).clamp(0.10, 0.60);
-        let keep = 1.0 - lambda;
-
-        for p in base.values_mut() {
-            *p *= keep;
-        }
-
-        let mut carrier_prior_sum = 0.0f32;
-        for &hap in carriers {
-            carrier_prior_sum += base.get(&hap).copied().unwrap_or(0.0);
-        }
-
-        if carrier_prior_sum > 0.0 {
-            let inv = 1.0 / carrier_prior_sum;
-            for &hap in carriers {
-                let prior = base.get(&hap).copied().unwrap_or(0.0);
-                let add = lambda * prior * inv;
-                if add > 0.0 {
-                    *base.entry(hap).or_insert(0.0) += add;
-                }
-            }
-        } else {
-            let add = lambda / carriers.len() as f32;
-            for &hap in carriers {
-                *base.entry(hap).or_insert(0.0) += add;
-            }
-        }
-
-        let sum: f32 = base.values().copied().sum();
-        if sum > 0.0 {
-            let inv = 1.0 / sum;
-            for p in base.values_mut() {
-                *p *= inv;
-            }
-        }
-        base
-    }
-
     fn carrier_injected_bridge_hap_probs<F>(
         &self,
         marker: usize,
-        state_probs: &[Vec<f32>],
+        alpha_a: &[f32],
+        beta_b: &[f32],
         haps_at_mkr_a: &[CombinedHapId],
         haps_at_mkr_b: &[CombinedHapId],
         carriers: &[u32],
@@ -12006,39 +12011,19 @@ impl Stage2Phaser {
     where
         F: Fn(usize, usize) -> u8,
     {
-        let mut base = self.bridge_hap_probs(marker, state_probs, haps_at_mkr_a, haps_at_mkr_b);
+        let base = self.bridge_hap_probs(marker, alpha_a, beta_b, haps_at_mkr_a, haps_at_mkr_b);
         if carriers.is_empty() || panel_haps == 0 {
-            return base;
-        }
-        if context_markers.is_empty() {
-            return Self::blend_base_with_carriers(base, carriers, panel_haps, obs_conf);
-        }
-
-        let mkr_a = self.prev_stage1_marker[marker];
-        let mkr_b = (mkr_a + 1).min(self.n_stage1.saturating_sub(1));
-        if mkr_a == mkr_b || self.stage1_markers.is_empty() {
-            return base;
-        }
-
-        let pos_a_idx = self.stage1_markers[mkr_a];
-        let pos_b_idx = self.stage1_markers[mkr_b];
-        let pos_a = *self.gen_positions.get(pos_a_idx).unwrap_or(&0.0);
-        let pos_b = *self.gen_positions.get(pos_b_idx).unwrap_or(&pos_a);
-        let pos_m = *self.gen_positions.get(marker).unwrap_or(&pos_a);
-        if !(pos_b > pos_a && pos_m >= pos_a && pos_m <= pos_b) {
             return base;
         }
 
         let err = p_mismatch.clamp(1e-4, 0.25);
-        let ln_match = (1.0 - err).ln();
-        let ln_mismatch = err.ln();
-        let prior_floor = (1.0 / panel_haps as f32).max(1e-9);
-        const MIN_CONTEXT_INFO_MARKERS: usize = 3;
-
-        let mut max_log_weight = f32::NEG_INFINITY;
-        let mut carrier_log_weights: Vec<(u32, f32)> = Vec::with_capacity(carriers.len());
+        let ln_match = (1.0 - err).max(1e-8).ln();
+        let ln_mismatch = err.max(1e-8).ln();
+        let noncarrier_floor = (1.0 / panel_haps.max(1) as f32).max(1e-6);
+        let prior_floor = noncarrier_floor * noncarrier_floor;
+        let mut carrier_ll: std::collections::HashMap<u32, f32> =
+            std::collections::HashMap::with_capacity(carriers.len());
         for &hap in carriers {
-            let mut n_info = 0usize;
             let mut ll = 0.0f32;
             for &ctx_m in context_markers {
                 let ta = get_allele(ctx_m, target_hap);
@@ -12048,68 +12033,57 @@ impl Stage2Phaser {
                 {
                     continue;
                 }
-                n_info += 1;
                 if ta == ha {
                     ll += ln_match;
                 } else {
                     ll += ln_mismatch;
                 }
             }
-            if n_info < MIN_CONTEXT_INFO_MARKERS {
-                continue;
-            }
-            let prior = base.get(&hap).copied().unwrap_or(0.0).max(prior_floor);
-            let log_weight = prior.ln() + ll;
-            if log_weight > max_log_weight {
-                max_log_weight = log_weight;
-            }
-            carrier_log_weights.push((hap, log_weight));
-        }
-        if carrier_log_weights.is_empty() {
-            return Self::blend_base_with_carriers(base, carriers, panel_haps, obs_conf);
+            carrier_ll.insert(hap, obs_conf.clamp(0.05, 1.0) * ll);
         }
 
-        let mut carrier_post_sum = 0.0f32;
-        for i in 0..carrier_log_weights.len() {
-            let log_weight = carrier_log_weights[i].1;
-            let w = (log_weight - max_log_weight).exp();
-            carrier_post_sum += w;
-        }
-        if carrier_post_sum <= 0.0 {
+        let mut candidates: Vec<u32> = base.keys().copied().collect();
+        candidates.extend_from_slice(carriers);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
             return base;
         }
-        let inv_post = 1.0 / carrier_post_sum;
 
-        // Adaptive carrier-conditioning strength:
-        // - stronger for very rare carrier sets and confident observations
-        // - weaker when many carriers dilute informativeness.
-        let carrier_frac = (carriers.len() as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        let rarity_boost = (1.0 - carrier_frac.sqrt()).clamp(0.0, 1.0);
-        let context_strength =
-            (carrier_log_weights.len() as f32 / context_markers.len() as f32).clamp(0.0, 1.0);
-        let lambda = (0.25 + 0.50 * rarity_boost + 0.15 * context_strength + 0.10 * obs_conf)
-            .clamp(0.20, 0.90);
-        let keep = 1.0 - lambda;
-
-        for p in base.values_mut() {
-            *p *= keep;
+        let mut max_log_w = f32::NEG_INFINITY;
+        let mut log_weights: Vec<(u32, f32)> = Vec::with_capacity(candidates.len());
+        let ln_noncarrier = noncarrier_floor.ln();
+        for hap in candidates {
+            let prior = base.get(&hap).copied().unwrap_or(prior_floor).max(1e-12);
+            let is_carrier = carriers.binary_search(&hap).is_ok();
+            let marker_prior = if is_carrier { 0.0 } else { ln_noncarrier };
+            let context_ll = carrier_ll.get(&hap).copied().unwrap_or(0.0);
+            let lw = prior.ln() + marker_prior + context_ll;
+            if lw > max_log_w {
+                max_log_w = lw;
+            }
+            log_weights.push((hap, lw));
         }
-        for (hap, log_weight) in carrier_log_weights {
-            let p_carrier = (log_weight - max_log_weight).exp() * inv_post;
-            let add = lambda * p_carrier;
-            if add > 0.0 {
-                *base.entry(hap).or_insert(0.0) += add;
+
+        let mut out: std::collections::HashMap<u32, f32> =
+            std::collections::HashMap::with_capacity(log_weights.len());
+        let mut sum = 0.0f32;
+        for (hap, lw) in log_weights {
+            let w = (lw - max_log_w).exp();
+            if w > 0.0 {
+                out.insert(hap, w);
+                sum += w;
             }
         }
-
-        let sum: f32 = base.values().copied().sum();
         if sum > 0.0 {
             let inv = 1.0 / sum;
-            for p in base.values_mut() {
+            for p in out.values_mut() {
                 *p *= inv;
             }
+            out
+        } else {
+            base
         }
-        base
     }
 
     fn carrier_context_markers(&self, marker: usize) -> Vec<usize> {
@@ -12374,6 +12348,29 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[inline]
+    fn emit_haploid_constrained(
+        ref_al: u8,
+        geno_a1: u8,
+        geno_a2: u8,
+        fixed_allele: u8,
+        geno_conf: f32,
+        phase_conf: f32,
+        p_no_err: f32,
+        p_err: f32,
+    ) -> f32 {
+        build_haploid_constrained_emit_profile(
+            geno_a1,
+            geno_a2,
+            fixed_allele,
+            geno_conf,
+            phase_conf,
+            p_no_err,
+            p_err,
+        )
+        .emit(ref_al)
+    }
 
     fn build_test_markers(
         n_markers: usize,
@@ -12696,7 +12693,7 @@ mod tests {
         let conf = 1.0;
 
         // H2 = 0, so H1 must = 1. Reference has 1 -> high emission
-        let emit_match = emit_haploid_constrained(1, 0, 1, 0, conf, p_no_err, p_err);
+        let emit_match = emit_haploid_constrained(1, 0, 1, 0, conf, 1.0, p_no_err, p_err);
         assert!(
             emit_match > 0.9,
             "Expected high emission when ref matches required allele, got {}",
@@ -12704,7 +12701,7 @@ mod tests {
         );
 
         // H2 = 0, so H1 must = 1. Reference has 0 -> low emission
-        let emit_mismatch = emit_haploid_constrained(0, 0, 1, 0, conf, p_no_err, p_err);
+        let emit_mismatch = emit_haploid_constrained(0, 0, 1, 0, conf, 1.0, p_no_err, p_err);
         assert!(
             emit_mismatch < 0.1,
             "Expected low emission when ref doesn't match, got {}",
@@ -12712,14 +12709,15 @@ mod tests {
         );
 
         // At homozygous site (fixed_allele = u8::MAX), H1 must match genotype
-        let emit_hom = emit_haploid_constrained(0, 0, 0, u8::MAX, conf, p_no_err, p_err);
+        let emit_hom = emit_haploid_constrained(0, 0, 0, u8::MAX, conf, 1.0, p_no_err, p_err);
         assert!(
             emit_hom > 0.9,
             "Expected high emission at hom site when ref matches, got {}",
             emit_hom
         );
 
-        let emit_hom_mismatch = emit_haploid_constrained(1, 0, 0, u8::MAX, conf, p_no_err, p_err);
+        let emit_hom_mismatch =
+            emit_haploid_constrained(1, 0, 0, u8::MAX, conf, 1.0, p_no_err, p_err);
         assert!(
             emit_hom_mismatch < 0.1,
             "Expected low emission at hom when ref doesn't match, got {}",
@@ -12734,11 +12732,11 @@ mod tests {
         let p_err = 0.001;
 
         // Full confidence: emission should be ~p_no_err
-        let emit_full_conf = emit_haploid_constrained(1, 0, 1, 0, 1.0, p_no_err, p_err);
+        let emit_full_conf = emit_haploid_constrained(1, 0, 1, 0, 1.0, 1.0, p_no_err, p_err);
         assert!((emit_full_conf - p_no_err).abs() < 0.01);
 
         // Zero confidence: emission should be 0.5
-        let emit_zero_conf = emit_haploid_constrained(1, 0, 1, 0, 0.0, p_no_err, p_err);
+        let emit_zero_conf = emit_haploid_constrained(1, 0, 1, 0, 0.0, 1.0, p_no_err, p_err);
         assert!(
             (emit_zero_conf - 0.5).abs() < 0.01,
             "Expected 0.5 with zero confidence, got {}",
@@ -12746,7 +12744,7 @@ mod tests {
         );
 
         // Half confidence: emission should be blend
-        let emit_half_conf = emit_haploid_constrained(1, 0, 1, 0, 0.5, p_no_err, p_err);
+        let emit_half_conf = emit_haploid_constrained(1, 0, 1, 0, 0.5, 1.0, p_no_err, p_err);
         let expected = 0.5 * p_no_err + 0.5 * 0.5;
         assert!(
             (emit_half_conf - expected).abs() < 0.01,
@@ -12761,7 +12759,7 @@ mod tests {
         let p_no_err = 0.999;
         let p_err = 0.001;
         let conf = 1.0;
-        let emit = emit_haploid_constrained(u8::MAX, 0, 1, 0, conf, p_no_err, p_err);
+        let emit = emit_haploid_constrained(u8::MAX, 0, 1, 0, conf, 1.0, p_no_err, p_err);
         assert!(
             (emit - 0.5).abs() < 1e-6,
             "Missing reference allele should be neutral, got {}",
@@ -12775,9 +12773,9 @@ mod tests {
         let p_err = 0.001;
         let conf = 1.0;
         // fixed_allele=2 is inconsistent with genotype {0,1}, so either allele should match.
-        let emit_ref0 = emit_haploid_constrained(0, 0, 1, 2, conf, p_no_err, p_err);
-        let emit_ref1 = emit_haploid_constrained(1, 0, 1, 2, conf, p_no_err, p_err);
-        let emit_ref2 = emit_haploid_constrained(2, 0, 1, 2, conf, p_no_err, p_err);
+        let emit_ref0 = emit_haploid_constrained(0, 0, 1, 2, conf, 1.0, p_no_err, p_err);
+        let emit_ref1 = emit_haploid_constrained(1, 0, 1, 2, conf, 1.0, p_no_err, p_err);
+        let emit_ref2 = emit_haploid_constrained(2, 0, 1, 2, conf, 1.0, p_no_err, p_err);
         assert!(
             emit_ref0 > 0.9,
             "Expected relaxed-match for ref=0, got {}",
@@ -12792,6 +12790,36 @@ mod tests {
             emit_ref2 < 0.1,
             "Expected mismatch for ref=2, got {}",
             emit_ref2
+        );
+    }
+
+    #[test]
+    fn test_emit_haploid_constrained_marginalizes_phase_orientation() {
+        let p_no_err = 0.999f32;
+        let p_err = 0.001f32;
+        let geno_conf = 1.0f32;
+
+        // For genotype 0/1 with fixed partner allele 0:
+        // - phase_conf=0.5 should make ref=0 and ref=1 equally likely.
+        let emit_ref1_half = emit_haploid_constrained(1, 0, 1, 0, geno_conf, 0.5, p_no_err, p_err);
+        let emit_ref0_half = emit_haploid_constrained(0, 0, 1, 0, geno_conf, 0.5, p_no_err, p_err);
+        assert!(
+            (emit_ref1_half - emit_ref0_half).abs() < 1e-6,
+            "Expected equal emissions at phase_conf=0.5, got ref1={} ref0={}",
+            emit_ref1_half,
+            emit_ref0_half
+        );
+
+        // As phase confidence increases, required allele should become preferred.
+        let emit_ref1_high =
+            emit_haploid_constrained(1, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
+        let emit_ref0_high =
+            emit_haploid_constrained(0, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
+        assert!(
+            emit_ref1_high > emit_ref0_high,
+            "Expected required allele preferred at high phase confidence, got ref1={} ref0={}",
+            emit_ref1_high,
+            emit_ref0_high
         );
     }
 
@@ -13283,6 +13311,7 @@ mod tests {
         let params = pipeline.params.clone();
         let allocation = allocate_lms_sparse(
             &scores_by_hap,
+            None,
             &candidate_haps,
             num_windows,
             &boundary_cm,
@@ -13905,4 +13934,3 @@ mod tests {
         assert!(posterior[0] < 0.5 && posterior[5] > 0.5);
     }
 }
-

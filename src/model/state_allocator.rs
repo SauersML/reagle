@@ -142,6 +142,23 @@ fn logaddexp(a: f32, b: f32) -> f32 {
     }
 }
 
+#[inline]
+fn dropout_eta_at(
+    credit: Option<&[(usize, f32)]>,
+    idx: &mut usize,
+    window: usize,
+) -> Option<f32> {
+    let credits = credit?;
+    while *idx < credits.len() && credits[*idx].0 < window {
+        *idx += 1;
+    }
+    if *idx < credits.len() && credits[*idx].0 == window {
+        Some(credits[*idx].1)
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 struct DpScratch {
     dp0: Vec<f32>,
@@ -235,6 +252,7 @@ fn dp_intervals_sparse_scratch(
     scores: &[(usize, f32)],
     logz: &[f32],
     mu: f32,
+    dropout_credit: Option<&[(usize, f32)]>,
     blocked: &[bool],
     t11: &[f32],
     t10: &[f32],
@@ -254,13 +272,20 @@ fn dp_intervals_sparse_scratch(
     active.fill(false);
 
     let mut s_idx = 0usize;
+    let mut c_idx = 0usize;
     let mut score0 = NEG_INF;
     if !scores.is_empty() && scores[0].0 == 0 {
         score0 = scores[0].1;
         s_idx = 1;
     }
     dp0[0] = 0.0;
-    let mut u0 = logaddexp(logz[0], score0) - logz[0] - mu;
+    let mut mu0 = mu;
+    if score0 <= NEG_INF {
+        if let Some(eta) = dropout_eta_at(dropout_credit, &mut c_idx, 0) {
+            mu0 *= eta.clamp(0.0, 1.0);
+        }
+    }
+    let mut u0 = logaddexp(logz[0], score0) - logz[0] - mu0;
     if blocked.get(0).copied().unwrap_or(false) {
         u0 = NEG_INF;
     }
@@ -272,7 +297,13 @@ fn dp_intervals_sparse_scratch(
             score = scores[s_idx].1;
             s_idx += 1;
         }
-        let mut u_w = logaddexp(logz[i], score) - logz[i] - mu;
+        let mut mu_w = mu;
+        if score <= NEG_INF {
+            if let Some(eta) = dropout_eta_at(dropout_credit, &mut c_idx, i) {
+                mu_w *= eta.clamp(0.0, 1.0);
+            }
+        }
+        let mut u_w = logaddexp(logz[i], score) - logz[i] - mu_w;
         if blocked.get(i).copied().unwrap_or(false) {
             u_w = NEG_INF;
         }
@@ -543,6 +574,7 @@ fn refresh_blocked_flags(counts: &[usize], per_window_caps: &[usize], blocked: &
 
 fn fill_residual_capacity(
     scores_by_hap: &[Vec<(usize, f32)>],
+    dropout_credit_by_hap: Option<&[Vec<(usize, f32)>]>,
     per_window_caps: &[usize],
     t11: &[f32],
     t10: &[f32],
@@ -577,6 +609,9 @@ fn fill_residual_capacity(
                 &scores_by_hap[h],
                 z_w,
                 0.0,
+                dropout_credit_by_hap
+                    .and_then(|credits| credits.get(h))
+                    .map(|v| v.as_slice()),
                 blocked_scratch,
                 t11,
                 t10,
@@ -643,6 +678,7 @@ fn fill_residual_capacity(
 /// - per_window_caps: per-window max states (global, same for all target haps).
 pub fn allocate_lms_sparse(
     scores_by_hap: &[Vec<(usize, f32)>],
+    dropout_credit_by_hap: Option<&[Vec<(usize, f32)>]>,
     candidate_haps: &[usize],
     num_windows: usize,
     boundary_cm: &[f64],
@@ -699,7 +735,16 @@ pub fn allocate_lms_sparse(
     let mut low_iter = 0usize;
     while low_iter < 5 {
         let (used, _) =
-            simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu_low, per_window_caps);
+            simulate_allocation(
+                scores_by_hap,
+                dropout_credit_by_hap,
+                w,
+                &t11,
+                &t10,
+                &t01,
+                mu_low,
+                per_window_caps,
+            );
         if used >= total_budget {
             break;
         }
@@ -709,7 +754,16 @@ pub fn allocate_lms_sparse(
     let mut high_iter = 0usize;
     while high_iter < 5 {
         let (used, _) =
-            simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu_high, per_window_caps);
+            simulate_allocation(
+                scores_by_hap,
+                dropout_credit_by_hap,
+                w,
+                &t11,
+                &t10,
+                &t01,
+                mu_high,
+                per_window_caps,
+            );
         if used <= total_budget {
             break;
         }
@@ -728,7 +782,16 @@ pub fn allocate_lms_sparse(
         let t = k as f32 / 16.0;
         let mu = mu_low + t * (mu_high - mu_low);
         let (used, gain) =
-            simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
+            simulate_allocation(
+                scores_by_hap,
+                dropout_credit_by_hap,
+                w,
+                &t11,
+                &t10,
+                &t01,
+                mu,
+                per_window_caps,
+            );
         coarse_samples.push((mu, used, gain));
         if used <= total_budget
             && (!found_feasible || gain > best_gain || (gain == best_gain && used > best_used))
@@ -764,7 +827,16 @@ pub fn allocate_lms_sparse(
             while j < 9 {
                 let mu = left + step * j as f32;
                 let (used, gain) =
-                    simulate_allocation(scores_by_hap, w, &t11, &t10, &t01, mu, per_window_caps);
+                    simulate_allocation(
+                        scores_by_hap,
+                        dropout_credit_by_hap,
+                        w,
+                        &t11,
+                        &t10,
+                        &t01,
+                        mu,
+                        per_window_caps,
+                    );
                 if used <= total_budget
                     && (gain > best_gain || (gain == best_gain && used > best_used))
                 {
@@ -842,6 +914,9 @@ pub fn allocate_lms_sparse(
                 scores,
                 &z_w,
                 mu,
+                dropout_credit_by_hap
+                    .and_then(|credits| credits.get(h))
+                    .map(|v| v.as_slice()),
                 &blocked_scratch,
                 &t11,
                 &t10,
@@ -867,6 +942,9 @@ pub fn allocate_lms_sparse(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
+            dropout_credit_by_hap
+                .and_then(|credits| credits.get(entry.idx))
+                .map(|v| v.as_slice()),
             &blocked_scratch,
             &t11,
             &t10,
@@ -905,6 +983,7 @@ pub fn allocate_lms_sparse(
     // Residual-capacity fill under true objective (mu=0).
     fill_residual_capacity(
         scores_by_hap,
+        dropout_credit_by_hap,
         per_window_caps,
         &t11,
         &t10,
@@ -941,6 +1020,9 @@ pub fn allocate_lms_sparse(
             &scores_by_hap[polish_idx],
             &z_w,
             mu,
+            dropout_credit_by_hap
+                .and_then(|credits| credits.get(polish_idx))
+                .map(|v| v.as_slice()),
             &blocked_scratch,
             &t11,
             &t10,
@@ -994,6 +1076,7 @@ pub fn allocate_lms_sparse(
     // Final residual pass after polish.
     fill_residual_capacity(
         scores_by_hap,
+        dropout_credit_by_hap,
         per_window_caps,
         &t11,
         &t10,
@@ -1022,6 +1105,7 @@ pub fn allocate_lms_sparse(
 }
 fn simulate_allocation(
     scores_by_hap: &[Vec<(usize, f32)>],
+    dropout_credit_by_hap: Option<&[Vec<(usize, f32)>]>,
     num_windows: usize,
     t11: &[f32],
     t10: &[f32],
@@ -1082,6 +1166,9 @@ fn simulate_allocation(
                 scores,
                 &z_w,
                 mu,
+                dropout_credit_by_hap
+                    .and_then(|credits| credits.get(h))
+                    .map(|v| v.as_slice()),
                 &blocked_scratch,
                 t11,
                 t10,
@@ -1104,6 +1191,9 @@ fn simulate_allocation(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
+            dropout_credit_by_hap
+                .and_then(|credits| credits.get(entry.idx))
+                .map(|v| v.as_slice()),
             &blocked_scratch,
             t11,
             t10,
