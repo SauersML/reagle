@@ -2675,12 +2675,23 @@ unsafe fn dense_identity_biallelic_sums_avx512(
     fb_products: Option<&[f32]>,
 ) -> (f32, f32, f32, usize, f32, f32, f32, usize) {
     use std::arch::x86_64::*;
-    let mut alt_sum_f_vec = _mm512_setzero_ps();
-    let mut alt_sum_b_vec = _mm512_setzero_ps();
-    let mut alt_sum_fb_vec = _mm512_setzero_ps();
-    let mut miss_sum_f_vec = _mm512_setzero_ps();
-    let mut miss_sum_b_vec = _mm512_setzero_ps();
-    let mut miss_sum_fb_vec = _mm512_setzero_ps();
+    let (
+        mut alt_sum_f_vec,
+        mut alt_sum_b_vec,
+        mut alt_sum_fb_vec,
+        mut miss_sum_f_vec,
+        mut miss_sum_b_vec,
+        mut miss_sum_fb_vec,
+    ) = unsafe {
+        (
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+        )
+    };
     let mut alt_count = 0usize;
     let mut miss_count = 0usize;
     let mut k = 0usize;
@@ -2700,37 +2711,52 @@ unsafe fn dense_identity_biallelic_sums_avx512(
         alt_count += alt_mask.count_ones() as usize;
         miss_count += miss_mask.count_ones() as usize;
 
-        let f_vec = _mm512_maskz_loadu_ps(valid_mask, fwd.as_ptr().add(k));
-        let b_vec = _mm512_maskz_loadu_ps(valid_mask, bwd.as_ptr().add(k));
-        let fb_vec = if let Some(fb) = fb_products {
-            _mm512_maskz_loadu_ps(valid_mask, fb.as_ptr().add(k))
-        } else {
-            _mm512_mul_ps(f_vec, b_vec)
-        };
+        unsafe {
+            let f_vec = _mm512_maskz_loadu_ps(valid_mask, fwd.as_ptr().add(k));
+            let b_vec = _mm512_maskz_loadu_ps(valid_mask, bwd.as_ptr().add(k));
+            let fb_vec = if let Some(fb) = fb_products {
+                _mm512_maskz_loadu_ps(valid_mask, fb.as_ptr().add(k))
+            } else {
+                _mm512_mul_ps(f_vec, b_vec)
+            };
 
-        // Dedicated masked accumulation: avoids materializing intermediate masked vectors.
-        alt_sum_f_vec = _mm512_mask_add_ps(alt_sum_f_vec, alt_mask, alt_sum_f_vec, f_vec);
-        alt_sum_b_vec = _mm512_mask_add_ps(alt_sum_b_vec, alt_mask, alt_sum_b_vec, b_vec);
-        alt_sum_fb_vec = _mm512_mask_add_ps(alt_sum_fb_vec, alt_mask, alt_sum_fb_vec, fb_vec);
-        miss_sum_f_vec = _mm512_mask_add_ps(miss_sum_f_vec, miss_mask, miss_sum_f_vec, f_vec);
-        miss_sum_b_vec = _mm512_mask_add_ps(miss_sum_b_vec, miss_mask, miss_sum_b_vec, b_vec);
-        miss_sum_fb_vec = _mm512_mask_add_ps(miss_sum_fb_vec, miss_mask, miss_sum_fb_vec, fb_vec);
+            // Dedicated masked accumulation: avoids materializing intermediate masked vectors.
+            alt_sum_f_vec = _mm512_mask_add_ps(alt_sum_f_vec, alt_mask, alt_sum_f_vec, f_vec);
+            alt_sum_b_vec = _mm512_mask_add_ps(alt_sum_b_vec, alt_mask, alt_sum_b_vec, b_vec);
+            alt_sum_fb_vec = _mm512_mask_add_ps(alt_sum_fb_vec, alt_mask, alt_sum_fb_vec, fb_vec);
+            miss_sum_f_vec = _mm512_mask_add_ps(miss_sum_f_vec, miss_mask, miss_sum_f_vec, f_vec);
+            miss_sum_b_vec = _mm512_mask_add_ps(miss_sum_b_vec, miss_mask, miss_sum_b_vec, b_vec);
+            miss_sum_fb_vec =
+                _mm512_mask_add_ps(miss_sum_fb_vec, miss_mask, miss_sum_fb_vec, fb_vec);
+        }
 
         k += 16;
     }
 
     let mut tmp = [0f32; 16];
-    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    }
     let alt_sum_f = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    }
     let alt_sum_b = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    }
     let alt_sum_fb = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    }
     let miss_sum_f = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    }
     let miss_sum_b = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    }
     let miss_sum_fb = tmp.iter().sum::<f32>();
     (
         alt_sum_f,
@@ -2755,12 +2781,23 @@ unsafe fn dense_identity_biallelic_sums_avx2(
     fb_products: Option<&[f32]>,
 ) -> (f32, f32, f32, usize, f32, f32, f32, usize) {
     use std::arch::x86_64::*;
-    let mut alt_sum_f_vec = _mm256_setzero_ps();
-    let mut alt_sum_b_vec = _mm256_setzero_ps();
-    let mut alt_sum_fb_vec = _mm256_setzero_ps();
-    let mut miss_sum_f_vec = _mm256_setzero_ps();
-    let mut miss_sum_b_vec = _mm256_setzero_ps();
-    let mut miss_sum_fb_vec = _mm256_setzero_ps();
+    let (
+        mut alt_sum_f_vec,
+        mut alt_sum_b_vec,
+        mut alt_sum_fb_vec,
+        mut miss_sum_f_vec,
+        mut miss_sum_b_vec,
+        mut miss_sum_fb_vec,
+    ) = unsafe {
+        (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        )
+    };
     let mut alt_count = 0usize;
     let mut miss_count = 0usize;
     let mut k = 0usize;
@@ -2781,69 +2818,85 @@ unsafe fn dense_identity_biallelic_sums_avx2(
         miss_count += miss_mask_bits.count_ones() as usize;
 
         let lane_mask = |bits: u8| -> __m256i {
-            _mm256_set_epi32(
-                if (bits & (1 << 7)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 6)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 5)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 4)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 3)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 2)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 1)) != 0 { -1 } else { 0 },
-                if (bits & (1 << 0)) != 0 { -1 } else { 0 },
-            )
+            unsafe {
+                _mm256_set_epi32(
+                    if (bits & (1 << 7)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 6)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 5)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 4)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 3)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 2)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 1)) != 0 { -1 } else { 0 },
+                    if (bits & (1 << 0)) != 0 { -1 } else { 0 },
+                )
+            }
         };
         let valid_mask_i = lane_mask(valid_bits);
         let alt_mask_i = lane_mask(alt_mask_bits);
         let miss_mask_i = lane_mask(miss_mask_bits);
 
-        let f_vec = _mm256_maskload_ps(fwd.as_ptr().add(k), valid_mask_i);
-        let b_vec = _mm256_maskload_ps(bwd.as_ptr().add(k), valid_mask_i);
-        let fb_vec = if let Some(fb) = fb_products {
-            _mm256_maskload_ps(fb.as_ptr().add(k), valid_mask_i)
-        } else {
-            _mm256_mul_ps(f_vec, b_vec)
-        };
+        unsafe {
+            let f_vec = _mm256_maskload_ps(fwd.as_ptr().add(k), valid_mask_i);
+            let b_vec = _mm256_maskload_ps(bwd.as_ptr().add(k), valid_mask_i);
+            let fb_vec = if let Some(fb) = fb_products {
+                _mm256_maskload_ps(fb.as_ptr().add(k), valid_mask_i)
+            } else {
+                _mm256_mul_ps(f_vec, b_vec)
+            };
 
-        alt_sum_f_vec = _mm256_add_ps(
-            alt_sum_f_vec,
-            _mm256_and_ps(f_vec, _mm256_castsi256_ps(alt_mask_i)),
-        );
-        alt_sum_b_vec = _mm256_add_ps(
-            alt_sum_b_vec,
-            _mm256_and_ps(b_vec, _mm256_castsi256_ps(alt_mask_i)),
-        );
-        alt_sum_fb_vec = _mm256_add_ps(
-            alt_sum_fb_vec,
-            _mm256_and_ps(fb_vec, _mm256_castsi256_ps(alt_mask_i)),
-        );
-        miss_sum_f_vec = _mm256_add_ps(
-            miss_sum_f_vec,
-            _mm256_and_ps(f_vec, _mm256_castsi256_ps(miss_mask_i)),
-        );
-        miss_sum_b_vec = _mm256_add_ps(
-            miss_sum_b_vec,
-            _mm256_and_ps(b_vec, _mm256_castsi256_ps(miss_mask_i)),
-        );
-        miss_sum_fb_vec = _mm256_add_ps(
-            miss_sum_fb_vec,
-            _mm256_and_ps(fb_vec, _mm256_castsi256_ps(miss_mask_i)),
-        );
+            alt_sum_f_vec = _mm256_add_ps(
+                alt_sum_f_vec,
+                _mm256_and_ps(f_vec, _mm256_castsi256_ps(alt_mask_i)),
+            );
+            alt_sum_b_vec = _mm256_add_ps(
+                alt_sum_b_vec,
+                _mm256_and_ps(b_vec, _mm256_castsi256_ps(alt_mask_i)),
+            );
+            alt_sum_fb_vec = _mm256_add_ps(
+                alt_sum_fb_vec,
+                _mm256_and_ps(fb_vec, _mm256_castsi256_ps(alt_mask_i)),
+            );
+            miss_sum_f_vec = _mm256_add_ps(
+                miss_sum_f_vec,
+                _mm256_and_ps(f_vec, _mm256_castsi256_ps(miss_mask_i)),
+            );
+            miss_sum_b_vec = _mm256_add_ps(
+                miss_sum_b_vec,
+                _mm256_and_ps(b_vec, _mm256_castsi256_ps(miss_mask_i)),
+            );
+            miss_sum_fb_vec = _mm256_add_ps(
+                miss_sum_fb_vec,
+                _mm256_and_ps(fb_vec, _mm256_castsi256_ps(miss_mask_i)),
+            );
+        }
 
         k += 8;
     }
 
     let mut tmp = [0f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    }
     let alt_sum_f = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    }
     let alt_sum_b = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    }
     let alt_sum_fb = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    }
     let miss_sum_f = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    }
     let miss_sum_b = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    }
     let miss_sum_fb = tmp.iter().sum::<f32>();
     (
         alt_sum_f,
