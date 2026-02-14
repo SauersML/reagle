@@ -12375,6 +12375,14 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn orientation_is_decisive(lr: f32, prob: f32, anchored: bool) -> bool {
+        if anchored {
+            lr >= 1.5
+        } else {
+            prob >= 0.75
+        }
+    }
+
     fn build_test_markers(
         n_markers: usize,
         step_bp: u32,
