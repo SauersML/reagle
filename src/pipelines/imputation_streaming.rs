@@ -6556,6 +6556,7 @@ impl crate::pipelines::ImputationPipeline {
                         #[derive(Clone)]
                         struct Constraint {
                             carriers: Vec<RefHapId>,
+                            weight: f32,
                         }
 
                         let mut constraints: Vec<Constraint> = Vec::new();
@@ -6590,6 +6591,7 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             constraints.push(Constraint {
                                 carriers: carriers_buf.clone(),
+                                weight: best_p,
                             });
                         }
 
@@ -6646,7 +6648,7 @@ impl crate::pipelines::ImputationPipeline {
                         let mut selected: Vec<usize> = Vec::with_capacity(k);
                         let mut covered = vec![0usize; r];
                         let mut best_selected: Option<Vec<usize>> = None;
-                        let mut best_covered = 0usize;
+                        let mut best_covered_weight = 0.0f32;
                         let mut best_base = 0usize;
                         const MAX_DUAL_ITERS: usize = 32;
 
@@ -6685,14 +6687,26 @@ impl crate::pipelines::ImputationPipeline {
                                 }
                             }
                             let covered_count = covered.iter().filter(|&&c| c > 0).count();
+                            let covered_weight: f32 = covered
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(j, &c)| {
+                                    if c > 0 {
+                                        Some(constraints[j].weight)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .sum();
                             let base_count = selected
                                 .iter()
                                 .filter(|&&idx| candidates[idx].is_base)
                                 .count();
-                            if covered_count > best_covered
-                                || (covered_count == best_covered && base_count > best_base)
+                            if covered_weight > best_covered_weight + f32::EPSILON
+                                || ((covered_weight - best_covered_weight).abs() <= f32::EPSILON
+                                    && base_count > best_base)
                             {
-                                best_covered = covered_count;
+                                best_covered_weight = covered_weight;
                                 best_base = base_count;
                                 best_selected = Some(selected.clone());
                             }
@@ -6703,7 +6717,11 @@ impl crate::pipelines::ImputationPipeline {
 
                             let eta = 1.0f32 / ((iter + 1) as f32).sqrt();
                             for j in 0..r {
-                                let v = if covered[j] > 0 { 0.0 } else { 1.0 };
+                                let v = if covered[j] > 0 {
+                                    0.0
+                                } else {
+                                    constraints[j].weight
+                                };
                                 lambdas[j] = (lambdas[j] + eta * v).max(0.0);
                             }
                         }
@@ -6962,6 +6980,8 @@ impl crate::pipelines::ImputationPipeline {
                             if recomb_rate > 0.0 && !state_probs.is_empty() {
                                 let k_f = k as f32;
                                 let n_f = n_transition_haps_f32.max(1.0);
+                                // Same fixed-lambda transition family used by run_impute_hmm:
+                                // equivalent to canonical subset transition at r_eff=r*(1-lambda).
                                 let rho =
                                     transition_lambda + (1.0 - transition_lambda) * (k_f / n_f);
                                 let z = ((1.0 - recomb_rate) + recomb_rate * rho).max(1e-30);

@@ -9,9 +9,9 @@ use crate::data::storage::{
     AlleleCode, DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
 use crate::error::{ReagleError, Result};
-#[cfg(test)]
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::types::RefHapId;
+use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -249,8 +249,9 @@ fn validate_reference_marker_count(
 #[cfg(test)]
 mod tests {
     use super::{
-        AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles, fill_emissions,
-        missing_emission_prob, subset_transition_params, transition_only_forward_update,
+        AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles, effective_recomb_rate,
+        fill_emissions, missing_emission_prob, subset_transition_params,
+        subset_transition_params_adaptive_q, transition_only_forward_update,
     };
     use super::{RefColumnLike, RefHapId};
     use crate::data::storage::AlleleCode;
@@ -319,6 +320,42 @@ mod tests {
         // Ensure we are not effectively using r/K scaling.
         let k_scaled = (recomb_rate / k) / ((1.0 - recomb_rate) + k * (recomb_rate / k));
         assert!(shift < k_scaled * 0.1);
+    }
+
+    #[test]
+    fn test_fixed_lambda_transition_equals_canonical_with_r_eff() {
+        let cases = [
+            (0.0f32, 0.0f32, 16usize, 1000usize),
+            (0.02f32, 0.0f32, 64usize, 10_000usize),
+            (0.02f32, 0.5f32, 64usize, 10_000usize),
+            (0.12f32, 0.98f32, 31usize, 6546usize),
+            (1.0f32, 0.25f32, 3usize, 500usize),
+        ];
+        for (r, lambda, k, n) in cases {
+            let (stay_l, shift_l) = subset_transition_params_adaptive_q(r, k, n, lambda);
+            let r_eff = effective_recomb_rate(r, lambda);
+            let (stay_e, shift_e) = subset_transition_params(r_eff, k, n);
+            assert!(
+                (stay_l - stay_e).abs() < 1e-6,
+                "stay mismatch r={} lambda={} k={} n={} got={} expected={}",
+                r,
+                lambda,
+                k,
+                n,
+                stay_l,
+                stay_e
+            );
+            assert!(
+                (shift_l - shift_e).abs() < 1e-8,
+                "shift mismatch r={} lambda={} k={} n={} got={} expected={}",
+                r,
+                lambda,
+                k,
+                n,
+                shift_l,
+                shift_e
+            );
+        }
     }
 
     #[test]
@@ -2085,7 +2122,6 @@ fn normalize_allele_posterior_structural_missing(
     }
 }
 
-#[cfg(test)]
 #[inline]
 fn subset_transition_params(
     recomb_rate: f32,
@@ -2127,6 +2163,13 @@ fn subset_transition_params(
 }
 
 #[inline]
+fn effective_recomb_rate(recomb_rate: f32, lambda: f32) -> f32 {
+    let r = recomb_rate.clamp(0.0, 1.0);
+    let lam = lambda.clamp(0.0, 1.0);
+    (r * (1.0 - lam)).clamp(0.0, 1.0)
+}
+
+#[inline]
 fn subset_transition_params_adaptive_q(
     recomb_rate: f32,
     active_states: usize,
@@ -2136,10 +2179,6 @@ fn subset_transition_params_adaptive_q(
     if active_states == 0 {
         return (0.0, 0.0);
     }
-    let r = recomb_rate.clamp(0.0, 1.0);
-    let n = n_ref_haps.max(1) as f32;
-    let k = active_states as f32;
-    let lam = lambda.clamp(0.0, 1.0);
     // Fixed-lambda subset transition family used throughout imputation.
     //
     // Affine update over represented states j=1..K:
@@ -2162,10 +2201,13 @@ fn subset_transition_params_adaptive_q(
     // Note: diagonal/self transition probability in the implied matrix is
     // (stay + shift), not stay alone, because the rank-1 additive term also
     // contributes to the diagonal.
-    let rho = lam + (1.0 - lam) * (k / n);
-    let d = ((1.0 - r) + r * rho).max(1e-30);
-    let stay = ((1.0 - r) + r * lam) / d;
-    let shift = (r * (1.0 - lam) / n) / d;
+    //
+    // Equivalent parameterization:
+    //   r_eff = r*(1-lambda)
+    // and then canonical subset coefficients at r_eff.
+    let r_eff = effective_recomb_rate(recomb_rate, lambda);
+    let (stay, shift) = subset_transition_params(r_eff, active_states, n_ref_haps);
+    let k = active_states as f32;
     if cfg!(debug_assertions) {
         assert!(
             (stay + k * shift - 1.0).abs() < 1e-3 || !stay.is_finite() || !shift.is_finite(),
@@ -2942,21 +2984,16 @@ fn forward_update_impl<C: RefColumnLike>(
             &mut ws.emissions[..active_states],
         );
         if recomb_rate > 0.0 {
-            let fwd_sum = 1.0f32;
-            let (stay_gap, shift) = subset_transition_params_adaptive_q(
-                recomb_rate,
-                active_states,
+            let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                1.0,
+                recomb_rate_eff,
                 transition_haps,
-                transition_lambda,
-            );
-            let scale = stay_gap / fwd_sum;
-            let mut sum = 0.0f32;
-            for i in 0..active_states {
-                let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
-                ws.fwd[i] = t;
-                sum += t;
-            }
-            sum.max(1e-30)
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
+                active_states,
+            )
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -3018,21 +3055,16 @@ fn forward_update_seqcoded(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            let fwd_sum = 1.0f32;
-            let (stay_gap, shift) = subset_transition_params_adaptive_q(
-                recomb_rate,
-                active_states,
+            let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                1.0,
+                recomb_rate_eff,
                 transition_haps,
-                transition_lambda,
-            );
-            let scale = stay_gap / fwd_sum;
-            let mut sum = 0.0f32;
-            for i in 0..active_states {
-                let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
-                ws.fwd[i] = t;
-                sum += t;
-            }
-            sum.max(1e-30)
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
+                active_states,
+            )
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -3099,21 +3131,16 @@ fn forward_update_dict(
             ws.emissions[i] = ws.pattern_emissions.get(pid).copied().unwrap_or(1.0);
         }
         if recomb_rate > 0.0 {
-            let fwd_sum = 1.0f32;
-            let (stay_gap, shift) = subset_transition_params_adaptive_q(
-                recomb_rate,
-                active_states,
+            let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
+            WeightedHmmUpdater::fwd_update_weighted(
+                &mut ws.fwd,
+                1.0,
+                recomb_rate_eff,
                 transition_haps,
-                transition_lambda,
-            );
-            let scale = stay_gap / fwd_sum;
-            let mut sum = 0.0f32;
-            for i in 0..active_states {
-                let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
-                ws.fwd[i] = t;
-                sum += t;
-            }
-            sum.max(1e-30)
+                PatternCounts::new(&ws.weights[..active_states]),
+                EmissionProbs::new(&ws.emissions[..active_states]),
+                active_states,
+            )
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
