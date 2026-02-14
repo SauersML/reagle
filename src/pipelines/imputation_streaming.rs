@@ -11,15 +11,14 @@ use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use bitvec::prelude::*;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use tracing::{info_span, instrument, warn};
 
-use crate::Config;
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::marker::{AnyMarkerSpace, Markers, RefWindowSpace};
@@ -28,18 +27,18 @@ use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
-use crate::io::bref3::{RefPanelReader, RefWindow, TargetMarkerIndex, convert_ref_vcf_to_bref3};
+use crate::io::bref3::{convert_ref_vcf_to_bref3, RefPanelReader, RefWindow, TargetMarkerIndex};
 use crate::io::prescan_cache::{
-    PackedRefColumn, PrescanCacheReader, PrescanCacheWriter, create_temp_cache_path,
-    pack_ref_columns,
+    create_temp_cache_path, pack_ref_columns, PackedRefColumn, PrescanCacheReader,
+    PrescanCacheWriter,
 };
 use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::impute_hmm::{
-    ImputeHmmContext, ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm,
-    state_posteriors_to_priors, compute_nearest_observed_lambda,
+    compute_nearest_observed_lambda, run_impute_hmm, state_posteriors_to_priors, ImputeHmmContext,
+    ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs,
 };
 use crate::model::parameters::ModelParams;
 use crate::model::phase_query::{
@@ -56,6 +55,7 @@ use crate::model::transition_matrix::TransitionMatrix;
 use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
+use crate::Config;
 
 /// Retain only the `k` highest-weight donors, discarding the rest.
 ///
@@ -241,7 +241,6 @@ impl SegmentExtent {
         self.core_end - self.core_start
     }
 
-
     /// Planning window range for state selection.
     #[inline]
     fn plan_range(&self) -> (usize, usize) {
@@ -290,7 +289,13 @@ impl SegmentExtent {
             }
             std::sync::Arc::new(local)
         });
-        TargetAlleleProbs::new(offsets, probs, observed, panel_priors, input_probs.min_untyped_prior_mix())
+        TargetAlleleProbs::new(
+            offsets,
+            probs,
+            observed,
+            panel_priors,
+            input_probs.min_untyped_prior_mix(),
+        )
     }
 
     /// HMM-local index for the prior/handoff marker (last core marker).
@@ -636,7 +641,11 @@ fn interval_support_over_range(
             total = total.saturating_add(1);
         }
     }
-    if total > 0 { Some(total) } else { None }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1045,9 +1054,7 @@ fn aggregate_window_sparse_scores(window_scores: &mut [Vec<(usize, f32)>]) {
         let mut acc: HashMap<usize, f32> = HashMap::with_capacity(ws.len() * 2);
         for &(hap, score) in ws.iter() {
             if score.is_finite() && score > 0.0 {
-                acc.entry(hap)
-                    .and_modify(|s| *s += score)
-                    .or_insert(score);
+                acc.entry(hap).and_modify(|s| *s += score).or_insert(score);
             }
         }
         ws.clear();
@@ -3239,10 +3246,7 @@ fn build_imputation_plan(
 struct SampleImputationResult {
     sample_idx: usize,
     hap_alt_probs: (Option<Vec<f32>>, Option<Vec<f32>>),
-    hap_posteriors: (
-        Option<SparseHapPosteriors>,
-        Option<SparseHapPosteriors>,
-    ),
+    hap_posteriors: (Option<SparseHapPosteriors>, Option<SparseHapPosteriors>),
 }
 
 #[derive(Clone, Debug)]
@@ -3319,21 +3323,17 @@ impl SampleImputationResult {
             } else {
                 0.5
             };
-            if allele == 1 { p_alt } else { 1.0 - p_alt }
+            if allele == 1 {
+                p_alt
+            } else {
+                1.0 - p_alt
+            }
         })
     }
 
     fn swap_hap_posteriors_at(&mut self, local_m: usize) {
-        let left = self
-            .hap_posteriors
-            .0
-            .as_mut()
-            .and_then(|s| s.take(local_m));
-        let right = self
-            .hap_posteriors
-            .1
-            .as_mut()
-            .and_then(|s| s.take(local_m));
+        let left = self.hap_posteriors.0.as_mut().and_then(|s| s.take(local_m));
+        let right = self.hap_posteriors.1.as_mut().and_then(|s| s.take(local_m));
         if let Some(v) = left {
             let slot = self
                 .hap_posteriors
@@ -3512,7 +3512,11 @@ impl AltProbDiskStoreView {
             )
         };
         let v = values.get(idx).copied()?;
-        if v.is_nan() { None } else { Some(v) }
+        if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
     }
 }
 
@@ -4608,9 +4612,9 @@ impl crate::pipelines::ImputationPipeline {
             .collect();
         if should_log {
             let n_multiallelic = ref_is_biallelic.iter().filter(|&&is_bi| !is_bi).count();
-            let dense_post_per_sample_bytes =
-                2u64.saturating_mul(output_markers as u64)
-                    .saturating_mul(std::mem::size_of::<AllelePosteriors>() as u64);
+            let dense_post_per_sample_bytes = 2u64
+                .saturating_mul(output_markers as u64)
+                .saturating_mul(std::mem::size_of::<AllelePosteriors>() as u64);
             let dense_alt_per_sample_bytes = 2u64
                 .saturating_mul(output_markers as u64)
                 .saturating_mul(std::mem::size_of::<f32>() as u64);
@@ -5273,8 +5277,7 @@ impl crate::pipelines::ImputationPipeline {
                                 let g = conf1.clamp(0.5, 1.0);
                                 // Preserve orientation direction: c<0.5 means the phased
                                 // hap order is likely flipped at this marker.
-                                let p_primary =
-                                    (0.5 + (c - 0.5) * (2.0 * g - 1.0)).clamp(0.0, 1.0);
+                                let p_primary = (0.5 + (c - 0.5) * (2.0 * g - 1.0)).clamp(0.0, 1.0);
                                 aligned1[mapped1 as usize] = p_primary;
                                 aligned1[mapped2 as usize] = 1.0 - p_primary;
                             } else {
@@ -5307,8 +5310,7 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(0.0, 1.0);
                                 let c = phase_conf;
                                 let g = conf2.clamp(0.5, 1.0);
-                                let p_primary =
-                                    (0.5 + (c - 0.5) * (2.0 * g - 1.0)).clamp(0.0, 1.0);
+                                let p_primary = (0.5 + (c - 0.5) * (2.0 * g - 1.0)).clamp(0.0, 1.0);
                                 aligned2[mapped2 as usize] = p_primary;
                                 aligned2[mapped1 as usize] = 1.0 - p_primary;
                             } else {
@@ -5762,11 +5764,8 @@ impl crate::pipelines::ImputationPipeline {
         if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
             let hmm_budget_bytes =
                 (avail_bytes as f64 * IMPUTE_RAM_FRACTION * STATE_BUDGET_SAFETY) as u64;
-            let per_job_bytes = estimate_hmm_job_bytes(
-                per_window_cap_local,
-                n_ref_markers,
-                target_win.n_markers(),
-            );
+            let per_job_bytes =
+                estimate_hmm_job_bytes(per_window_cap_local, n_ref_markers, target_win.n_markers());
             if per_job_bytes > 0 {
                 let cap = (hmm_budget_bytes / per_job_bytes).max(1) as usize;
                 hmm_threads = hmm_threads.min(cap.max(1));
@@ -7397,10 +7396,18 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
                                 let hard = if donor_candidates.is_empty() {
-                                    if target_allele == 1 { 1.0 } else { 0.0 }
+                                    if target_allele == 1 {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
                                 } else {
                                     let allele = col.get(HapIdx::new(donor));
-                                    if allele == 1 { 1.0 } else { 0.0 }
+                                    if allele == 1 {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
                                 };
                                 (orient_weight * hard + (1.0 - orient_weight) * 0.5)
                                     .clamp(1e-6, 1.0 - 1e-6)
@@ -7565,9 +7572,10 @@ impl crate::pipelines::ImputationPipeline {
                     )
                 } else {
                     let mut alpha = ORIENTATION_ALPHA_MIN;
-                    if let (Some(p1), Some(p2)) =
-                        (result.hap_posterior(0, local_m), result.hap_posterior(1, local_m))
-                    {
+                    if let (Some(p1), Some(p2)) = (
+                        result.hap_posterior(0, local_m),
+                        result.hap_posterior(1, local_m),
+                    ) {
                         let n_alleles = ref_markers
                             .marker(MarkerIdx::new(ref_m as u32))
                             .n_alleles()
@@ -7591,9 +7599,10 @@ impl crate::pipelines::ImputationPipeline {
                             alpha = ((conf1 + conf2) * 0.5)
                                 .clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX);
                         }
-                    } else if let (Some(p1_alt), Some(p2_alt)) =
-                        (result.hap_alt_prob(0, local_m), result.hap_alt_prob(1, local_m))
-                    {
+                    } else if let (Some(p1_alt), Some(p2_alt)) = (
+                        result.hap_alt_prob(0, local_m),
+                        result.hap_alt_prob(1, local_m),
+                    ) {
                         let q1 = (p1_alt as f64).clamp(0.0, 1.0);
                         let q2 = (p2_alt as f64).clamp(0.0, 1.0);
                         let h_bin = |q: f64| -> f64 {
@@ -7818,8 +7827,7 @@ impl crate::pipelines::ImputationPipeline {
                 let alt_bytes =
                     buffered_alt_values.saturating_mul(std::mem::size_of::<f32>() as u64);
                 let sparse_bytes = buffered_sparse_entries.saturating_mul(
-                    (std::mem::size_of::<usize>() + std::mem::size_of::<AllelePosteriors>())
-                        as u64,
+                    (std::mem::size_of::<usize>() + std::mem::size_of::<AllelePosteriors>()) as u64,
                 );
                 let result_struct_bytes = (all_results.len() as u64)
                     .saturating_mul(std::mem::size_of::<SampleImputationResult>() as u64);
@@ -8122,9 +8130,14 @@ impl crate::pipelines::ImputationPipeline {
         for (ref_marker_idx, slot) in target_marker_pos_cache.iter_mut().enumerate() {
             *slot = resolve_target_marker_by_alleles(ref_marker_idx);
         }
-        let pick_target_marker_by_alleles =
-            |ref_marker_idx: usize| target_marker_pos_cache.get(ref_marker_idx).copied().flatten();
-        let marker_is_imputed: Vec<bool> = quality.marker_stats.iter().map(|s| s.is_imputed).collect();
+        let pick_target_marker_by_alleles = |ref_marker_idx: usize| {
+            target_marker_pos_cache
+                .get(ref_marker_idx)
+                .copied()
+                .flatten()
+        };
+        let marker_is_imputed: Vec<bool> =
+            quality.marker_stats.iter().map(|s| s.is_imputed).collect();
 
         let map_pos_fallback_allele =
             |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
@@ -8669,7 +8682,11 @@ impl crate::pipelines::ImputationPipeline {
                     if gp01 >= gp00 && gp01 >= gp11 {
                         let p10 = p1_alt * (1.0 - p2_alt);
                         let p01 = (1.0 - p1_alt) * p2_alt;
-                        if p10 >= p01 { (1, 0) } else { (0, 1) }
+                        if p10 >= p01 {
+                            (1, 0)
+                        } else {
+                            (0, 1)
+                        }
                     } else if gp11 >= gp00 {
                         (1, 1)
                     } else {
@@ -9199,12 +9216,12 @@ impl crate::pipelines::ImputationPipeline {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
-    use crate::data::storage::GenotypeColumn;
     use crate::data::storage::phase_state::{Phased, Unphased};
+    use crate::data::storage::GenotypeColumn;
+    use crate::data::ChromIdx;
     use crate::io::bref3::StreamingRefVcfReader;
     use crate::io::vcf::{ImputationQuality, VcfWriter};
     use crate::pipelines::ImputationPipeline;

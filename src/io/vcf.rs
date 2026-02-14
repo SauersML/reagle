@@ -17,7 +17,7 @@ use tracing::info_span;
 use crate::data::haplotype::Samples;
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::matrix::PlMatrix;
-use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
+use crate::data::storage::{compress_block, GenotypeColumn, GenotypeMatrix, PhaseState};
 use crate::error::{ReagleError, Result};
 use crate::utils::telemetry::TelemetryBlackboard;
 
@@ -33,7 +33,11 @@ pub(crate) fn parse_pl(pl_str: &str) -> Option<Vec<u16>> {
         let v = lexical_core::parse::<u32>(s.as_bytes()).ok()?;
         out.push(v.min(u16::MAX as u32) as u16);
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub(crate) fn gl_to_pl(gl_str: &str) -> Option<Vec<u16>> {
@@ -1397,7 +1401,18 @@ impl VcfWriter {
                     let a1 = column.get(hap1);
                     let a2 = column.get(hap2);
                     let sep = '|';
-                    write!(self.writer, "\t{}{}{}", a1, sep, a2)?;
+                    write!(self.writer, "\t")?;
+                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() {
+                        write!(self.writer, ".")?;
+                    } else {
+                        write!(self.writer, "{}", a1)?;
+                    }
+                    write!(self.writer, "{}", sep)?;
+                    if a2 == crate::data::storage::AlleleCode::MISSING.raw() {
+                        write!(self.writer, ".")?;
+                    } else {
+                        write!(self.writer, "{}", a2)?;
+                    }
                 }
                 writeln!(self.writer)?;
             }
@@ -1572,7 +1587,11 @@ impl VcfWriter {
                             .and_then(|f| f(m, s))
                             .and_then(|gp| {
                                 let expected = n_alleles * (n_alleles + 1) / 2;
-                                if gp.len() == expected { Some(gp) } else { None }
+                                if gp.len() == expected {
+                                    Some(gp)
+                                } else {
+                                    None
+                                }
                             });
                     let (a1, a2) = if let Some(ref gp) = gp_override {
                         best_gt_from_gp(n_alleles, gp)
@@ -1586,7 +1605,11 @@ impl VcfWriter {
                             if gp01 >= gp00 && gp01 >= gp11 {
                                 let p10 = p1_alt * (1.0 - p2_alt);
                                 let p01 = (1.0 - p1_alt) * p2_alt;
-                                if p10 >= p01 { (1, 0) } else { (0, 1) }
+                                if p10 >= p01 {
+                                    (1, 0)
+                                } else {
+                                    (0, 1)
+                                }
                             } else if gp11 >= gp00 {
                                 (1, 1)
                             } else {
