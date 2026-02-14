@@ -17,6 +17,8 @@ pub struct TransitionMatrix {
     recomb_rate: f32,
     /// Total panel haplotypes in Li-Stephens transition model.
     n_panel_haps: usize,
+    /// Exogenous transition stickiness in [0, 1].
+    transition_lambda: f32,
 }
 
 impl TransitionMatrix {
@@ -25,6 +27,7 @@ impl TransitionMatrix {
         next_states: &[RefHapId],
         recomb_rate: f32,
         n_panel_haps: usize,
+        transition_lambda: f32,
     ) -> Self {
         let n_next = next_states.len();
         let mut prev_to_next = Vec::with_capacity(prev_states.len());
@@ -43,6 +46,7 @@ impl TransitionMatrix {
             n_next,
             recomb_rate: recomb_rate.clamp(0.0, 1.0),
             n_panel_haps: n_panel_haps.max(1),
+            transition_lambda: transition_lambda.clamp(0.0, 1.0),
         }
     }
 
@@ -96,10 +100,12 @@ impl TransitionMatrix {
         let k_next = self.n_next as f32;
         let n_panel = self.n_panel_haps as f32;
         let r = self.recomb_rate;
-        let switch_full = r / n_panel;
-        let denom_in = ((1.0 - r) + k_next * switch_full).max(1e-30);
-        let stay_scale = (1.0 - r) / denom_in;
-        let switch_from_overlap_each = overlap_mass * switch_full / denom_in;
+        let lam = self.transition_lambda;
+        let rho = lam + (1.0 - lam) * (k_next / n_panel);
+        let denom_in = ((1.0 - r) + r * rho).max(1e-30);
+        let stay_scale = ((1.0 - r) + r * lam) / denom_in;
+        let switch_each = (r * (1.0 - lam) / n_panel) / denom_in;
+        let switch_from_overlap_each = overlap_mass * switch_each;
         // For dropped states (not in next subset), conditioning on "state in next
         // subset" yields entry mass over next states. Default is uniform; caller
         // can provide a window-local entry prior pi for safer state introduction.
@@ -135,9 +141,8 @@ impl TransitionMatrix {
             } else {
                 dropped_mass / k_next.max(1.0)
             };
-            next[j] = stay_scale * overlap_mass_by_next[j]
-                + switch_from_overlap_each
-                + dropped_entry;
+            next[j] =
+                stay_scale * overlap_mass_by_next[j] + switch_from_overlap_each + dropped_entry;
         }
 
         let mut sum = 0.0f32;

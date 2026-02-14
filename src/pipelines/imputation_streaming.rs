@@ -5744,10 +5744,11 @@ impl crate::pipelines::ImputationPipeline {
             let info_llr = ((1.0 - theta) / theta).ln();
             let mut prefix_log_stay_full = vec![0.0f32; n_ref_markers.saturating_add(1)];
             if n_ref_markers > 0 {
-                let n_panel = plan.n_ref_haps.max(1) as f32;
                 for m in 0..n_ref_markers {
                     let r = p_recomb.get(m).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let stay = ((1.0 - r) + r / n_panel).clamp(1e-12, 1.0);
+                    // Match Li-Stephens convention used by subset transition math:
+                    // full-panel stay term is (1-r), with switch mass handled separately.
+                    let stay = (1.0 - r).clamp(1e-12, 1.0);
                     prefix_log_stay_full[m + 1] = prefix_log_stay_full[m] + stay.ln();
                 }
             }
@@ -5971,21 +5972,9 @@ impl crate::pipelines::ImputationPipeline {
                                 continue;
                             }
                             if donor_picks.is_empty() {
-                                push_donor_weight(
-                                    &mut sm_donor_counts[hap_idx],
-                                    RefHapId::new(donor),
-                                    info_weight * 0.1,
-                                );
                                 continue;
                             }
-
-                            let beam_uncertainty =
-                                pbwt_beam_uncertainty(beam, plan.n_ref_haps, query_alleles[i]);
-                            let beam_conf = (1.0 - beam_uncertainty).clamp(0.05, 1.0);
-                            let coverage_conf = ((donor_picks.len() as f32 / donor_k.max(1) as f32)
-                                .sqrt())
-                            .clamp(0.25, 1.0);
-                            let marker_mass = info_weight * beam_conf * coverage_conf;
+                            let marker_mass = info_weight;
                             if marker_mass <= 0.0 || !marker_mass.is_finite() {
                                 continue;
                             }
@@ -6158,50 +6147,31 @@ impl crate::pipelines::ImputationPipeline {
                 // keep_top_k_donors_by_weight for empirical IQA results.
                 let max_fast_donors = per_window_cap_local.saturating_mul(2).max(64);
                 let build_donor_pool = |hap_usize: usize| -> Vec<(RefHapId, f32)> {
-                    let mut combined: HashMap<RefHapId, f32> = HashMap::new();
-                    for (h, c) in &sm_donor_counts[hap_usize] {
-                        combined.insert(*h, *c);
+                    let mut combined: Vec<(RefHapId, f32)> = sm_donor_counts[hap_usize]
+                        .iter()
+                        .map(|(h, c)| (*h, *c))
+                        .collect();
+                    if !combined.is_empty() {
+                        return combined;
                     }
-
-                    let donor_mass: f32 = combined.values().copied().sum::<f32>().max(1.0);
+                    // No donor evidence: fall back to structural priors only.
+                    let mut fallback: HashMap<RefHapId, f32> = HashMap::new();
                     if let Some(core) = plan.core_states.get(hap_usize) {
-                        let core_total = core.len().max(1) as f32;
-                        let core_boost = donor_mass * 0.05 / core_total;
                         for &h in core {
-                            combined
-                                .entry(h)
-                                .and_modify(|v| *v += core_boost)
-                                .or_insert(core_boost);
+                            fallback.entry(h).or_insert(1.0);
                         }
                     }
-
                     if let Some(intervals) = plan.window_intervals.get(hap_usize) {
-                        let mut window_raw: Vec<(RefHapId, f32)> = Vec::with_capacity(intervals.len());
-                        let mut raw_total = 0.0f32;
                         for interval in intervals {
-                            if let Some(span_len) = interval_support_over_range(
-                                interval,
-                                plan_range_start,
-                                plan_range_end,
-                            ) {
-                                let raw = span_len.max(1) as f32;
-                                raw_total += raw;
-                                window_raw.push((interval.hap, raw));
-                            }
-                        }
-                        if raw_total > 0.0 {
-                            let scale = donor_mass * 0.10 / raw_total;
-                            for (hap, raw) in window_raw.into_iter() {
-                                let boost = raw * scale;
-                                combined
-                                    .entry(hap)
-                                    .and_modify(|v| *v += boost)
-                                    .or_insert(boost);
+                            if interval_support_over_range(interval, plan_range_start, plan_range_end)
+                                .is_some()
+                            {
+                                fallback.entry(interval.hap).or_insert(1.0);
                             }
                         }
                     }
-
-                    combined.into_iter().collect()
+                    combined = fallback.into_iter().collect();
+                    combined
                 };
                 let mut donors_h1 = build_donor_pool(h1_idx.as_usize());
                 let mut donors_h2 = build_donor_pool(h2_idx.as_usize());

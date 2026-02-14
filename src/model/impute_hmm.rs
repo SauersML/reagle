@@ -12,7 +12,6 @@ use crate::error::{ReagleError, Result};
 #[cfg(test)]
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::types::RefHapId;
-use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -2925,32 +2924,20 @@ fn forward_update_impl<C: RefColumnLike>(
         );
         if recomb_rate > 0.0 {
             let fwd_sum = 1.0f32;
-            if transition_lambda <= 1e-6 {
-                WeightedHmmUpdater::fwd_update_weighted(
-                    &mut ws.fwd,
-                    1.0,
-                    recomb_rate,
-                    transition_haps,
-                    PatternCounts::new(&ws.weights[..active_states]),
-                    EmissionProbs::new(&ws.emissions[..active_states]),
-                    active_states,
-                )
-            } else {
-                let (stay_gap, shift) = subset_transition_params_adaptive_q(
-                    recomb_rate,
-                    active_states,
-                    transition_haps,
-                    transition_lambda,
-                );
-                let scale = stay_gap / fwd_sum;
-                let mut sum = 0.0f32;
-                for i in 0..active_states {
-                    let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
-                    ws.fwd[i] = t;
-                    sum += t;
-                }
-                sum.max(1e-30)
+            let (stay_gap, shift) = subset_transition_params_adaptive_q(
+                recomb_rate,
+                active_states,
+                transition_haps,
+                transition_lambda,
+            );
+            let scale = stay_gap / fwd_sum;
+            let mut sum = 0.0f32;
+            for i in 0..active_states {
+                let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
+                ws.fwd[i] = t;
+                sum += t;
             }
+            sum.max(1e-30)
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -3013,32 +3000,20 @@ fn forward_update_seqcoded(
         }
         if recomb_rate > 0.0 {
             let fwd_sum = 1.0f32;
-            if transition_lambda <= 1e-6 {
-                WeightedHmmUpdater::fwd_update_weighted(
-                    &mut ws.fwd,
-                    1.0,
-                    recomb_rate,
-                    transition_haps,
-                    PatternCounts::new(&ws.weights[..active_states]),
-                    EmissionProbs::new(&ws.emissions[..active_states]),
-                    active_states,
-                )
-            } else {
-                let (stay_gap, shift) = subset_transition_params_adaptive_q(
-                    recomb_rate,
-                    active_states,
-                    transition_haps,
-                    transition_lambda,
-                );
-                let scale = stay_gap / fwd_sum;
-                let mut sum = 0.0f32;
-                for i in 0..active_states {
-                    let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
-                    ws.fwd[i] = t;
-                    sum += t;
-                }
-                sum.max(1e-30)
+            let (stay_gap, shift) = subset_transition_params_adaptive_q(
+                recomb_rate,
+                active_states,
+                transition_haps,
+                transition_lambda,
+            );
+            let scale = stay_gap / fwd_sum;
+            let mut sum = 0.0f32;
+            for i in 0..active_states {
+                let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
+                ws.fwd[i] = t;
+                sum += t;
             }
+            sum.max(1e-30)
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
@@ -3106,32 +3081,20 @@ fn forward_update_dict(
         }
         if recomb_rate > 0.0 {
             let fwd_sum = 1.0f32;
-            if transition_lambda <= 1e-6 {
-                WeightedHmmUpdater::fwd_update_weighted(
-                    &mut ws.fwd,
-                    1.0,
-                    recomb_rate,
-                    transition_haps,
-                    PatternCounts::new(&ws.weights[..active_states]),
-                    EmissionProbs::new(&ws.emissions[..active_states]),
-                    active_states,
-                )
-            } else {
-                let (stay_gap, shift) = subset_transition_params_adaptive_q(
-                    recomb_rate,
-                    active_states,
-                    transition_haps,
-                    transition_lambda,
-                );
-                let scale = stay_gap / fwd_sum;
-                let mut sum = 0.0f32;
-                for i in 0..active_states {
-                    let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
-                    ws.fwd[i] = t;
-                    sum += t;
-                }
-                sum.max(1e-30)
+            let (stay_gap, shift) = subset_transition_params_adaptive_q(
+                recomb_rate,
+                active_states,
+                transition_haps,
+                transition_lambda,
+            );
+            let scale = stay_gap / fwd_sum;
+            let mut sum = 0.0f32;
+            for i in 0..active_states {
+                let t = scale.mul_add(ws.fwd[i], shift) * ws.emissions[i];
+                ws.fwd[i] = t;
+                sum += t;
             }
+            sum.max(1e-30)
         } else {
             for i in 0..active_states {
                 ws.fwd[i] *= ws.emissions[i];
