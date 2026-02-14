@@ -548,8 +548,8 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
-    let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    let p = freq.max(min_freq).min(1.0);
+    -(p.ln())
 }
 
 #[inline]
@@ -1279,7 +1279,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
         if ref_bins.len() < n_alleles {
             ref_bins.resize_with(n_alleles, Vec::new);
         }
-        for bins in ref_bins.iter_mut().take(n_alleles) {
+        for bins in ref_bins.iter_mut() {
             bins.clear();
         }
 
@@ -9297,7 +9297,7 @@ mod tests {
             if ref_bins.len() < n_alleles {
                 ref_bins.resize_with(n_alleles, Vec::new);
             }
-            for bins in ref_bins.iter_mut().take(n_alleles) {
+            for bins in ref_bins.iter_mut() {
                 bins.clear();
             }
 
