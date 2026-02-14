@@ -9,6 +9,7 @@ use crate::data::storage::{
 };
 use crate::data::HapIdx;
 use crate::error::{ReagleError, Result};
+#[cfg(test)]
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::types::RefHapId;
 use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
@@ -264,7 +265,7 @@ mod tests {
         let mut fwd = vec![1.0 / transition_haps as f32; transition_haps];
 
         let fwd_sum: f32 = fwd.iter().sum();
-        transition_only_forward_update(&mut fwd, fwd_sum, recomb_rate, transition_haps);
+        transition_only_forward_update(&mut fwd, fwd_sum, recomb_rate, transition_haps, 0.0);
 
         let sum: f32 = fwd.iter().sum();
         println!(
@@ -287,7 +288,7 @@ mod tests {
 
         let mut fwd = vec![1.0 / n_states as f32; n_states];
         let fwd_sum: f32 = fwd.iter().sum();
-        transition_only_forward_update(&mut fwd, fwd_sum, recomb_rate, n_states);
+        transition_only_forward_update(&mut fwd, fwd_sum, recomb_rate, n_states, 0.0);
 
         let sum: f32 = fwd.iter().sum();
         println!(
@@ -614,6 +615,7 @@ struct AffineBlockCoeffs {
 struct AffineWindowCache {
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
     active_markers: usize,
     recomb_hash: u64,
     checkpoint_markers: Vec<usize>,
@@ -787,6 +789,7 @@ impl ImputeWorkspace {
         checkpoint_grid: &CheckpointGrid,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
         active_markers: usize,
     ) {
         let recomb_hash = hash_recomb_slice(p_recomb);
@@ -801,6 +804,7 @@ impl ImputeWorkspace {
             .map(|cache| {
                 cache.active_states == active_states
                     && cache.transition_haps == transition_haps
+                    && cache.transition_lambda.to_bits() == transition_lambda.to_bits()
                     && cache.active_markers == active_markers
                     && cache.recomb_hash == recomb_hash
                     && cache.checkpoint_markers == checkpoint_markers
@@ -832,6 +836,7 @@ impl ImputeWorkspace {
                 block_end,
                 active_states,
                 transition_haps,
+                transition_lambda,
             );
             fill_bwd_affine_coeffs(
                 &mut bwd_a,
@@ -841,6 +846,7 @@ impl ImputeWorkspace {
                 block_end,
                 active_states,
                 transition_haps,
+                transition_lambda,
             );
             by_checkpoint[cp_idx.as_usize()] = Some(Arc::new(AffineBlockCoeffs {
                 block_start,
@@ -854,6 +860,7 @@ impl ImputeWorkspace {
         self.affine_window_cache = Some(AffineWindowCache {
             active_states,
             transition_haps,
+            transition_lambda,
             active_markers,
             recomb_hash,
             checkpoint_markers,
@@ -2079,6 +2086,7 @@ fn normalize_allele_posterior_structural_missing(
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn subset_transition_params(
     recomb_rate: f32,
@@ -2117,49 +2125,6 @@ fn subset_transition_params(
         stay + shift * active_states as f32
     );
     (stay, shift)
-}
-
-#[inline]
-fn adaptive_transition_lambda_from_probs(probs: &[f32], sum: f32) -> f32 {
-    const LAMBDA_MAX: f32 = 0.98;
-    if probs.len() <= 1 {
-        return 1.0;
-    }
-    let norm = sum.max(1e-30);
-    let mut sum_q2 = 0.0f32;
-    for &v in probs {
-        let q = (v / norm).max(0.0);
-        sum_q2 += q * q;
-    }
-    if !sum_q2.is_finite() || sum_q2 <= 0.0 {
-        return 0.0;
-    }
-    let k = probs.len() as f32;
-    let ess = (1.0 / sum_q2).clamp(1.0, k);
-    let ess_norm = ((ess - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
-    let confidence = 1.0 - ess_norm;
-    (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX)
-}
-
-#[inline]
-fn adaptive_transition_lambda_from_normalized_probs(probs: &[f32]) -> f32 {
-    const LAMBDA_MAX: f32 = 0.98;
-    if probs.is_empty() {
-        return 0.0;
-    }
-    if probs.len() == 1 {
-        return LAMBDA_MAX;
-    }
-    let mut sum_sq = 0.0f32;
-    for &v in probs {
-        sum_sq += v * v;
-    }
-    let norm_sq = sum_sq.max(1e-30);
-    let k = probs.len() as f32;
-    let ess = (1.0 / norm_sq).clamp(1.0, k);
-    let ess_norm = ((ess - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
-    let confidence = 1.0 - ess_norm;
-    (confidence * LAMBDA_MAX).clamp(0.0, LAMBDA_MAX)
 }
 
 #[inline]
@@ -2202,6 +2167,7 @@ fn transition_only_forward_update(
     fwd_sum: f32,
     recomb_rate: f32,
     transition_haps: usize,
+    transition_lambda: f32,
 ) -> f32 {
     if fwd.is_empty() {
         return 0.0;
@@ -2210,9 +2176,12 @@ fn transition_only_forward_update(
         return fwd_sum;
     }
     let denom = fwd_sum.max(1e-30);
-    let lambda = adaptive_transition_lambda_from_probs(fwd, denom);
-    let (stay_gap, shift) =
-        subset_transition_params_adaptive_q(recomb_rate, fwd.len(), transition_haps, lambda);
+    let (stay_gap, shift) = subset_transition_params_adaptive_q(
+        recomb_rate,
+        fwd.len(),
+        transition_haps,
+        transition_lambda,
+    );
     let scale = stay_gap / denom;
     let mut new_sum = 0.0f32;
     for v in fwd.iter_mut() {
@@ -2229,13 +2198,17 @@ fn transition_only_backward_update(
     recomb_rate: f32,
     transition_haps: usize,
     bwd_sum: f32,
+    transition_lambda: f32,
 ) -> f32 {
     if bwd.is_empty() || recomb_rate <= 0.0 {
         return bwd_sum;
     }
-    let lambda = adaptive_transition_lambda_from_probs(bwd, bwd_sum);
-    let (stay_gap, shift_base) =
-        subset_transition_params_adaptive_q(recomb_rate, bwd.len(), transition_haps, lambda);
+    let (stay_gap, shift_base) = subset_transition_params_adaptive_q(
+        recomb_rate,
+        bwd.len(),
+        transition_haps,
+        transition_lambda,
+    );
     let shift = shift_base * bwd_sum;
     let scale = stay_gap;
     for v in bwd.iter_mut() {
@@ -2253,6 +2226,7 @@ fn batched_transition_forward(
     end: usize,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
 ) {
     if active_states == 0 || start >= end {
         return;
@@ -2275,7 +2249,6 @@ fn batched_transition_forward(
     // This driver keeps forward vectors normalized in the HMM recursion, so the
     // composed update is applied to a probability vector and re-normalized for
     // floating-point drift if needed.
-    let lambda = adaptive_transition_lambda_from_normalized_probs(&fwd[..active_states]);
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
@@ -2289,7 +2262,7 @@ fn batched_transition_forward(
             recomb_rate,
             active_states,
             transition_haps,
-            lambda,
+            transition_lambda,
         );
         let stay = stay as f64;
         let shift = shift as f64;
@@ -2330,6 +2303,7 @@ fn batched_transition_backward(
     end: usize,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
 ) -> f32 {
     if active_states == 0 || start >= end {
         return bwd_sum;
@@ -2345,7 +2319,6 @@ fn batched_transition_backward(
     //   a   = product_t stay_t
     //   add = b_coeff * bwd_sum
     // and b_coeff follows the same affine recurrence as forward composition.
-    let lambda = adaptive_transition_lambda_from_probs(&bwd[..active_states], bwd_sum);
     let mut a = 1.0f64;
     let mut b_coeff = 0.0f64;
     let mut touched = false;
@@ -2359,7 +2332,7 @@ fn batched_transition_backward(
             recomb_rate,
             active_states,
             transition_haps,
-            lambda,
+            transition_lambda,
         );
         let stay = stay as f64;
         let shift = shift as f64;
@@ -2392,6 +2365,7 @@ fn fill_bwd_affine_coeffs(
     block_end: usize,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
 ) {
     if block_start + 1 >= block_end {
         return;
@@ -2419,8 +2393,12 @@ fn fill_bwd_affine_coeffs(
     for m in (block_start + 1..right).rev() {
         let recomb_rate = marker_recomb_rate(p_recomb, m + 1);
         if recomb_rate > 0.0 {
-            let (stay, shift) =
-                subset_transition_params(recomb_rate, active_states, transition_haps);
+            let (stay, shift) = subset_transition_params_adaptive_q(
+                recomb_rate,
+                active_states,
+                transition_haps,
+                transition_lambda,
+            );
             let stay = stay as f64;
             let shift = shift as f64;
             let a_new = stay * a;
@@ -2444,6 +2422,7 @@ fn fill_fwd_affine_coeffs(
     block_end: usize,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
 ) {
     if block_start + 1 >= block_end {
         return;
@@ -2470,8 +2449,12 @@ fn fill_fwd_affine_coeffs(
     for m in block_start + 1..block_end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate > 0.0 {
-            let (stay, shift) =
-                subset_transition_params(recomb_rate, active_states, transition_haps);
+            let (stay, shift) = subset_transition_params_adaptive_q(
+                recomb_rate,
+                active_states,
+                transition_haps,
+                transition_lambda,
+            );
             let stay = stay as f64;
             let shift = shift as f64;
             let a_new = stay * a;
@@ -2912,6 +2895,7 @@ fn forward_update_impl<C: RefColumnLike>(
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
 ) -> f32 {
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
@@ -2923,6 +2907,7 @@ fn forward_update_impl<C: RefColumnLike>(
             1.0,
             recomb_rate,
             transition_haps,
+            transition_lambda,
         )
     } else {
         let ref_alleles = refresh_ref_alleles(
@@ -2940,8 +2925,7 @@ fn forward_update_impl<C: RefColumnLike>(
         );
         if recomb_rate > 0.0 {
             let fwd_sum = 1.0f32;
-            let lambda = adaptive_transition_lambda_from_normalized_probs(&ws.fwd[..active_states]);
-            if lambda <= 1e-6 {
+            if transition_lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
                     1.0,
@@ -2956,7 +2940,7 @@ fn forward_update_impl<C: RefColumnLike>(
                     recomb_rate,
                     active_states,
                     transition_haps,
-                    lambda,
+                    transition_lambda,
                 );
                 let scale = stay_gap / fwd_sum;
                 let mut sum = 0.0f32;
@@ -2997,6 +2981,7 @@ fn forward_update_seqcoded(
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
     last_hap_ptr: &mut *const u16,
 ) -> f32 {
     let probs = target_probs.probs_for_marker_trusted(m);
@@ -3012,6 +2997,7 @@ fn forward_update_seqcoded(
             1.0,
             recomb_rate,
             transition_haps,
+            transition_lambda,
         )
     } else {
         fill_pattern_emissions(
@@ -3027,8 +3013,7 @@ fn forward_update_seqcoded(
         }
         if recomb_rate > 0.0 {
             let fwd_sum = 1.0f32;
-            let lambda = adaptive_transition_lambda_from_normalized_probs(&ws.fwd[..active_states]);
-            if lambda <= 1e-6 {
+            if transition_lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
                     1.0,
@@ -3043,7 +3028,7 @@ fn forward_update_seqcoded(
                     recomb_rate,
                     active_states,
                     transition_haps,
-                    lambda,
+                    transition_lambda,
                 );
                 let scale = stay_gap / fwd_sum;
                 let mut sum = 0.0f32;
@@ -3084,6 +3069,7 @@ fn forward_update_dict(
     current_error: f32,
     active_states: usize,
     transition_haps: usize,
+    transition_lambda: f32,
     last_dict_ptr: &mut *const DictionaryColumn,
 ) -> f32 {
     let probs = target_probs.probs_for_marker_trusted(m);
@@ -3096,6 +3082,7 @@ fn forward_update_dict(
             1.0,
             recomb_rate,
             transition_haps,
+            transition_lambda,
         )
     } else {
         let col = dict_col_ref(&ref_columns[m]);
@@ -3119,8 +3106,7 @@ fn forward_update_dict(
         }
         if recomb_rate > 0.0 {
             let fwd_sum = 1.0f32;
-            let lambda = adaptive_transition_lambda_from_normalized_probs(&ws.fwd[..active_states]);
-            if lambda <= 1e-6 {
+            if transition_lambda <= 1e-6 {
                 WeightedHmmUpdater::fwd_update_weighted(
                     &mut ws.fwd,
                     1.0,
@@ -3135,7 +3121,7 @@ fn forward_update_dict(
                     recomb_rate,
                     active_states,
                     transition_haps,
-                    lambda,
+                    transition_lambda,
                 );
                 let scale = stay_gap / fwd_sum;
                 let mut sum = 0.0f32;
@@ -3194,6 +3180,7 @@ trait ImputeKernel {
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
     ) -> f32;
 
     fn prepare_marker(
@@ -3560,6 +3547,7 @@ impl ImputeKernel for DenseKernel {
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
     ) -> f32 {
         forward_update_impl(
             ws,
@@ -3571,6 +3559,7 @@ impl ImputeKernel for DenseKernel {
             current_error,
             active_states,
             transition_haps,
+            transition_lambda,
         )
     }
 
@@ -4362,6 +4351,7 @@ trait PatternSource {
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
     ) -> f32;
 
     fn prepare_patterns(
@@ -4397,6 +4387,7 @@ impl PatternSource for SeqcodedSource {
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
     ) -> f32 {
         forward_update_seqcoded(
             ws,
@@ -4408,6 +4399,7 @@ impl PatternSource for SeqcodedSource {
             current_error,
             active_states,
             transition_haps,
+            transition_lambda,
             stamp,
         )
     }
@@ -4459,6 +4451,7 @@ impl PatternSource for DictionarySource {
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
     ) -> f32 {
         forward_update_dict(
             ws,
@@ -4470,6 +4463,7 @@ impl PatternSource for DictionarySource {
             current_error,
             active_states,
             transition_haps,
+            transition_lambda,
             stamp,
         )
     }
@@ -4545,6 +4539,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
         current_error: f32,
         active_states: usize,
         transition_haps: usize,
+        transition_lambda: f32,
     ) -> f32 {
         S::forward_update(
             &mut self.forward_stamp,
@@ -4557,6 +4552,7 @@ impl<S: PatternSource> ImputeKernel for PatternKernel<S> {
             current_error,
             active_states,
             transition_haps,
+            transition_lambda,
         )
     }
 
@@ -4623,6 +4619,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
+    transition_haps: usize,
+    transition_lambda: f32,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
     external_nearest_obs_retain: Option<&[f32]>,
@@ -4652,8 +4650,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         ws.weights[..active_states].fill(1.0);
     }
 
-    let panel_haps = ref_allele_freqs.n_ref_haps().max(1);
-    let transition_haps = panel_haps;
+    let transition_haps = transition_haps.max(ref_allele_freqs.n_ref_haps().max(1));
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
         if let Some(ext_retain) = external_nearest_obs_retain {
@@ -4689,6 +4686,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         &checkpoint_grid,
         active_states,
         transition_haps,
+        transition_lambda,
         active_markers,
     );
 
@@ -4726,6 +4724,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                     m,
                     active_states,
                     transition_haps,
+                    transition_lambda,
                 );
             }
             kernel.forward_update(
@@ -4738,6 +4737,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 current_error,
                 active_states,
                 transition_haps,
+                transition_lambda,
             );
             ws.store_checkpoint(cp_idx, active_states);
             prev_marker = m + 1;
@@ -4750,6 +4750,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 active_markers,
                 active_states,
                 transition_haps,
+                transition_lambda,
             );
         }
 
@@ -5068,7 +5069,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             missing_ref_mass_f32,
                                             missing_ood_mass_f32,
                                             active_states,
-                                            panel_haps,
+                                            transition_haps,
                                             target_probs.min_untyped_prior_mix(),
                                             &mut warned_af_fallback,
                                             context,
@@ -5114,6 +5115,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         block_end,
                         active_states,
                         transition_haps,
+                        transition_lambda,
                     );
                 }
 
@@ -5335,7 +5337,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         missing_ref_mass_f32,
                                         missing_ood_mass_f32,
                                         active_states,
-                                        panel_haps,
+                                        transition_haps,
                                         target_probs.min_untyped_prior_mix(),
                                         &mut warned_af_fallback,
                                         context,
@@ -5384,6 +5386,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         recomb_rate,
                         transition_haps,
                         bwd_sum,
+                        transition_lambda,
                     );
                 } else {
                     fill_pattern_emissions(
@@ -5401,13 +5404,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         emit_beta_sum += emit * ws.bwd[i];
                     }
                     let c_t = ws.fwd_scales.get(m_rev).copied().unwrap_or(1.0).max(1e-30);
-                    let lambda =
-                        adaptive_transition_lambda_from_probs(&ws.bwd[..active_states], bwd_sum);
                     let (stay_gap, shift_base) = subset_transition_params_adaptive_q(
                         recomb_rate,
                         active_states,
                         transition_haps,
-                        lambda,
+                        transition_lambda,
                     );
                     let scale = stay_gap / c_t;
                     let shift = shift_base * (emit_beta_sum / c_t);
@@ -5447,6 +5448,8 @@ fn run_hmm_generic(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
+    transition_haps: usize,
+    transition_lambda: f32,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
     external_nearest_obs_retain: Option<&[f32]>,
@@ -5462,6 +5465,8 @@ fn run_hmm_generic(
         prior_marker_idx,
         state_priors,
         ref_allele_freqs,
+        transition_haps,
+        transition_lambda,
         context,
         smoothing_cluster_cm,
         external_nearest_obs_retain,
@@ -5478,6 +5483,8 @@ fn run_hmm_seqcoded(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
+    transition_haps: usize,
+    transition_lambda: f32,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
     external_nearest_obs_retain: Option<&[f32]>,
@@ -5493,6 +5500,8 @@ fn run_hmm_seqcoded(
         prior_marker_idx,
         state_priors,
         ref_allele_freqs,
+        transition_haps,
+        transition_lambda,
         context,
         smoothing_cluster_cm,
         external_nearest_obs_retain,
@@ -5512,6 +5521,8 @@ fn run_hmm_dictionary(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
+    transition_haps: usize,
+    transition_lambda: f32,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
     external_nearest_obs_retain: Option<&[f32]>,
@@ -5527,6 +5538,8 @@ fn run_hmm_dictionary(
         prior_marker_idx,
         state_priors,
         ref_allele_freqs,
+        transition_haps,
+        transition_lambda,
         context,
         smoothing_cluster_cm,
         external_nearest_obs_retain,
@@ -5550,6 +5563,8 @@ pub fn run_impute_hmm(
     prior_marker_idx: Option<usize>,
     state_priors: Option<&[f32]>,
     ref_allele_freqs: &RefAlleleFreqs,
+    transition_haps: usize,
+    transition_lambda: f32,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
     external_nearest_obs_retain: Option<&[f32]>,
@@ -5582,6 +5597,8 @@ pub fn run_impute_hmm(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            transition_haps,
+            transition_lambda,
             context,
             smoothing_cluster_cm,
             external_nearest_obs_retain,
@@ -5602,6 +5619,8 @@ pub fn run_impute_hmm(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            transition_haps,
+            transition_lambda,
             context,
             smoothing_cluster_cm,
             external_nearest_obs_retain,
@@ -5622,6 +5641,8 @@ pub fn run_impute_hmm(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            transition_haps,
+            transition_lambda,
             context,
             smoothing_cluster_cm,
             external_nearest_obs_retain,
@@ -5646,6 +5667,8 @@ pub fn run_impute_hmm(
             prior_marker_idx,
             state_priors,
             ref_allele_freqs,
+            transition_haps,
+            transition_lambda,
             context,
             smoothing_cluster_cm,
             external_nearest_obs_retain,
@@ -5662,6 +5685,8 @@ pub fn run_impute_hmm(
         prior_marker_idx,
         state_priors,
         ref_allele_freqs,
+        transition_haps,
+        transition_lambda,
         context,
         smoothing_cluster_cm,
         external_nearest_obs_retain,

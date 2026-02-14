@@ -4027,28 +4027,6 @@ impl crate::pipelines::ImputationPipeline {
         } else {
             None
         };
-        // Imputation HMM copies from the reference panel; align LS parameters
-        // to the donor pool size (reference haplotypes), not target+reference.
-        let n_ref_pool = plan.n_ref_haps.max(1);
-        self.params = crate::model::parameters::ModelParams::for_imputation(
-            n_ref_pool,
-            self.config.ne,
-            self.config.err,
-        );
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
-            .min(ModelParams::MAX_RECOMB_INTENSITY)
-            .max(1e-6);
-        self.params.recomb_intensity = impute_recomb_intensity;
-        eprintln!(
-            "Imputation recomb_intensity: {:.6} (source=config-ne)",
-            self.params.recomb_intensity,
-        );
-        // Do not inherit phasing mismatch estimates for imputation. Imputation
-        // should use the Li-Stephens mismatch prior (or user override) tied to
-        // the reference panel, not phasing-specific error rates.
-        self.params
-            .set_n_states(n_ref_pool.saturating_sub(2).max(1));
-
         let target_samples = target_reader.samples_arc();
         let n_target_samples = target_samples.len();
         if n_target_samples == 0 {
@@ -4056,6 +4034,31 @@ impl crate::pipelines::ImputationPipeline {
                 "No target samples found in input VCF".to_string(),
             ));
         }
+
+        let n_ref_pool = plan.n_ref_haps.max(1);
+        let n_target_haps = n_target_samples.saturating_mul(2);
+        let n_total_pool = n_ref_pool.saturating_add(n_target_haps).max(1);
+        self.params = crate::model::parameters::ModelParams::for_imputation(
+            n_ref_pool,
+            self.config.ne,
+            self.config.err,
+        );
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_total_pool as f32)
+            .min(ModelParams::MAX_RECOMB_INTENSITY)
+            .max(1e-6);
+        self.params.recomb_intensity = impute_recomb_intensity;
+        eprintln!(
+            "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_total_haps={})",
+            self.params.recomb_intensity,
+            n_ref_pool,
+            n_target_haps,
+            n_total_pool,
+        );
+        // Do not inherit phasing mismatch estimates for imputation. Imputation
+        // should use the Li-Stephens mismatch prior (or user override) tied to
+        // the reference panel, not phasing-specific error rates.
+        self.params
+            .set_n_states(n_ref_pool.saturating_sub(2).max(1));
 
         let output_path = self.config.out.with_extension("vcf.gz");
         eprintln!("Writing output to {:?}", output_path);
@@ -4768,6 +4771,9 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
+        let n_target_haps = n_target_samples.saturating_mul(2);
+        let n_transition_haps = plan.n_ref_haps.saturating_add(n_target_haps).max(1);
+        let n_transition_haps_f32 = n_transition_haps as f32;
         let should_log = should_log_impute_window(window_idx);
         let use_abyss = true;
         let output_markers = output_end.saturating_sub(output_start);
@@ -5027,7 +5033,7 @@ impl crate::pipelines::ImputationPipeline {
                                 &prev_states,
                                 next_states,
                                 handoff_recomb_rate,
-                                plan.n_ref_haps,
+                                n_transition_haps,
                             )));
                         }
                     } else {
@@ -6576,7 +6582,6 @@ impl crate::pipelines::ImputationPipeline {
                         }
 
                         let k = priors.ids().len();
-                        let n_ref_haps = ref_allele_freqs.n_ref_haps().max(1) as f32;
                         let mut state_probs = priors.probs().to_vec();
                         let mut state_sum = 0.0f32;
                         for v in &mut state_probs {
@@ -6607,7 +6612,7 @@ impl crate::pipelines::ImputationPipeline {
                         for ref_m in 0..output_end {
                             let recomb_rate = p_recomb.get(ref_m).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                             if recomb_rate > 0.0 && !state_probs.is_empty() {
-                                let switch_full = recomb_rate / n_ref_haps;
+                                let switch_full = recomb_rate / n_transition_haps_f32;
                                 let z = ((1.0 - recomb_rate) + (k as f32) * switch_full).max(1e-30);
                                 let stay_gap = (1.0 - recomb_rate) / z;
                                 let shift = switch_full / z;
@@ -6814,7 +6819,7 @@ impl crate::pipelines::ImputationPipeline {
                                         &prev_states_buf,
                                         &state_haps,
                                         recomb_boundary,
-                                        plan.n_ref_haps,
+                                        n_transition_haps,
                                     );
                                     mapper.map_into_with_pi(
                                         p.probs(),
@@ -6881,6 +6886,7 @@ impl crate::pipelines::ImputationPipeline {
                                     Some(extent.handoff_hmm_idx()),
                                     seg_state_priors.as_deref(),
                                     &ref_allele_freqs,
+                                    n_transition_haps,
                                     transition_lambda,
                                     ImputeHmmContext {
                                         window_idx,
@@ -7014,7 +7020,7 @@ impl crate::pipelines::ImputationPipeline {
                                     &prev_states_buf,
                                     &state_haps,
                                     handoff_recomb_rate,
-                                    plan.n_ref_haps,
+                                    n_transition_haps,
                                 );
                                 mapper.map_into_with_pi(
                                     p.probs(),
@@ -7085,6 +7091,7 @@ impl crate::pipelines::ImputationPipeline {
                             prior_marker_idx,
                             state_priors_slice.take(),
                             &ref_allele_freqs,
+                            n_transition_haps,
                             transition_lambda,
                             ImputeHmmContext {
                                 window_idx,
