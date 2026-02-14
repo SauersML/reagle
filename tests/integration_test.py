@@ -623,28 +623,30 @@ def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2, map_p
 
 
 def _run_beagle_phasing(paths, input_vcf):
-    """Run Beagle in phasing-only mode (no imputation)."""
+    """Run Beagle in phasing-only mode (reference-based, no imputation)."""
     beagle_jar = paths["beagle_jar"]
-    # For phasing-only, we treat the input as the 'ref' panel to phase itself.
-    # Beagle will fill missing genotypes and phase all samples.
-    # IMPORTANT: Do NOT use gt={input} as that triggers imputation from ref.
-    # We want phasing of the input samples using the input itself (and potentially a genetic map).
-    ref_vcf = input_vcf
+    ref_vcf = paths["ref_vcf"]
+    target_vcf = input_vcf
     output_prefix = paths["data_dir"] / "beagle_phased"
     
     # Ensure PLINK map exists for Beagle
     map_path = ensure_plink_genetic_map(paths["ref_vcf"], paths["data_dir"] / "plink.map")
     
-    # Use ref={input} to phase the file itself without an external reference panel
-    # Beagle 5.4+ uses ref= for VCF input to be phased/imputed
-    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} out={output_prefix} nthreads=2 map={map_path}"
+    # Use ref={reference} gt={target} impute=false to use reference panel for phasing
+    # but restrict output to target sites (no imputation of missing markers).
+    # This matches Reagle/EagleImp phasing-only behavior.
+    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} gt={target_vcf} out={output_prefix} impute=false nthreads=2 map={map_path}"
     try:
         run(cmd)
         output_vcf = Path(f"{output_prefix}.vcf.gz")
         if output_vcf.exists():
             run(f"bcftools index -f {output_vcf}")
             return output_vcf
-        # Beagle might produce .vcf.gz depending on version/input, but usually adds .vcf.gz
+        # If Beagle didn't add .vcf.gz, check exact match
+        if Path(f"{output_prefix}.vcf").exists():
+             run(f"bgzip -f {output_prefix}.vcf")
+             run(f"bcftools index -f {output_vcf}")
+             return output_vcf
         raise RuntimeError(f"Beagle phased output not found: {output_vcf}")
     except subprocess.CalledProcessError as e:
         print(f"Beagle phasing failed: {e}")
