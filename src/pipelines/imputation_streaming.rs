@@ -1319,7 +1319,8 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
         // Exact grouped update with deferred sparse accumulation:
         // Original per-row score for row i, hap h at marker m:
         //   S_i[h] += w_{m,a_i} * 1{a_h == a_i}
-        // where a_i is target allele for row i and w_{m,a} = -ln(freq_{m,a}).
+        // where a_i is target allele for row i and
+        // w_{m,a} = prescan_match_weight(freq_{m,a}, min_freq).
         //
         // Grouping rows by a_i is algebraically identical:
         // for each allele a, all rows in group G_a share the same w_{m,a},
@@ -6698,21 +6699,25 @@ impl crate::pipelines::ImputationPipeline {
                                 output_markers
                             )));
                         }
-                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
-                            if !input_probs.is_observed_marker(ref_m) {
-                                continue;
+                        if self.config.err.is_none() {
+                            for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                                if !input_probs.is_observed_marker(ref_m) {
+                                    continue;
+                                }
+                                let probs = input_probs.probs_for_marker(ref_m);
+                                if probs.is_empty() {
+                                    continue;
+                                }
+                                out_posts[out_idx] = if probs.len() == 2 {
+                                    AllelePosteriors::Biallelic(
+                                        probs.get(1).copied().unwrap_or(0.0),
+                                    )
+                                } else {
+                                    AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                        probs.to_vec(),
+                                    ))
+                                };
                             }
-                            let probs = input_probs.probs_for_marker(ref_m);
-                            if probs.is_empty() {
-                                continue;
-                            }
-                            out_posts[out_idx] = if probs.len() == 2 {
-                                AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
-                            } else {
-                                AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
-                                    probs.to_vec(),
-                                ))
-                            };
                         }
                         let next_priors = chained_priors.unwrap_or_else(HaplotypePriors::empty);
                         return Ok((out_posts, next_priors, subsetted_any, informative_ratio));
@@ -6850,24 +6855,26 @@ impl crate::pipelines::ImputationPipeline {
                         )
                     })?;
 
-                    // Preserve direct target evidence at observed markers. Imputation
-                    // should not overwrite measured genotype probabilities at typed
-                    // sites, otherwise dosage correlation is artificially degraded.
-                    for (out_idx, ref_m) in (output_start..output_end).enumerate() {
-                        if !input_probs.is_observed_marker(ref_m) {
-                            continue;
+                    if self.config.err.is_none() {
+                        // Preserve direct target evidence at observed markers. Imputation
+                        // should not overwrite measured genotype probabilities at typed
+                        // sites, otherwise dosage correlation is artificially degraded.
+                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                            if !input_probs.is_observed_marker(ref_m) {
+                                continue;
+                            }
+                            let probs = input_probs.probs_for_marker(ref_m);
+                            if probs.is_empty() {
+                                continue;
+                            }
+                            posteriors[out_idx] = if probs.len() == 2 {
+                                AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
+                            } else {
+                                AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                    probs.to_vec(),
+                                ))
+                            };
                         }
-                        let probs = input_probs.probs_for_marker(ref_m);
-                        if probs.is_empty() {
-                            continue;
-                        }
-                        posteriors[out_idx] = if probs.len() == 2 {
-                            AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
-                        } else {
-                            AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
-                                probs.to_vec(),
-                            ))
-                        };
                     }
 
                     let mut next_priors = HaplotypePriors::empty();
@@ -8541,7 +8548,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
                     return d;
                 }
@@ -8639,7 +8646,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(gt) = hard_call {
                     return gt;
                 }
@@ -9348,7 +9355,10 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
