@@ -1917,21 +1917,65 @@ fn rank_donor_mass(mass_by_hap: std::collections::HashMap<usize, f64>, max_out: 
     ranked
 }
 
+fn rank_donor_mass_dense(mass_by_hap: &[f64], touched: &[usize], max_out: usize) -> Vec<(usize, f32)> {
+    if max_out == 0 {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, f32)> = touched
+        .iter()
+        .filter_map(|&h| {
+            let m = mass_by_hap.get(h).copied().unwrap_or(0.0);
+            if m > 0.0 { Some((h, m as f32)) } else { None }
+        })
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if ranked.len() > max_out {
+        ranked.truncate(max_out);
+    }
+    ranked
+}
+
 fn donor_posterior_mass_terminal(
     beam: &[BeamPath],
     weights: &[f64],
     z: f64,
+    n_ref_haps: usize,
     max_out: usize,
 ) -> Vec<(usize, f32)> {
-    if beam.is_empty() || max_out == 0 || z <= f64::MIN_POSITIVE {
+    if beam.is_empty() || max_out == 0 || z <= f64::MIN_POSITIVE || n_ref_haps == 0 {
         return Vec::new();
+    }
+    const DENSE_ACCUM_MAX_HAPS: usize = 32 * 1024;
+    if n_ref_haps <= DENSE_ACCUM_MAX_HAPS {
+        let mut mass_by_hap = vec![0.0f64; n_ref_haps];
+        let mut touched: Vec<usize> = Vec::with_capacity(beam.len().saturating_mul(2).min(n_ref_haps));
+        for (p, &w) in beam.iter().zip(weights.iter()) {
+            let post_half = 0.5 * (w / z);
+            if p.hap1 < n_ref_haps {
+                if mass_by_hap[p.hap1] == 0.0 {
+                    touched.push(p.hap1);
+                }
+                mass_by_hap[p.hap1] += post_half;
+            }
+            if p.hap2 < n_ref_haps {
+                if mass_by_hap[p.hap2] == 0.0 {
+                    touched.push(p.hap2);
+                }
+                mass_by_hap[p.hap2] += post_half;
+            }
+        }
+        return rank_donor_mass_dense(&mass_by_hap, &touched, max_out);
     }
     let mut mass_by_hap: std::collections::HashMap<usize, f64> =
         std::collections::HashMap::with_capacity(beam.len().saturating_mul(2));
     for (p, &w) in beam.iter().zip(weights.iter()) {
-        let post = w / z;
-        *mass_by_hap.entry(p.hap1).or_insert(0.0) += 0.5 * post;
-        *mass_by_hap.entry(p.hap2).or_insert(0.0) += 0.5 * post;
+        let post_half = 0.5 * (w / z);
+        if p.hap1 < n_ref_haps {
+            *mass_by_hap.entry(p.hap1).or_insert(0.0) += post_half;
+        }
+        if p.hap2 < n_ref_haps {
+            *mass_by_hap.entry(p.hap2).or_insert(0.0) += post_half;
+        }
     }
     rank_donor_mass(mass_by_hap, max_out)
 }
@@ -1955,52 +1999,116 @@ fn donor_posterior_mass(
 
     let n_steps = step_haps.len();
     if n_steps == 0 || backptrs.len() != n_steps || segment_ptrs.len() != n_steps {
-        return donor_posterior_mass_terminal(beam, &weights, z, max_out);
+        return donor_posterior_mass_terminal(beam, &weights, z, n_ref_haps, max_out);
     }
 
-    let mut mass_by_hap: std::collections::HashMap<usize, f64> =
-        std::collections::HashMap::with_capacity(beam.len().saturating_mul(n_steps).max(16));
+    const DENSE_ACCUM_MAX_HAPS: usize = 32 * 1024;
+    let use_dense = n_ref_haps <= DENSE_ACCUM_MAX_HAPS;
+    let mut mass_dense: Vec<f64> = if use_dense {
+        vec![0.0f64; n_ref_haps]
+    } else {
+        Vec::new()
+    };
+    let mut touched: Vec<usize> = if use_dense {
+        Vec::with_capacity(beam.len().saturating_mul(n_steps).min(n_ref_haps))
+    } else {
+        Vec::new()
+    };
+    let mut mass_sparse: std::collections::HashMap<usize, f64> = if use_dense {
+        std::collections::HashMap::new()
+    } else {
+        std::collections::HashMap::with_capacity(beam.len().saturating_mul(n_steps).max(16))
+    };
     let step_scale = 1.0f64 / n_steps as f64;
     let mut broken_chain = false;
 
-    for (terminal_idx, &w) in weights.iter().enumerate() {
-        let post = w / z;
-        let mut idx = terminal_idx;
-        if let Some(ptrs) = trailing_ptrs {
-            idx = ptrs.get(idx).copied().unwrap_or(0) as usize;
-        }
-        for step in (0..n_steps).rev() {
-            let Some(&(h1, h2)) = step_haps[step].get(idx) else {
-                broken_chain = true;
-                break;
-            };
-            if h1 < n_ref_haps {
-                *mass_by_hap.entry(h1).or_insert(0.0) += 0.5 * post * step_scale;
+    if let Some(ptrs) = trailing_ptrs {
+        for (terminal_idx, &w) in weights.iter().enumerate() {
+            let post_step_half = 0.5 * (w / z) * step_scale;
+            let mut idx = ptrs.get(terminal_idx).copied().unwrap_or(0) as usize;
+            for step in (0..n_steps).rev() {
+                if idx >= step_haps[step].len() || idx >= backptrs[step].len() {
+                    broken_chain = true;
+                    break;
+                }
+                let (h1, h2) = step_haps[step][idx];
+                if h1 < n_ref_haps {
+                    if use_dense {
+                        if mass_dense[h1] == 0.0 {
+                            touched.push(h1);
+                        }
+                        mass_dense[h1] += post_step_half;
+                    } else {
+                        *mass_sparse.entry(h1).or_insert(0.0) += post_step_half;
+                    }
+                }
+                if h2 < n_ref_haps {
+                    if use_dense {
+                        if mass_dense[h2] == 0.0 {
+                            touched.push(h2);
+                        }
+                        mass_dense[h2] += post_step_half;
+                    } else {
+                        *mass_sparse.entry(h2).or_insert(0.0) += post_step_half;
+                    }
+                }
+                let bp = unpack_backptr(backptrs[step][idx]);
+                let prev_idx = bp.prev as usize;
+                idx = segment_ptrs[step].get(prev_idx).copied().unwrap_or(0) as usize;
             }
-            if h2 < n_ref_haps {
-                *mass_by_hap.entry(h2).or_insert(0.0) += 0.5 * post * step_scale;
-            }
-            let Some(&packed) = backptrs[step].get(idx) else {
-                broken_chain = true;
+            if broken_chain {
                 break;
-            };
-            let bp = unpack_backptr(packed);
-            let prev_idx = bp.prev as usize;
-            idx = segment_ptrs[step]
-                .get(prev_idx)
-                .copied()
-                .unwrap_or(0) as usize;
+            }
         }
-        if broken_chain {
-            break;
+    } else {
+        for (terminal_idx, &w) in weights.iter().enumerate() {
+            let post_step_half = 0.5 * (w / z) * step_scale;
+            let mut idx = terminal_idx;
+            for step in (0..n_steps).rev() {
+                if idx >= step_haps[step].len() || idx >= backptrs[step].len() {
+                    broken_chain = true;
+                    break;
+                }
+                let (h1, h2) = step_haps[step][idx];
+                if h1 < n_ref_haps {
+                    if use_dense {
+                        if mass_dense[h1] == 0.0 {
+                            touched.push(h1);
+                        }
+                        mass_dense[h1] += post_step_half;
+                    } else {
+                        *mass_sparse.entry(h1).or_insert(0.0) += post_step_half;
+                    }
+                }
+                if h2 < n_ref_haps {
+                    if use_dense {
+                        if mass_dense[h2] == 0.0 {
+                            touched.push(h2);
+                        }
+                        mass_dense[h2] += post_step_half;
+                    } else {
+                        *mass_sparse.entry(h2).or_insert(0.0) += post_step_half;
+                    }
+                }
+                let bp = unpack_backptr(backptrs[step][idx]);
+                let prev_idx = bp.prev as usize;
+                idx = segment_ptrs[step].get(prev_idx).copied().unwrap_or(0) as usize;
+            }
+            if broken_chain {
+                break;
+            }
         }
     }
 
     if broken_chain {
-        return donor_posterior_mass_terminal(beam, &weights, z, max_out);
+        return donor_posterior_mass_terminal(beam, &weights, z, n_ref_haps, max_out);
     }
 
-    rank_donor_mass(mass_by_hap, max_out)
+    if use_dense {
+        rank_donor_mass_dense(&mass_dense, &touched, max_out)
+    } else {
+        rank_donor_mass(mass_sparse, max_out)
+    }
 }
 
 #[cfg(test)]
