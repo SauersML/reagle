@@ -4920,25 +4920,25 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         let delta_coeff = forward_affine.b * backward_affine.add;
 
                         if prior_marker_idx == Some(m) {
-                            let gamma = &mut ws.state_posterior_scratch[..active_states];
+                            // Extract Forward (Alpha) state at this marker to serve as
+                            // the prior for the next window starting here.
+                            // Do NOT use Gamma (Forward*Backward) here, as that would
+                            // leak "future" information into the next window's prior,
+                            // causing double-counting of evidence in the overlap region.
+                            let alpha = &mut ws.state_posterior_scratch[..active_states];
                             let mut sum = 0.0f32;
                             for i in 0..active_states {
                                 let u = ws.fwd[i];
-                                let v = ws.bwd[i];
-                                let g = (alpha_coeff * (u * v)
-                                    + beta_coeff * u
-                                    + gamma_coeff * v
-                                    + delta_coeff)
-                                    .max(0.0);
-                                gamma[i] = g;
-                                sum += g;
+                                let a = (forward_affine.a * u + forward_affine.b).max(0.0);
+                                alpha[i] = a;
+                                sum += a;
                             }
                             if sum > 0.0 {
                                 let inv = 1.0f32 / sum;
-                                for g in gamma.iter_mut() {
-                                    *g *= inv;
+                                for a in alpha.iter_mut() {
+                                    *a *= inv;
                                 }
-                                final_prior_state_post = Some(gamma.to_vec());
+                                final_prior_state_post = Some(alpha.to_vec());
                             }
                         }
 
@@ -5169,19 +5169,21 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 } else {
                     let fwd_slice = &ws.fwd[..active_states];
                     if prior_marker_idx == Some(m_rev) {
-                        let gamma = &mut ws.state_posterior_scratch[..active_states];
+                        // Extract Forward (Alpha) state at this marker to serve as
+                        // the prior for the next window starting here.
+                        let alpha = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
-                            gamma[i] = g;
-                            sum += g;
+                            let a = fwd_slice[i].max(0.0);
+                            alpha[i] = a;
+                            sum += a;
                         }
                         if sum > 0.0 {
                             let inv = 1.0f32 / sum;
-                            for g in gamma.iter_mut() {
-                                *g *= inv;
+                            for a in alpha.iter_mut() {
+                                *a *= inv;
                             }
-                            final_prior_state_post = Some(gamma.to_vec());
+                            final_prior_state_post = Some(alpha.to_vec());
                         }
                     }
 

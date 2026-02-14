@@ -282,12 +282,6 @@ const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
 // copy signal to the window end is at least epsilon.
 const HANDOFF_RETAIN_EPS: f64 = 1e-3;
 
-/// Extra markers appended past each piecewise segment's core boundary so the
-/// backward pass warms up before reaching the core region.  Zero RAM cost
-/// (ref_columns are already loaded for the full I/O window) and negligible
-/// speed cost (~10 extra forward-backward markers per segment boundary).
-const BACKWARD_HALO_MARKERS: usize = 10;
-
 /// Describes a piecewise HMM segment with an optional backward halo.
 ///
 /// Layout within the I/O window's marker array:
@@ -330,7 +324,11 @@ impl SegmentExtent {
     ) -> Self {
         assert!(core_start <= core_end);
         assert!(core_end <= n_window_markers);
-        let extended_end = (core_end + BACKWARD_HALO_MARKERS).min(n_window_markers);
+        // Use the full available window buffer for the HMM backward pass.
+        // Truncating the backward pass (e.g. using a small halo) degrades
+        // accuracy at the window boundary because it ignores the buffered
+        // future context (overlap) that was explicitly loaded for this purpose.
+        let extended_end = n_window_markers;
         Self {
             core_start,
             core_end,
@@ -4999,7 +4997,10 @@ impl crate::pipelines::ImputationPipeline {
         let target_pl_matrix = target_pl.unwrap_or(target_win);
         let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
-        let smoothing_cluster_cm = self.config.cluster.max(1e-6);
+        // Use a robust smoothing window size (e.g. 5.0 cM) even if the I/O
+        // window is small, to ensure consistent regularization strength
+        // regardless of processing chunk size.
+        let smoothing_cluster_cm = self.config.cluster.max(5.0);
         let overlap_start = overlap_start_from_hazard(output_start, output_end, &p_recomb);
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,

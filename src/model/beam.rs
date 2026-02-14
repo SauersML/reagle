@@ -799,6 +799,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let mut segment_ptrs: Vec<Vec<u32>> = Vec::with_capacity(n_calls);
         let mut logsum_unswapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         let mut logsum_swapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
+
+        let n_ref = self.packed_ref.n_ref_haps();
+        let mut donor_counts: Vec<f32> = vec![0.0; n_ref];
+        let mut total_mass = 0.0;
+
         for i in 0..n_calls {
             let segment = &condensed.segments[i];
             let call = &condensed.call_sites[i];
@@ -861,6 +866,22 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 );
             }
             self.prune_and_collapse(&mut next);
+
+            // Accumulate donor mass from next (current marker posterior)
+            if let Some(first_path) = next.first() {
+                let min_score = first_path.score;
+                for p in &next {
+                    let prob = (-(p.score - min_score) as f64 / 1_000_000.0).exp() as f32;
+                    if p.hap1 < n_ref {
+                        donor_counts[p.hap1] += prob;
+                    }
+                    if p.hap2 < n_ref {
+                        donor_counts[p.hap2] += prob;
+                    }
+                    total_mass += prob * 2.0;
+                }
+            }
+
             let mut step_ptrs: Vec<u16> = Vec::with_capacity(next.len());
             for p in &next {
                 assert!(p.prev_idx <= MAX_BACKPTR_PREV, "beam backptr overflow");
@@ -942,22 +963,28 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 }
             }
 
-            let mut donor_counts: std::collections::HashMap<usize, f32> =
-                std::collections::HashMap::new();
-            let mut total_mass = 0.0;
-            let min_score = beam.iter().map(|p| p.score).min().unwrap_or(0);
-
-            for p in &beam {
-                let prob = (-(p.score - min_score) as f64 / 1_000_000.0).exp() as f32;
-                *donor_counts.entry(p.hap1).or_insert(0.0) += prob;
-                *donor_counts.entry(p.hap2).or_insert(0.0) += prob;
-                total_mass += prob * 2.0;
+            // Accumulate donor mass from final beam
+            if let Some(first_path) = beam.first() {
+                let min_score = first_path.score;
+                for p in &beam {
+                    let prob = (-(p.score - min_score) as f64 / 1_000_000.0).exp() as f32;
+                    if p.hap1 < n_ref {
+                        donor_counts[p.hap1] += prob;
+                    }
+                    if p.hap2 < n_ref {
+                        donor_counts[p.hap2] += prob;
+                    }
+                    total_mass += prob * 2.0;
+                }
             }
 
-            let mut donor_mass: Vec<(usize, f32)> = Vec::with_capacity(donor_counts.len());
+            let mut donor_mass: Vec<(usize, f32)> = Vec::new();
             if total_mass > 0.0 {
-                for (hap, mass) in donor_counts {
-                    donor_mass.push((hap, mass / total_mass));
+                let inv_total = 1.0 / total_mass;
+                for (hap, &count) in donor_counts.iter().enumerate() {
+                    if count > 0.0 {
+                        donor_mass.push((hap, count * inv_total));
+                    }
                 }
             }
 
