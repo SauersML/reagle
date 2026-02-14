@@ -29,6 +29,8 @@ pub struct CallSite {
     pub hi_idx: usize,
     pub a1: u8,
     pub a2: u8,
+    /// Orientation confidence c = P(a1|a2 ordering is correct) at this marker.
+    pub phase_conf: f32,
     /// Frequency of allele a1 in the reference panel (for TMRCA-aware scoring).
     pub a1_freq: f32,
     /// Frequency of allele a2 in the reference panel (for TMRCA-aware scoring).
@@ -91,6 +93,7 @@ impl CondensedTarget {
                     0.0
                 };
                 let fixed = !sample_phase.is_unphased(orig_m);
+                let phase_conf = sample_phase.phase_confidence(orig_m).clamp(0.0, 1.0);
                 let flip_cost = if fixed {
                     let conf = sample_phase
                         .phase_confidence(orig_m)
@@ -138,6 +141,7 @@ impl CondensedTarget {
                     hi_idx,
                     a1,
                     a2,
+                    phase_conf,
                     a1_freq,
                     a2_freq,
                     pbwt_len_morgans_a1,
@@ -220,6 +224,7 @@ impl CondensedTarget {
                 hi_idx,
                 a1: cs.a1,
                 a2: cs.a2,
+                phase_conf: cs.phase_conf,
                 a1_freq: cs.a1_freq,
                 a2_freq: cs.a2_freq,
                 pbwt_len_morgans_a1: cs.pbwt_len_morgans_a1,

@@ -345,7 +345,13 @@ fn restore_cached_subset(
     Some((ref_dst, input_dst, truth_dst))
 }
 
-fn cache_subset_inputs(cache_root: &Path, key: &str, ref_vcf: &Path, input_vcf: &Path, truth_vcf: &Path) {
+fn cache_subset_inputs(
+    cache_root: &Path,
+    key: &str,
+    ref_vcf: &Path,
+    input_vcf: &Path,
+    truth_vcf: &Path,
+) {
     let dir = subset_cache_dir(cache_root, key);
     fs::create_dir_all(&dir).expect("create subset cache dir");
     copy_with_index(ref_vcf, &dir.join("ref.vcf.gz"));
@@ -364,7 +370,11 @@ fn compute_chr22_fraction_region(vcf: &Path, num: usize, den: usize) -> (String,
     let target_span = std::cmp::max(1_i64, scaled_span as i64);
     let end = min_pos + target_span - 1;
     let end_clamped = std::cmp::min(end, max_pos);
-    (format!("{CHR22}:{min_pos}-{end_clamped}"), min_pos, end_clamped)
+    (
+        format!("{CHR22}:{min_pos}-{end_clamped}"),
+        min_pos,
+        end_clamped,
+    )
 }
 
 fn query_chr22_bounds(vcf: &Path) -> (i64, i64) {
@@ -597,13 +607,8 @@ fn download_latest_quality_artifacts(repo: &str, cache_root: &Path) -> (PathBuf,
         }
     }
     let ref_run_id = reference_run_id.expect("no recent run contains reference-panel artifact");
-    let reference_dir = ensure_artifact_dir(
-        cache_root,
-        repo,
-        ref_run_id,
-        "reference-panel",
-        "reference",
-    );
+    let reference_dir =
+        ensure_artifact_dir(cache_root, repo, ref_run_id, "reference-panel", "reference");
     let mut best_input: Option<(i64, PathBuf)> = None;
     let mut best_truth: Option<(i64, PathBuf)> = None;
     let mut target_only_candidates: Vec<(i64, PathBuf, PathBuf, usize)> = Vec::new();
@@ -617,7 +622,13 @@ fn download_latest_quality_artifacts(repo: &str, cache_root: &Path) -> (PathBuf,
         let has_truth = find_truth_file(&candidate_dir).is_some();
 
         if has_input && has_truth {
-            write_artifact_selection_cache(repo, cache_root, ref_run_id, run_id, outputs_name.as_str());
+            write_artifact_selection_cache(
+                repo,
+                cache_root,
+                ref_run_id,
+                run_id,
+                outputs_name.as_str(),
+            );
             return (reference_dir.clone(), candidate_dir);
         }
         if has_input {
@@ -662,19 +673,12 @@ fn download_latest_quality_artifacts(repo: &str, cache_root: &Path) -> (PathBuf,
     if let (Some((input_run, input_dir)), Some((truth_run, truth_dir))) =
         (best_input.clone(), best_truth.clone())
     {
-        let merged = build_outputs_union_dir(
-            cache_root,
-            &input_dir,
-            &truth_dir,
-            input_run,
-            truth_run,
-        );
+        let merged =
+            build_outputs_union_dir(cache_root, &input_dir, &truth_dir, input_run, truth_run);
         return (reference_dir, merged);
     }
     if best_truth.is_none() && target_only_candidates.len() >= 2 {
-        target_only_candidates.sort_by(|a, b| {
-            b.3.cmp(&a.3).then_with(|| b.0.cmp(&a.0))
-        });
+        target_only_candidates.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| b.0.cmp(&a.0)));
         let truth_pick = target_only_candidates
             .first()
             .expect("truth candidate should exist");
@@ -836,12 +840,8 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
                 let replace = best_merged_out
                     .as_ref()
                     .map(|best| {
-                        let cur = fs::metadata(&path)
-                            .and_then(|m| m.modified())
-                            .ok();
-                        let prev = fs::metadata(best)
-                            .and_then(|m| m.modified())
-                            .ok();
+                        let cur = fs::metadata(&path).and_then(|m| m.modified()).ok();
+                        let prev = fs::metadata(best).and_then(|m| m.modified()).ok();
                         match (cur, prev) {
                             (Some(c), Some(p)) => c > p,
                             (Some(_), None) => true,
@@ -865,11 +865,7 @@ fn find_cached_quality_artifacts(cache_root: &Path) -> Option<(PathBuf, PathBuf)
                 (best_input, best_truth)
             {
                 let merged = build_outputs_union_dir(
-                    cache_root,
-                    &input_dir,
-                    &truth_dir,
-                    input_run,
-                    truth_run,
+                    cache_root, &input_dir, &truth_dir, input_run, truth_run,
                 );
                 Some((ref_dir, merged))
             } else {
@@ -933,7 +929,10 @@ fn build_outputs_union_dir(
         )
     });
     let truth_src = find_truth_file(truth_dir).unwrap_or_else(|| {
-        panic!("missing truth in cached outputs dir {}", truth_dir.display())
+        panic!(
+            "missing truth in cached outputs dir {}",
+            truth_dir.display()
+        )
     });
     build_outputs_union_dir_from_sources(
         cache_root,
@@ -1121,20 +1120,14 @@ fn copy_with_index(src_vcf: &Path, dst_vcf: &Path) {
 
 fn link_or_copy_file(src: &Path, dst: &Path) {
     if dst.exists() {
-        fs::remove_file(dst).unwrap_or_else(|e| {
-            panic!("failed removing existing {}: {e}", dst.display())
-        });
+        fs::remove_file(dst)
+            .unwrap_or_else(|e| panic!("failed removing existing {}: {e}", dst.display()));
     }
     if fs::hard_link(src, dst).is_ok() {
         return;
     }
-    fs::copy(src, dst).unwrap_or_else(|e| {
-        panic!(
-            "failed copying {} -> {}: {e}",
-            src.display(),
-            dst.display()
-        )
-    });
+    fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("failed copying {} -> {}: {e}", src.display(), dst.display()));
 }
 
 fn find_file_recursive(root: &Path, filename: &str) -> Option<PathBuf> {
@@ -1196,8 +1189,12 @@ fn next_truth_site(reader: &mut BufReader<std::process::ChildStdout>) -> Option<
         let mut fields = line.trim_end().split('\t');
         let Some(chrom) = fields.next() else { continue };
         let Some(pos_s) = fields.next() else { continue };
-        let Some(ref_allele) = fields.next() else { continue };
-        let Some(alt_allele) = fields.next() else { continue };
+        let Some(ref_allele) = fields.next() else {
+            continue;
+        };
+        let Some(alt_allele) = fields.next() else {
+            continue;
+        };
         let Some(gt) = fields.next() else { continue };
         let pos = match pos_s.parse::<i64>() {
             Ok(v) => v,
@@ -1226,9 +1223,15 @@ fn next_imputed_site(reader: &mut BufReader<std::process::ChildStdout>) -> Optio
         let mut fields = line.trim_end().split('\t');
         let Some(chrom) = fields.next() else { continue };
         let Some(pos_s) = fields.next() else { continue };
-        let Some(ref_allele) = fields.next() else { continue };
-        let Some(alt_allele) = fields.next() else { continue };
-        let Some(sample) = fields.next() else { continue };
+        let Some(ref_allele) = fields.next() else {
+            continue;
+        };
+        let Some(alt_allele) = fields.next() else {
+            continue;
+        };
+        let Some(sample) = fields.next() else {
+            continue;
+        };
         let pos = match pos_s.parse::<i64>() {
             Ok(v) => v,
             Err(_) => continue,
@@ -1366,9 +1369,7 @@ fn compute_metrics_streaming(truth_vcf: &Path, imputed_vcf: &Path, label: &str) 
                     (t.ref_allele == i.ref_allele && t.alt_allele == i.alt_allele) || swapped;
 
                 if allele_compatible {
-                    let mut i_dos = i
-                        .ds
-                        .or_else(|| gt_to_nonref_dosage(&i.gt));
+                    let mut i_dos = i.ds.or_else(|| gt_to_nonref_dosage(&i.gt));
                     if let (Some(t_dos), Some(mut i_dos_val)) =
                         (gt_to_nonref_dosage(&t.gt), i_dos.take())
                     {
@@ -1421,7 +1422,10 @@ fn compute_metrics_streaming(truth_vcf: &Path, imputed_vcf: &Path, label: &str) 
 }
 
 fn sample_names(vcf: &Path) -> Vec<String> {
-    let stdout = run_capture("bcftools", ["query", "-l", vcf.to_str().expect("vcf path utf8")]);
+    let stdout = run_capture(
+        "bcftools",
+        ["query", "-l", vcf.to_str().expect("vcf path utf8")],
+    );
     stdout
         .lines()
         .map(str::trim)

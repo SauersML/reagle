@@ -705,46 +705,13 @@ fn adaptive_prescan_top_m(scores: &[f32], base_top: usize, n_ref_haps: usize) ->
         .clamp(min_top as f32, base as f32) as usize
 }
 
-fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
-    #[inline]
-    fn clamp_prob(p: f32) -> f32 {
-        p.clamp(1e-6, 1.0 - 1e-6)
-    }
-    let fwd_len = fwd.len();
-    if fwd_len == 0 {
-        return Vec::new();
-    }
-    let shared_len = fwd_len.min(bwd.len());
-    let mut out = Vec::with_capacity(fwd_len);
-    for i in 0..shared_len {
-        let pf = clamp_prob(fwd[i]);
-        let pb = clamp_prob(bwd[i]);
-        // Conservative linear pooling for correlated forward/reverse passes.
-        //
-        // Forward and reverse traversals are computed from the same marker evidence,
-        // so they are strongly dependent. Odds multiplication (logit-add) assumes
-        // conditional independence and overconcentrates posterior mass.
-        //
-        // We therefore use:
-        //   p = 0.5 * pf + 0.5 * pb
-        // as a calibration-preserving compromise.
-        out.push(clamp_prob(0.5 * (pf + pb)));
-    }
-    // Exact tail behavior when reverse is missing:
-    // pb = 0.5 => pooled p = 0.5 * (pf + 0.5).
-    for &pf_raw in &fwd[shared_len..] {
-        let pf = clamp_prob(pf_raw);
-        out.push(clamp_prob(0.5 * (pf + 0.5)));
-    }
-    out
-}
-
 fn merge_donor_mass(
     fwd: &[(usize, f32)],
     bwd: &[(usize, f32)],
     cap: usize,
     min_mass: f32,
 ) -> Vec<usize> {
+    const MASS_BUDGET: f32 = 0.995;
     if cap == 0 {
         return Vec::new();
     }
@@ -759,16 +726,46 @@ fn merge_donor_mass(
     }
     let mut ranked: Vec<(usize, f32)> = accum.into_iter().collect();
     ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let total_mass: f32 = ranked.iter().map(|(_, m)| *m).sum::<f32>().max(1e-30);
     let mut out = Vec::with_capacity(cap);
+    let mut cum = 0.0f32;
     for (h, m) in ranked {
         if out.len() >= cap {
             break;
         }
-        if m >= min_mass {
-            out.push(h);
+        if m < min_mass {
+            continue;
+        }
+        out.push(h);
+        cum += m;
+        // Preserve donor diversity up to a posterior-mass budget instead of
+        // only top-count truncation. Keep at least two donors when possible.
+        if out.len() >= 2 && (cum / total_mass) >= MASS_BUDGET {
+            break;
         }
     }
     out
+}
+
+#[inline]
+fn conservative_orientation_consensus(p_fwd: f32, p_bwd: f32) -> f32 {
+    let pf = p_fwd.clamp(1e-6, 1.0 - 1e-6);
+    let pb = p_bwd.clamp(1e-6, 1.0 - 1e-6);
+    let fwd_swap = pf >= 0.5;
+    let bwd_swap = pb >= 0.5;
+    // Under unknown dependence between two approximate passes, only trust
+    // consensus orientation. If signs disagree, stay neutral.
+    if fwd_swap != bwd_swap {
+        return 0.5;
+    }
+    let df = (pf - 0.5).abs();
+    let db = (pb - 0.5).abs();
+    let d = df.min(db);
+    if fwd_swap {
+        0.5 + d
+    } else {
+        0.5 - d
+    }
 }
 
 fn build_sparse_scores(
@@ -2925,7 +2922,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
             let ibs2 = Ibs2::new(&target_gt, &gen_maps, chrom, &maf);
 
-            let mut threaded_haps_vec = self.build_phasing_prescan_states(
+            let threaded_haps_vec = self.build_phasing_prescan_states(
                 &target_gt,
                 &geno,
                 Some(ref_gt.as_ref()),
@@ -3014,39 +3011,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     &mut active_pool,
                     &mut injector,
                 );
-                let condensed_rev = condensed.reversed(&hi_freq_gen_positions);
-                let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
-                let mut tmp_rev =
-                    vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
-                let rev_seed_marker = hi_freq_to_orig.len().saturating_sub(1);
-                th.materialize_at(rev_seed_marker, &mut tmp_rev);
-                for id in tmp_rev.iter().copied() {
-                    let hid = id.as_u32() as usize;
-                    if hid >= n_target_haps {
-                        let ref_id = hid - n_target_haps;
-                        if ref_id < packed_ref.n_ref_haps() {
-                            active_pool_rev.add(ref_id);
-                        }
-                    }
-                }
-                let mut sp_rev = sp.clone();
-                let mut injector_rev = PbwtInjector::new(
-                    &beam_index,
-                    packed_ref.n_ref_haps(),
-                    beam_config_fast.inject_k,
-                );
-                let bwd = phaser_fast.phase_sample(
-                    &condensed_rev,
-                    &mut sp_rev,
-                    &mut active_pool_rev,
-                    &mut injector_rev,
-                );
-                let mut p_swapped_bwd = bwd.p_swapped;
-                p_swapped_bwd.reverse();
-                let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
                 if let Ok(mut slot) = fast_confidence[s].lock() {
                     slot.clear();
-                    for (i, &p) in combined.iter().enumerate() {
+                    for (i, &p) in fwd.p_swapped.iter().enumerate() {
                         let call = &condensed.call_sites[i];
                         slot.push((call.marker.as_usize(), call.a1, call.a2, p));
                     }
@@ -3198,11 +3165,14 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let bwd_donor_mass = bwd.donor_mass.clone();
                     let mut p_swapped_bwd = bwd.p_swapped;
                     p_swapped_bwd.reverse();
-                    let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
-
                     if let Ok(mut slot) = beam_confidence[s].lock() {
                         slot.clear();
-                        for (i, &p) in combined.iter().enumerate() {
+                        for (i, &pf) in fwd.p_swapped.iter().enumerate() {
+                            let p = p_swapped_bwd
+                                .get(i)
+                                .copied()
+                                .map(|pb| conservative_orientation_consensus(pf, pb))
+                                .unwrap_or(pf);
                             let call = &condensed.call_sites[i];
                             slot.push((call.marker.as_usize(), call.a1, call.a2, p));
                         }
@@ -3224,31 +3194,34 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 }
             }
 
-            // Feed beam-selected donors back into the HMM state set.
+            // LMS-preserving donor handoff:
+            // keep only beam donors already present in the prescan-selected state
+            // support for each sample, and do not expand the HMM state universe.
             if packed_ref.n_ref_haps() > 0 {
                 let offset = n_target_haps as u32;
                 for s in 0..n_samples {
-                    let Ok(donors) = beam_donors[s].lock() else {
+                    let threaded_haps = &threaded_haps_vec[s];
+                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
+                    threaded_haps.materialize_at(0, &mut existing);
+                    let mut allowed_ref: HashSet<usize> = HashSet::with_capacity(existing.len());
+                    for id in existing {
+                        let hid = id.as_u32();
+                        if hid < offset {
+                            continue;
+                        }
+                        let ref_id = (hid - offset) as usize;
+                        if ref_id < packed_ref.n_ref_haps() {
+                            allowed_ref.insert(ref_id);
+                        }
+                    }
+
+                    let Ok(mut donors) = beam_donors[s].lock() else {
                         continue;
                     };
                     if donors.is_empty() {
                         continue;
                     }
-                    let threaded_haps = &mut threaded_haps_vec[s];
-                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
-                    threaded_haps.materialize_at(0, &mut existing);
-                    let mut seen: HashSet<u32> =
-                        HashSet::with_capacity(existing.len() + donors.len());
-                    for id in existing {
-                        seen.insert(id.as_u32());
-                    }
-                    for &h in donors.iter() {
-                        let combined = combined_from_ref(RefHapId::from(h), offset);
-                        let id = combined.as_u32();
-                        if seen.insert(id) {
-                            threaded_haps.push_new(combined);
-                        }
-                    }
+                    donors.retain(|h| allowed_ref.contains(h));
                 }
             }
 
@@ -3264,7 +3237,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         continue;
                     }
                     let d1 = donors[0];
-                    let d2 = *donors.get(1).unwrap_or(&donors[0]);
+                    let Some(d2) = donors.iter().copied().find(|&h| h != d1) else {
+                        // Do not force a degenerate single-donor seed; let Stage-1
+                        // initialize from its own LMS-supported dynamics.
+                        continue;
+                    };
                     let hap1 = CombinedHapId::new(offset + d1 as u32);
                     let hap2 = CombinedHapId::new(offset + d2 as u32);
                     let path1 = vec![hap1; n_hi_freq];
@@ -4171,7 +4148,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             };
 
-            let mut threaded_haps_vec = self.build_phasing_prescan_states(
+            let threaded_haps_vec = self.build_phasing_prescan_states(
                 target_gt,
                 &geno,
                 Some(ref_gt.as_ref()),
@@ -4262,10 +4239,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         bwd_donor_mass = bwd.donor_mass.clone();
                         let mut p_swapped_bwd = bwd.p_swapped;
                         p_swapped_bwd.reverse();
-                        let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
                         for (i, &swapped) in fwd.decisions.iter().enumerate() {
                             let m = condensed.call_sites[i].marker.as_usize();
-                            let p = combined.get(i).copied().unwrap_or(0.5);
+                            let pf = fwd.p_swapped.get(i).copied().unwrap_or(0.5);
+                            let p = p_swapped_bwd
+                                .get(i)
+                                .copied()
+                                .map(|pb| conservative_orientation_consensus(pf, pb))
+                                .unwrap_or(pf);
                             let conf = if has_input_phase {
                                 if swapped { p } else { 1.0 - p }
                             } else {
@@ -4286,31 +4267,34 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
                 });
 
-            // Feed beam-selected donors back into the HMM state set.
+            // LMS-preserving donor handoff:
+            // keep only beam donors already present in the prescan-selected state
+            // support for each sample, and do not expand the HMM state universe.
             if packed_ref.n_ref_haps() > 0 {
                 let offset = n_target_haps as u32;
                 for s in 0..n_samples {
-                    let Ok(donors) = beam_donors[s].lock() else {
+                    let threaded_haps = &threaded_haps_vec[s];
+                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
+                    threaded_haps.materialize_at(0, &mut existing);
+                    let mut allowed_ref: HashSet<usize> = HashSet::with_capacity(existing.len());
+                    for id in existing {
+                        let hid = id.as_u32();
+                        if hid < offset {
+                            continue;
+                        }
+                        let ref_id = (hid - offset) as usize;
+                        if ref_id < packed_ref.n_ref_haps() {
+                            allowed_ref.insert(ref_id);
+                        }
+                    }
+
+                    let Ok(mut donors) = beam_donors[s].lock() else {
                         continue;
                     };
                     if donors.is_empty() {
                         continue;
                     }
-                    let threaded_haps = &mut threaded_haps_vec[s];
-                    let mut existing = vec![CombinedHapId::from(0u32); threaded_haps.n_states()];
-                    threaded_haps.materialize_at(0, &mut existing);
-                    let mut seen: HashSet<u32> =
-                        HashSet::with_capacity(existing.len() + donors.len());
-                    for id in existing {
-                        seen.insert(id.as_u32());
-                    }
-                    for &h in donors.iter() {
-                        let combined = combined_from_ref(RefHapId::from(h), offset);
-                        let id = combined.as_u32();
-                        if seen.insert(id) {
-                            threaded_haps.push_new(combined);
-                        }
-                    }
+                    donors.retain(|h| allowed_ref.contains(h));
                 }
             }
 
@@ -6326,7 +6310,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                                     sample_p_no_err,
                                                     sample_p_err,
                                                 );
-                                                0.5 * (keep + swap)
+                                                orientation_mixture_likelihood(keep, swap, conf_m)
                                             };
                                             score += emit.max(1e-30).ln();
                                         }
@@ -8610,6 +8594,20 @@ fn emit_prob(ref_al: u8, targ_al: u8, conf: f32, p_no_err: f32, p_err: f32) -> f
 }
 
 #[inline(always)]
+fn orientation_mixture_likelihood(keep: f32, swap: f32, phase_conf: f32) -> f32 {
+    let c = phase_conf.clamp(0.0, 1.0);
+    (c * keep + (1.0 - c) * swap).max(1e-30)
+}
+
+#[inline(always)]
+fn orientation_swap_posterior(keep: f32, swap: f32, phase_conf: f32) -> f32 {
+    let c = phase_conf.clamp(0.0, 1.0);
+    let num = ((1.0 - c) * swap).max(0.0);
+    let den = (c * keep + (1.0 - c) * swap).max(1e-30);
+    (num / den).clamp(0.0, 1.0)
+}
+
+#[inline(always)]
 fn emit_prob_hard(
     ref_al: u8,
     targ_al: u8,
@@ -10145,7 +10143,7 @@ fn sample_dynamic_mcmc(
                                 * emit_prob(r2, a2, conf_m, p_no_err, p_err);
                             let swap = emit_prob(r1, a2, conf_m, p_no_err, p_err)
                                 * emit_prob(r2, a1, conf_m, p_no_err, p_err);
-                            0.5 * (keep + swap)
+                            orientation_mixture_likelihood(keep, swap, conf_m)
                         } else {
                             let obs = if a1 != crate::data::storage::AlleleCode::MISSING.raw() {
                                 a1
@@ -11633,8 +11631,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
                 emit_prob(ref1, a1, c, p_no_err, p_err) * emit_prob(ref2, a2, c, p_no_err, p_err);
             let swap =
                 emit_prob(ref1, a2, c, p_no_err, p_err) * emit_prob(ref2, a1, c, p_no_err, p_err);
-            let denom = (keep + swap).max(1e-30);
-            let mut p_swap_sample = (swap / denom).clamp(0.0, 1.0);
+            let mut p_swap_sample = orientation_swap_posterior(keep, swap, c);
             if sample_flip {
                 p_swap_sample = 1.0 - p_swap_sample;
             }
@@ -12638,36 +12635,6 @@ mod tests {
     }
 
     #[test]
-    fn test_combine_swap_probs_aligns_reverse_polarity_when_complemented() {
-        let fwd = vec![0.90f32, 0.80, 0.20, 0.10];
-        let bwd_complement = vec![0.10f32, 0.20, 0.80, 0.90];
-
-        let combined = combine_swap_probs(&fwd, &bwd_complement);
-        assert_eq!(combined.len(), fwd.len());
-
-        for &p in &combined {
-            assert!(
-                (p - 0.5).abs() < 1e-5,
-                "conservative pool should be neutral under polarity disagreement, got {}",
-                p
-            );
-        }
-    }
-
-    #[test]
-    fn test_combine_swap_probs_single_marker_reduces_to_forward_marginal() {
-        let fwd = vec![0.99f32];
-        let bwd = vec![0.01f32];
-        let combined = combine_swap_probs(&fwd, &bwd);
-        assert_eq!(combined.len(), 1);
-        assert!(
-            (combined[0] - 0.5).abs() < 1e-5,
-            "single-marker conservative pool should neutralize opposing evidence: got {}",
-            combined[0],
-        );
-    }
-
-    #[test]
     fn test_stage2_bridge_uses_two_sided_product_messages() {
         let stage2 = Stage2Phaser::new(&[0, 2], &[0.0, 1.0, 2.0], 3, 50.0, 100);
         let marker = 1usize;
@@ -13142,6 +13109,48 @@ mod tests {
             "Expected required allele preferred at high phase confidence, got ref1={} ref0={}",
             emit_ref1_high,
             emit_ref0_high
+        );
+    }
+
+    #[test]
+    fn test_orientation_mixture_likelihood_uses_phase_confidence() {
+        let keep = 0.9f32;
+        let swap = 0.1f32;
+        let high_keep = orientation_mixture_likelihood(keep, swap, 0.9);
+        let neutral = orientation_mixture_likelihood(keep, swap, 0.5);
+        let high_swap = orientation_mixture_likelihood(keep, swap, 0.1);
+        assert!(
+            (high_keep - 0.82).abs() < 1e-6,
+            "expected c-weighted mixture at c=0.9, got {}",
+            high_keep
+        );
+        assert!(
+            (neutral - 0.5).abs() < 1e-6,
+            "expected neutral mixture at c=0.5, got {}",
+            neutral
+        );
+        assert!(
+            (high_swap - 0.18).abs() < 1e-6,
+            "expected c-weighted mixture at c=0.1, got {}",
+            high_swap
+        );
+    }
+
+    #[test]
+    fn test_orientation_swap_posterior_respects_phase_confidence() {
+        let keep = 0.8f32;
+        let swap = 0.2f32;
+        let p_swap_c9 = orientation_swap_posterior(keep, swap, 0.9);
+        let p_swap_c5 = orientation_swap_posterior(keep, swap, 0.5);
+        assert!(
+            (p_swap_c9 - 0.027027028).abs() < 1e-6,
+            "expected confidence-weighted swap posterior at c=0.9, got {}",
+            p_swap_c9
+        );
+        assert!(
+            (p_swap_c5 - 0.2).abs() < 1e-6,
+            "expected symmetric swap posterior at c=0.5, got {}",
+            p_swap_c5
         );
     }
 

@@ -50,6 +50,7 @@ pub struct ThreadWorkspace {
     pub ffbs_fwd_prev: Vec<f32>,
     pub ffbs_fwd_at_marker: Vec<f32>,
     pub ffbs_weights: Vec<f32>,
+    pub ffbs_neighbor_alleles: Vec<u8>,
     /// Checkpoint storage buffers (reused between samples)
     pub combined_checkpoint_data: Vec<f32>,
     pub hap1_checkpoint_data: Vec<f32>,
@@ -106,6 +107,7 @@ impl ThreadWorkspace {
             ffbs_fwd_prev: Vec::new(),
             ffbs_fwd_at_marker: Vec::new(),
             ffbs_weights: Vec::new(),
+            ffbs_neighbor_alleles: Vec::new(),
             combined_checkpoint_data: Vec::new(),
             hap1_checkpoint_data: Vec::new(),
             hap2_checkpoint_data: Vec::new(),
@@ -237,6 +239,10 @@ impl ThreadWorkspace {
         }
         if self.ffbs_weights.len() < n_states {
             self.ffbs_weights.resize(n_states, 0.0);
+        }
+        if self.ffbs_neighbor_alleles.len() < n_states {
+            self.ffbs_neighbor_alleles
+                .resize(n_states, crate::data::storage::AlleleCode::MISSING.raw());
         }
         let needed = ElemCount::from(n_markers)
             .checked_mul(ElemCount::from(n_states), "FFBS marker-state buffer length")

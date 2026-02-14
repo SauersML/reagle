@@ -18,8 +18,8 @@ use std::time::Instant;
 
 use reagle::Config;
 use reagle::Result;
-use reagle::{ImputationPipeline, PhasingPipeline};
 use reagle::utils::telemetry::{HeartbeatConfig, HeartbeatHandle, Stage, TelemetryBlackboard};
+use reagle::{ImputationPipeline, PhasingPipeline};
 
 fn main() {
     if let Err(e) = run() {

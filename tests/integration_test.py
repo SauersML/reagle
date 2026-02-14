@@ -4233,23 +4233,10 @@ def run_minimac_chr(chrom, paths):
             region_arg = resolve_region_arg(paths, chrom)
             
             # Minimac4 v4.x requires reference in MSAV format
-
             msav_ref = data_dir / "ref.msav"
-            # Note: minimac4 uses --processReference to create .msav files.
-            # The --prefix argument determines the output basename (e.g., prefix 'ref' creates 'ref.msav').
             if not msav_ref.exists():
                 print("Converting reference to MSAV format for Minimac4...")
-                msav_prefix = data_dir / "ref"
-                # Remove stale files if any
-                for ext in [".msav", ".erate", ".rec"]:
-                    if (data_dir / f"ref{ext}").exists():
-                        (data_dir / f"ref{ext}").unlink()
-                
-                run(f"{minimac_bin} --refHaps {paths['ref_vcf']} --processReference --prefix {msav_prefix}")
-                
-                if not msav_ref.exists():
-                    # Fallback: check if it created something else or failed silently
-                    raise RuntimeError(f"Minimac4 failed to create reference panel: {msav_ref}")
+                run(f"{minimac_bin} --compress-reference {paths['ref_vcf']} > {msav_ref}")
             
             print_tool_help("Minimac4", str(minimac_bin))
             print(f"Minimac4 region: {region_arg}")
@@ -4265,11 +4252,8 @@ def run_minimac_chr(chrom, paths):
                 minimac_map_arg = f" --map {minimac_map}"
             elif tool_supports_flag(str(minimac_bin), "--mapFile"):
                 minimac_map_arg = f" --mapFile {minimac_map}"
-            
-            # Run imputation with explicit flags
-            # Use --prefix to generate output files (e.g. prefix.dose.vcf.gz)
             run(
-                f"{minimac_bin} --refHaps {msav_ref} --haps {paths['input_vcf']} --prefix {prefix} "
+                f"{minimac_bin} {msav_ref} {paths['input_vcf']} --output {prefix}.dose.vcf.gz "
                 f"--threads 4 --format GT,DS --region {region_arg}{minimac_map_arg}"
             )
             

@@ -13,8 +13,8 @@
 
 use crate::data::storage::{AlleleCode, GenotypeView};
 use crate::data::{HapIdx, MarkerIdx};
-use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::li_stephens::normalized_switch_scale_shift;
+use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
 use aligned_vec::{AVec, ConstAlign};
 use std::sync::OnceLock;

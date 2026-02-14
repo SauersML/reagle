@@ -8,6 +8,7 @@ use crate::data::ref_packed::PackedRefView;
 use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
+use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
 use crate::model::reference_pbwt::{DonorPick, PbwtStrictAllele, RankBeam, ReferencePbwt};
 
@@ -70,14 +71,26 @@ impl Default for BeamConfig {
 pub struct BeamCosts {
     pub p_err: f64,
     pub recomb_intensity: f64,
+    pub match_emit_cost: i32,
+    pub mismatch_emit_cost: i32,
 }
 
 impl BeamCosts {
     pub fn from_params(params: &ModelParams) -> Self {
         let p_err = params.p_mismatch.max(1e-9).min(1.0 - 1e-9);
+        let p_match = (1.0 - p_err) as f64;
+        let p_mismatch = p_err as f64;
+        let match_emit_cost = (-(p_match.ln()) * 1_000_000.0)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        let mismatch_emit_cost = (-(p_mismatch.ln()) * 1_000_000.0)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
         Self {
             p_err: p_err as f64,
             recomb_intensity: params.recomb_intensity.max(1e-12) as f64,
+            match_emit_cost,
+            mismatch_emit_cost,
         }
     }
 }
@@ -122,6 +135,7 @@ pub struct BeamPath {
 pub struct BeamPosteriors {
     pub decisions: Vec<bool>,
     pub p_swapped: Vec<f32>,
+    pub donor_mass: Vec<(usize, f32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -712,29 +726,6 @@ impl SwitchSupportCache {
         self.global_match_counts[0] = self.global_match_counts[0].max(1);
         self.global_match_counts[1] = self.global_match_counts[1].max(1);
     }
-
-    #[inline]
-    fn global_match_count(&self, allele: u8) -> usize {
-        if allele == 0 {
-            self.global_match_counts[0]
-        } else {
-            self.global_match_counts[1]
-        }
-    }
-
-    #[inline]
-    fn cluster_match_count(&self, allele: u8, cluster_id: u16) -> usize {
-        let Some(cid) = PbwtClusterIx::from_u16(cluster_id) else {
-            return 1;
-        };
-        let idx = cid.as_usize();
-        let count = if allele == 0 {
-            self.cluster_match_counts0[idx]
-        } else {
-            self.cluster_match_counts1[idx]
-        };
-        count.max(1)
-    }
 }
 
 impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
@@ -772,6 +763,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return BeamPosteriors {
                 decisions: Vec::new(),
                 p_swapped: Vec::new(),
+                donor_mass: Vec::new(),
             };
         }
         if active_pool.is_empty() {
@@ -821,6 +813,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
             } else if self.beam_collapsed(&beam) {
                 injector.maybe_inject(i, call.hi_idx, call.marker, active_pool);
+            }
+            // Subset stickiness: keep donors currently used by active paths in the pool.
+            // This prevents artificial forced switches when dynamic injection jitter
+            // would otherwise evict a donor that still carries high posterior support.
+            let sticky_version = call.hi_idx as u32;
+            for p in &beam {
+                active_pool.touch(p.hap1, sticky_version);
+                active_pool.touch(p.hap2, sticky_version);
             }
             let ttl = if self.config.active_pool_ttl > 0 {
                 self.config.active_pool_ttl
@@ -885,6 +885,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             trailing_ptrs = Some(seg_ptrs);
         }
 
+        let donor_mass = donor_posterior_mass(&beam, self.config.beam_width.saturating_mul(4));
+
         // Pick best path
         if let Some((best_idx, _)) = beam.iter().enumerate().min_by_key(|(_, p)| p.score) {
             let mut phases = Vec::with_capacity(n_calls);
@@ -942,11 +944,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return BeamPosteriors {
                 decisions: phases,
                 p_swapped,
+                donor_mass,
             };
         }
         BeamPosteriors {
             decisions: Vec::new(),
             p_swapped: vec![0.5; n_calls],
+            donor_mass,
         }
     }
 
@@ -1310,26 +1314,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         cutoff: i64,
         scratch: &mut BeamScratch,
     ) {
+        let recomb_prob = self.recomb_prob_from_dist(call.dist_morgans);
         self.repair_hap_for_allele_into(
             path.hap1,
             call.marker,
             hap1_al,
-            if swapped {
-                call.pbwt_len_morgans_a2
-            } else {
-                call.pbwt_len_morgans_a1
-            },
-            if swapped {
-                call.pbwt_density_a2
-            } else {
-                call.pbwt_density_a1
-            },
-            call.dist_morgans,
-            pbwt_version as u32,
-            call.fixed,
+            recomb_prob,
             active_pool,
             pool_alleles,
-            &scratch.switch_support,
             &mut scratch.hap1_allele,
             &mut scratch.spread,
         );
@@ -1337,22 +1329,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             path.hap2,
             call.marker,
             hap2_al,
-            if swapped {
-                call.pbwt_len_morgans_a1
-            } else {
-                call.pbwt_len_morgans_a2
-            },
-            if swapped {
-                call.pbwt_density_a1
-            } else {
-                call.pbwt_density_a2
-            },
-            call.dist_morgans,
-            pbwt_version as u32,
-            call.fixed,
+            recomb_prob,
             active_pool,
             pool_alleles,
-            &scratch.switch_support,
             &mut scratch.hap2_allele,
             &mut scratch.spread,
         );
@@ -1378,10 +1357,18 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 let score = score_no_flip + flip_penalty;
                 let model_score = model_score_no_flip + flip_penalty;
                 let logp = -(model_score as f64) / 1_000_000.0;
+                // Posterior orientation mass at a marker should include the local
+                // orientation confidence prior c:
+                //   P(keep) ∝ c * w_keep, P(swap) ∝ (1-c) * w_swap.
+                // We only apply this in the reporting accumulator (`p_swapped`)
+                // so search/ranking remains unchanged.
+                let c = call.phase_conf.clamp(1e-6, 1.0 - 1e-6) as f64;
+                let orient_prior = if swapped { (1.0 - c).ln() } else { c.ln() };
+                let logp_post = logp + orient_prior;
                 if swapped {
-                    logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp);
+                    logsum_swapped[call_idx] = logaddexp(logsum_swapped[call_idx], logp_post);
                 } else {
-                    logsum_unswapped[call_idx] = logaddexp(logsum_unswapped[call_idx], logp);
+                    logsum_unswapped[call_idx] = logaddexp(logsum_unswapped[call_idx], logp_post);
                 }
                 let (history_bits, history_len) =
                     push_history_bits(path.history_bits, path.history_len, swapped);
@@ -1417,231 +1404,98 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         hap: usize,
         marker: MarkerIdx,
         targ_allele: u8,
-        pbwt_match_len: f32,
-        pbwt_density: f32,
-        dist_morgans: f32,
-        pbwt_version: u32,
-        fixed: bool,
+        recomb_prob: f32,
         active_pool: &ActivePool,
         pool_alleles: &[u8],
-        switch_support: &SwitchSupportCache,
         out: &mut Vec<(usize, i32, i32, i32)>,
         spread: &mut Vec<usize>,
     ) {
         out.clear();
         let marker_idx = marker.as_usize();
-
-        // Emission costs (uniform genotyping error model):
-        //   P(match) = 1 - θ
-        //   P(mismatch) = θ
-        let theta = self.costs.p_err.max(1e-9).min(1.0 - 1e-9);
-        let p_match = 1.0 - theta;
-        let p_mismatch = theta;
-        let effective_match_cost = (-(p_match.ln()) * 1_000_000.0)
-            .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        let effective_mismatch_cost = (-(p_mismatch.ln()) * 1_000_000.0)
-            .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-
-        let allele = targ_allele;
-        let meta_curr = active_pool.pbwt_meta(allele, hap, pbwt_version);
-        let (match_len_morgans, cluster_size, cluster_id) = if let Some(meta) = meta_curr {
-            (
-                meta.match_len_morgans.max(0.0),
-                meta.cluster_size.max(0.0),
-                meta.cluster_id,
-            )
-        } else {
-            (pbwt_match_len.max(0.0), pbwt_density.max(0.0), u16::MAX)
-        };
-        let n_match_global = switch_support.global_match_count(targ_allele);
-        let n_match_cluster = switch_support.cluster_match_count(targ_allele, cluster_id);
-        let (pbwt_stay_cost, pbwt_switch_event_cost) =
-            self.pbwt_switch_cost(match_len_morgans, cluster_size, dist_morgans);
-        let selection_cost_global = self.selection_cost(n_match_global);
-        let selection_cost_cluster = self.selection_cost(n_match_cluster);
+        let effective_match_cost = self.costs.match_emit_cost;
+        let effective_mismatch_cost = self.costs.mismatch_emit_cost;
 
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
-        if fixed {
-            // For phased anchors, always scan the full pool to ensure we honor the fixed allele
-            // while still exploring better-matching donors.
-            if matches {
-                out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_match_cost));
+        // Build candidate support C first, then normalize exact transition probabilities on C.
+        // Each candidate stores (hap, emission_cost, is_stay_candidate).
+        let mut cand: Vec<(usize, i32, bool)> =
+            Vec::with_capacity(self.config.switch_candidates.saturating_add(2));
+        #[inline]
+        fn push_unique(cand: &mut Vec<(usize, i32, bool)>, h: usize, emit: i32, is_stay: bool) {
+            if cand.iter().any(|(x, _, _)| *x == h) {
+                return;
             }
-            for (idx, &h) in active_pool.list().iter().rev().enumerate() {
-                let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
-                let pooled = pool_alleles[pool_idx];
-                if h == hap && matches {
-                    continue;
-                }
-                if pooled == targ_allele {
-                    let same_cluster = active_pool
-                        .pbwt_meta(allele, h, pbwt_version)
-                        .map(|m| m.cluster_id == cluster_id)
-                        .unwrap_or(false);
-                    let selection_cost = if same_cluster {
-                        selection_cost_cluster
-                    } else {
-                        selection_cost_global
-                    };
-                    let effective_switch_cost =
-                        pbwt_switch_event_cost.saturating_add(selection_cost);
-                    out.push((
-                        h,
-                        effective_switch_cost,
-                        pbwt_switch_event_cost,
-                        effective_match_cost,
-                    ));
-                    if out.len() >= self.config.switch_candidates {
-                        break;
-                    }
-                }
-            }
-            if out.is_empty() {
-                out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_mismatch_cost));
-            }
-            return;
+            cand.push((h, emit, is_stay));
         }
-        if matches {
-            out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_match_cost));
-            // also allow a limited switch to a strong candidate for future-proofing
-            for (idx, &h) in active_pool.list().iter().rev().take(1).enumerate() {
-                let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
-                let pooled = pool_alleles[pool_idx];
-                if h != hap && pooled == targ_allele {
-                    let same_cluster = active_pool
-                        .pbwt_meta(allele, h, pbwt_version)
-                        .map(|m| m.cluster_id == cluster_id)
-                        .unwrap_or(false);
-                    let selection_cost = if same_cluster {
-                        selection_cost_cluster
-                    } else {
-                        selection_cost_global
-                    };
-                    let effective_switch_cost =
-                        pbwt_switch_event_cost.saturating_add(selection_cost);
-                    out.push((
-                        h,
-                        effective_switch_cost,
-                        pbwt_switch_event_cost,
-                        effective_match_cost,
-                    ));
-                }
+
+        // Always keep stay branch so truncation never forces a recombination.
+        let stay_emit = if matches {
+            effective_match_cost
+        } else {
+            effective_mismatch_cost
+        };
+        push_unique(&mut cand, hap, stay_emit, true);
+
+        // Add recent switch candidates without hard allele gating. Under non-zero
+        // emission error, non-matching donors must remain reachable.
+        let cap = self.config.switch_candidates.max(1);
+        for (idx, &h) in active_pool.list().iter().rev().enumerate() {
+            if h == hap {
+                continue;
             }
-            return;
-        }
-        // Try switching to matching haps
-        for (idx, &h) in active_pool
-            .list()
-            .iter()
-            .rev()
-            .take(self.config.switch_candidates)
-            .enumerate()
-        {
             let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
             let pooled = pool_alleles[pool_idx];
-            if pooled == targ_allele {
-                let same_cluster = active_pool
-                    .pbwt_meta(allele, h, pbwt_version)
-                    .map(|m| m.cluster_id == cluster_id)
-                    .unwrap_or(false);
-                let selection_cost = if same_cluster {
-                    selection_cost_cluster
-                } else {
-                    selection_cost_global
-                };
-                let effective_switch_cost = pbwt_switch_event_cost.saturating_add(selection_cost);
-                out.push((
-                    h,
-                    effective_switch_cost,
-                    pbwt_switch_event_cost,
-                    effective_match_cost,
-                ));
-            }
-            if out.len() >= self.config.switch_candidates {
+            let emit = if pooled == targ_allele {
+                effective_match_cost
+            } else {
+                effective_mismatch_cost
+            };
+            push_unique(&mut cand, h, emit, false);
+            if cand.len() >= cap.saturating_add(1) {
                 break;
             }
         }
-        if out.len() < self.config.switch_candidates {
-            sample_even_into(active_pool.list(), self.config.switch_candidates, spread);
+
+        // Diversity backstop from spread sampling over the active pool.
+        if cand.len() < cap.saturating_add(1) {
+            sample_even_into(active_pool.list(), cap, spread);
             for &h in spread.iter() {
-                if self.ref_allele_matches(marker_idx, h, targ_allele) {
-                    let same_cluster = active_pool
-                        .pbwt_meta(allele, h, pbwt_version)
-                        .map(|m| m.cluster_id == cluster_id)
-                        .unwrap_or(false);
-                    let selection_cost = if same_cluster {
-                        selection_cost_cluster
-                    } else {
-                        selection_cost_global
-                    };
-                    let effective_switch_cost =
-                        pbwt_switch_event_cost.saturating_add(selection_cost);
-                    out.push((
-                        h,
-                        effective_switch_cost,
-                        pbwt_switch_event_cost,
-                        effective_match_cost,
-                    ));
+                if h == hap {
+                    continue;
                 }
-                if out.len() >= self.config.switch_candidates {
+                let emit = if self.ref_allele_matches(marker_idx, h, targ_allele) {
+                    effective_match_cost
+                } else {
+                    effective_mismatch_cost
+                };
+                push_unique(&mut cand, h, emit, false);
+                if cand.len() >= cap.saturating_add(1) {
                     break;
                 }
             }
         }
-        // Always allow staying with a mismatch cost to avoid forced switching.
-        // Mismatch cost is error-rate dependent under the uniform error model.
-        out.push((hap, pbwt_stay_cost, pbwt_stay_cost, effective_mismatch_cost));
-    }
 
-    #[inline]
-    fn pbwt_switch_cost(
-        &self,
-        match_len_morgans: f32,
-        density: f32,
-        dist_morgans: f32,
-    ) -> (i32, i32) {
-        // Coalescent-based stay probability from PBWT one-sided match length with
-        // explicit recombination-intensity scaling.
-        // Here rho is ModelParams::recomb_intensity (typically 0.04 * Ne / nHaps),
-        // used with distance in Morgans (same convention as ModelParams::p_recomb).
-        //   prior: t ~ Exp(1) over TMRCA (coalescent units)
-        //   L | t ~ Exp(rate = rho * t)
-        //   t | L ~ Gamma(α=2, β=1 + rho * L) for a single exponential draw
-        //   P(stay | L, d) = E[exp(-rho * t * d)] = (β / (β + rho * d))^2
-        // The PBWT uses a max over candidates; we map the observed max length to
-        // an effective single-draw length using an order-statistic correction.
-        // Use true negative log transition probabilities (no log-odds).
-        const EULER_MASCHERONI: f64 = 0.5772156649015329;
-        let l_raw = match_len_morgans.max(0.0) as f64;
-        let k = density.max(0.0) as f64;
-        let l = if k > 0.0 {
-            // Order-statistic correction: E[L_max] ~= H_k / (rho * t),
-            // where H_k is the harmonic number (or its continuous extension).
-            let h_k = Self::harmonic_number_approx(k, EULER_MASCHERONI);
-            l_raw / h_k.max(1.0)
-        } else {
-            l_raw
-        };
-        let d = dist_morgans.max(0.0) as f64;
-        let rho = self.costs.recomb_intensity;
-        let beta = 1.0 + rho * l;
-        let denom = beta + rho * d;
-        let p_no_recomb = if denom > 0.0 {
-            (beta / denom).powi(2)
-        } else {
-            0.0
-        };
-        let p_stay = p_no_recomb.clamp(1e-12, 1.0 - 1e-12);
-        let p_switch_event = 1.0 - p_stay;
-        let stay_cost = (-(p_stay.ln()) * 1_000_000.0)
+        let n_total = self.packed_ref.n_ref_haps().max(1);
+        let k_subset = cand.len().max(1) as f32;
+        let (stay_gap, shift) = subset_linear_exact_k(recomb_prob, k_subset, n_total);
+        let stay_prob = (stay_gap + shift).clamp(1e-12, 1.0 - 1e-12);
+        let switch_prob = shift.clamp(1e-12, 1.0 - 1e-12);
+        let stay_cost = (-(f64::from(stay_prob).ln()) * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        let switch_event_cost = (-(p_switch_event.ln()) * 1_000_000.0)
+        let switch_cost = (-(f64::from(switch_prob).ln()) * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        (stay_cost, switch_event_cost)
+
+        out.reserve(cand.len());
+        for (h, emit_cost, is_stay) in cand {
+            let t_cost = if is_stay && h == hap {
+                stay_cost
+            } else {
+                switch_cost
+            };
+            out.push((h, t_cost, t_cost, emit_cost));
+        }
     }
 
     #[inline]
@@ -1650,14 +1504,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let rho = self.costs.recomb_intensity.max(1e-12);
         let p_stay = (-rho * d).exp().clamp(1e-6, 1.0 - 1e-6);
         ((p_stay / (1.0 - p_stay)).ln() * 1_000_000.0)
-            .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
-    }
-
-    #[inline]
-    fn selection_cost(&self, n_eff: usize) -> i32 {
-        let n_eff = (n_eff as f64).max(1.0);
-        (n_eff.ln() * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
@@ -1673,23 +1519,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn harmonic_number_approx(k: f64, euler_mascheroni: f64) -> f64 {
-        if !k.is_finite() || k <= 1.0 {
-            return 1.0;
-        }
-        let k_round = k.round();
-        if (k - k_round).abs() <= 1e-9 && k_round <= 128.0 {
-            let n = k_round as usize;
-            let mut h = 0.0;
-            for i in 1..=n {
-                h += 1.0 / (i as f64);
-            }
-            return h;
-        }
-        let inv = 1.0 / k;
-        let inv2 = inv * inv;
-        let inv4 = inv2 * inv2;
-        k.ln() + euler_mascheroni + 0.5 * inv - (inv2 / 12.0) + (inv4 / 120.0)
+    fn recomb_prob_from_dist(&self, dist_morgans: f32) -> f32 {
+        let d = dist_morgans.max(0.0) as f64;
+        let lambda = self.costs.recomb_intensity.max(1e-12);
+        (-f64::exp_m1(-lambda * d)).clamp(0.0, 1.0) as f32
     }
 
     #[inline]
@@ -1712,10 +1545,9 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         out.reserve(list.len());
         for &h in list {
             out.push(
-                self
-                .packed_ref
-                .ref_allele_targ(marker, h)
-                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
+                self.packed_ref
+                    .ref_allele_targ(marker, h)
+                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw()),
             );
         }
         AlignedPoolAlleles {
@@ -2035,16 +1867,68 @@ fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> 
     out
 }
 
+fn donor_posterior_mass(beam: &[BeamPath], max_out: usize) -> Vec<(usize, f32)> {
+    if beam.is_empty() || max_out == 0 {
+        return Vec::new();
+    }
+    let mut best = i64::MAX;
+    for p in beam {
+        if p.model_score < best {
+            best = p.model_score;
+        }
+    }
+    let mut weights: Vec<f64> = Vec::with_capacity(beam.len());
+    let mut z = 0.0f64;
+    for p in beam {
+        // Scores are in scaled nats (1e6). Clip to avoid denorm/underflow churn.
+        let delta_nats = ((p.model_score - best) as f64 / 1_000_000.0).max(0.0);
+        let w = (-delta_nats.min(80.0)).exp();
+        weights.push(w);
+        z += w;
+    }
+    if z <= f64::MIN_POSITIVE {
+        return Vec::new();
+    }
+    let n_ref = beam
+        .iter()
+        .flat_map(|p| [p.hap1, p.hap2])
+        .max()
+        .map_or(0usize, |h| h.saturating_add(1));
+    if n_ref == 0 {
+        return Vec::new();
+    }
+    let mut mass = vec![0.0f64; n_ref];
+    for (p, &w) in beam.iter().zip(weights.iter()) {
+        // Let q(path) be posterior over beam paths after normalization.
+        // A haplotype can appear in either copy track (hap1/hap2), so we attribute:
+        //   mass(h) += 0.5*q(path) if h==hap1  +  0.5*q(path) if h==hap2
+        // This yields a symmetric marginal occupancy proxy over donor identities.
+        let post = w / z;
+        mass[p.hap1] += 0.5 * post;
+        mass[p.hap2] += 0.5 * post;
+    }
+    let mut ranked: Vec<(usize, f32)> = mass
+        .into_iter()
+        .enumerate()
+        .filter_map(|(h, m)| if m > 0.0 { Some((h, m as f32)) } else { None })
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if ranked.len() > max_out {
+        ranked.truncate(max_out);
+    }
+    ranked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
+    use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::ref_packed::PackedRefView;
-    use crate::data::haplotype::Samples;
     use crate::data::storage::phase_state::{Phased, Unphased};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
-    use crate::data::ChromIdx;
     use crate::model::parameters::ModelParams;
     use std::sync::Arc;
 
@@ -2146,8 +2030,7 @@ mod tests {
         let mut scratch_pool_alleles = Vec::new();
 
         {
-            let aligned =
-                phaser.fill_pool_alleles(0usize, &active_pool, &mut scratch_pool_alleles);
+            let aligned = phaser.fill_pool_alleles(0usize, &active_pool, &mut scratch_pool_alleles);
             assert_eq!(aligned.alleles().len(), active_pool.list().len());
             let mut switch_support = SwitchSupportCache::new();
             switch_support.ensure_initialized(0usize, 10, &aligned);
@@ -2159,8 +2042,7 @@ mod tests {
         assert_eq!(active_pool.list().len(), 2);
 
         {
-            let aligned =
-                phaser.fill_pool_alleles(1usize, &active_pool, &mut scratch_pool_alleles);
+            let aligned = phaser.fill_pool_alleles(1usize, &active_pool, &mut scratch_pool_alleles);
             assert_eq!(aligned.alleles().len(), active_pool.list().len());
             let mut switch_support = SwitchSupportCache::new();
             switch_support.ensure_initialized(1usize, 100, &aligned);
