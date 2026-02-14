@@ -575,7 +575,7 @@ pub struct ImputeWorkspace {
     emission_by_allele: Vec<f32>,
     nearest_obs_fwd: Vec<f32>,
     nearest_obs_bwd: Vec<f32>,
-    nearest_obs_retain: Vec<f32>,
+    pub(crate) nearest_obs_retain: Vec<f32>,
     affine_window_cache: Option<AffineWindowCache>,
     pattern_sum_f: Vec<f32>,
     pattern_sum_b: Vec<f32>,
@@ -1285,7 +1285,7 @@ fn recomb_lambda_from_p(p: f32) -> f32 {
     -q.ln()
 }
 
-fn compute_nearest_observed_lambda(
+pub(crate) fn compute_nearest_observed_lambda(
     ws: &mut ImputeWorkspace,
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
@@ -3189,6 +3189,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    external_nearest_obs_retain: Option<&[f32]>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_target_probs_nonempty(target_probs, context, K::LABEL)?;
@@ -3218,7 +3219,21 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let transition_haps = panel_haps;
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
-        compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
+        if let Some(ext_retain) = external_nearest_obs_retain {
+            // Use pre-computed retain from the full I/O window to avoid
+            // edge-biased smoothing at piecewise segment boundaries.
+            let n = target_probs.n_markers();
+            ws.nearest_obs_retain.resize(n, 0.0);
+            let copy_len = ext_retain.len().min(n);
+            ws.nearest_obs_retain[..copy_len].copy_from_slice(&ext_retain[..copy_len]);
+            // If external retain is shorter (shouldn't happen), fill remainder
+            // with 0.0 to trigger maximum smoothing as a safe fallback.
+            if copy_len < n {
+                ws.nearest_obs_retain[copy_len..n].fill(0.0);
+            }
+        } else {
+            compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
+        }
     } else {
         ws.nearest_obs_retain.clear();
     }
@@ -4003,6 +4018,7 @@ fn run_hmm_generic(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    external_nearest_obs_retain: Option<&[f32]>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     run_hmm_with_kernel(
@@ -4017,6 +4033,7 @@ fn run_hmm_generic(
         ref_allele_freqs,
         context,
         smoothing_cluster_cm,
+        external_nearest_obs_retain,
         ws,
     )
 }
@@ -4032,6 +4049,7 @@ fn run_hmm_seqcoded(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    external_nearest_obs_retain: Option<&[f32]>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     run_hmm_with_kernel(
@@ -4046,6 +4064,7 @@ fn run_hmm_seqcoded(
         ref_allele_freqs,
         context,
         smoothing_cluster_cm,
+        external_nearest_obs_retain,
         ws,
     )
 }
@@ -4064,6 +4083,7 @@ fn run_hmm_dictionary(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    external_nearest_obs_retain: Option<&[f32]>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     run_hmm_with_kernel(
@@ -4078,12 +4098,18 @@ fn run_hmm_dictionary(
         ref_allele_freqs,
         context,
         smoothing_cluster_cm,
+        external_nearest_obs_retain,
         ws,
     )
 }
 /// Run forward-backward HMM and emit allele posteriors.
 ///
 /// Returns (posteriors, optional state posterior at prior marker).
+///
+/// `external_nearest_obs_retain`: when `Some`, provides pre-computed
+/// nearest-observed-marker retain values computed over the full I/O window.
+/// This avoids edge-biased smoothing at piecewise segment boundaries where
+/// the per-segment computation cannot see typed anchors in adjacent segments.
 pub fn run_impute_hmm(
     state_haps: &[RefHapId],
     ref_columns: &[GenotypeColumn],
@@ -4095,6 +4121,7 @@ pub fn run_impute_hmm(
     ref_allele_freqs: &RefAlleleFreqs,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    external_nearest_obs_retain: Option<&[f32]>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     validate_reference_marker_count(ref_columns.len(), target_probs, context, "dispatch")?;
@@ -4126,6 +4153,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            external_nearest_obs_retain,
             ws,
         );
     }
@@ -4145,6 +4173,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            external_nearest_obs_retain,
             ws,
         );
     }
@@ -4164,6 +4193,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            external_nearest_obs_retain,
             ws,
         );
     }
@@ -4187,6 +4217,7 @@ pub fn run_impute_hmm(
             ref_allele_freqs,
             context,
             smoothing_cluster_cm,
+            external_nearest_obs_retain,
             ws,
         );
     }
@@ -4202,6 +4233,7 @@ pub fn run_impute_hmm(
         ref_allele_freqs,
         context,
         smoothing_cluster_cm,
+        external_nearest_obs_retain,
         ws,
     )
 }

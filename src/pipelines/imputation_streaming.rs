@@ -39,7 +39,7 @@ use crate::io::streaming::{
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::impute_hmm::{
     ImputeHmmContext, ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs, run_impute_hmm,
-    state_posteriors_to_priors,
+    state_posteriors_to_priors, compute_nearest_observed_lambda,
 };
 use crate::model::parameters::ModelParams;
 use crate::model::phase_query::{
@@ -445,6 +445,7 @@ struct ImputationPlan {
     per_window_caps: Vec<usize>, // per I/O window (global, same for all target haps)
     io_to_planning_ranges: Vec<(usize, usize)>, // per I/O window -> planning window range [start, end)
     planning_num_windows: usize,
+    planning_handoff: Vec<(f64, f64)>, // per planning window: (start_cm, end_cm)
     full_panel: bool,
     stats: ImputationPlanStats,
 }
@@ -2092,6 +2093,7 @@ fn build_imputation_plan(
         per_window_caps: Vec::new(),
         io_to_planning_ranges: Vec::new(),
         planning_num_windows: 0,
+        planning_handoff: Vec::new(),
         full_panel: false,
         stats: ImputationPlanStats::default(),
     };
@@ -2113,6 +2115,7 @@ fn build_imputation_plan(
     let per_window_caps = ref_data.per_window_caps();
     let (planning_handoff, io_to_planning_ranges) =
         build_planning_grid_from_handoff(window_handoff, params);
+    plan.planning_handoff = planning_handoff.clone();
     let planning_num_windows = planning_handoff.len();
     if planning_num_windows == 0 {
         return Err(ReagleError::vcf(
@@ -6307,7 +6310,7 @@ impl crate::pipelines::ImputationPipeline {
                     };
                     let use_piecewise_segments = n_markers > 0
                         && plan_range_end > plan_range_start + 1
-                        && plan_range_end <= planning_handoff.len();
+                        && plan_range_end <= plan.planning_handoff.len();
                     if use_piecewise_segments {
                         let mut marker_plan_idx = vec![plan_range_start; n_markers];
                         let mut pidx = plan_range_start;
@@ -6317,10 +6320,10 @@ impl crate::pipelines::ImputationPipeline {
                                 *slot = pidx;
                                 continue;
                             }
-                            while pidx + 1 < plan_range_end && gp >= planning_handoff[pidx].1 {
+                            while pidx + 1 < plan_range_end && gp >= plan.planning_handoff[pidx].1 {
                                 pidx += 1;
                             }
-                            while pidx > plan_range_start && gp < planning_handoff[pidx].0 {
+                            while pidx > plan_range_start && gp < plan.planning_handoff[pidx].0 {
                                 pidx -= 1;
                             }
                             *slot = pidx;
@@ -6344,6 +6347,20 @@ impl crate::pipelines::ImputationPipeline {
                         let mut out_posts: Vec<AllelePosteriors> =
                             Vec::with_capacity(output_markers);
                         let mut subsetted_any = false;
+
+                        // Pre-compute nearest-observed-marker retain over the
+                        // full I/O window so per-segment HMM smoothing can see
+                        // typed anchors in adjacent segments.
+                        let full_window_retain: Vec<f32> = {
+                            let mut tmp_ws = ImputeWorkspace::new(1, n_markers);
+                            compute_nearest_observed_lambda(
+                                &mut tmp_ws,
+                                input_probs,
+                                &p_recomb,
+                                smoothing_cluster_cm,
+                            );
+                            tmp_ws.nearest_obs_retain[..n_markers].to_vec()
+                        };
 
                         for (seg_start, seg_end, seg_plan_start, seg_plan_end) in segments {
                             let seg_len = seg_end.saturating_sub(seg_start);
@@ -6498,6 +6515,7 @@ impl crate::pipelines::ImputationPipeline {
                                         hap_idx: hap_idx.as_usize(),
                                     },
                                     smoothing_cluster_cm,
+                                    Some(&full_window_retain[seg_start..seg_end]),
                                     ws,
                                 )
                             })?;
@@ -6695,6 +6713,7 @@ impl crate::pipelines::ImputationPipeline {
                                 hap_idx: hap_idx.as_usize(),
                             },
                             smoothing_cluster_cm,
+                            None,
                             ws,
                         )
                     })?;
