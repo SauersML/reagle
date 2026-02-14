@@ -142,23 +142,6 @@ fn logaddexp(a: f32, b: f32) -> f32 {
     }
 }
 
-#[inline]
-fn dropout_credit_at(
-    credit: Option<&[(usize, f32)]>,
-    idx: &mut usize,
-    window: usize,
-) -> Option<f32> {
-    let credits = credit?;
-    while *idx < credits.len() && credits[*idx].0 < window {
-        *idx += 1;
-    }
-    if *idx < credits.len() && credits[*idx].0 == window {
-        Some(credits[*idx].1)
-    } else {
-        None
-    }
-}
-
 #[derive(Default)]
 struct DpScratch {
     dp0: Vec<f32>,
@@ -252,7 +235,7 @@ fn dp_intervals_sparse_scratch(
     scores: &[(usize, f32)],
     logz: &[f32],
     mu: f32,
-    dropout_credit: Option<&[(usize, f32)]>,
+    lambda_w: &[f32],
     blocked: &[bool],
     t11: &[f32],
     t10: &[f32],
@@ -272,20 +255,14 @@ fn dp_intervals_sparse_scratch(
     active.fill(false);
 
     let mut s_idx = 0usize;
-    let mut c_idx = 0usize;
     let mut score0 = NEG_INF;
     if !scores.is_empty() && scores[0].0 == 0 {
         score0 = scores[0].1;
         s_idx = 1;
     }
     dp0[0] = 0.0;
-    let mut bonus0 = 0.0f32;
-    if score0 <= NEG_INF {
-        if let Some(bonus) = dropout_credit_at(dropout_credit, &mut c_idx, 0) {
-            bonus0 = bonus.max(0.0);
-        }
-    }
-    let mut u0 = logaddexp(logz[0], score0) - logz[0] - mu + bonus0;
+    let penalty0 = mu + lambda_w.get(0).copied().unwrap_or(0.0).max(0.0);
+    let mut u0 = logaddexp(logz[0], score0) - logz[0] - penalty0;
     if blocked.get(0).copied().unwrap_or(false) {
         u0 = NEG_INF;
     }
@@ -297,13 +274,8 @@ fn dp_intervals_sparse_scratch(
             score = scores[s_idx].1;
             s_idx += 1;
         }
-        let mut bonus_w = 0.0f32;
-        if score <= NEG_INF {
-            if let Some(bonus) = dropout_credit_at(dropout_credit, &mut c_idx, i) {
-                bonus_w = bonus.max(0.0);
-            }
-        }
-        let mut u_w = logaddexp(logz[i], score) - logz[i] - mu + bonus_w;
+        let penalty_w = mu + lambda_w.get(i).copied().unwrap_or(0.0).max(0.0);
+        let mut u_w = logaddexp(logz[i], score) - logz[i] - penalty_w;
         if blocked.get(i).copied().unwrap_or(false) {
             u_w = NEG_INF;
         }
@@ -574,7 +546,7 @@ fn refresh_blocked_flags(counts: &[usize], per_window_caps: &[usize], blocked: &
 
 fn fill_residual_capacity(
     scores_by_hap: &[Vec<(usize, f32)>],
-    dropout_credit_by_hap: Option<&[Vec<(usize, f32)>]>,
+    lambda_w: &[f32],
     per_window_caps: &[usize],
     t11: &[f32],
     t10: &[f32],
@@ -609,9 +581,7 @@ fn fill_residual_capacity(
                 &scores_by_hap[h],
                 z_w,
                 0.0,
-                dropout_credit_by_hap
-                    .and_then(|credits| credits.get(h))
-                    .map(|v| v.as_slice()),
+                lambda_w,
                 blocked_scratch,
                 t11,
                 t10,
@@ -678,7 +648,6 @@ fn fill_residual_capacity(
 /// - per_window_caps: per-window max states (global, same for all target haps).
 pub fn allocate_lms_sparse(
     scores_by_hap: &[Vec<(usize, f32)>],
-    dropout_credit_by_hap: Option<&[Vec<(usize, f32)>]>,
     candidate_haps: &[usize],
     num_windows: usize,
     boundary_cm: &[f64],
@@ -722,160 +691,21 @@ pub fn allocate_lms_sparse(
     let mut z_w = vec![0.0f32; w];
     let mut selected_states: Vec<Option<AllocationState>> = vec![None; n];
     let mut remaining = total_budget;
+    let zero_lambda = vec![0.0f32; w];
 
     let n_pool_by_boundary =
         boundary_pool_sizes_from_scores(scores_by_hap, w, per_window_caps, n_pool);
     let (t11, t10, t01) = continuity_terms(boundary_cm, params, &n_pool_by_boundary);
 
-    // Determine mu by bracket + coarse search + local refinement.
-    // Larger mu reduces activations under the same surrogate objective.
-    let mut mu_low = -10.0f32;
-    let mut mu_high = 10.0f32;
-
-    let mut low_iter = 0usize;
-    while low_iter < 5 {
-        let (used, _) =
-            simulate_allocation(
-                scores_by_hap,
-                dropout_credit_by_hap,
-                w,
-                &t11,
-                &t10,
-                &t01,
-                mu_low,
-                total_budget,
-                per_window_caps,
-            );
-        if used >= total_budget {
-            break;
-        }
-        mu_low -= 5.0;
-        low_iter += 1;
-    }
-    let mut high_iter = 0usize;
-    while high_iter < 5 {
-        let (used, _) =
-            simulate_allocation(
-                scores_by_hap,
-                dropout_credit_by_hap,
-                w,
-                &t11,
-                &t10,
-                &t01,
-                mu_high,
-                total_budget,
-                per_window_caps,
-            );
-        if used <= total_budget {
-            break;
-        }
-        mu_high += 5.0;
-        high_iter += 1;
-    }
-
-    let mut mu_best = mu_high;
-    let mut best_used = 0usize;
-    let mut best_gain = NEG_INF;
-    let mut best_k = 0usize;
-    let mut found_feasible = false;
-    let mut coarse_samples: Vec<(f32, usize, f32)> = Vec::with_capacity(17);
-    let mut k = 0usize;
-    while k < 17 {
-        let t = k as f32 / 16.0;
-        let mu = mu_low + t * (mu_high - mu_low);
-        let (used, gain) =
-            simulate_allocation(
-                scores_by_hap,
-                dropout_credit_by_hap,
-                w,
-                &t11,
-                &t10,
-                &t01,
-                mu,
-                total_budget,
-                per_window_caps,
-            );
-        coarse_samples.push((mu, used, gain));
-        if used <= total_budget
-            && (!found_feasible || gain > best_gain || (gain == best_gain && used > best_used))
-        {
-            found_feasible = true;
-            mu_best = mu;
-            best_used = used;
-            best_gain = gain;
-            best_k = k;
-        }
-        k += 1;
-    }
-
-    if found_feasible {
-        let mut left = if best_k > 0 {
-            coarse_samples[best_k - 1].0
-        } else {
-            mu_low
-        };
-        let mut right = if best_k + 1 < coarse_samples.len() {
-            coarse_samples[best_k + 1].0
-        } else {
-            mu_high
-        };
-        let mut refine_iter = 0usize;
-        while refine_iter < 3 {
-            let span = right - left;
-            if span <= 1e-3 {
-                break;
-            }
-            let step = span / 8.0;
-            let mut j = 0usize;
-            while j < 9 {
-                let mu = left + step * j as f32;
-                let (used, gain) =
-                    simulate_allocation(
-                        scores_by_hap,
-                        dropout_credit_by_hap,
-                        w,
-                        &t11,
-                        &t10,
-                        &t01,
-                        mu,
-                        total_budget,
-                        per_window_caps,
-                    );
-                if used <= total_budget
-                    && (gain > best_gain || (gain == best_gain && used > best_used))
-                {
-                    mu_best = mu;
-                    best_used = used;
-                    best_gain = gain;
-                }
-                j += 1;
-            }
-            left = (mu_best - step).max(mu_low);
-            right = (mu_best + step).min(mu_high);
-            refine_iter += 1;
-        }
-    } else if !coarse_samples.is_empty() {
-        // Fallback under non-monotone allocation behavior: minimize overuse first,
-        // then maximize gain. This keeps mu selection stable even when
-        // approximate monotonicity in used(mu) is imperfect.
-        let mut fallback_mu = coarse_samples[0].0;
-        let mut fallback_overuse = coarse_samples[0].1.saturating_sub(total_budget);
-        let mut fallback_gain = coarse_samples[0].2;
-        let mut i = 1usize;
-        while i < coarse_samples.len() {
-            let (mu_i, used_i, gain_i) = coarse_samples[i];
-            let overuse = used_i.saturating_sub(total_budget);
-            if overuse < fallback_overuse || (overuse == fallback_overuse && gain_i > fallback_gain)
-            {
-                fallback_mu = mu_i;
-                fallback_overuse = overuse;
-                fallback_gain = gain_i;
-            }
-            i += 1;
-        }
-        mu_best = fallback_mu;
-    }
-    let mu = mu_best;
+    let (mu, lambda_w) = dual_penalties(
+        scores_by_hap,
+        w,
+        &t11,
+        &t10,
+        &t01,
+        total_budget,
+        per_window_caps,
+    );
 
     #[derive(Clone)]
     struct HeapEntry {
@@ -918,9 +748,7 @@ pub fn allocate_lms_sparse(
                 scores,
                 &z_w,
                 mu,
-                dropout_credit_by_hap
-                    .and_then(|credits| credits.get(h))
-                    .map(|v| v.as_slice()),
+                &lambda_w,
                 &blocked_scratch,
                 &t11,
                 &t10,
@@ -946,9 +774,7 @@ pub fn allocate_lms_sparse(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
-            dropout_credit_by_hap
-                .and_then(|credits| credits.get(entry.idx))
-                .map(|v| v.as_slice()),
+            &lambda_w,
             &blocked_scratch,
             &t11,
             &t10,
@@ -987,7 +813,7 @@ pub fn allocate_lms_sparse(
     // Residual-capacity fill under true objective (mu=0).
     fill_residual_capacity(
         scores_by_hap,
-        dropout_credit_by_hap,
+        &zero_lambda,
         per_window_caps,
         &t11,
         &t10,
@@ -1024,9 +850,7 @@ pub fn allocate_lms_sparse(
             &scores_by_hap[polish_idx],
             &z_w,
             mu,
-            dropout_credit_by_hap
-                .and_then(|credits| credits.get(polish_idx))
-                .map(|v| v.as_slice()),
+            &lambda_w,
             &blocked_scratch,
             &t11,
             &t10,
@@ -1080,7 +904,7 @@ pub fn allocate_lms_sparse(
     // Final residual pass after polish.
     fill_residual_capacity(
         scores_by_hap,
-        dropout_credit_by_hap,
+        &zero_lambda,
         per_window_caps,
         &t11,
         &t10,
@@ -1107,23 +931,18 @@ pub fn allocate_lms_sparse(
 
     WindowAllocation { intervals_by_hap }
 }
-fn simulate_allocation(
+fn simulate_relaxed_allocation(
     scores_by_hap: &[Vec<(usize, f32)>],
-    dropout_credit_by_hap: Option<&[Vec<(usize, f32)>]>,
     num_windows: usize,
     t11: &[f32],
     t10: &[f32],
     t01: &[f32],
     mu: f32,
-    total_budget: usize,
-    per_window_caps: &[usize],
-) -> (usize, f32) {
+    lambda_w: &[f32],
+) -> (usize, Vec<usize>, f32) {
     let w = num_windows;
     if w == 0 {
-        return (0, 0.0);
-    }
-    if per_window_caps.len() != w {
-        return (0, 0.0);
+        return (0, Vec::new(), 0.0);
     }
     let n = scores_by_hap.len();
     let mut counts = vec![0usize; w];
@@ -1162,27 +981,21 @@ fn simulate_allocation(
 
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut dp_scratch = DpScratch::default();
-    let mut blocked_scratch: Vec<bool> = vec![false; w];
-    {
-        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
-        for h in 0..n {
-            let scores = &scores_by_hap[h];
-            let (gain, len) = dp_intervals_sparse_scratch(
-                scores,
-                &z_w,
-                mu,
-                dropout_credit_by_hap
-                    .and_then(|credits| credits.get(h))
-                    .map(|v| v.as_slice()),
-                &blocked_scratch,
-                t11,
-                t10,
-                t01,
-                &mut dp_scratch,
-            );
-            if gain > 0.0 && len > 0 {
-                heap.push(HeapEntry { gain, idx: h });
-            }
+    let blocked = vec![false; w];
+    for h in 0..n {
+        let (gain, len) = dp_intervals_sparse_scratch(
+            &scores_by_hap[h],
+            &z_w,
+            mu,
+            lambda_w,
+            &blocked,
+            t11,
+            t10,
+            t01,
+            &mut dp_scratch,
+        );
+        if gain > 0.0 && len > 0 {
+            heap.push(HeapEntry { gain, idx: h });
         }
     }
 
@@ -1191,22 +1004,19 @@ fn simulate_allocation(
         if selected[entry.idx] {
             continue;
         }
-        refresh_blocked_flags(&counts, per_window_caps, &mut blocked_scratch);
         let (gain, len) = dp_intervals_sparse_scratch(
             &scores_by_hap[entry.idx],
             &z_w,
             mu,
-            dropout_credit_by_hap
-                .and_then(|credits| credits.get(entry.idx))
-                .map(|v| v.as_slice()),
-            &blocked_scratch,
+            lambda_w,
+            &blocked,
             t11,
             t10,
             t01,
             &mut dp_scratch,
         );
         let active = dp_scratch.active[..w].to_vec();
-        if gain <= 0.0 || len == 0 || used.saturating_add(len) > total_budget {
+        if gain <= 0.0 || len == 0 {
             continue;
         }
         let next_gain = heap.peek().map(|e| e.gain).unwrap_or(NEG_INF);
@@ -1215,7 +1025,7 @@ fn simulate_allocation(
             total_gain += gain;
             used += len;
             for win in 0..w {
-                if active[win] && counts[win] < per_window_caps[win] {
+                if active[win] {
                     counts[win] += 1;
                 }
             }
@@ -1230,7 +1040,41 @@ fn simulate_allocation(
         }
     }
 
-    (used, total_gain)
+    (used, counts, total_gain)
+}
+
+fn dual_penalties(
+    scores_by_hap: &[Vec<(usize, f32)>],
+    num_windows: usize,
+    t11: &[f32],
+    t10: &[f32],
+    t01: &[f32],
+    total_budget: usize,
+    per_window_caps: &[usize],
+) -> (f32, Vec<f32>) {
+    let w = num_windows;
+    if w == 0 {
+        return (0.0, Vec::new());
+    }
+    let mut mu = 0.0f32;
+    let mut lambda_w = vec![0.0f32; w];
+    let budget_f = total_budget as f32;
+    let mut iter = 0usize;
+    while iter < 24 {
+        let (used_total, used_by_window, _) =
+            simulate_relaxed_allocation(scores_by_hap, w, t11, t10, t01, mu, &lambda_w);
+        let step = 0.8f32 / ((iter + 1) as f32).sqrt();
+        mu = (mu + step * (used_total as f32 - budget_f)).max(0.0);
+        let mut win = 0usize;
+        while win < w {
+            let cap = per_window_caps.get(win).copied().unwrap_or(0) as f32;
+            let used = used_by_window.get(win).copied().unwrap_or(0) as f32;
+            lambda_w[win] = (lambda_w[win] + step * (used - cap)).max(0.0);
+            win += 1;
+        }
+        iter += 1;
+    }
+    (mu, lambda_w)
 }
 
 #[cfg(test)]

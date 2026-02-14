@@ -719,6 +719,15 @@ fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
     for i in 0..shared_len {
         let pf = clamp_prob(fwd[i]);
         let pb = clamp_prob(bwd[i]);
+        // Conservative linear pooling for correlated forward/reverse passes.
+        //
+        // Forward and reverse traversals are computed from the same marker evidence,
+        // so they are strongly dependent. Odds multiplication (logit-add) assumes
+        // conditional independence and overconcentrates posterior mass.
+        //
+        // We therefore use:
+        //   p = 0.5 * pf + 0.5 * pb
+        // as a calibration-preserving compromise.
         out.push(clamp_prob(0.5 * (pf + pb)));
     }
     // Exact tail behavior when reverse is missing:
@@ -744,6 +753,8 @@ fn merge_donor_mass(
         if !m.is_finite() || m <= 0.0 {
             continue;
         }
+        // Approximate two-sided donor posterior support by additive pooling of
+        // marginal occupancy mass from forward and reverse beam passes.
         *accum.entry(h).or_insert(0.0) += m;
     }
     let mut ranked: Vec<(usize, f32)> = accum.into_iter().collect();
@@ -3184,6 +3195,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         &mut active_pool_rev,
                         &mut injector_rev,
                     );
+                    let bwd_donor_mass = bwd.donor_mass.clone();
                     let mut p_swapped_bwd = bwd.p_swapped;
                     p_swapped_bwd.reverse();
                     let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
@@ -3201,7 +3213,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             .beam_width
                             .max(beam_config.inject_k.saturating_mul(2))
                             .max(beam_config.switch_candidates.saturating_mul(4));
-                        let donors = merge_donor_mass(&fwd.donor_mass, &bwd.donor_mass, cap, 1e-6);
+                        let donors = merge_donor_mass(&fwd.donor_mass, &bwd_donor_mass, cap, 1e-6);
                         slot.extend(donors);
                     }
                 });
@@ -5239,7 +5251,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
                 let allocation = allocate_lms_sparse(
                     &scores_by_hap,
-                    None,
                     &candidate_haps,
                     num_windows,
                     &boundary_cm,
@@ -8805,7 +8816,11 @@ fn build_haploid_constrained_emit_profile(
             } else {
                 geno_a1
             };
-            let opposite = if required == geno_a1 { geno_a2 } else { geno_a1 };
+            let opposite = if required == geno_a1 {
+                geno_a2
+            } else {
+                geno_a1
+            };
             // Marginalize over partner orientation uncertainty:
             // q = P(current fixed_allele assignment is correct).
             let raw_required = q * p_no_err + (1.0 - q) * p_err;
@@ -13120,10 +13135,8 @@ mod tests {
         );
 
         // As phase confidence increases, required allele should become preferred.
-        let emit_ref1_high =
-            emit_haploid_constrained(1, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
-        let emit_ref0_high =
-            emit_haploid_constrained(0, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
+        let emit_ref1_high = emit_haploid_constrained(1, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
+        let emit_ref0_high = emit_haploid_constrained(0, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
         assert!(
             emit_ref1_high > emit_ref0_high,
             "Expected required allele preferred at high phase confidence, got ref1={} ref0={}",
@@ -13620,7 +13633,6 @@ mod tests {
         let params = pipeline.params.clone();
         let allocation = allocate_lms_sparse(
             &scores_by_hap,
-            None,
             &candidate_haps,
             num_windows,
             &boundary_cm,

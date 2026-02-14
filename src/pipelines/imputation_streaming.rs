@@ -250,12 +250,6 @@ const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
-const DROPOUT_MAX_GAP_WINDOWS: usize = 2;
-const DROPOUT_MAX_GAP_CM: f64 = 0.35;
-const DROPOUT_MIN_FLANK_SCORE: f32 = 0.25;
-const DROPOUT_MIN_FLANK_RATIO: f32 = 0.5;
-const DROPOUT_BONUS_MIN: f32 = 0.03;
-const DROPOUT_BONUS_MAX: f32 = 0.35;
 const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
@@ -1293,81 +1287,6 @@ fn adaptive_top_m_window(
         out = out.saturating_mul(PRESCAN_TOPM_STRONG_MULT_NUM) / PRESCAN_TOPM_STRONG_MULT_DEN;
     }
     out.max(per_window_cap_window.max(1)).min(n_ref_haps.max(1))
-}
-
-fn build_dropout_credit_map(
-    scores_by_hap: &[Vec<(usize, f32)>],
-    num_windows: usize,
-    boundary_cm: &[f64],
-) -> Vec<Vec<(usize, f32)>> {
-    let mut out: Vec<Vec<(usize, f32)>> = vec![Vec::new(); scores_by_hap.len()];
-    if num_windows == 0 {
-        return out;
-    }
-    for (hap_idx, scores) in scores_by_hap.iter().enumerate() {
-        if scores.len() < 2 {
-            continue;
-        }
-        for pair in scores.windows(2) {
-            let (left_w, left_s) = pair[0];
-            let (right_w, right_s) = pair[1];
-            if !left_s.is_finite() || !right_s.is_finite() || left_s <= 0.0 || right_s <= 0.0 {
-                continue;
-            }
-            if right_w <= left_w + 1 {
-                continue;
-            }
-            let gap = right_w - left_w - 1;
-            if gap == 0 || gap > DROPOUT_MAX_GAP_WINDOWS {
-                continue;
-            }
-            let flank_min = left_s.min(right_s);
-            let flank_max = left_s.max(right_s);
-            if flank_min < DROPOUT_MIN_FLANK_SCORE {
-                continue;
-            }
-            if flank_min < flank_max * DROPOUT_MIN_FLANK_RATIO {
-                continue;
-            }
-            let mut gap_cm = 0.0f64;
-            for b in left_w..right_w {
-                gap_cm += boundary_cm.get(b).copied().unwrap_or(0.0).max(0.0);
-            }
-            if gap_cm > DROPOUT_MAX_GAP_CM {
-                continue;
-            }
-            let balance = (flank_min / (flank_max + 1e-6)).clamp(0.0, 1.0);
-            let cm_credit = (1.0 - (gap_cm / DROPOUT_MAX_GAP_CM) as f32).clamp(0.0, 1.0);
-            let gap_penalty = if gap == 1 { 0.0 } else { 0.08 };
-            let bonus = (0.10 + 0.18 * balance + 0.12 * cm_credit - gap_penalty)
-                .clamp(DROPOUT_BONUS_MIN, DROPOUT_BONUS_MAX);
-            for w in (left_w + 1)..right_w {
-                if w < num_windows {
-                    out[hap_idx].push((w, bonus));
-                }
-            }
-        }
-    }
-    for credits in out.iter_mut() {
-        if credits.len() <= 1 {
-            continue;
-        }
-        credits.sort_by_key(|(w, _)| *w);
-        let mut write = 0usize;
-        let mut read = 0usize;
-        while read < credits.len() {
-            let (w, mut bonus) = credits[read];
-            read += 1;
-            while read < credits.len() && credits[read].0 == w {
-                bonus = bonus.max(credits[read].1);
-                read += 1;
-            }
-            credits[write] = (w, bonus);
-            write += 1;
-        }
-        credits.truncate(write);
-    }
-    out
 }
 
 fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
@@ -2745,8 +2664,6 @@ fn build_imputation_plan(
     let mut adaptive_top_m_max = 0usize;
     let mut adaptive_top_m_boosted = 0usize;
     let mut adaptive_top_m_reduced = 0usize;
-    let mut dropout_credit_haps_total = 0usize;
-    let mut dropout_credit_windows_total = 0usize;
     while batch_start < n_target_haps {
         batch_idx += 1;
         let batch_end = (batch_start + batch_size).min(n_target_haps);
@@ -3376,7 +3293,7 @@ fn build_imputation_plan(
                         }
                     }
                 }
-                let (intervals, core, dropout_haps, dropout_windows) = if per_window_cap_min >= n_ref_haps {
+                let (intervals, core) = if per_window_cap_min >= n_ref_haps {
                     // Keep abyss active even when we can fit the full panel:
                     // here abyss is a denoising prior over candidate donors,
                     // not only a memory-pruning mechanism.
@@ -3394,17 +3311,14 @@ fn build_imputation_plan(
                         });
                         core.push(hap);
                     }
-                    (intervals, core, 0usize, 0usize)
+                    (intervals, core)
                 } else {
                     let (candidate_haps, scores_by_hap) =
                         build_sparse_scores(window_scores_matrix, &abyss);
-                    let dropout_credit_by_hap =
-                        build_dropout_credit_map(&scores_by_hap, num_windows, &boundary_cm);
                     let global_slot_budget =
                         per_window_caps_used.iter().copied().sum::<usize>().max(1);
                     let allocation = crate::model::state_allocator::allocate_lms_sparse(
                         &scores_by_hap,
-                        Some(&dropout_credit_by_hap),
                         &candidate_haps,
                         num_windows,
                         &boundary_cm,
@@ -3428,15 +3342,7 @@ fn build_imputation_plan(
                             core.push(hi.hap);
                         }
                     }
-                    let dropout_haps = dropout_credit_by_hap
-                        .iter()
-                        .filter(|credits| !credits.is_empty())
-                        .count();
-                    let dropout_windows = dropout_credit_by_hap
-                        .iter()
-                        .map(|credits| credits.len())
-                        .sum::<usize>();
-                    (intervals, core, dropout_haps, dropout_windows)
+                    (intervals, core)
                 };
                 let core_len = core.len();
                 let intervals_len = intervals.len();
@@ -3448,30 +3354,15 @@ fn build_imputation_plan(
                     core_len,
                     intervals_len,
                     abyss_count,
-                    dropout_haps,
-                    dropout_windows,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        for (
-            hap_idx,
-            abyss,
-            intervals,
-            core,
-            core_len,
-            intervals_len,
-            abyss_count,
-            dropout_haps,
-            dropout_windows,
-        ) in batch_results
+        for (hap_idx, abyss, intervals, core, core_len, intervals_len, abyss_count) in batch_results
         {
             plan.abyss_mask[hap_idx] = abyss;
             plan.window_intervals[hap_idx] = intervals;
             plan.core_states[hap_idx] = core;
-            dropout_credit_haps_total = dropout_credit_haps_total.saturating_add(dropout_haps);
-            dropout_credit_windows_total =
-                dropout_credit_windows_total.saturating_add(dropout_windows);
             plan.stats.update(
                 core_len,
                 intervals_len.saturating_sub(core_len),
@@ -3533,11 +3424,6 @@ fn build_imputation_plan(
             adaptive_top_m_reduced
         );
     }
-    eprintln!(
-        "LMS dropout credits: haps={} windows={}",
-        dropout_credit_haps_total, dropout_credit_windows_total
-    );
-
     Ok(plan)
 }
 
@@ -6646,15 +6532,15 @@ impl crate::pipelines::ImputationPipeline {
                         let r = constraints.len();
                         let mut lambdas = vec![0.0f32; r];
                         let mut selected: Vec<usize> = Vec::with_capacity(k);
-                        let mut covered = vec![0usize; r];
+                        let mut covered = vec![false; r];
                         let mut best_selected: Option<Vec<usize>> = None;
                         let mut best_covered_weight = 0.0f32;
                         let mut best_base = 0usize;
+                        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(candidates.len());
                         const MAX_DUAL_ITERS: usize = 32;
 
                         for iter in 0..MAX_DUAL_ITERS {
-                            let mut scored: Vec<(usize, f32)> =
-                                Vec::with_capacity(candidates.len());
+                            scored.clear();
                             for (idx, cand) in candidates.iter().enumerate() {
                                 let mut score = if cand.is_base { 1.0 } else { 0.0 };
                                 for &j in &cand.constraints {
@@ -6662,7 +6548,7 @@ impl crate::pipelines::ImputationPipeline {
                                 }
                                 scored.push((idx, score));
                             }
-                            scored.sort_unstable_by(|a, b| {
+                            let rank_cmp = |a: &(usize, f32), b: &(usize, f32)| {
                                 b.1.partial_cmp(&a.1)
                                     .unwrap_or(std::cmp::Ordering::Equal)
                                     .then_with(|| {
@@ -6676,28 +6562,25 @@ impl crate::pipelines::ImputationPipeline {
                                             .as_u32()
                                             .cmp(&candidates[b.0].hap.as_u32())
                                     })
-                            });
+                            };
+                            if scored.len() > k {
+                                scored.select_nth_unstable_by(k - 1, rank_cmp);
+                            }
 
                             selected.clear();
-                            covered.fill(0);
-                            for (idx, _) in scored.into_iter().take(k) {
+                            covered.fill(false);
+                            let mut covered_count = 0usize;
+                            let mut covered_weight = 0.0f32;
+                            for &(idx, _) in scored.iter().take(k) {
                                 selected.push(idx);
                                 for &j in &candidates[idx].constraints {
-                                    covered[j] += 1;
+                                    if !covered[j] {
+                                        covered[j] = true;
+                                        covered_count += 1;
+                                        covered_weight += constraints[j].weight;
+                                    }
                                 }
                             }
-                            let covered_count = covered.iter().filter(|&&c| c > 0).count();
-                            let covered_weight: f32 = covered
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(j, &c)| {
-                                    if c > 0 {
-                                        Some(constraints[j].weight)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .sum();
                             let base_count = selected
                                 .iter()
                                 .filter(|&&idx| candidates[idx].is_base)
@@ -6717,7 +6600,7 @@ impl crate::pipelines::ImputationPipeline {
 
                             let eta = 1.0f32 / ((iter + 1) as f32).sqrt();
                             for j in 0..r {
-                                let v = if covered[j] > 0 {
+                                let v = if covered[j] {
                                     0.0
                                 } else {
                                     constraints[j].weight
@@ -6729,6 +6612,8 @@ impl crate::pipelines::ImputationPipeline {
                         let Some(chosen) = best_selected else {
                             return;
                         };
+                        let state_set: std::collections::HashSet<RefHapId> =
+                            state_haps.iter().copied().collect();
                         let chosen_set: std::collections::HashSet<RefHapId> = chosen
                             .iter()
                             .map(|&idx| candidates[idx].hap)
@@ -6743,7 +6628,7 @@ impl crate::pipelines::ImputationPipeline {
                         let mut extras: Vec<RefHapId> = chosen
                             .iter()
                             .map(|&idx| candidates[idx].hap)
-                            .filter(|hap| !state_haps.contains(hap))
+                            .filter(|hap| !state_set.contains(hap))
                             .collect();
                         extras.sort_unstable_by_key(|h| h.as_u32());
                         for hap in extras {
