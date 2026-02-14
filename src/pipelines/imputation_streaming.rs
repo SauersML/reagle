@@ -525,7 +525,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.01 + 0.22 * missing_ramp;
+    let floor = 0.01 + 0.05 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
 }
 
@@ -6445,6 +6445,7 @@ impl crate::pipelines::ImputationPipeline {
                         });
                         Ok((out, HaplotypePriors::new(priors.ids().to_vec(), probs)))
                     };
+                    let correct_errors = self.config.err.is_some();
                     let mut process_haplotype = |hap_idx: HapIdx,
                                                  priors: Option<&HaplotypePriors>,
                                                  input_probs: &mut TargetAlleleProbs,
@@ -6854,21 +6855,23 @@ impl crate::pipelines::ImputationPipeline {
                     // Preserve direct target evidence at observed markers. Imputation
                     // should not overwrite measured genotype probabilities at typed
                     // sites, otherwise dosage correlation is artificially degraded.
-                    for (out_idx, ref_m) in (output_start..output_end).enumerate() {
-                        if !input_probs.is_observed_marker(ref_m) {
-                            continue;
+                    if !correct_errors {
+                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                            if !input_probs.is_observed_marker(ref_m) {
+                                continue;
+                            }
+                            let probs = input_probs.probs_for_marker(ref_m);
+                            if probs.is_empty() {
+                                continue;
+                            }
+                            posteriors[out_idx] = if probs.len() == 2 {
+                                AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
+                            } else {
+                                AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                    probs.to_vec(),
+                                ))
+                            };
                         }
-                        let probs = input_probs.probs_for_marker(ref_m);
-                        if probs.is_empty() {
-                            continue;
-                        }
-                        posteriors[out_idx] = if probs.len() == 2 {
-                            AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
-                        } else {
-                            AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
-                                probs.to_vec(),
-                            ))
-                        };
                     }
 
                     let mut next_priors = HaplotypePriors::empty();
@@ -8528,7 +8531,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
                     return d;
                 }
@@ -8626,7 +8629,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(gt) = hard_call {
                     return gt;
                 }
@@ -8727,7 +8730,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                     return (a1 as f32, a2 as f32);
                 }
@@ -9331,7 +9334,10 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                let weight = prescan_match_weight(freq, min_freq);
+                if weight <= 0.0 {
+                    continue;
+                }
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
