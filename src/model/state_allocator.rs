@@ -143,7 +143,7 @@ fn logaddexp(a: f32, b: f32) -> f32 {
 }
 
 #[inline]
-fn dropout_eta_at(
+fn dropout_credit_at(
     credit: Option<&[(usize, f32)]>,
     idx: &mut usize,
     window: usize,
@@ -279,13 +279,13 @@ fn dp_intervals_sparse_scratch(
         s_idx = 1;
     }
     dp0[0] = 0.0;
-    let mut mu0 = mu;
+    let mut bonus0 = 0.0f32;
     if score0 <= NEG_INF {
-        if let Some(eta) = dropout_eta_at(dropout_credit, &mut c_idx, 0) {
-            mu0 *= eta.clamp(0.0, 1.0);
+        if let Some(bonus) = dropout_credit_at(dropout_credit, &mut c_idx, 0) {
+            bonus0 = bonus.max(0.0);
         }
     }
-    let mut u0 = logaddexp(logz[0], score0) - logz[0] - mu0;
+    let mut u0 = logaddexp(logz[0], score0) - logz[0] - mu + bonus0;
     if blocked.get(0).copied().unwrap_or(false) {
         u0 = NEG_INF;
     }
@@ -297,13 +297,13 @@ fn dp_intervals_sparse_scratch(
             score = scores[s_idx].1;
             s_idx += 1;
         }
-        let mut mu_w = mu;
+        let mut bonus_w = 0.0f32;
         if score <= NEG_INF {
-            if let Some(eta) = dropout_eta_at(dropout_credit, &mut c_idx, i) {
-                mu_w *= eta.clamp(0.0, 1.0);
+            if let Some(bonus) = dropout_credit_at(dropout_credit, &mut c_idx, i) {
+                bonus_w = bonus.max(0.0);
             }
         }
-        let mut u_w = logaddexp(logz[i], score) - logz[i] - mu_w;
+        let mut u_w = logaddexp(logz[i], score) - logz[i] - mu + bonus_w;
         if blocked.get(i).copied().unwrap_or(false) {
             u_w = NEG_INF;
         }
@@ -743,6 +743,7 @@ pub fn allocate_lms_sparse(
                 &t10,
                 &t01,
                 mu_low,
+                total_budget,
                 per_window_caps,
             );
         if used >= total_budget {
@@ -762,6 +763,7 @@ pub fn allocate_lms_sparse(
                 &t10,
                 &t01,
                 mu_high,
+                total_budget,
                 per_window_caps,
             );
         if used <= total_budget {
@@ -790,6 +792,7 @@ pub fn allocate_lms_sparse(
                 &t10,
                 &t01,
                 mu,
+                total_budget,
                 per_window_caps,
             );
         coarse_samples.push((mu, used, gain));
@@ -835,6 +838,7 @@ pub fn allocate_lms_sparse(
                         &t10,
                         &t01,
                         mu,
+                        total_budget,
                         per_window_caps,
                     );
                 if used <= total_budget
@@ -1111,6 +1115,7 @@ fn simulate_allocation(
     t10: &[f32],
     t01: &[f32],
     mu: f32,
+    total_budget: usize,
     per_window_caps: &[usize],
 ) -> (usize, f32) {
     let w = num_windows;
@@ -1201,7 +1206,7 @@ fn simulate_allocation(
             &mut dp_scratch,
         );
         let active = dp_scratch.active[..w].to_vec();
-        if gain <= 0.0 || len == 0 {
+        if gain <= 0.0 || len == 0 || used.saturating_add(len) > total_budget {
             continue;
         }
         let next_gain = heap.peek().map(|e| e.gain).unwrap_or(NEG_INF);

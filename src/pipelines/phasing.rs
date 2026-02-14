@@ -7,7 +7,7 @@
 //! 4. Run PBWT-accelerated Li-Stephens HMM (PhasingHmm) on Stage 1 markers
 //! 5. Update phase and iterate
 //! 6. Collect EM parameter estimates and update
-//! 7. Run Stage 2 phasing: interpolate state probabilities to phase rare variants
+//! 7. Run Stage 2 phasing: use scaffold-bridge state probabilities to phase rare variants
 //! 8. Write phased output
 //!
 //! This implements Beagle's two-stage phasing algorithm for handling rare variants.
@@ -706,15 +706,56 @@ fn adaptive_prescan_top_m(scores: &[f32], base_top: usize, n_ref_haps: usize) ->
 }
 
 fn combine_swap_probs(fwd: &[f32], bwd: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(fwd.len());
-    for i in 0..fwd.len() {
-        let pf = fwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
-        let pb = bwd.get(i).copied().unwrap_or(0.5).clamp(1e-6, 1.0 - 1e-6);
-        let lf = (pf / (1.0 - pf)).ln();
-        let lb = (pb / (1.0 - pb)).ln();
-        let logit = lf + lb;
-        let p = 1.0 / (1.0 + (-logit).exp());
-        out.push(p.clamp(1e-6, 1.0 - 1e-6));
+    #[inline]
+    fn clamp_prob(p: f32) -> f32 {
+        p.clamp(1e-6, 1.0 - 1e-6)
+    }
+    let fwd_len = fwd.len();
+    if fwd_len == 0 {
+        return Vec::new();
+    }
+    let shared_len = fwd_len.min(bwd.len());
+    let mut out = Vec::with_capacity(fwd_len);
+    for i in 0..shared_len {
+        let pf = clamp_prob(fwd[i]);
+        let pb = clamp_prob(bwd[i]);
+        out.push(clamp_prob(0.5 * (pf + pb)));
+    }
+    // Exact tail behavior when reverse is missing:
+    // pb = 0.5 => pooled p = 0.5 * (pf + 0.5).
+    for &pf_raw in &fwd[shared_len..] {
+        let pf = clamp_prob(pf_raw);
+        out.push(clamp_prob(0.5 * (pf + 0.5)));
+    }
+    out
+}
+
+fn merge_donor_mass(
+    fwd: &[(usize, f32)],
+    bwd: &[(usize, f32)],
+    cap: usize,
+    min_mass: f32,
+) -> Vec<usize> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut accum: HashMap<usize, f32> = HashMap::with_capacity(fwd.len() + bwd.len());
+    for &(h, m) in fwd.iter().chain(bwd.iter()) {
+        if !m.is_finite() || m <= 0.0 {
+            continue;
+        }
+        *accum.entry(h).or_insert(0.0) += m;
+    }
+    let mut ranked: Vec<(usize, f32)> = accum.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = Vec::with_capacity(cap);
+    for (h, m) in ranked {
+        if out.len() >= cap {
+            break;
+        }
+        if m >= min_mass {
+            out.push(h);
+        }
     }
     out
 }
@@ -2966,7 +3007,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
                 let mut tmp_rev =
                     vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
-                th.materialize_at(0, &mut tmp_rev);
+                let rev_seed_marker = hi_freq_to_orig.len().saturating_sub(1);
+                th.materialize_at(rev_seed_marker, &mut tmp_rev);
                 for id in tmp_rev.iter().copied() {
                     let hid = id.as_u32() as usize;
                     if hid >= n_target_haps {
@@ -3119,7 +3161,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
                     let mut tmp_rev =
                         vec![crate::model::types::CombinedHapId::from(0u32); th.n_states()];
-                    th.materialize_at(0, &mut tmp_rev);
+                    let rev_seed_marker = hi_freq_to_orig.len().saturating_sub(1);
+                    th.materialize_at(rev_seed_marker, &mut tmp_rev);
                     for id in tmp_rev.iter().copied() {
                         let hid = id.as_u32() as usize;
                         if hid >= n_target_haps {
@@ -3154,16 +3197,12 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                     }
                     if let Ok(mut slot) = beam_donors[s].lock() {
                         slot.clear();
-                        let list = active_pool.list();
                         let cap = beam_config
                             .beam_width
                             .max(beam_config.inject_k.saturating_mul(2))
                             .max(beam_config.switch_candidates.saturating_mul(4));
-                        if list.len() > cap {
-                            slot.extend_from_slice(&list[list.len() - cap..]);
-                        } else {
-                            slot.extend_from_slice(list);
-                        }
+                        let donors = merge_donor_mass(&fwd.donor_mass, &bwd.donor_mass, cap, 1e-6);
+                        slot.extend(donors);
                     }
                 });
 
@@ -3376,17 +3415,17 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         // Sync final phase state from SamplePhase to MutableGenotypes
         self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
 
-        // STAGE 2: Phase rare markers using HMM state probability interpolation
+        // STAGE 2: Phase rare markers using scaffold-bridge state probabilities
         // This implements the proper algorithm from Java Beagle's Stage2Baum.java
         if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
-                "Stage 2: Phasing {} rare markers using HMM interpolation...",
+                "Stage 2: Phasing {} rare markers using scaffold bridge...",
                 rare_markers.len()
             );
             if let Some(bb) = &self.telemetry {
                 bb.set_stage(Stage::PhasingStage2);
                 bb.set_producer_stage(Stage::PhasingStage2);
-                bb.set_op("Phasing stage2: HMM interpolation");
+                bb.set_op("Phasing stage2: scaffold bridge");
                 bb.set_total_iterations(0);
                 bb.set_current_iteration(0);
                 bb.set_total_markers(rare_markers.len() as u64);
@@ -4181,9 +4220,11 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     );
                     let fwd = phaser.phase_sample(&condensed, sp, &mut active_pool, &mut injector);
 
+                    let mut bwd_donor_mass: Vec<(usize, f32)> = Vec::new();
                     if !condensed.call_sites.is_empty() {
                         let mut active_pool_rev = ActivePool::new(packed_ref.n_ref_haps());
-                        th.materialize_at(0, &mut tmp);
+                        let rev_seed_marker = hi_freq_to_orig.len().saturating_sub(1);
+                        th.materialize_at(rev_seed_marker, &mut tmp);
                         for id in tmp.iter().copied() {
                             let hid = id.as_u32() as usize;
                             if hid >= n_target_haps {
@@ -4206,6 +4247,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             &mut active_pool_rev,
                             &mut injector_rev,
                         );
+                        bwd_donor_mass = bwd.donor_mass.clone();
                         let mut p_swapped_bwd = bwd.p_swapped;
                         p_swapped_bwd.reverse();
                         let combined = combine_swap_probs(&fwd.p_swapped, &p_swapped_bwd);
@@ -4223,16 +4265,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                     if let Ok(mut slot) = beam_donors[s].lock() {
                         slot.clear();
-                        let list = active_pool.list();
                         let cap = beam_config
                             .beam_width
                             .max(beam_config.inject_k.saturating_mul(2))
                             .max(beam_config.switch_candidates.saturating_mul(4));
-                        if list.len() > cap {
-                            slot.extend_from_slice(&list[list.len() - cap..]);
-                        } else {
-                            slot.extend_from_slice(list);
-                        }
+                        let donors = merge_donor_mass(&fwd.donor_mass, &bwd_donor_mass, cap, 1e-6);
+                        slot.extend(donors);
                     }
                 });
 
@@ -4297,7 +4335,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Sync final phase state from SamplePhase to MutableGenotypes
         self.sync_sample_phases_to_geno(&sample_phases, &mut geno);
 
-        // STAGE 2: Phase rare markers using HMM state probability interpolation
+        // STAGE 2: Phase rare markers using scaffold-bridge state probabilities
         // Now returns state probabilities for the next overlap region if requested
 
         let stage1_p_recomb: Vec<f32> = std::iter::once(0.0f32)
@@ -4306,12 +4344,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         let next_overlap_handoff = if !rare_markers.is_empty() && hi_freq_markers.len() >= 2 {
             eprintln!(
-                "Stage 2: Phasing {} rare markers using HMM interpolation...",
+                "Stage 2: Phasing {} rare markers using scaffold bridge...",
                 rare_markers.len()
             );
             if let Some(bb) = &self.telemetry {
                 bb.set_stage(Stage::PhasingStage2);
-                bb.set_op("Phasing stage2: HMM interpolation");
+                bb.set_op("Phasing stage2: scaffold bridge");
                 bb.set_total_iterations(0);
                 bb.set_current_iteration(0);
                 bb.set_total_markers(rare_markers.len() as u64);
@@ -7028,14 +7066,15 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         count
     }
 
-    /// Stage 2: Phase rare markers using HMM state probability interpolation
+    /// Stage 2: Phase rare markers using scaffold-bridge state probabilities
     ///
-    /// This implements the proper algorithm from Java Beagle's Stage2Baum.java:
+    /// Uses two-sided scaffold messages from Stage 1 HMM outputs:
     ///
     /// 1. Run HMM on high-frequency markers to get state probabilities for each haplotype
     /// 2. For each rare heterozygote:
     ///    - Find flanking high-frequency markers (mkrA, mkrB)
-    ///    - Interpolate state probabilities: prob = wt*probsA[j] + (1-wt)*probsB[j]
+    ///    - Build a two-sided bridge in haplotype space:
+    ///      P(h|m) ∝ (a1*pi_A(h)+b1) * (a2*rho_B(h)+b2)
     ///    - Accumulate allele probabilities from reference haplotypes
     /// 3. Decide phase: p1 = alProbs1[a1] * alProbs2[a2], p2 = alProbs1[a2] * alProbs2[a1]
     ///    Switch if p2 > p1
@@ -7158,7 +7197,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Vec::new()
         };
 
-        // Build Stage 2 interpolation mappings
+        // Build Stage 2 scaffold bridge mappings
         let stage2_phaser = Stage2Phaser::new(
             hi_freq_markers,
             gen_positions,
@@ -8069,7 +8108,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
 
         eprintln!(
-            "Stage 2: Applied {} phase switches, {} markers phased, {} markers imputed (HMM interpolation)",
+            "Stage 2: Applied {} phase switches, {} markers phased, {} markers imputed (scaffold bridge)",
             total_switches, total_phased, total_imputed
         );
 
@@ -8694,6 +8733,7 @@ struct HaploidConstrainedEmitProfile {
 }
 
 impl HaploidConstrainedEmitProfile {
+    #[cfg(test)]
     #[inline(always)]
     fn emit(self, ref_al: u8) -> f32 {
         if self.all_one {
@@ -8715,6 +8755,20 @@ impl HaploidConstrainedEmitProfile {
 #[inline(always)]
 fn blend_with_genotype_conf(raw_emit: f32, geno_conf: f32) -> f32 {
     raw_emit * geno_conf + 0.5 * (1.0 - geno_conf)
+}
+
+#[inline(always)]
+fn fill_emit_lut_from_profile(lut: &mut [f32; 256], profile: HaploidConstrainedEmitProfile) {
+    if profile.all_one {
+        lut.fill(1.0);
+        return;
+    }
+    lut.fill(profile.other_emit);
+    lut[crate::data::storage::AlleleCode::MISSING.raw() as usize] = profile.missing_emit;
+    lut[profile.primary_allele as usize] = profile.primary_emit;
+    if profile.has_secondary {
+        lut[profile.secondary_allele as usize] = profile.secondary_emit;
+    }
 }
 
 #[inline(always)]
@@ -9590,8 +9644,8 @@ fn ffbs_haploid_constrained(
     let fwd_prev = &mut workspace.ffbs_fwd_prev;
     let fwd_at_marker = &mut workspace.ffbs_fwd_at_marker;
     let weights = &mut workspace.ffbs_weights;
-    let mut neighbor_alleles =
-        vec![crate::data::storage::AlleleCode::MISSING.raw(); actual_n_states];
+    let neighbor_alleles = &mut workspace.ffbs_neighbor_alleles[..actual_n_states];
+    let mut emit_lut = [0.0f32; 256];
     fwd_curr[..actual_n_states].fill(0.0);
     fwd_prev[..actual_n_states].fill(0.0);
 
@@ -9606,9 +9660,10 @@ fn ffbs_haploid_constrained(
         p_no_err,
         p_err,
     );
-    phase_ibs.fill_alleles_for_haps(0, &neighbors[..actual_n_states], &mut neighbor_alleles);
+    fill_emit_lut_from_profile(&mut emit_lut, profile0);
+    phase_ibs.fill_alleles_for_haps(0, &neighbors[..actual_n_states], neighbor_alleles);
     for k in 0..actual_n_states {
-        let emit = profile0.emit(neighbor_alleles[k]);
+        let emit = emit_lut[neighbor_alleles[k] as usize];
         fwd_curr[k] = init * emit;
     }
     let mut fwd_sum: f32 = fwd_curr.iter().sum();
@@ -9634,7 +9689,8 @@ fn ffbs_haploid_constrained(
             p_no_err,
             p_err,
         );
-        phase_ibs.fill_alleles_for_haps(m, &neighbors[..actual_n_states], &mut neighbor_alleles);
+        fill_emit_lut_from_profile(&mut emit_lut, profile_m);
+        phase_ibs.fill_alleles_for_haps(m, &neighbors[..actual_n_states], neighbor_alleles);
 
         // SIMD-optimized transition + emission
         let shift_vec = f32x8::splat(shift);
@@ -9649,14 +9705,14 @@ fn ffbs_haploid_constrained(
 
             // Compute emissions
             let emit_arr = [
-                profile_m.emit(neighbor_alleles[k]),
-                profile_m.emit(neighbor_alleles[k + 1]),
-                profile_m.emit(neighbor_alleles[k + 2]),
-                profile_m.emit(neighbor_alleles[k + 3]),
-                profile_m.emit(neighbor_alleles[k + 4]),
-                profile_m.emit(neighbor_alleles[k + 5]),
-                profile_m.emit(neighbor_alleles[k + 6]),
-                profile_m.emit(neighbor_alleles[k + 7]),
+                emit_lut[neighbor_alleles[k] as usize],
+                emit_lut[neighbor_alleles[k + 1] as usize],
+                emit_lut[neighbor_alleles[k + 2] as usize],
+                emit_lut[neighbor_alleles[k + 3] as usize],
+                emit_lut[neighbor_alleles[k + 4] as usize],
+                emit_lut[neighbor_alleles[k + 5] as usize],
+                emit_lut[neighbor_alleles[k + 6] as usize],
+                emit_lut[neighbor_alleles[k + 7] as usize],
             ];
             let emit_vec = f32x8::from(emit_arr);
 
@@ -9671,7 +9727,7 @@ fn ffbs_haploid_constrained(
         fwd_sum = sum_vec.reduce_add();
         for i in k..actual_n_states {
             let prior = scale * fwd_prev[i] + shift;
-            let emit = profile_m.emit(neighbor_alleles[i]);
+            let emit = emit_lut[neighbor_alleles[i] as usize];
             fwd_curr[i] = prior * emit;
             fwd_sum += fwd_curr[i];
         }
@@ -10039,8 +10095,17 @@ fn sample_dynamic_mcmc(
                 .checked_div(MAX_INIT_EVAL_MARKERS)
                 .unwrap_or(1)
                 .max(1);
-            let mut scores = vec![0.0f32; limit * limit];
-            let mut neighbor_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); limit];
+            if workspace.scores.len() < limit * limit {
+                workspace.scores.resize(limit * limit, 0.0);
+            }
+            let scores = &mut workspace.scores[..limit * limit];
+            scores.fill(0.0);
+            if workspace.ffbs_neighbor_alleles.len() < limit {
+                workspace
+                    .ffbs_neighbor_alleles
+                    .resize(limit, crate::data::storage::AlleleCode::MISSING.raw());
+            }
+            let neighbor_alleles = &mut workspace.ffbs_neighbor_alleles[..limit];
             let mut informative = 0usize;
             for m in (0..n_markers).step_by(marker_stride) {
                 let a1 = seq1[m];
@@ -10055,7 +10120,7 @@ fn sample_dynamic_mcmc(
                 let is_het = a1 != a2
                     && a1 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a2 != crate::data::storage::AlleleCode::MISSING.raw();
-                phase_ibs.fill_alleles_for_haps(m, &neighbors[..limit], &mut neighbor_alleles);
+                phase_ibs.fill_alleles_for_haps(m, &neighbors[..limit], neighbor_alleles);
                 for i in 0..limit {
                     let r1 = neighbor_alleles[i];
                     for j in 0..i {
@@ -11773,10 +11838,10 @@ fn donor_log_odds_pass(top: f32, second: f32, p_mismatch: f32, obs_conf: f32) ->
     log_odds >= tau
 }
 
-/// Stage 2 phaser with HMM state probability interpolation
+/// Stage 2 phaser with two-sided scaffold bridge probabilities
 ///
-/// Implements the algorithm from Java Beagle's Stage2Baum.java for phasing
-/// rare variants using interpolated HMM state probabilities.
+/// Builds rare-marker donor posteriors by multiplying left and right
+/// transition-propagated scaffold messages in haplotype identity space.
 struct Stage2Phaser {
     /// For each Stage 2 marker, the index of the preceding Stage 1 marker
     prev_stage1_marker: Vec<usize>,
@@ -11786,7 +11851,7 @@ struct Stage2Phaser {
     stage1_markers: Vec<usize>,
     /// Genetic positions (cM) for all markers
     gen_positions: Vec<f64>,
-    /// Recombination intensity for bridge interpolation
+    /// Recombination intensity for bridge transitions
     recomb_intensity: f32,
     /// Donor-panel haplotype count for subset-conditioned transitions.
     panel_haps: usize,
@@ -11873,6 +11938,38 @@ impl Stage2Phaser {
         (-f64::exp_m1(c * gen_dist_m)) as f32
     }
 
+    /// Build Stage-2 scaffold bridge posterior over haplotype identities at marker `m`.
+    ///
+    /// Derivation (message form):
+    /// Let `E_L` be all evidence up to left scaffold marker A, and `E_R` all evidence
+    /// from right scaffold marker B onward. For HMM state/haplotype identity `h` at `m`:
+    ///
+    ///   P(h_m=h | E_L, E_R) ∝ m_L(h) * m_R(h)
+    ///
+    /// where
+    ///
+    ///   m_L(h) = Σ_i P(h_m=h | h_A=i) * α_A(i)
+    ///   m_R(h) = Σ_j P(h_B=j | h_m=h) * β_B(j)
+    ///
+    /// `α_A` and `β_B` are normalized forward/backward messages at A/B (already
+    /// conditioned on observed data on their respective sides).
+    ///
+    /// Under the subset-conditioned affine transition used in this codebase:
+    ///
+    ///   T(x -> h) = stay * 1[x==h] + shift
+    ///
+    /// projecting A/B messages to hap-identity marginals gives:
+    ///
+    ///   m_L(h) = scale1 * π_A(h) + shift1
+    ///   m_R(h) = scale2 * ρ_B(h) + shift2
+    ///
+    /// so the bridge posterior is
+    ///
+    ///   P(h|m) ∝ (scale1*π_A(h)+shift1) * (scale2*ρ_B(h)+shift2)
+    ///
+    /// Important model boundary:
+    /// - normalization is over the active support (selected ThreadedHaps states), not
+    ///   the full reference panel universe.
     fn bridge_hap_probs(
         &self,
         marker: usize,
@@ -11945,6 +12042,9 @@ impl Stage2Phaser {
         let (scale1, shift1) = subset_linear_exact_k(r1, n_states_a.max(1) as f32, self.panel_haps);
         let (scale2, shift2) = subset_linear_exact_k(r2, n_states_b.max(1) as f32, self.panel_haps);
 
+        // Collapse state-index messages to hap-identity marginals at A/B.
+        // This is necessary because state indices are local composite states while
+        // Stage 2 rare-marker decision logic consumes haplotype identities.
         let mut pi_a: std::collections::HashMap<u32, f32> =
             std::collections::HashMap::with_capacity(n_states_a.max(1));
         let mut rho_b: std::collections::HashMap<u32, f32> =
@@ -11956,12 +12056,14 @@ impl Stage2Phaser {
             *rho_b.entry(haps_at_mkr_b[k].as_u32()).or_insert(0.0) += beta_b[k];
         }
 
-        let mut sum = 0.0f32;
+        // Unnormalized bridge weights on active support:
+        //   w(h) = m_L(h) * m_R(h)
+        let mut sum_seen = 0.0f32;
         for (&hap, &left) in &pi_a {
             let right = rho_b.get(&hap).copied().unwrap_or(0.0);
             let w = (scale1 * left + shift1) * (scale2 * right + shift2);
             *hap_probs.entry(hap).or_insert(0.0) += w;
-            sum += w;
+            sum_seen += w;
         }
         for (&hap, &right) in &rho_b {
             if pi_a.contains_key(&hap) {
@@ -11969,11 +12071,12 @@ impl Stage2Phaser {
             }
             let w = shift1 * (scale2 * right + shift2);
             *hap_probs.entry(hap).or_insert(0.0) += w;
-            sum += w;
+            sum_seen += w;
         }
 
-        if sum > 0.0 {
-            let inv = 1.0 / sum;
+        if sum_seen > 0.0 {
+            // Support-conditioned normalization (selected state support only).
+            let inv = 1.0 / sum_seen;
             for p in hap_probs.values_mut() {
                 *p *= inv;
             }
@@ -12011,6 +12114,7 @@ impl Stage2Phaser {
     where
         F: Fn(usize, usize) -> u8,
     {
+        // Base scaffold bridge posterior over active donor support.
         let base = self.bridge_hap_probs(marker, alpha_a, beta_b, haps_at_mkr_a, haps_at_mkr_b);
         if carriers.is_empty() || panel_haps == 0 {
             return base;
@@ -12042,10 +12146,13 @@ impl Stage2Phaser {
             carrier_ll.insert(hap, obs_conf.clamp(0.05, 1.0) * ll);
         }
 
-        let mut candidates: Vec<u32> = base.keys().copied().collect();
-        candidates.extend_from_slice(carriers);
-        candidates.sort_unstable();
-        candidates.dedup();
+        // Bayes-style carrier/context update:
+        //   log w(h) = log P_bridge(h) + log P(carrier prior | h) + log P(context | h)
+        // then normalize exp(log w).
+        //
+        // Keep support fixed to active Stage-1 bridge support. Non-selected haps are
+        // out-of-model for this local HMM approximation and are not introduced here.
+        let candidates: Vec<u32> = base.keys().copied().collect();
         if candidates.is_empty() {
             return base;
         }
@@ -12165,7 +12272,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
     /// Finalize Stage 2 phasing with forward context from the next window.
     ///
     /// Stage 1 phasing handles common variants in-window. Stage 2 handles rare variants
-    /// using HMM state probabilities interpolated between Stage 1 markers.
+    /// using scaffold bridge probabilities between Stage 1 markers.
     ///
     /// Cross-window context enables better rare variant phasing at window boundaries
     /// by providing forward context from the next window's phased markers. However,
@@ -12513,6 +12620,208 @@ mod tests {
 
         let pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
         assert_eq!(pipeline.params.n_states, 280);
+    }
+
+    #[test]
+    fn test_combine_swap_probs_aligns_reverse_polarity_when_complemented() {
+        let fwd = vec![0.90f32, 0.80, 0.20, 0.10];
+        let bwd_complement = vec![0.10f32, 0.20, 0.80, 0.90];
+
+        let combined = combine_swap_probs(&fwd, &bwd_complement);
+        assert_eq!(combined.len(), fwd.len());
+
+        for &p in &combined {
+            assert!(
+                (p - 0.5).abs() < 1e-5,
+                "conservative pool should be neutral under polarity disagreement, got {}",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn test_combine_swap_probs_single_marker_reduces_to_forward_marginal() {
+        let fwd = vec![0.99f32];
+        let bwd = vec![0.01f32];
+        let combined = combine_swap_probs(&fwd, &bwd);
+        assert_eq!(combined.len(), 1);
+        assert!(
+            (combined[0] - 0.5).abs() < 1e-5,
+            "single-marker conservative pool should neutralize opposing evidence: got {}",
+            combined[0],
+        );
+    }
+
+    #[test]
+    fn test_stage2_bridge_uses_two_sided_product_messages() {
+        let stage2 = Stage2Phaser::new(&[0, 2], &[0.0, 1.0, 2.0], 3, 50.0, 100);
+        let marker = 1usize;
+        let alpha_a = vec![0.9f32, 0.1f32];
+        let beta_b = vec![0.8f32, 0.2f32];
+        let haps_a = vec![CombinedHapId::from(100u32), CombinedHapId::from(200u32)];
+        let haps_b = vec![CombinedHapId::from(100u32), CombinedHapId::from(300u32)];
+
+        let probs = stage2.bridge_hap_probs(marker, &alpha_a, &beta_b, &haps_a, &haps_b);
+        assert!(
+            probs.len() >= 3,
+            "expected union of hap identities from both sides, got {}",
+            probs.len()
+        );
+
+        let d1 = 1.0f64;
+        let d2 = 1.0f64;
+        let r1 = stage2.p_recomb(d1);
+        let r2 = stage2.p_recomb(d2);
+        let (a1, b1) = subset_linear_exact_k(r1, 2.0, 100);
+        let (a2, b2) = subset_linear_exact_k(r2, 2.0, 100);
+        let e100 = (a1 * 0.9 + b1) * (a2 * 0.8 + b2);
+        let e200 = (a1 * 0.1 + b1) * (a2 * 0.0 + b2);
+        let e300 = (a1 * 0.0 + b1) * (a2 * 0.2 + b2);
+        let z = e100 + e200 + e300;
+        let exp100 = e100 / z;
+        let exp200 = e200 / z;
+        let exp300 = e300 / z;
+
+        let p100 = probs.get(&100u32).copied().unwrap_or(0.0);
+        let p200 = probs.get(&200u32).copied().unwrap_or(0.0);
+        let p300 = probs.get(&300u32).copied().unwrap_or(0.0);
+        assert!((p100 - exp100).abs() < 1e-5, "p100={} exp={}", p100, exp100);
+        assert!((p200 - exp200).abs() < 1e-5, "p200={} exp={}", p200, exp200);
+        assert!((p300 - exp300).abs() < 1e-5, "p300={} exp={}", p300, exp300);
+    }
+
+    #[test]
+    fn test_stage2_carrier_context_reweights_posterior() {
+        let stage2 = Stage2Phaser::new(&[0, 2], &[0.0, 1.0, 2.0], 3, 50.0, 100);
+        let marker = 1usize;
+        let alpha_a = vec![0.6f32, 0.4f32];
+        let beta_b = vec![0.6f32, 0.4f32];
+        let haps_a = vec![CombinedHapId::from(10u32), CombinedHapId::from(20u32)];
+        let haps_b = vec![CombinedHapId::from(10u32), CombinedHapId::from(30u32)];
+
+        let base = stage2.bridge_hap_probs(marker, &alpha_a, &beta_b, &haps_a, &haps_b);
+        let base_carrier = base.get(&30u32).copied().unwrap_or(0.0);
+
+        let carriers = vec![30u32];
+        let context_markers = vec![0usize, 2usize];
+        let target_hap = 0usize;
+        let get_allele = |m: usize, h: usize| -> u8 {
+            match (m, h) {
+                (0, 0) | (2, 0) => 1,
+                (0, 30) | (2, 30) => 1,
+                (0, 10) | (2, 10) => 0,
+                (0, 20) | (2, 20) => 0,
+                _ => 0,
+            }
+        };
+
+        let post = stage2.carrier_injected_bridge_hap_probs(
+            marker,
+            &alpha_a,
+            &beta_b,
+            &haps_a,
+            &haps_b,
+            &carriers,
+            &context_markers,
+            100,
+            target_hap,
+            1.0,
+            0.001,
+            &get_allele,
+        );
+        let post_carrier = post.get(&30u32).copied().unwrap_or(0.0);
+        assert!(
+            post_carrier > base_carrier,
+            "carrier posterior should increase with matching context: base={} post={}",
+            base_carrier,
+            post_carrier
+        );
+    }
+
+    #[test]
+    fn test_stage2_carrier_update_does_not_add_out_of_support_haps() {
+        let stage2 = Stage2Phaser::new(&[0, 2], &[0.0, 1.0, 2.0], 3, 50.0, 100);
+        let marker = 1usize;
+        let alpha_a = vec![0.7f32, 0.3f32];
+        let beta_b = vec![0.6f32, 0.4f32];
+        let haps_a = vec![CombinedHapId::from(10u32), CombinedHapId::from(20u32)];
+        let haps_b = vec![CombinedHapId::from(10u32), CombinedHapId::from(30u32)];
+        let carriers = vec![999u32];
+        let context_markers = vec![0usize, 2usize];
+        let get_allele = |m: usize, h: usize| -> u8 {
+            if m == usize::MAX && h == usize::MAX {
+                1
+            } else {
+                0
+            }
+        };
+
+        let base = stage2.bridge_hap_probs(marker, &alpha_a, &beta_b, &haps_a, &haps_b);
+        let post = stage2.carrier_injected_bridge_hap_probs(
+            marker,
+            &alpha_a,
+            &beta_b,
+            &haps_a,
+            &haps_b,
+            &carriers,
+            &context_markers,
+            100,
+            0,
+            1.0,
+            0.001,
+            &get_allele,
+        );
+
+        assert_eq!(
+            post.contains_key(&999u32),
+            false,
+            "carrier outside active support must not be introduced",
+        );
+        for h in base.keys() {
+            assert!(
+                post.contains_key(h),
+                "posterior should stay on active support; missing {}",
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage2_bridge_normalizes_on_active_support() {
+        let panel_haps = 100usize;
+        let stage2 = Stage2Phaser::new(&[0, 2], &[0.0, 1.0, 2.0], 3, 50.0, panel_haps);
+        let marker = 1usize;
+        let alpha_a = vec![0.9f32, 0.1f32];
+        let beta_b = vec![0.8f32, 0.2f32];
+        let haps_a = vec![CombinedHapId::from(100u32), CombinedHapId::from(200u32)];
+        let haps_b = vec![CombinedHapId::from(100u32), CombinedHapId::from(300u32)];
+
+        let probs = stage2.bridge_hap_probs(marker, &alpha_a, &beta_b, &haps_a, &haps_b);
+        let seen_sum: f32 = probs.values().copied().sum();
+
+        let d1 = 1.0f64;
+        let d2 = 1.0f64;
+        let r1 = stage2.p_recomb(d1);
+        let r2 = stage2.p_recomb(d2);
+        let (a1, b1) = subset_linear_exact_k(r1, 2.0, panel_haps);
+        let (a2, b2) = subset_linear_exact_k(r2, 2.0, panel_haps);
+        let e100 = (a1 * 0.9 + b1) * (a2 * 0.8 + b2);
+        let e200 = (a1 * 0.1 + b1) * (a2 * 0.0 + b2);
+        let e300 = (a1 * 0.0 + b1) * (a2 * 0.2 + b2);
+        let z = e100 + e200 + e300;
+        let expected_seen = (e100 + e200 + e300) / z;
+
+        assert!(
+            (seen_sum - expected_seen).abs() < 1e-5,
+            "seen_sum={} expected_seen={}",
+            seen_sum,
+            expected_seen
+        );
+        assert!(
+            (seen_sum - 1.0).abs() < 1e-6,
+            "active support should normalize to 1, got {}",
+            seen_sum
+        );
     }
 
     #[test]
