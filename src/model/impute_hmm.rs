@@ -2700,12 +2700,15 @@ unsafe fn dense_identity_biallelic_sums_avx512(
         alt_count += alt_mask.count_ones() as usize;
         miss_count += miss_mask.count_ones() as usize;
 
-        let f_vec = _mm512_maskz_loadu_ps(valid_mask, fwd.as_ptr().add(k));
-        let b_vec = _mm512_maskz_loadu_ps(valid_mask, bwd.as_ptr().add(k));
-        let fb_vec = if let Some(fb) = fb_products {
-            _mm512_maskz_loadu_ps(valid_mask, fb.as_ptr().add(k))
-        } else {
-            _mm512_mul_ps(f_vec, b_vec)
+        let (f_vec, b_vec, fb_vec) = unsafe {
+            let f = _mm512_maskz_loadu_ps(valid_mask, fwd.as_ptr().add(k));
+            let b = _mm512_maskz_loadu_ps(valid_mask, bwd.as_ptr().add(k));
+            let fb = if let Some(fb) = fb_products {
+                _mm512_maskz_loadu_ps(valid_mask, fb.as_ptr().add(k))
+            } else {
+                _mm512_mul_ps(f, b)
+            };
+            (f, b, fb)
         };
 
         // Dedicated masked accumulation: avoids materializing intermediate masked vectors.
@@ -2720,17 +2723,29 @@ unsafe fn dense_identity_biallelic_sums_avx512(
     }
 
     let mut tmp = [0f32; 16];
-    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    }
     let alt_sum_f = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    }
     let alt_sum_b = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    }
     let alt_sum_fb = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    }
     let miss_sum_f = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    }
     let miss_sum_b = tmp.iter().sum::<f32>();
-    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    unsafe {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    }
     let miss_sum_fb = tmp.iter().sum::<f32>();
     (
         alt_sum_f,
@@ -2796,12 +2811,15 @@ unsafe fn dense_identity_biallelic_sums_avx2(
         let alt_mask_i = lane_mask(alt_mask_bits);
         let miss_mask_i = lane_mask(miss_mask_bits);
 
-        let f_vec = _mm256_maskload_ps(fwd.as_ptr().add(k), valid_mask_i);
-        let b_vec = _mm256_maskload_ps(bwd.as_ptr().add(k), valid_mask_i);
-        let fb_vec = if let Some(fb) = fb_products {
-            _mm256_maskload_ps(fb.as_ptr().add(k), valid_mask_i)
-        } else {
-            _mm256_mul_ps(f_vec, b_vec)
+        let (f_vec, b_vec, fb_vec) = unsafe {
+            let f = _mm256_maskload_ps(fwd.as_ptr().add(k), valid_mask_i);
+            let b = _mm256_maskload_ps(bwd.as_ptr().add(k), valid_mask_i);
+            let fb = if let Some(fb) = fb_products {
+                _mm256_maskload_ps(fb.as_ptr().add(k), valid_mask_i)
+            } else {
+                _mm256_mul_ps(f, b)
+            };
+            (f, b, fb)
         };
 
         alt_sum_f_vec = _mm256_add_ps(
@@ -2833,17 +2851,29 @@ unsafe fn dense_identity_biallelic_sums_avx2(
     }
 
     let mut tmp = [0f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    }
     let alt_sum_f = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    }
     let alt_sum_b = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    }
     let alt_sum_fb = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    }
     let miss_sum_f = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    }
     let miss_sum_b = tmp.iter().sum::<f32>();
-    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    unsafe {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    }
     let miss_sum_fb = tmp.iter().sum::<f32>();
     (
         alt_sum_f,

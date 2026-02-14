@@ -548,8 +548,8 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
-    let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    let p = freq.max(min_freq);
+    -p.ln()
 }
 
 #[inline]
@@ -4543,6 +4543,7 @@ impl crate::pipelines::ImputationPipeline {
         phase_conf_valid: bool,
         sample_error_rates: &mut [f32],
     ) -> Result<Option<ImputationWindowResults>> {
+        let correct_errors = self.config.err.is_some();
         let window_span = if self.config.profile {
             Some(
                 info_span!(
@@ -6699,21 +6700,23 @@ impl crate::pipelines::ImputationPipeline {
                                 output_markers
                             )));
                         }
-                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
-                            if !input_probs.is_observed_marker(ref_m) {
-                                continue;
+                        if !correct_errors {
+                            for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                                if !input_probs.is_observed_marker(ref_m) {
+                                    continue;
+                                }
+                                let probs = input_probs.probs_for_marker(ref_m);
+                                if probs.is_empty() {
+                                    continue;
+                                }
+                                out_posts[out_idx] = if probs.len() == 2 {
+                                    AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
+                                } else {
+                                    AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                        probs.to_vec(),
+                                    ))
+                                };
                             }
-                            let probs = input_probs.probs_for_marker(ref_m);
-                            if probs.is_empty() {
-                                continue;
-                            }
-                            out_posts[out_idx] = if probs.len() == 2 {
-                                AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
-                            } else {
-                                AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
-                                    probs.to_vec(),
-                                ))
-                            };
                         }
                         let next_priors = chained_priors.unwrap_or_else(HaplotypePriors::empty);
                         return Ok((out_posts, next_priors, subsetted_any, informative_ratio));
@@ -6854,21 +6857,23 @@ impl crate::pipelines::ImputationPipeline {
                     // Preserve direct target evidence at observed markers. Imputation
                     // should not overwrite measured genotype probabilities at typed
                     // sites, otherwise dosage correlation is artificially degraded.
-                    for (out_idx, ref_m) in (output_start..output_end).enumerate() {
-                        if !input_probs.is_observed_marker(ref_m) {
-                            continue;
+                    if !correct_errors {
+                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                            if !input_probs.is_observed_marker(ref_m) {
+                                continue;
+                            }
+                            let probs = input_probs.probs_for_marker(ref_m);
+                            if probs.is_empty() {
+                                continue;
+                            }
+                            posteriors[out_idx] = if probs.len() == 2 {
+                                AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
+                            } else {
+                                AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
+                                    probs.to_vec(),
+                                ))
+                            };
                         }
-                        let probs = input_probs.probs_for_marker(ref_m);
-                        if probs.is_empty() {
-                            continue;
-                        }
-                        posteriors[out_idx] = if probs.len() == 2 {
-                            AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
-                        } else {
-                            AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(
-                                probs.to_vec(),
-                            ))
-                        };
                     }
 
                     let mut next_priors = HaplotypePriors::empty();
@@ -8528,7 +8533,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(d) = get_target_raw_dosage(marker_idx, sample_idx) {
                     return d;
                 }
@@ -8626,7 +8631,7 @@ impl crate::pipelines::ImputationPipeline {
             let hard_call = get_genotyped_alleles(marker_idx, sample_idx);
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
 
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some(gt) = hard_call {
                     return gt;
                 }
@@ -8727,7 +8732,7 @@ impl crate::pipelines::ImputationPipeline {
 
         let get_hap_probs = |marker_idx: usize, sample_idx: usize| -> (f32, f32) {
             let is_imputed = marker_is_imputed.get(marker_idx).copied().unwrap_or(true);
-            if !is_imputed {
+            if !is_imputed && !correct_errors {
                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, sample_idx) {
                     return (a1 as f32, a2 as f32);
                 }
