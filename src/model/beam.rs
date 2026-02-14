@@ -628,6 +628,7 @@ struct BeamScratch {
     hap2_candidates: Vec<(usize, i32)>,
     hap1_allele: Vec<(usize, i32, i32, i32)>,
     hap2_allele: Vec<(usize, i32, i32, i32)>,
+    repair_cand: Vec<(usize, i32, bool)>,
     spread: Vec<usize>,
     pool_alleles: Vec<u8>,
     switch_support: SwitchSupportCache,
@@ -667,6 +668,7 @@ impl BeamScratch {
             hap2_candidates: Vec::with_capacity(cap),
             hap1_allele: Vec::with_capacity(cap),
             hap2_allele: Vec::with_capacity(cap),
+            repair_cand: Vec::with_capacity(cap.saturating_add(2)),
             spread: Vec::with_capacity(cap),
             pool_alleles: Vec::with_capacity(cap),
             switch_support: SwitchSupportCache::new(),
@@ -787,6 +789,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let n_calls = condensed.call_sites.len();
         let mut backptrs: Vec<Vec<u16>> = Vec::with_capacity(n_calls);
         let mut segment_ptrs: Vec<Vec<u32>> = Vec::with_capacity(n_calls);
+        let mut step_haps: Vec<Vec<(usize, usize)>> = Vec::with_capacity(n_calls);
         let mut logsum_unswapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         let mut logsum_swapped: Vec<f64> = vec![f64::NEG_INFINITY; n_calls];
         for i in 0..n_calls {
@@ -860,11 +863,14 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
             self.prune_and_collapse(&mut next);
             let mut step_ptrs: Vec<u16> = Vec::with_capacity(next.len());
+            let mut step_pairs: Vec<(usize, usize)> = Vec::with_capacity(next.len());
             for p in &next {
                 assert!(p.prev_idx <= MAX_BACKPTR_PREV, "beam backptr overflow");
                 step_ptrs.push(pack_backptr(p.prev_idx, p.prev_swapped));
+                step_pairs.push((p.hap1, p.hap2));
             }
             backptrs.push(step_ptrs);
+            step_haps.push(step_pairs);
             beam = next;
         }
 
@@ -885,7 +891,15 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             trailing_ptrs = Some(seg_ptrs);
         }
 
-        let donor_mass = donor_posterior_mass(&beam, self.config.beam_width.saturating_mul(4));
+        let donor_mass = donor_posterior_mass(
+            &beam,
+            &step_haps,
+            &backptrs,
+            &segment_ptrs,
+            trailing_ptrs.as_deref(),
+            self.packed_ref.n_ref_haps(),
+            self.config.beam_width.saturating_mul(4),
+        );
 
         // Pick best path
         if let Some((best_idx, _)) = beam.iter().enumerate().min_by_key(|(_, p)| p.score) {
@@ -1323,6 +1337,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             active_pool,
             pool_alleles,
             &mut scratch.hap1_allele,
+            &mut scratch.repair_cand,
             &mut scratch.spread,
         );
         self.repair_hap_for_allele_into(
@@ -1333,6 +1348,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             active_pool,
             pool_alleles,
             &mut scratch.hap2_allele,
+            &mut scratch.repair_cand,
             &mut scratch.spread,
         );
         for (h1, c1_total, c1_model, e1) in scratch.hap1_allele.iter() {
@@ -1408,9 +1424,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         out: &mut Vec<(usize, i32, i32, i32)>,
+        cand: &mut Vec<(usize, i32, bool)>,
         spread: &mut Vec<usize>,
     ) {
         out.clear();
+        cand.clear();
         let marker_idx = marker.as_usize();
         let effective_match_cost = self.costs.match_emit_cost;
         let effective_mismatch_cost = self.costs.mismatch_emit_cost;
@@ -1418,8 +1436,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         // Build candidate support C first, then normalize exact transition probabilities on C.
         // Each candidate stores (hap, emission_cost, is_stay_candidate).
-        let mut cand: Vec<(usize, i32, bool)> =
-            Vec::with_capacity(self.config.switch_candidates.saturating_add(2));
         #[inline]
         fn push_unique(cand: &mut Vec<(usize, i32, bool)>, h: usize, emit: i32, is_stay: bool) {
             if cand.iter().any(|(x, _, _)| *x == h) {
@@ -1434,7 +1450,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         } else {
             effective_mismatch_cost
         };
-        push_unique(&mut cand, hap, stay_emit, true);
+        push_unique(cand, hap, stay_emit, true);
 
         // Add recent switch candidates without hard allele gating. Under non-zero
         // emission error, non-matching donors must remain reachable.
@@ -1450,7 +1466,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             } else {
                 effective_mismatch_cost
             };
-            push_unique(&mut cand, h, emit, false);
+            push_unique(cand, h, emit, false);
             if cand.len() >= cap.saturating_add(1) {
                 break;
             }
@@ -1468,7 +1484,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 } else {
                     effective_mismatch_cost
                 };
-                push_unique(&mut cand, h, emit, false);
+                push_unique(cand, h, emit, false);
                 if cand.len() >= cap.saturating_add(1) {
                     break;
                 }
@@ -1488,7 +1504,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
 
         out.reserve(cand.len());
-        for (h, emit_cost, is_stay) in cand {
+        for (h, emit_cost, is_stay) in cand.drain(..) {
             let t_cost = if is_stay && h == hap {
                 stay_cost
             } else {
@@ -1867,10 +1883,7 @@ fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> 
     out
 }
 
-fn donor_posterior_mass(beam: &[BeamPath], max_out: usize) -> Vec<(usize, f32)> {
-    if beam.is_empty() || max_out == 0 {
-        return Vec::new();
-    }
+fn posterior_path_weights(beam: &[BeamPath]) -> (Vec<f64>, f64) {
     let mut best = i64::MAX;
     for p in beam {
         if p.model_score < best {
@@ -1886,30 +1899,15 @@ fn donor_posterior_mass(beam: &[BeamPath], max_out: usize) -> Vec<(usize, f32)> 
         weights.push(w);
         z += w;
     }
-    if z <= f64::MIN_POSITIVE {
+    (weights, z)
+}
+
+fn rank_donor_mass(mass_by_hap: std::collections::HashMap<usize, f64>, max_out: usize) -> Vec<(usize, f32)> {
+    if max_out == 0 {
         return Vec::new();
     }
-    let n_ref = beam
-        .iter()
-        .flat_map(|p| [p.hap1, p.hap2])
-        .max()
-        .map_or(0usize, |h| h.saturating_add(1));
-    if n_ref == 0 {
-        return Vec::new();
-    }
-    let mut mass = vec![0.0f64; n_ref];
-    for (p, &w) in beam.iter().zip(weights.iter()) {
-        // Let q(path) be posterior over beam paths after normalization.
-        // A haplotype can appear in either copy track (hap1/hap2), so we attribute:
-        //   mass(h) += 0.5*q(path) if h==hap1  +  0.5*q(path) if h==hap2
-        // This yields a symmetric marginal occupancy proxy over donor identities.
-        let post = w / z;
-        mass[p.hap1] += 0.5 * post;
-        mass[p.hap2] += 0.5 * post;
-    }
-    let mut ranked: Vec<(usize, f32)> = mass
+    let mut ranked: Vec<(usize, f32)> = mass_by_hap
         .into_iter()
-        .enumerate()
         .filter_map(|(h, m)| if m > 0.0 { Some((h, m as f32)) } else { None })
         .collect();
     ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1917,6 +1915,92 @@ fn donor_posterior_mass(beam: &[BeamPath], max_out: usize) -> Vec<(usize, f32)> 
         ranked.truncate(max_out);
     }
     ranked
+}
+
+fn donor_posterior_mass_terminal(
+    beam: &[BeamPath],
+    weights: &[f64],
+    z: f64,
+    max_out: usize,
+) -> Vec<(usize, f32)> {
+    if beam.is_empty() || max_out == 0 || z <= f64::MIN_POSITIVE {
+        return Vec::new();
+    }
+    let mut mass_by_hap: std::collections::HashMap<usize, f64> =
+        std::collections::HashMap::with_capacity(beam.len().saturating_mul(2));
+    for (p, &w) in beam.iter().zip(weights.iter()) {
+        let post = w / z;
+        *mass_by_hap.entry(p.hap1).or_insert(0.0) += 0.5 * post;
+        *mass_by_hap.entry(p.hap2).or_insert(0.0) += 0.5 * post;
+    }
+    rank_donor_mass(mass_by_hap, max_out)
+}
+
+fn donor_posterior_mass(
+    beam: &[BeamPath],
+    step_haps: &[Vec<(usize, usize)>],
+    backptrs: &[Vec<u16>],
+    segment_ptrs: &[Vec<u32>],
+    trailing_ptrs: Option<&[u32]>,
+    n_ref_haps: usize,
+    max_out: usize,
+) -> Vec<(usize, f32)> {
+    if beam.is_empty() || max_out == 0 {
+        return Vec::new();
+    }
+    let (weights, z) = posterior_path_weights(beam);
+    if z <= f64::MIN_POSITIVE {
+        return Vec::new();
+    }
+
+    let n_steps = step_haps.len();
+    if n_steps == 0 || backptrs.len() != n_steps || segment_ptrs.len() != n_steps {
+        return donor_posterior_mass_terminal(beam, &weights, z, max_out);
+    }
+
+    let mut mass_by_hap: std::collections::HashMap<usize, f64> =
+        std::collections::HashMap::with_capacity(beam.len().saturating_mul(n_steps).max(16));
+    let step_scale = 1.0f64 / n_steps as f64;
+    let mut broken_chain = false;
+
+    for (terminal_idx, &w) in weights.iter().enumerate() {
+        let post = w / z;
+        let mut idx = terminal_idx;
+        if let Some(ptrs) = trailing_ptrs {
+            idx = ptrs.get(idx).copied().unwrap_or(0) as usize;
+        }
+        for step in (0..n_steps).rev() {
+            let Some(&(h1, h2)) = step_haps[step].get(idx) else {
+                broken_chain = true;
+                break;
+            };
+            if h1 < n_ref_haps {
+                *mass_by_hap.entry(h1).or_insert(0.0) += 0.5 * post * step_scale;
+            }
+            if h2 < n_ref_haps {
+                *mass_by_hap.entry(h2).or_insert(0.0) += 0.5 * post * step_scale;
+            }
+            let Some(&packed) = backptrs[step].get(idx) else {
+                broken_chain = true;
+                break;
+            };
+            let bp = unpack_backptr(packed);
+            let prev_idx = bp.prev as usize;
+            idx = segment_ptrs[step]
+                .get(prev_idx)
+                .copied()
+                .unwrap_or(0) as usize;
+        }
+        if broken_chain {
+            break;
+        }
+    }
+
+    if broken_chain {
+        return donor_posterior_mass_terminal(beam, &weights, z, max_out);
+    }
+
+    rank_donor_mass(mass_by_hap, max_out)
 }
 
 #[cfg(test)]
@@ -2048,5 +2132,73 @@ mod tests {
             switch_support.ensure_initialized(1usize, 100, &aligned);
         }
         assert_eq!(scratch_pool_alleles.len(), active_pool.list().len());
+    }
+
+    #[test]
+    fn donor_mass_uses_trajectory_occupancy_not_terminal_only() {
+        let beam = vec![BeamPath {
+            hap1: 1,
+            hap2: 2,
+            cluster1: u16::MAX,
+            cluster2: u16::MAX,
+            score: 0,
+            model_score: 0,
+            last_swapped: false,
+            history_bits: 0,
+            history_len: 0,
+            prev_idx: 0,
+            prev_swapped: false,
+        }];
+        let step_haps = vec![vec![(0usize, 0usize)], vec![(1usize, 2usize)]];
+        let backptrs = vec![vec![pack_backptr(0, false)], vec![pack_backptr(0, false)]];
+        let segment_ptrs = vec![vec![0u32], vec![0u32]];
+
+        let ranked = donor_posterior_mass(
+            &beam,
+            &step_haps,
+            &backptrs,
+            &segment_ptrs,
+            None,
+            3,
+            3,
+        );
+        assert_eq!(ranked.first().map(|(h, _)| *h), Some(0));
+        assert!(ranked.iter().any(|(h, _)| *h == 1));
+        assert!(ranked.iter().any(|(h, _)| *h == 2));
+    }
+
+    #[test]
+    fn donor_mass_falls_back_to_terminal_when_chain_is_inconsistent() {
+        let beam = vec![BeamPath {
+            hap1: 1,
+            hap2: 2,
+            cluster1: u16::MAX,
+            cluster2: u16::MAX,
+            score: 0,
+            model_score: 0,
+            last_swapped: false,
+            history_bits: 0,
+            history_len: 0,
+            prev_idx: 0,
+            prev_swapped: false,
+        }];
+        // Broken chain: missing step_haps entry for the terminal step index.
+        let step_haps = vec![vec![(0usize, 0usize)], Vec::new()];
+        let backptrs = vec![vec![pack_backptr(0, false)], vec![pack_backptr(0, false)]];
+        let segment_ptrs = vec![vec![0u32], vec![0u32]];
+
+        let ranked = donor_posterior_mass(
+            &beam,
+            &step_haps,
+            &backptrs,
+            &segment_ptrs,
+            None,
+            3,
+            3,
+        );
+        assert!(!ranked.is_empty());
+        assert!(ranked.iter().any(|(h, _)| *h == 1));
+        assert!(ranked.iter().any(|(h, _)| *h == 2));
+        assert!(!ranked.iter().any(|(h, _)| *h == 0));
     }
 }

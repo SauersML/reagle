@@ -1264,20 +1264,16 @@ fn compute_target_freqs_packed<TargetSpace, RefSpace>(
 }
 
 #[inline]
-fn adaptive_top_m_window(
-    scores: &[f32],
+fn adaptive_top_m_window_from_support(
+    support: usize,
     base_top_m: usize,
     per_window_cap_window: usize,
     n_ref_haps: usize,
 ) -> usize {
-    if base_top_m == 0 || scores.is_empty() {
+    if base_top_m == 0 {
         return per_window_cap_window.max(1).min(n_ref_haps.max(1));
     }
-    let support = scores
-        .iter()
-        .filter(|&&s| s.is_finite() && s > 0.0)
-        .count()
-        .max(1);
+    let support = support.max(1);
     let denom = n_ref_haps.max(1) as f64;
     let support_frac = support as f64 / denom;
     let mut out = base_top_m;
@@ -1287,6 +1283,64 @@ fn adaptive_top_m_window(
         out = out.saturating_mul(PRESCAN_TOPM_STRONG_MULT_NUM) / PRESCAN_TOPM_STRONG_MULT_DEN;
     }
     out.max(per_window_cap_window.max(1)).min(n_ref_haps.max(1))
+}
+
+#[inline]
+fn adaptive_top_m_upper_bound(base_top_m: usize, per_window_cap_window: usize, n_ref_haps: usize) -> usize {
+    if base_top_m == 0 {
+        return per_window_cap_window.max(1).min(n_ref_haps.max(1));
+    }
+    let boosted = base_top_m.saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM) / PRESCAN_TOPM_WEAK_MULT_DEN;
+    boosted
+        .max(per_window_cap_window.max(1))
+        .min(n_ref_haps.max(1))
+}
+
+fn select_top_k_adaptive_with_support(
+    scores: &[f32],
+    base_top_m: usize,
+    per_window_cap_window: usize,
+    n_ref_haps: usize,
+) -> (usize, Vec<(usize, f32)>) {
+    if scores.is_empty() {
+        let top_m = per_window_cap_window.max(1).min(n_ref_haps.max(1));
+        return (top_m, Vec::new());
+    }
+    let upper_k = adaptive_top_m_upper_bound(base_top_m, per_window_cap_window, n_ref_haps)
+        .max(1)
+        .min(scores.len().max(1));
+    let mut heap: BinaryHeap<Reverse<RankedScore>> =
+        BinaryHeap::with_capacity(upper_k.saturating_add(1));
+    let mut support = 0usize;
+    for (idx, &score) in scores.iter().enumerate() {
+        if !score.is_finite() || score <= 0.0 {
+            continue;
+        }
+        support = support.saturating_add(1);
+        let candidate = RankedScore { idx, score };
+        if heap.len() < upper_k {
+            heap.push(Reverse(candidate));
+            continue;
+        }
+        let keep = heap
+            .peek()
+            .map(|lowest| candidate > lowest.0)
+            .unwrap_or(true);
+        if keep {
+            heap.pop();
+            heap.push(Reverse(candidate));
+        }
+    }
+    let top_m = adaptive_top_m_window_from_support(support, base_top_m, per_window_cap_window, n_ref_haps);
+    let mut ranked: Vec<(usize, f32)> = heap
+        .into_iter()
+        .map(|Reverse(r)| (r.idx, r.score))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if ranked.len() > top_m {
+        ranked.truncate(top_m);
+    }
+    (top_m, ranked)
 }
 
 fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
@@ -2922,7 +2976,7 @@ fn build_imputation_plan(
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
                             .max(per_window_cap_window)
                             .min(n_ref_haps.max(1));
-                        let top_m = adaptive_top_m_window(
+                        let (top_m, top) = select_top_k_adaptive_with_support(
                             &window_scores[i],
                             base_top_m,
                             per_window_cap_window,
@@ -2937,7 +2991,6 @@ fn build_imputation_plan(
                         } else if top_m < base_top_m {
                             adaptive_top_m_reduced = adaptive_top_m_reduced.saturating_add(1);
                         }
-                        let top = select_top_k(&window_scores[i], top_m);
                         distribute_scores_to_planning_bins(
                             &top,
                             io_s,
@@ -3161,7 +3214,7 @@ fn build_imputation_plan(
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
                             .max(per_window_cap_window)
                             .min(n_ref_haps.max(1));
-                        let top_m = adaptive_top_m_window(
+                        let (top_m, top) = select_top_k_adaptive_with_support(
                             &window_scores[i],
                             base_top_m,
                             per_window_cap_window,
@@ -3176,7 +3229,6 @@ fn build_imputation_plan(
                         } else if top_m < base_top_m {
                             adaptive_top_m_reduced = adaptive_top_m_reduced.saturating_add(1);
                         }
-                        let top = select_top_k(&window_scores[i], top_m);
                         distribute_scores_to_planning_bins(
                             &top,
                             io_s,
@@ -4012,19 +4064,20 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_pool = plan.n_ref_haps.max(1);
         let n_target_haps = n_target_samples.saturating_mul(2);
-        let n_total_pool = n_ref_pool.saturating_add(n_target_haps).max(1);
         self.params = crate::model::parameters::ModelParams::for_imputation(
             n_ref_pool,
             self.config.ne,
             self.config.err,
         );
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_total_pool as f32)
+        // Imputation transitions copy from the reference panel only; target batch
+        // size must not alter Li-Stephens transition physics.
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
         eprintln!(
-            "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_total_haps={})",
-            self.params.recomb_intensity, n_ref_pool, n_target_haps, n_total_pool,
+            "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_transition_haps={})",
+            self.params.recomb_intensity, n_ref_pool, n_target_haps, n_ref_pool,
         );
         // Do not inherit phasing mismatch estimates for imputation. Imputation
         // should use the Li-Stephens mismatch prior (or user override) tied to
@@ -4743,8 +4796,8 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_markers = ref_markers.len();
         let n_target_samples = target_win.n_samples();
-        let n_target_haps = n_target_samples.saturating_mul(2);
-        let n_transition_haps = plan.n_ref_haps.saturating_add(n_target_haps).max(1);
+        // Transition panel size for imputation is the reference panel only.
+        let n_transition_haps = plan.n_ref_haps.max(1);
         let n_transition_haps_f32 = n_transition_haps as f32;
         let should_log = should_log_impute_window(window_idx);
         let use_abyss = true;

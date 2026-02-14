@@ -93,11 +93,16 @@ impl CondensedTarget {
                     0.0
                 };
                 let fixed = !sample_phase.is_unphased(orig_m);
-                let phase_conf = sample_phase.phase_confidence(orig_m).clamp(0.0, 1.0);
+                let phase_conf = {
+                    let conf = sample_phase.phase_confidence(orig_m);
+                    if conf.is_finite() {
+                        conf.clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                };
                 let flip_cost = if fixed {
-                    let conf = sample_phase
-                        .phase_confidence(orig_m)
-                        .clamp(1e-6, 1.0 - 1e-6) as f64;
+                    let conf = phase_conf.clamp(1e-6, 1.0 - 1e-6) as f64;
                     let odds = (1.0 - conf) / conf;
                     (-(odds.ln()) * 1_000_000.0).round() as i32
                 } else {

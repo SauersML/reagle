@@ -346,6 +346,20 @@ fn parse_debug_hmm_counters(stderr: &str) -> Vec<[usize; 7]> {
     out
 }
 
+fn parse_logged_imputation_recomb_intensity(stderr: &str) -> Option<f32> {
+    for line in stderr.lines() {
+        if !line.contains("Imputation recomb_intensity:") {
+            continue;
+        }
+        let tail = line.split("Imputation recomb_intensity:").nth(1)?.trim();
+        let num = tail.split_whitespace().next()?;
+        if let Ok(v) = num.parse::<f32>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
 #[test]
 fn test_missing_confidence_is_not_full_by_default() {
     // Hypothesis: missing GL/PL causes confidence to default to 1.0 (hard evidence).
@@ -539,7 +553,7 @@ fn test_imputation_recomb_intensity_decoupled_from_phasing_estimate() {
         stderr
     );
     assert!(
-        stderr.contains("Imputation recomb_intensity:") && stderr.contains("(source=config-ne)"),
+        stderr.contains("Imputation recomb_intensity:") && stderr.contains("source=config-ne"),
         "Expected imputation recombination intensity sourced from config-ne. stderr:\n{}",
         stderr
     );
@@ -547,6 +561,68 @@ fn test_imputation_recomb_intensity_decoupled_from_phasing_estimate() {
         !stderr.contains("source=phasing-estimated"),
         "Imputation should not reuse phasing-estimated recombination intensity. stderr:\n{}",
         stderr
+    );
+}
+
+#[test]
+fn test_imputation_recomb_intensity_independent_of_target_batch_size() {
+    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let ref_vcf = work_dir.path().join("ref.vcf");
+    let target_one = work_dir.path().join("target_one.vcf");
+    let target_two = work_dir.path().join("target_two.vcf");
+
+    let n_markers = 160usize;
+    let ref_names: Vec<String> = (0..50).map(|i| format!("R{}", i + 1)).collect();
+    let ref_name_refs: Vec<&str> = ref_names.iter().map(|s| s.as_str()).collect();
+    write_synthetic_vcf(&ref_vcf, n_markers, &ref_name_refs, |i, s| {
+        if (i + s) % 2 == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
+    });
+
+    write_synthetic_vcf(&target_one, n_markers, &["T1"], |i, _| {
+        if i % 3 == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
+    });
+    write_synthetic_vcf(&target_two, n_markers, &["T1", "T2"], |i, s| {
+        if (i + s) % 3 == 0 {
+            "0|0".to_string()
+        } else {
+            "1|1".to_string()
+        }
+    });
+
+    let out_one = work_dir.path().join("out_one");
+    let out_two = work_dir.path().join("out_two");
+    let run_one = run_cli_imputation_capture(&target_one, &ref_vcf, &out_one);
+    let run_two = run_cli_imputation_capture(&target_two, &ref_vcf, &out_two);
+    assert!(
+        run_one.status.success() && run_two.status.success(),
+        "CLI run failed:\none stdout={}\none stderr={}\ntwo stdout={}\ntwo stderr={}",
+        String::from_utf8_lossy(&run_one.stdout),
+        String::from_utf8_lossy(&run_one.stderr),
+        String::from_utf8_lossy(&run_two.stdout),
+        String::from_utf8_lossy(&run_two.stderr)
+    );
+
+    let stderr_one = String::from_utf8_lossy(&run_one.stderr);
+    let stderr_two = String::from_utf8_lossy(&run_two.stderr);
+    let intensity_one = parse_logged_imputation_recomb_intensity(&stderr_one)
+        .expect("missing intensity log for one-target run");
+    let intensity_two = parse_logged_imputation_recomb_intensity(&stderr_two)
+        .expect("missing intensity log for two-target run");
+    assert!(
+        (intensity_one - intensity_two).abs() < 1e-8,
+        "Imputation recomb intensity should not vary by target batch size: one={} two={}\none stderr:\n{}\ntwo stderr:\n{}",
+        intensity_one,
+        intensity_two,
+        stderr_one,
+        stderr_two
     );
 }
 
