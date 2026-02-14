@@ -4659,7 +4659,18 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         ws.weights[..active_states].fill(1.0);
     }
 
-    let transition_haps = transition_haps.max(ref_allele_freqs.n_ref_haps().max(1));
+    let n_ref_haps = ref_allele_freqs.n_ref_haps().max(1);
+    assert!(
+        transition_haps == n_ref_haps,
+        "imputation transition_haps must equal n_ref_haps: got transition_haps={} n_ref_haps={} window={} sample={} hap={} kernel={}",
+        transition_haps,
+        n_ref_haps,
+        context.window_idx,
+        context.sample_idx,
+        context.hap_idx,
+        K::LABEL
+    );
+    let transition_haps = n_ref_haps;
     let use_prior_smoothing = target_probs.has_untyped_markers();
     if use_prior_smoothing {
         if let Some(ext_retain) = external_nearest_obs_retain {
