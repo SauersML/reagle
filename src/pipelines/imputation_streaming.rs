@@ -171,6 +171,164 @@ const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
 // copy signal to the window end is at least epsilon.
 const HANDOFF_RETAIN_EPS: f64 = 1e-3;
 
+/// Extra markers appended past each piecewise segment's core boundary so the
+/// backward pass warms up before reaching the core region.  Zero RAM cost
+/// (ref_columns are already loaded for the full I/O window) and negligible
+/// speed cost (~10 extra forward-backward markers per segment boundary).
+const BACKWARD_HALO_MARKERS: usize = 10;
+
+/// Describes a piecewise HMM segment with an optional backward halo.
+///
+/// Layout within the I/O window's marker array:
+///
+/// ```text
+///   [-------- core --------][-- halo --]
+///    ^core_start             ^core_end  ^extended_end
+/// ```
+///
+/// The HMM processes `[core_start..extended_end)`.
+/// Only `[core_start..core_end)` posteriors are emitted.
+///
+/// All index arithmetic is encapsulated here so callers never perform raw
+/// `seg_start`/`seg_end` math — preventing off-by-one and range-confusion bugs
+/// at compile time via API design (zero runtime cost).
+#[derive(Clone, Debug)]
+struct SegmentExtent {
+    /// First marker in the core output range (I/O window index, inclusive).
+    core_start: usize,
+    /// Last marker in the core output range (I/O window index, exclusive).
+    core_end: usize,
+    /// Last marker in the extended range (I/O window index, exclusive).
+    /// `extended_end >= core_end`; the surplus is backward halo.
+    extended_end: usize,
+    /// Planning window index for state selection (inclusive).
+    plan_start: usize,
+    /// Planning window index for state selection (exclusive).
+    plan_end: usize,
+}
+
+impl SegmentExtent {
+    /// Build a segment extent, clamping the backward halo to the window size.
+    #[inline]
+    fn new(
+        core_start: usize,
+        core_end: usize,
+        plan_start: usize,
+        plan_end: usize,
+        n_window_markers: usize,
+    ) -> Self {
+        assert!(core_start <= core_end);
+        assert!(core_end <= n_window_markers);
+        let extended_end = (core_end + BACKWARD_HALO_MARKERS).min(n_window_markers);
+        Self {
+            core_start,
+            core_end,
+            extended_end,
+            plan_start,
+            plan_end,
+        }
+    }
+
+    /// Total markers the HMM will process (core + halo).
+    #[inline]
+    fn hmm_len(&self) -> usize {
+        self.extended_end - self.core_start
+    }
+
+    /// Number of core output markers.
+    #[inline]
+    fn core_len(&self) -> usize {
+        self.core_end - self.core_start
+    }
+
+
+    /// Planning window range for state selection.
+    #[inline]
+    fn plan_range(&self) -> (usize, usize) {
+        (self.plan_start, self.plan_end)
+    }
+
+    /// Slice `ref_columns` for HMM input (core + halo).
+    #[inline]
+    fn slice_ref_columns<'a>(&self, cols: &'a [GenotypeColumn]) -> &'a [GenotypeColumn] {
+        &cols[self.core_start..self.extended_end]
+    }
+
+    /// Slice `nearest_obs_retain` for HMM input (core + halo).
+    #[inline]
+    fn slice_retain<'a>(&self, retain: &'a [f32]) -> &'a [f32] {
+        &retain[self.core_start..self.extended_end]
+    }
+
+    /// Build `p_recomb` for HMM input (core + halo), zeroing the first entry
+    /// when the segment received boundary-mapped priors.
+    #[inline]
+    fn build_p_recomb(&self, full_p_recomb: &[f32], boundary_mapped: bool) -> Vec<f32> {
+        let mut out = full_p_recomb[self.core_start..self.extended_end].to_vec();
+        if boundary_mapped && !out.is_empty() {
+            out[0] = 0.0;
+        }
+        out
+    }
+
+    /// Build `TargetAlleleProbs` for the extended range (core + halo).
+    fn build_target_probs(&self, input_probs: &TargetAlleleProbs) -> TargetAlleleProbs {
+        let hmm_len = self.hmm_len();
+        let mut offsets = Vec::with_capacity(hmm_len + 1);
+        let mut probs = Vec::new();
+        let mut observed = Vec::with_capacity(hmm_len);
+        offsets.push(0);
+        for m in self.core_start..self.extended_end {
+            probs.extend_from_slice(input_probs.probs_for_marker(m));
+            offsets.push(probs.len());
+            observed.push(input_probs.is_observed_marker(m));
+        }
+        let panel_priors = input_probs.panel_priors().map(|panel| {
+            let mut local = Vec::with_capacity(hmm_len);
+            for m in self.core_start..self.extended_end {
+                local.push(panel[m].clone());
+            }
+            std::sync::Arc::new(local)
+        });
+        TargetAlleleProbs::new(offsets, probs, observed, panel_priors, input_probs.min_untyped_prior_mix())
+    }
+
+    /// HMM-local index for the prior/handoff marker (last core marker).
+    ///
+    /// State posteriors at this index are used to build `chained_priors` for
+    /// the next segment.  This deliberately points to the last *core* marker,
+    /// not the last halo marker, so the handoff reflects the core region's
+    /// posterior rather than the less-constrained halo tail.
+    #[inline]
+    fn handoff_hmm_idx(&self) -> usize {
+        self.core_len().saturating_sub(1)
+    }
+
+    /// The boundary recombination rate for boundary mapping (at core_start).
+    #[inline]
+    fn boundary_recomb(&self, full_p_recomb: &[f32]) -> f32 {
+        full_p_recomb
+            .get(self.core_start)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Extract core-range posteriors from the full HMM output, clipped to the
+    /// output window `[output_start..output_end)`.
+    #[inline]
+    fn extract_output_posteriors<'a>(
+        &'a self,
+        seg_posteriors: &'a [AllelePosteriors],
+        output_start: usize,
+        output_end: usize,
+    ) -> impl Iterator<Item = AllelePosteriors> + 'a {
+        let take_start = self.core_start.max(output_start);
+        let take_end = self.core_end.min(output_end);
+        (take_start..take_end).map(move |gm| seg_posteriors[gm - self.core_start].clone())
+    }
+}
+
 #[inline]
 fn recomb_lambda_from_p(p: f32) -> f64 {
     let p = p as f64;
@@ -6329,7 +6487,7 @@ impl crate::pipelines::ImputationPipeline {
                             *slot = pidx;
                         }
 
-                        let mut segments: Vec<(usize, usize, usize, usize)> = Vec::new();
+                        let mut segments: Vec<SegmentExtent> = Vec::new();
                         let mut seg_start = 0usize;
                         while seg_start < n_markers {
                             let seg_plan = marker_plan_idx[seg_start];
@@ -6339,7 +6497,13 @@ impl crate::pipelines::ImputationPipeline {
                             }
                             let seg_plan_start = seg_plan.min(plan_range_end.saturating_sub(1));
                             let seg_plan_end = (seg_plan_start + 1).min(plan_range_end);
-                            segments.push((seg_start, seg_end, seg_plan_start, seg_plan_end));
+                            segments.push(SegmentExtent::new(
+                                seg_start,
+                                seg_end,
+                                seg_plan_start,
+                                seg_plan_end,
+                                n_markers,
+                            ));
                             seg_start = seg_end;
                         }
 
@@ -6362,11 +6526,11 @@ impl crate::pipelines::ImputationPipeline {
                             tmp_ws.nearest_obs_retain[..n_markers].to_vec()
                         };
 
-                        for (seg_start, seg_end, seg_plan_start, seg_plan_end) in segments {
-                            let seg_len = seg_end.saturating_sub(seg_start);
-                            if seg_len == 0 {
+                        for extent in &segments {
+                            if extent.core_len() == 0 {
                                 continue;
                             }
+                            let (seg_plan_start, seg_plan_end) = extent.plan_range();
                             let state_haps = build_state_haps(
                                 hap_idx,
                                 chained_priors.as_ref(),
@@ -6380,8 +6544,8 @@ impl crate::pipelines::ImputationPipeline {
                                     window_idx,
                                     s,
                                     hap_idx.as_usize(),
-                                    seg_start,
-                                    seg_end
+                                    extent.core_start,
+                                    extent.core_end
                                 )));
                             }
                             if state_haps.len() < plan.n_ref_haps {
@@ -6406,11 +6570,7 @@ impl crate::pipelines::ImputationPipeline {
                                     for id in p.ids() {
                                         prev_states_buf.push(RefHapId::new(id.0));
                                     }
-                                    let recomb_boundary = p_recomb
-                                        .get(seg_start)
-                                        .copied()
-                                        .unwrap_or(0.0)
-                                        .clamp(0.0, 1.0);
+                                    let recomb_boundary = extent.boundary_recomb(&p_recomb);
                                     let mapper = TransitionMatrix::build(
                                         &prev_states_buf,
                                         &state_haps,
@@ -6445,8 +6605,8 @@ impl crate::pipelines::ImputationPipeline {
                                             window_idx,
                                             s,
                                             hap_idx.as_usize(),
-                                            seg_start,
-                                            seg_end,
+                                            extent.core_start,
+                                            extent.core_end,
                                             state_haps.len()
                                         )));
                                     }
@@ -6458,45 +6618,18 @@ impl crate::pipelines::ImputationPipeline {
                                     window_idx,
                                     s,
                                     hap_idx.as_usize(),
-                                    seg_start,
-                                    seg_end
+                                    extent.core_start,
+                                    extent.core_end
                                 )));
                             }
 
-                            let mut seg_offsets: Vec<usize> = Vec::with_capacity(seg_len + 1);
-                            let mut seg_probs: Vec<f32> = Vec::new();
-                            let mut seg_observed: Vec<bool> = Vec::with_capacity(seg_len);
-                            seg_offsets.push(0);
-                            for m in seg_start..seg_end {
-                                seg_probs.extend_from_slice(input_probs.probs_for_marker(m));
-                                seg_offsets.push(seg_probs.len());
-                                seg_observed.push(input_probs.is_observed_marker(m));
-                            }
-                            let seg_panel_priors = input_probs.panel_priors().map(|panel| {
-                                let mut local = Vec::with_capacity(seg_len);
-                                for m in seg_start..seg_end {
-                                    local.push(panel[m].clone());
-                                }
-                                Arc::new(local)
-                            });
-                            let seg_input_probs = TargetAlleleProbs::new(
-                                seg_offsets,
-                                seg_probs,
-                                seg_observed,
-                                seg_panel_priors,
-                                input_probs.min_untyped_prior_mix(),
-                            );
-                            let mut seg_p_recomb: Vec<f32> = p_recomb[seg_start..seg_end].to_vec();
-                            // After explicit boundary mapping of priors from the previous
-                            // segment, the first transition inside this segment must not
-                            // re-apply the same boundary recombination event.
-                            if seg_boundary_mapped && !seg_p_recomb.is_empty() {
-                                seg_p_recomb[0] = 0.0;
-                            }
-                            let seg_ref_columns = &ref_columns[seg_start..seg_end];
+                            let seg_input_probs = extent.build_target_probs(input_probs);
+                            let seg_p_recomb = extent.build_p_recomb(&p_recomb, seg_boundary_mapped);
+                            let seg_ref_columns = extent.slice_ref_columns(ref_columns);
+                            let hmm_len = extent.hmm_len();
                             let (seg_posteriors, seg_state_post) = LOCAL_WORKSPACE.with(|cell| {
                                 let mut ws_opt = cell.borrow_mut();
-                                *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), seg_len));
+                                *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), hmm_len));
                                 let ws = ws_opt.as_mut().unwrap();
                                 let effective_error_rate =
                                     calibrated_emission_error(&seg_input_probs, error_rate);
@@ -6506,7 +6639,7 @@ impl crate::pipelines::ImputationPipeline {
                                     &seg_input_probs,
                                     &seg_p_recomb,
                                     effective_error_rate,
-                                    Some(seg_len.saturating_sub(1)),
+                                    Some(extent.handoff_hmm_idx()),
                                     seg_state_priors.as_deref(),
                                     &ref_allele_freqs,
                                     ImputeHmmContext {
@@ -6515,16 +6648,16 @@ impl crate::pipelines::ImputationPipeline {
                                         hap_idx: hap_idx.as_usize(),
                                     },
                                     smoothing_cluster_cm,
-                                    Some(&full_window_retain[seg_start..seg_end]),
+                                    Some(extent.slice_retain(&full_window_retain)),
                                     ws,
                                 )
                             })?;
 
-                            let take_start = seg_start.max(output_start);
-                            let take_end = seg_end.min(output_end);
-                            for gm in take_start..take_end {
-                                out_posts.push(seg_posteriors[gm - seg_start].clone());
-                            }
+                            out_posts.extend(extent.extract_output_posteriors(
+                                &seg_posteriors,
+                                output_start,
+                                output_end,
+                            ));
 
                             let mut next_priors_local = HaplotypePriors::empty();
                             if let Some(state_post) = seg_state_post.as_ref() {
@@ -6534,8 +6667,8 @@ impl crate::pipelines::ImputationPipeline {
                                         window_idx,
                                         s,
                                         hap_idx.as_usize(),
-                                        seg_start,
-                                        seg_end,
+                                        extent.core_start,
+                                        extent.core_end,
                                         state_post.len(),
                                         state_haps.len()
                                     )));
