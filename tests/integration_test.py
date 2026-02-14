@@ -617,8 +617,39 @@ def run_beagle(ref_vcf, target_vcf, output_prefix, beagle_jar, nthreads=2, map_p
             run(f"bcftools index -f {output}")
         return output
     except subprocess.CalledProcessError as e:
+
         print(f"Beagle failed: {e}")
         return None
+
+
+def _run_beagle_phasing(paths, input_vcf):
+    """Run Beagle in phasing-only mode (no imputation)."""
+    beagle_jar = paths["beagle_jar"]
+    # For phasing-only, we treat the input as the 'ref' panel to phase itself.
+    # Beagle will fill missing genotypes and phase all samples.
+    # IMPORTANT: Do NOT use gt={input} as that triggers imputation from ref.
+    # We want phasing of the input samples using the input itself (and potentially a genetic map).
+    ref_vcf = input_vcf
+    output_prefix = paths["data_dir"] / "beagle_phased"
+    
+    # Ensure PLINK map exists for Beagle
+    map_path = ensure_plink_genetic_map(paths["ref_vcf"], paths["data_dir"] / "plink.map")
+    
+    # Use ref={input} to phase the file itself without an external reference panel
+    # Beagle 5.4+ uses ref= for VCF input to be phased/imputed
+    cmd = f"java -Xmx4g -jar {beagle_jar} ref={ref_vcf} out={output_prefix} nthreads=2 map={map_path}"
+    try:
+        run(cmd)
+        output_vcf = Path(f"{output_prefix}.vcf.gz")
+        if output_vcf.exists():
+            run(f"bcftools index -f {output_vcf}")
+            return output_vcf
+        # Beagle might produce .vcf.gz depending on version/input, but usually adds .vcf.gz
+        raise RuntimeError(f"Beagle phased output not found: {output_vcf}")
+    except subprocess.CalledProcessError as e:
+        print(f"Beagle phasing failed: {e}")
+        return None
+
 
 
 def run_reagle(ref_vcf, target_vcf, output_prefix, reagle_bin, map_path=None):
@@ -3300,6 +3331,30 @@ def stage_phasing_reagle():
     print("Phasing Reagle stage completed successfully.")
 
 
+def stage_phasing_beagle():
+    """Run only Beagle phasing for phasing comparison pipeline."""
+    print("=" * 60)
+    print("STAGE: PHASING BEAGLE - Beagle phasing-only")
+    print("=" * 60)
+
+    paths = get_paths()
+    for name in ["ref_vcf", "input_vcf"]:
+        if not paths[name].exists():
+            print(f"ERROR: Required file not found: {paths[name]}")
+            print("Run 'prepare' stage first.")
+            sys.exit(1)
+
+    input_vcf = _prepare_phasing_input(paths)
+    beagle_vcf = _run_beagle_phasing(paths, input_vcf)
+    if beagle_vcf:
+        print(f"\nBeagle phased output: {beagle_vcf}")
+        print("Phasing Beagle stage completed successfully.")
+    else:
+        print("Beagle phasing failed.")
+        sys.exit(1)
+
+
+
 def stage_phasing_eagleimp():
     """Run only EagleImp phasing for phasing comparison pipeline."""
     print("=" * 60)
@@ -3337,6 +3392,8 @@ def stage_phasing_metrics():
     eagleimp_prefix = paths["data_dir"] / "eagleimp_phased"
     eagleimp_vcf = find_eagleimp_phased_output(eagleimp_prefix, paths["data_dir"])
 
+    beagle_vcf = paths["data_dir"] / "beagle_phased.vcf.gz"
+
     if not reagle_vcf.exists():
         print(f"ERROR: Reagle phased output not found: {reagle_vcf}")
         print("Run 'phasing-reagle' stage first.")
@@ -3344,11 +3401,14 @@ def stage_phasing_metrics():
     ensure_index(reagle_vcf)
 
     if not eagleimp_vcf or not eagleimp_vcf.exists():
-        print("ERROR: EagleImp phased output not found.")
-        print("Run 'phasing-eagleimp' stage first.")
-        sys.exit(1)
-    if str(eagleimp_vcf).endswith(".vcf.gz"):
+        print("Warning: EagleImp phased output not found. Skipping EagleImp metrics.")
+    elif str(eagleimp_vcf).endswith(".vcf.gz"):
         ensure_index(eagleimp_vcf)
+
+    if not beagle_vcf.exists():
+        print("Warning: Beagle phased output not found. Skipping Beagle metrics.")
+    else:
+        ensure_index(beagle_vcf)
 
     print("\n" + "=" * 60)
     print("Calculating phasing accuracy metrics...")
@@ -3363,14 +3423,25 @@ def stage_phasing_metrics():
         reference_vcf=str(paths["ref_vcf"]),
         require_ds_gp=False
     )
-    metrics["eagleimp"] = calculate_metrics(
-        str(paths["truth_vcf"]),
-        str(eagleimp_vcf),
-        str(paths["data_dir"] / "eagleimp_phasing"),
-        input_vcf=str(input_vcf),
-        reference_vcf=str(paths["ref_vcf"]),
-        require_ds_gp=False
-    )
+
+    if eagleimp_vcf and eagleimp_vcf.exists():
+        metrics["eagleimp"] = calculate_metrics(
+            str(paths["truth_vcf"]),
+            str(eagleimp_vcf),
+            str(paths["data_dir"] / "eagleimp_phasing"),
+            input_vcf=str(input_vcf),
+            reference_vcf=str(paths["ref_vcf"]),
+            require_ds_gp=False
+        )
+    if beagle_vcf.exists():
+        metrics["beagle"] = calculate_metrics(
+            str(paths["truth_vcf"]),
+            str(beagle_vcf),
+            str(paths["data_dir"] / "beagle_phasing"),
+            input_vcf=str(input_vcf),
+            reference_vcf=str(paths["ref_vcf"]),
+            require_ds_gp=False
+        )
     metrics["truth"] = calculate_metrics(
         str(paths["truth_vcf"]),
         str(paths["truth_vcf"]),
@@ -3397,7 +3468,7 @@ def stage_phasing_metrics():
     summary_lines.append("| Tool | SER | Phase Concordance | N50 (bp) | Sites Compared | Truth Overlap |")
     summary_lines.append("| :--- | ---: | ---: | ---: | ---: | ---: |")
 
-    for tool_name in ["reagle", "eagleimp", "truth"]:
+    for tool_name in ["reagle", "eagleimp", "beagle", "truth"]:
         data = metrics.get(tool_name)
         if not data:
             summary_lines.append(f"| {tool_name.upper()} | FAILED | FAILED | FAILED | FAILED | FAILED |")
@@ -3445,7 +3516,10 @@ def stage_phasing_compare():
     print("=" * 60)
 
     stage_phasing_reagle()
+    stage_phasing_reagle()
     stage_phasing_eagleimp()
+    stage_phasing_beagle()
+
     stage_phasing_metrics()
     print("\nPhasing comparison completed successfully.")
 
@@ -3648,8 +3722,10 @@ Stages:
   prepare-profile  Prepare middle 5% of chr22 target markers for profiling
   beagle       Run Java Beagle imputation
   reagle       Run Reagle imputation
+
   phasing-reagle  Run Reagle phasing-only
   phasing-eagleimp  Run EagleImp phasing-only
+  phasing-beagle    Run Beagle phasing-only
   phasing-metrics  Calculate phasing metrics from phased outputs
   phasing-compare  Compare phasing accuracy (Reagle vs EagleImp vs TRUTH baseline)
   impute5      Run IMPUTE5 imputation
@@ -3679,7 +3755,7 @@ Examples:
         nargs='?',
         default='all',
         choices=['all', 'prepare', 'prepare-profile', 'beagle', 'reagle', 'impute5', 'minimac', 
-                 'glimpse', 'metrics', 'phasing-reagle', 'phasing-eagleimp', 'phasing-metrics',
+                 'glimpse', 'metrics', 'phasing-reagle', 'phasing-eagleimp', 'phasing-beagle', 'phasing-metrics',
                  'phasing-compare', 'prepare-chr', 'impute-chr', 
                  'metrics-chr', 'summary'],
         help='Stage to run (default: all)'
@@ -3719,6 +3795,8 @@ Examples:
         stage_phasing_reagle()
     elif args.stage == 'phasing-eagleimp':
         stage_phasing_eagleimp()
+    elif args.stage == 'phasing-beagle':
+        stage_phasing_beagle()
     elif args.stage == 'phasing-metrics':
         stage_phasing_metrics()
     elif args.stage == 'phasing-compare':
