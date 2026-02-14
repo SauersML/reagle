@@ -1520,10 +1520,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
+                let weight = -(freq.max(min_freq)).ln();
                 pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
@@ -1606,10 +1603,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
+                let weight = -(freq.max(min_freq)).ln();
                 pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
