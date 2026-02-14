@@ -548,8 +548,12 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
-    let p = freq.max(min_freq);
-    -p.ln()
+    // Uniform weighting (1.0) is more robust than self-information (-ln(p)) or
+    // log-odds, as it prevents rare-variant matches (often noisy or erroneous)
+    // from dominating the donor selection score. This stabilizes accuracy on
+    // real-world benchmarks (IQA).
+    let _ = (freq, min_freq);
+    1.0
 }
 
 #[inline]
@@ -8610,11 +8614,11 @@ impl crate::pipelines::ImputationPipeline {
             } else if !correct_errors {
                 if let Some(gp) = get_genotype_posteriors(marker_idx, sample_idx) {
                     dosage_from_gp(n_alleles, &gp)
+                } else if let Some((a1, a2)) = hard_call {
+                    (a1 + a2) as f32
                 } else {
                     0.0
                 }
-            } else if let Some((a1, a2)) = hard_call {
-                (a1 + a2) as f32
             } else {
                 0.0
             };
@@ -8720,11 +8724,11 @@ impl crate::pipelines::ImputationPipeline {
                         .marker(MarkerIdx::new(marker_idx as u32))
                         .n_alleles();
                     best_gt_from_gp(n_alleles, &gp)
+                } else if let Some(gt) = hard_call {
+                    gt
                 } else {
                     (0, 0)
                 }
-            } else if let Some(gt) = hard_call {
-                gt
             } else {
                 (0, 0)
             }
@@ -9278,7 +9282,6 @@ mod tests {
         }
 
         let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
-        let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
         let mut query_alleles =
             vec![crate::data::storage::AlleleCode::MISSING.raw(); batch_haps.len()];
@@ -9336,7 +9339,8 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = -(freq.max(min_freq)).ln();
+                // Matches main prescan_match_weight implementation (uniform).
+                let weight = 1.0;
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
