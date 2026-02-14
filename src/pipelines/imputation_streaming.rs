@@ -812,11 +812,15 @@ fn estimate_scan_batch_size(
     // Each stored score is `(usize, f32)` from `select_top_k`.
     let pair_bytes = std::mem::size_of::<(usize, f32)>() as u64;
     let sparse_pairs_per_hap = per_window_caps.iter().fold(0u64, |acc, &cap| {
-        let top_m = cap
+        let base_top_m = cap
             .saturating_mul(PBWT_PER_WINDOW_MULT)
             .max(cap)
-            .min(n_ref_haps.max(1)) as u64;
-        acc.saturating_add(top_m)
+            .min(n_ref_haps.max(1));
+        // Budget batch memory for worst-case adaptive top-M expansion in weak windows.
+        let top_m = base_top_m
+            .saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM)
+            / PRESCAN_TOPM_WEAK_MULT_DEN;
+        acc.saturating_add(top_m.min(n_ref_haps.max(1)) as u64)
     });
     // `Vec<Vec<(usize, f32)>>` header bytes per window for one hap entry.
     let vec_header_bytes = (per_window_caps.len() as u64)
@@ -6447,6 +6451,44 @@ impl crate::pipelines::ImputationPipeline {
                             false
                         }
                     };
+                let compute_transition_lambda =
+                    |state_haps: &[RefHapId], donors: &[(RefHapId, u32)]| -> f32 {
+                        const LAMBDA_MAX: f32 = 0.98;
+                        if state_haps.is_empty() {
+                            return 0.0;
+                        }
+                        if state_haps.len() == 1 {
+                            return LAMBDA_MAX;
+                        }
+                        let mut donor_weight: std::collections::HashMap<RefHapId, f32> =
+                            std::collections::HashMap::with_capacity(donors.len().max(1) * 2);
+                        for &(hap, c) in donors {
+                            let w = c as f32;
+                            if w.is_finite() && w > 0.0 {
+                                donor_weight
+                                    .entry(hap)
+                                    .and_modify(|v| *v += w)
+                                    .or_insert(w);
+                            }
+                        }
+                        let mut sum_w = 0.0f32;
+                        let mut sum_w2 = 0.0f32;
+                        for &hap in state_haps {
+                            let w = donor_weight.get(&hap).copied().unwrap_or(0.0);
+                            if w > 0.0 && w.is_finite() {
+                                sum_w += w;
+                                sum_w2 += w * w;
+                            }
+                        }
+                        if sum_w <= 0.0 || sum_w2 <= 0.0 || !sum_w.is_finite() || !sum_w2.is_finite()
+                        {
+                            return 0.0;
+                        }
+                        let k = state_haps.len() as f32;
+                        let neff = ((sum_w * sum_w) / sum_w2).clamp(1.0, k);
+                        let ess_norm = ((neff - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
+                        (LAMBDA_MAX * (1.0 - ess_norm)).clamp(0.0, LAMBDA_MAX)
+                    };
                 let exact_no_info_posteriors =
                     |hap_idx: HapIdx,
                      donors: &[(RefHapId, u32)],
@@ -6747,6 +6789,7 @@ impl crate::pipelines::ImputationPipeline {
                             if state_haps.len() < plan.n_ref_haps {
                                 subsetted_any = true;
                             }
+                            let transition_lambda = compute_transition_lambda(&state_haps, donors);
 
                             let mut seg_state_priors: Option<Vec<f32>> = None;
                             let mut seg_boundary_mapped = false;
@@ -6838,6 +6881,7 @@ impl crate::pipelines::ImputationPipeline {
                                     Some(extent.handoff_hmm_idx()),
                                     seg_state_priors.as_deref(),
                                     &ref_allele_freqs,
+                                    transition_lambda,
                                     ImputeHmmContext {
                                         window_idx,
                                         sample_idx: s,
@@ -6930,6 +6974,7 @@ impl crate::pipelines::ImputationPipeline {
                             priors.is_some()
                         )));
                     }
+                    let transition_lambda = compute_transition_lambda(&state_haps, donors);
 
                     let mut state_priors_slice: Option<&[f32]> = if let Some(p) = priors {
                         if p.is_empty() {
@@ -7040,6 +7085,7 @@ impl crate::pipelines::ImputationPipeline {
                             prior_marker_idx,
                             state_priors_slice.take(),
                             &ref_allele_freqs,
+                            transition_lambda,
                             ImputeHmmContext {
                                 window_idx,
                                 sample_idx: s,
