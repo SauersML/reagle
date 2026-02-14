@@ -4,10 +4,10 @@
 //! reference haplotypes (state set). Emissions are computed using per-haplotype
 //! allele probabilities from the target, and reference alleles are read on demand.
 
+use crate::data::HapIdx;
 use crate::data::storage::{
     AlleleCode, DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
-use crate::data::HapIdx;
 use crate::error::{ReagleError, Result};
 #[cfg(test)]
 use crate::model::li_stephens::subset_linear_exact_k;
@@ -249,8 +249,8 @@ fn validate_reference_marker_count(
 #[cfg(test)]
 mod tests {
     use super::{
-        fill_emissions, missing_emission_prob, subset_transition_params,
-        transition_only_forward_update, AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles,
+        AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles, fill_emissions,
+        missing_emission_prob, subset_transition_params, transition_only_forward_update,
     };
     use super::{RefColumnLike, RefHapId};
     use crate::data::storage::AlleleCode;
@@ -2140,9 +2140,16 @@ fn subset_transition_params_adaptive_q(
     let n = n_ref_haps.max(1) as f32;
     let k = active_states as f32;
     let lam = lambda.clamp(0.0, 1.0);
-    // Truncation-aware conditioning with confidence-adaptive shrink:
-    // q_t(j) is represented by active-state posterior; shrink to uniform 1/N by (1-lambda).
-    // Denominator conditions on the event "next donor remains represented".
+    // Fixed-lambda subset transition family used throughout imputation:
+    //   rho  = lambda + (1-lambda) * K/N
+    //   d    = (1-r) + r*rho
+    //   stay = ((1-r) + r*lambda) / d
+    //   shift= (r*(1-lambda)/N) / d
+    //
+    // Affine update is:
+    //   x'_j = stay*x_j + shift*sum_i x_i
+    // and preserves represented-state mass exactly because:
+    //   stay + K*shift = 1.
     let rho = lam + (1.0 - lam) * (k / n);
     let d = ((1.0 - r) + r * rho).max(1e-30);
     let stay = ((1.0 - r) + r * lam) / d;

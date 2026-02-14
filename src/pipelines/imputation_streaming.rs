@@ -11,14 +11,15 @@ use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::*;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use tracing::{info_span, instrument, warn};
 
+use crate::Config;
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::marker::{AnyMarkerSpace, Markers, RefWindowSpace};
@@ -27,18 +28,18 @@ use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::{ChromIdx, HapIdx, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
-use crate::io::bref3::{convert_ref_vcf_to_bref3, RefPanelReader, RefWindow, TargetMarkerIndex};
+use crate::io::bref3::{RefPanelReader, RefWindow, TargetMarkerIndex, convert_ref_vcf_to_bref3};
 use crate::io::prescan_cache::{
-    create_temp_cache_path, pack_ref_columns, PackedRefColumn, PrescanCacheReader,
-    PrescanCacheWriter,
+    PackedRefColumn, PrescanCacheReader, PrescanCacheWriter, create_temp_cache_path,
+    pack_ref_columns,
 };
 use crate::io::streaming::{
     GlobalHapId, HaplotypePriors, PhasedOverlap, StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::impute_hmm::{
-    compute_nearest_observed_lambda, run_impute_hmm, state_posteriors_to_priors, ImputeHmmContext,
-    ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs,
+    ImputeHmmContext, ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs,
+    compute_nearest_observed_lambda, run_impute_hmm, state_posteriors_to_priors,
 };
 use crate::model::parameters::ModelParams;
 use crate::model::phase_query::{
@@ -57,7 +58,6 @@ use crate::model::transition_matrix::TransitionMatrix;
 use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
-use crate::Config;
 
 /// Retain only the `k` highest-weight donors, discarding the rest.
 ///
@@ -67,8 +67,8 @@ use crate::Config;
 ///
 /// **Accuracy note**: Truncating low-weight donors also acts as a
 /// denoising filter for the downstream HMM. By concentrating the
-/// posterior probability budget on haplotypes that genuinely match
-/// the target (high PBWT match count), the HMM avoids diluting its
+/// posterior probability budget on haplotypes with high continuity-
+/// weighted evidence mass, the HMM avoids diluting its
 /// allele posteriors across hundreds of weakly-matching reference
 /// haplotypes. Empirically this improved overall R² by +0.0057 and
 /// SEN by +0.00086 on the Kat benchmark (IQA run #1371 vs base).
@@ -141,11 +141,7 @@ fn fill_ref_alleles(col: &GenotypeColumn, out: &mut [u8]) {
 }
 
 #[inline]
-fn is_represented_in_states(
-    state_haps: &[RefHapId],
-    col: &GenotypeColumn,
-    allele: u8,
-) -> bool {
+fn is_represented_in_states(state_haps: &[RefHapId], col: &GenotypeColumn, allele: u8) -> bool {
     for &hap in state_haps {
         if col.get(HapIdx::new(hap.as_u32())) == allele {
             return true;
@@ -762,11 +758,7 @@ fn interval_support_over_range(
             total = total.saturating_add(1);
         }
     }
-    if total > 0 {
-        Some(total)
-    } else {
-        None
-    }
+    if total > 0 { Some(total) } else { None }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -928,9 +920,8 @@ fn estimate_scan_batch_size(
             .max(cap)
             .min(n_ref_haps.max(1));
         // Budget batch memory for worst-case adaptive top-M expansion in weak windows.
-        let top_m = base_top_m
-            .saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM)
-            / PRESCAN_TOPM_WEAK_MULT_DEN;
+        let top_m =
+            base_top_m.saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM) / PRESCAN_TOPM_WEAK_MULT_DEN;
         acc.saturating_add(top_m.min(n_ref_haps.max(1)) as u64)
     });
     // `Vec<Vec<(usize, f32)>>` header bytes per window for one hap entry.
@@ -1297,13 +1288,9 @@ fn adaptive_top_m_window(
     let support_frac = support as f64 / denom;
     let mut out = base_top_m;
     if support_frac <= 0.08 {
-        out = out
-            .saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM)
-            / PRESCAN_TOPM_WEAK_MULT_DEN;
+        out = out.saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM) / PRESCAN_TOPM_WEAK_MULT_DEN;
     } else if support_frac >= 0.65 {
-        out = out
-            .saturating_mul(PRESCAN_TOPM_STRONG_MULT_NUM)
-            / PRESCAN_TOPM_STRONG_MULT_DEN;
+        out = out.saturating_mul(PRESCAN_TOPM_STRONG_MULT_NUM) / PRESCAN_TOPM_STRONG_MULT_DEN;
     }
     out.max(per_window_cap_window.max(1)).min(n_ref_haps.max(1))
 }
@@ -3548,8 +3535,7 @@ fn build_imputation_plan(
     }
     eprintln!(
         "LMS dropout credits: haps={} windows={}",
-        dropout_credit_haps_total,
-        dropout_credit_windows_total
+        dropout_credit_haps_total, dropout_credit_windows_total
     );
 
     Ok(plan)
@@ -3635,11 +3621,7 @@ impl SampleImputationResult {
             } else {
                 0.5
             };
-            if allele == 1 {
-                p_alt
-            } else {
-                1.0 - p_alt
-            }
+            if allele == 1 { p_alt } else { 1.0 - p_alt }
         })
     }
 
@@ -3824,11 +3806,7 @@ impl AltProbDiskStoreView {
             )
         };
         let v = values.get(idx).copied()?;
-        if v.is_nan() {
-            None
-        } else {
-            Some(v)
-        }
+        if v.is_nan() { None } else { Some(v) }
     }
 }
 
@@ -4160,10 +4138,7 @@ impl crate::pipelines::ImputationPipeline {
         self.params.recomb_intensity = impute_recomb_intensity;
         eprintln!(
             "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_total_haps={})",
-            self.params.recomb_intensity,
-            n_ref_pool,
-            n_target_haps,
-            n_total_pool,
+            self.params.recomb_intensity, n_ref_pool, n_target_haps, n_total_pool,
         );
         // Do not inherit phasing mismatch estimates for imputation. Imputation
         // should use the Li-Stephens mismatch prior (or user override) tied to
@@ -5748,6 +5723,10 @@ impl crate::pipelines::ImputationPipeline {
                     let r = p_recomb.get(m).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                     // Match Li-Stephens convention used by subset transition math:
                     // full-panel stay term is (1-r), with switch mass handled separately.
+                    // Let s_t = 1-r_t. For donor tract start a and marker b, continuity is:
+                    //   cont(a->b) = product_{t=a+1..b} s_t
+                    // Taking logs gives a fast O(1) span query via prefix sums:
+                    //   log cont(a->b) = sum_{t=a+1..b} log s_t
                     let stay = (1.0 - r).clamp(1e-12, 1.0);
                     prefix_log_stay_full[m + 1] = prefix_log_stay_full[m] + stay.ln();
                 }
@@ -5974,7 +5953,15 @@ impl crate::pipelines::ImputationPipeline {
                             if donor_picks.is_empty() {
                                 continue;
                             }
-                            let marker_mass = info_weight;
+                            // Marker evidence mass (in nats) from typed-query emission info,
+                            // tempered by candidate coverage:
+                            //   alpha_m = info_weight(m) * c_m
+                            //   c_m = |C_m| / k_m in [0,1]
+                            // This avoids assigning full mass when PBWT returns a small
+                            // candidate set (low recall / brittle beam context).
+                            let coverage =
+                                (donor_picks.len() as f32 / donor_k.max(1) as f32).clamp(0.0, 1.0);
+                            let marker_mass = info_weight * coverage;
                             if marker_mass <= 0.0 || !marker_mass.is_finite() {
                                 continue;
                             }
@@ -5987,8 +5974,11 @@ impl crate::pipelines::ImputationPipeline {
                                 let log_cont = if start >= ref_m {
                                     0.0
                                 } else {
-                                    prefix_log_stay_full[ref_m + 1] - prefix_log_stay_full[start + 1]
+                                    prefix_log_stay_full[ref_m + 1]
+                                        - prefix_log_stay_full[start + 1]
                                 };
+                                // q_m(d) proportional to continuity mass:
+                                //   q_m(d) proportional to cont_d(m) = exp(log_cont_d(m))
                                 if log_cont > max_log {
                                     max_log = log_cont;
                                 }
@@ -5999,17 +5989,28 @@ impl crate::pipelines::ImputationPipeline {
                                 denom += (*v - max_log).exp();
                             }
                             if denom <= 0.0 || !denom.is_finite() {
-                                push_donor_weight(
-                                    &mut sm_donor_counts[hap_idx],
-                                    RefHapId::new(donor),
-                                    marker_mass,
-                                );
+                                let uniform = marker_mass / donor_picks.len().max(1) as f32;
+                                for pick in donor_picks.iter() {
+                                    push_donor_weight(
+                                        &mut sm_donor_counts[hap_idx],
+                                        RefHapId::new(pick.hap),
+                                        uniform,
+                                    );
+                                }
                                 continue;
                             }
                             let inv = 1.0 / denom;
                             for (hap, lv) in log_mass.into_iter() {
+                                // Numerically stable softmax:
+                                //   q_m(d) = exp(l_d - l_max) / sum_c exp(l_c - l_max)
+                                // Donor accumulation objective:
+                                //   W(d) += alpha_m * q_m(d)
                                 let p = (lv - max_log).exp() * inv;
-                                push_donor_weight(&mut sm_donor_counts[hap_idx], hap, marker_mass * p);
+                                push_donor_weight(
+                                    &mut sm_donor_counts[hap_idx],
+                                    hap,
+                                    marker_mass * p,
+                                );
                             }
                         }
                     }
@@ -6152,6 +6153,8 @@ impl crate::pipelines::ImputationPipeline {
                         .map(|(h, c)| (*h, *c))
                         .collect();
                     if !combined.is_empty() {
+                        // Primary path: state proposal uses donor evidence W(d) learned from
+                        // informative-marker mass and Li-Stephens continuity.
                         return combined;
                     }
                     // No donor evidence: fall back to structural priors only.
@@ -6798,20 +6801,31 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         let mut sum_w = 0.0f32;
                         let mut sum_w2 = 0.0f32;
+                        let mut k_ess = 0usize;
                         for &hap in state_haps {
                             let w = donor_weight.get(&hap).copied().unwrap_or(0.0);
                             if w > 0.0 && w.is_finite() {
                                 sum_w += w;
                                 sum_w2 += w * w;
+                                k_ess += 1;
                             }
                         }
                         if sum_w <= 0.0 || sum_w2 <= 0.0 || !sum_w.is_finite() || !sum_w2.is_finite()
                         {
+                            // No donor support on the selected state set -> use canonical subset
+                            // transition (lambda=0) rather than injecting sticky behavior.
                             return 0.0;
                         }
-                        let k = state_haps.len() as f32;
-                        let neff = ((sum_w * sum_w) / sum_w2).clamp(1.0, k);
-                        let ess_norm = ((neff - 1.0) / (k - 1.0)).clamp(0.0, 1.0);
+                        if k_ess <= 1 {
+                            return LAMBDA_MAX;
+                        }
+                        // Effective sample size over donor weights on the FINAL selected state set:
+                        //   Neff = (sum w)^2 / sum(w^2), with Neff in [1, K_ess].
+                        // We normalize by K_ess (supported states), not raw K, to avoid
+                        // artificial stickiness when many selected states have zero donor weight.
+                        let k_ess_f = k_ess as f32;
+                        let neff = ((sum_w * sum_w) / sum_w2).clamp(1.0, k_ess_f);
+                        let ess_norm = ((neff - 1.0) / (k_ess_f - 1.0)).clamp(0.0, 1.0);
                         (LAMBDA_MAX * (1.0 - ess_norm)).clamp(0.0, LAMBDA_MAX)
                     };
                 let exact_no_info_posteriors =
@@ -7989,18 +8003,10 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
                                 let hard = if donor_candidates.is_empty() {
-                                    if target_allele == 1 {
-                                        1.0
-                                    } else {
-                                        0.0
-                                    }
+                                    if target_allele == 1 { 1.0 } else { 0.0 }
                                 } else {
                                     let allele = col.get(HapIdx::new(donor));
-                                    if allele == 1 {
-                                        1.0
-                                    } else {
-                                        0.0
-                                    }
+                                    if allele == 1 { 1.0 } else { 0.0 }
                                 };
                                 (orient_weight * hard + (1.0 - orient_weight) * 0.5)
                                     .clamp(1e-6, 1.0 - 1e-6)
@@ -9275,11 +9281,7 @@ impl crate::pipelines::ImputationPipeline {
                     if gp01 >= gp00 && gp01 >= gp11 {
                         let p10 = p1_alt * (1.0 - p2_alt);
                         let p01 = (1.0 - p1_alt) * p2_alt;
-                        if p10 >= p01 {
-                            (1, 0)
-                        } else {
-                            (0, 1)
-                        }
+                        if p10 >= p01 { (1, 0) } else { (0, 1) }
                     } else if gp11 >= gp00 {
                         (1, 1)
                     } else {
@@ -9809,12 +9811,12 @@ impl crate::pipelines::ImputationPipeline {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
-    use crate::data::storage::phase_state::{Phased, Unphased};
     use crate::data::storage::GenotypeColumn;
-    use crate::data::ChromIdx;
+    use crate::data::storage::phase_state::{Phased, Unphased};
     use crate::io::bref3::StreamingRefVcfReader;
     use crate::io::vcf::{ImputationQuality, VcfWriter};
     use crate::pipelines::ImputationPipeline;
