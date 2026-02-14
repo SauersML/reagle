@@ -5,8 +5,8 @@
 
 use bitvec::prelude::*;
 
-use crate::data::HapIdx;
 use crate::data::marker::bits_per_allele;
+use crate::data::HapIdx;
 use crate::model::types::RefHapId;
 
 /// Dense bit-packed storage for genotype data
@@ -25,6 +25,9 @@ pub struct DenseColumn {
 
     /// Number of haplotypes stored
     n_haplotypes: u32,
+
+    /// Stable column fingerprint for fast equality prefiltering in hot paths.
+    fingerprint: u64,
 }
 
 impl DenseColumn {
@@ -37,7 +40,9 @@ impl DenseColumn {
             missing: bitvec![u64, Lsb0; 0; n_haplotypes],
             bits_per_allele,
             n_haplotypes: n_haplotypes as u32,
+            fingerprint: 0,
         }
+        .with_fingerprint()
     }
 
     /// Create from an iterator of alleles
@@ -68,7 +73,44 @@ impl DenseColumn {
             missing,
             bits_per_allele,
             n_haplotypes: n_haplotypes as u32,
+            fingerprint: 0,
         }
+        .with_fingerprint()
+    }
+
+    #[inline]
+    fn with_fingerprint(mut self) -> Self {
+        self.fingerprint = Self::compute_fingerprint(
+            self.bits.as_raw_slice(),
+            self.missing.as_raw_slice(),
+            self.bits_per_allele,
+            self.n_haplotypes,
+        );
+        self
+    }
+
+    #[inline]
+    fn compute_fingerprint(
+        bits: &[u64],
+        missing: &[u64],
+        bits_per_allele: u8,
+        n_haplotypes: u32,
+    ) -> u64 {
+        // FNV-1a over immutable column payload.
+        let mut h: u64 = 0xcbf29ce484222325;
+        h ^= bits_per_allele as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= n_haplotypes as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        for &w in bits {
+            h ^= w;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for &w in missing {
+            h ^= w;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
     }
 
     /// Calculate bits needed per allele (minimum 1 for storage)
@@ -136,6 +178,11 @@ impl DenseColumn {
     #[inline]
     pub fn missing_raw(&self) -> &[u64] {
         self.missing.as_raw_slice()
+    }
+
+    #[inline]
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
     }
 
     /// Count of ALT alleles (for biallelic)

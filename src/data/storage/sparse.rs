@@ -50,6 +50,18 @@ impl SparseColumn {
         }
     }
 
+    /// Borrow sorted carrier haplotype indices.
+    #[inline]
+    pub fn carriers(&self) -> &[HapIdx] {
+        &self.carriers
+    }
+
+    /// Whether carrier semantics are inverted.
+    #[inline]
+    pub fn is_inverted(&self) -> bool {
+        self.inverted
+    }
+
     /// Number of haplotypes
     pub fn n_haplotypes(&self) -> usize {
         self.n_haplotypes as usize

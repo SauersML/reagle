@@ -4,10 +4,10 @@
 //! reference haplotypes (state set). Emissions are computed using per-haplotype
 //! allele probabilities from the target, and reference alleles are read on demand.
 
-use crate::data::HapIdx;
 use crate::data::storage::{
     AlleleCode, DenseColumn, DictionaryColumn, GenotypeColumn, SeqCodedColumn, SparseColumn,
 };
+use crate::data::HapIdx;
 use crate::error::{ReagleError, Result};
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::types::RefHapId;
@@ -249,8 +249,8 @@ fn validate_reference_marker_count(
 #[cfg(test)]
 mod tests {
     use super::{
-        AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles, fill_emissions,
-        missing_emission_prob, subset_transition_params, transition_only_forward_update,
+        fill_emissions, missing_emission_prob, subset_transition_params,
+        transition_only_forward_update, AlleleProbsView, BackwardAffine, ForwardAffine, RefAlleles,
     };
     use super::{RefColumnLike, RefHapId};
     use crate::data::storage::AlleleCode;
@@ -570,9 +570,12 @@ pub struct ImputeWorkspace {
     pub allele_probs: Vec<f32>,
     smoothing_prior_counts: Vec<f32>,
     state_posterior_scratch: Vec<f32>,
+    boundary_fb_products: Vec<f32>,
     allele_prior_scratch: Vec<f32>,
     dict_pattern_alleles: Vec<u8>,
     emission_by_allele: Vec<f32>,
+    pattern_id_cache: Vec<PatternIdCacheEntry>,
+    pattern_id_cache_capacity: usize,
     nearest_obs_fwd: Vec<f32>,
     nearest_obs_bwd: Vec<f32>,
     pub(crate) nearest_obs_retain: Vec<f32>,
@@ -583,6 +586,18 @@ pub struct ImputeWorkspace {
     pattern_state_count: Vec<f32>,
     active_states: usize,
     active_markers: usize,
+}
+
+struct PatternIdCacheEntry {
+    marker_key: usize,
+    state_ptr: usize,
+    active_states: usize,
+    patterns: Vec<u16>,
+}
+
+struct PatternCacheView {
+    ptr: *const u16,
+    len: usize,
 }
 
 #[derive(Clone)]
@@ -701,9 +716,12 @@ impl ImputeWorkspace {
             allele_probs: Vec::new(),
             smoothing_prior_counts: Vec::new(),
             state_posterior_scratch: Vec::new(),
+            boundary_fb_products: Vec::new(),
             allele_prior_scratch: Vec::new(),
             dict_pattern_alleles: Vec::new(),
             emission_by_allele: Vec::new(),
+            pattern_id_cache: Vec::new(),
+            pattern_id_cache_capacity: 8,
             nearest_obs_fwd: Vec::new(),
             nearest_obs_bwd: Vec::new(),
             nearest_obs_retain: Vec::new(),
@@ -736,6 +754,9 @@ impl ImputeWorkspace {
         }
         if self.fwd_scales.len() < n_markers {
             self.fwd_scales.resize(n_markers, 1.0);
+        }
+        if self.pattern_id_cache_capacity == 0 {
+            self.pattern_id_cache_capacity = 8;
         }
         self.active_states = n_states;
         self.active_markers = n_markers;
@@ -874,10 +895,73 @@ impl ImputeWorkspace {
     }
 
     #[inline]
+    fn ensure_boundary_fb_products(&mut self, n_states: usize) {
+        if self.boundary_fb_products.len() < n_states {
+            self.boundary_fb_products.resize(n_states, 0.0);
+        }
+    }
+
+    #[inline]
     fn ensure_smoothing_prior_counts(&mut self, n_alleles: usize) {
         if self.smoothing_prior_counts.len() < n_alleles {
             self.smoothing_prior_counts.resize(n_alleles, 0.0);
         }
+    }
+
+    #[inline]
+    fn pattern_cache_lookup(
+        &self,
+        marker_key: usize,
+        state_haps_ptr: *const RefHapId,
+        active_states: usize,
+    ) -> Option<PatternCacheView> {
+        let state_ptr = state_haps_ptr as usize;
+        self.pattern_id_cache
+            .iter()
+            .find(|entry| {
+                entry.marker_key == marker_key
+                    && entry.state_ptr == state_ptr
+                    && entry.active_states == active_states
+            })
+            .map(|entry| PatternCacheView {
+                ptr: entry.patterns.as_ptr(),
+                len: entry.patterns.len(),
+            })
+    }
+
+    #[inline]
+    fn pattern_cache_insert(
+        &mut self,
+        marker_key: usize,
+        state_haps_ptr: *const RefHapId,
+        active_states: usize,
+        patterns: &[u16],
+    ) {
+        let state_ptr = state_haps_ptr as usize;
+        if let Some(entry) = self.pattern_id_cache.iter_mut().find(|entry| {
+            entry.marker_key == marker_key
+                && entry.state_ptr == state_ptr
+                && entry.active_states == active_states
+        }) {
+            entry.patterns.clear();
+            entry.patterns.extend_from_slice(patterns);
+            return;
+        }
+        if self.pattern_id_cache.len() >= self.pattern_id_cache_capacity {
+            self.pattern_id_cache.rotate_left(1);
+            self.pattern_id_cache.pop();
+        }
+        self.pattern_id_cache.push(PatternIdCacheEntry {
+            marker_key,
+            state_ptr,
+            active_states,
+            patterns: patterns.to_vec(),
+        });
+    }
+
+    #[inline]
+    fn pattern_cache_clear(&mut self) {
+        self.pattern_id_cache.clear();
     }
 }
 
@@ -1563,8 +1647,8 @@ fn apply_marker_prior_smoothing(
     // Approximation error combines structural-missingness and truncation:
     //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
     // This term captures model/subset limitations, not map distance.
-    let approximation_error = (1.0 - (1.0 - missing_mass) * (1.0 - truncation_error))
-        .clamp(0.0, 0.9999);
+    let approximation_error =
+        (1.0 - (1.0 - missing_mass) * (1.0 - truncation_error)).clamp(0.0, 0.9999);
     // Combine map and approximation uncertainty via independent-failure union:
     //   combined_error = 1 - (1-dist_error)*(1-approx_error)
     // so either axis can activate extra regularization.
@@ -2439,6 +2523,340 @@ fn fill_pattern_sums(
     }
 }
 
+#[inline]
+fn fill_pattern_sums_with_products(
+    state_patterns: &[u16],
+    active_states: usize,
+    fwd_base: &[f32],
+    bwd_base: &[f32],
+    fb_products: &[f32],
+    sum_f: &mut [f32],
+    sum_b: &mut [f32],
+    sum_fb: &mut [f32],
+    state_count: &mut [f32],
+) {
+    sum_f.fill(0.0);
+    sum_b.fill(0.0);
+    sum_fb.fill(0.0);
+    state_count.fill(0.0);
+    for i in 0..active_states {
+        let pid = state_patterns[i] as usize;
+        if pid >= sum_f.len() {
+            continue;
+        }
+        let f = fwd_base[i];
+        let b = bwd_base[i];
+        sum_f[pid] += f;
+        sum_b[pid] += b;
+        sum_fb[pid] += fb_products[i];
+        state_count[pid] += 1.0;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn bitmask16_at(words: &[u64], word_idx: usize, bit_off: usize) -> u16 {
+    let lo = words.get(word_idx).copied().unwrap_or(0);
+    if bit_off <= 48 {
+        ((lo >> bit_off) & 0xFFFF) as u16
+    } else {
+        let hi = words.get(word_idx + 1).copied().unwrap_or(0);
+        let left = lo >> bit_off;
+        let right = hi << (64 - bit_off);
+        ((left | right) & 0xFFFF) as u16
+    }
+}
+
+#[inline]
+fn dense_identity_biallelic_sums_scalar(
+    limit: usize,
+    bits: &[u64],
+    missing: &[u64],
+    fwd: &[f32],
+    bwd: &[f32],
+    fb_products: Option<&[f32]>,
+) -> (f32, f32, f32, usize, f32, f32, f32, usize) {
+    let mut alt_sum_f = 0.0f32;
+    let mut alt_sum_b = 0.0f32;
+    let mut alt_sum_fb = 0.0f32;
+    let mut alt_count = 0usize;
+    let mut miss_sum_f = 0.0f32;
+    let mut miss_sum_b = 0.0f32;
+    let mut miss_sum_fb = 0.0f32;
+    let mut miss_count = 0usize;
+    let max_words = (limit.saturating_add(63)) >> 6;
+    if let Some(fb) = fb_products {
+        for word_idx in 0..max_words {
+            let base = word_idx << 6;
+            let miss_bits = missing.get(word_idx).copied().unwrap_or(0);
+            let mut miss_word = miss_bits;
+            while miss_word != 0 {
+                let bit = miss_word.trailing_zeros() as usize;
+                let h = base + bit;
+                if h >= limit {
+                    break;
+                }
+                miss_sum_f += fwd[h];
+                miss_sum_b += bwd[h];
+                miss_sum_fb += fb[h];
+                miss_count += 1;
+                miss_word &= miss_word - 1;
+            }
+            let mut alt_word = bits.get(word_idx).copied().unwrap_or(0) & !miss_bits;
+            while alt_word != 0 {
+                let bit = alt_word.trailing_zeros() as usize;
+                let h = base + bit;
+                if h >= limit {
+                    break;
+                }
+                alt_sum_f += fwd[h];
+                alt_sum_b += bwd[h];
+                alt_sum_fb += fb[h];
+                alt_count += 1;
+                alt_word &= alt_word - 1;
+            }
+        }
+    } else {
+        for word_idx in 0..max_words {
+            let base = word_idx << 6;
+            let miss_bits = missing.get(word_idx).copied().unwrap_or(0);
+            let mut miss_word = miss_bits;
+            while miss_word != 0 {
+                let bit = miss_word.trailing_zeros() as usize;
+                let h = base + bit;
+                if h >= limit {
+                    break;
+                }
+                let f = fwd[h];
+                let b = bwd[h];
+                miss_sum_f += f;
+                miss_sum_b += b;
+                miss_sum_fb += f * b;
+                miss_count += 1;
+                miss_word &= miss_word - 1;
+            }
+            let mut alt_word = bits.get(word_idx).copied().unwrap_or(0) & !miss_bits;
+            while alt_word != 0 {
+                let bit = alt_word.trailing_zeros() as usize;
+                let h = base + bit;
+                if h >= limit {
+                    break;
+                }
+                let f = fwd[h];
+                let b = bwd[h];
+                alt_sum_f += f;
+                alt_sum_b += b;
+                alt_sum_fb += f * b;
+                alt_count += 1;
+                alt_word &= alt_word - 1;
+            }
+        }
+    }
+    (
+        alt_sum_f,
+        alt_sum_b,
+        alt_sum_fb,
+        alt_count,
+        miss_sum_f,
+        miss_sum_b,
+        miss_sum_fb,
+        miss_count,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dense_identity_biallelic_sums_avx512(
+    limit: usize,
+    bits: &[u64],
+    missing: &[u64],
+    fwd: &[f32],
+    bwd: &[f32],
+    fb_products: Option<&[f32]>,
+) -> (f32, f32, f32, usize, f32, f32, f32, usize) {
+    use std::arch::x86_64::*;
+    let mut alt_sum_f_vec = _mm512_setzero_ps();
+    let mut alt_sum_b_vec = _mm512_setzero_ps();
+    let mut alt_sum_fb_vec = _mm512_setzero_ps();
+    let mut miss_sum_f_vec = _mm512_setzero_ps();
+    let mut miss_sum_b_vec = _mm512_setzero_ps();
+    let mut miss_sum_fb_vec = _mm512_setzero_ps();
+    let mut alt_count = 0usize;
+    let mut miss_count = 0usize;
+    let mut k = 0usize;
+    while k < limit {
+        let remaining = limit - k;
+        let valid_mask: __mmask16 = if remaining >= 16 {
+            0xFFFF
+        } else {
+            ((1u32 << remaining) - 1) as __mmask16
+        };
+        let word_idx = k >> 6;
+        let bit_off = k & 63;
+        let miss16 = bitmask16_at(missing, word_idx, bit_off);
+        let bits16 = bitmask16_at(bits, word_idx, bit_off);
+        let miss_mask: __mmask16 = (miss16 as __mmask16) & valid_mask;
+        let alt_mask: __mmask16 = (bits16 as __mmask16) & (!miss_mask) & valid_mask;
+        alt_count += alt_mask.count_ones() as usize;
+        miss_count += miss_mask.count_ones() as usize;
+
+        let f_vec = _mm512_maskz_loadu_ps(valid_mask, fwd.as_ptr().add(k));
+        let b_vec = _mm512_maskz_loadu_ps(valid_mask, bwd.as_ptr().add(k));
+        let fb_vec = if let Some(fb) = fb_products {
+            _mm512_maskz_loadu_ps(valid_mask, fb.as_ptr().add(k))
+        } else {
+            _mm512_mul_ps(f_vec, b_vec)
+        };
+
+        // Dedicated masked accumulation: avoids materializing intermediate masked vectors.
+        alt_sum_f_vec = _mm512_mask_add_ps(alt_sum_f_vec, alt_mask, alt_sum_f_vec, f_vec);
+        alt_sum_b_vec = _mm512_mask_add_ps(alt_sum_b_vec, alt_mask, alt_sum_b_vec, b_vec);
+        alt_sum_fb_vec = _mm512_mask_add_ps(alt_sum_fb_vec, alt_mask, alt_sum_fb_vec, fb_vec);
+        miss_sum_f_vec = _mm512_mask_add_ps(miss_sum_f_vec, miss_mask, miss_sum_f_vec, f_vec);
+        miss_sum_b_vec = _mm512_mask_add_ps(miss_sum_b_vec, miss_mask, miss_sum_b_vec, b_vec);
+        miss_sum_fb_vec = _mm512_mask_add_ps(miss_sum_fb_vec, miss_mask, miss_sum_fb_vec, fb_vec);
+
+        k += 16;
+    }
+
+    let mut tmp = [0f32; 16];
+    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    let alt_sum_f = tmp.iter().sum::<f32>();
+    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    let alt_sum_b = tmp.iter().sum::<f32>();
+    _mm512_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    let alt_sum_fb = tmp.iter().sum::<f32>();
+    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    let miss_sum_f = tmp.iter().sum::<f32>();
+    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    let miss_sum_b = tmp.iter().sum::<f32>();
+    _mm512_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    let miss_sum_fb = tmp.iter().sum::<f32>();
+    (
+        alt_sum_f,
+        alt_sum_b,
+        alt_sum_fb,
+        alt_count,
+        miss_sum_f,
+        miss_sum_b,
+        miss_sum_fb,
+        miss_count,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dense_identity_biallelic_sums_avx2(
+    limit: usize,
+    bits: &[u64],
+    missing: &[u64],
+    fwd: &[f32],
+    bwd: &[f32],
+    fb_products: Option<&[f32]>,
+) -> (f32, f32, f32, usize, f32, f32, f32, usize) {
+    use std::arch::x86_64::*;
+    let mut alt_sum_f_vec = _mm256_setzero_ps();
+    let mut alt_sum_b_vec = _mm256_setzero_ps();
+    let mut alt_sum_fb_vec = _mm256_setzero_ps();
+    let mut miss_sum_f_vec = _mm256_setzero_ps();
+    let mut miss_sum_b_vec = _mm256_setzero_ps();
+    let mut miss_sum_fb_vec = _mm256_setzero_ps();
+    let mut alt_count = 0usize;
+    let mut miss_count = 0usize;
+    let mut k = 0usize;
+    while k < limit {
+        let remaining = limit - k;
+        let valid_bits: u8 = if remaining >= 8 {
+            0xFF
+        } else {
+            ((1u16 << remaining) - 1) as u8
+        };
+        let word_idx = k >> 6;
+        let bit_off = k & 63;
+        let miss8 = bitmask16_at(missing, word_idx, bit_off) as u8;
+        let bits8 = bitmask16_at(bits, word_idx, bit_off) as u8;
+        let miss_mask_bits = miss8 & valid_bits;
+        let alt_mask_bits = bits8 & (!miss_mask_bits) & valid_bits;
+        alt_count += alt_mask_bits.count_ones() as usize;
+        miss_count += miss_mask_bits.count_ones() as usize;
+
+        let lane_mask = |bits: u8| -> __m256i {
+            _mm256_set_epi32(
+                if (bits & (1 << 7)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 6)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 5)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 4)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 3)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 2)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 1)) != 0 { -1 } else { 0 },
+                if (bits & (1 << 0)) != 0 { -1 } else { 0 },
+            )
+        };
+        let valid_mask_i = lane_mask(valid_bits);
+        let alt_mask_i = lane_mask(alt_mask_bits);
+        let miss_mask_i = lane_mask(miss_mask_bits);
+
+        let f_vec = _mm256_maskload_ps(fwd.as_ptr().add(k), valid_mask_i);
+        let b_vec = _mm256_maskload_ps(bwd.as_ptr().add(k), valid_mask_i);
+        let fb_vec = if let Some(fb) = fb_products {
+            _mm256_maskload_ps(fb.as_ptr().add(k), valid_mask_i)
+        } else {
+            _mm256_mul_ps(f_vec, b_vec)
+        };
+
+        alt_sum_f_vec = _mm256_add_ps(
+            alt_sum_f_vec,
+            _mm256_and_ps(f_vec, _mm256_castsi256_ps(alt_mask_i)),
+        );
+        alt_sum_b_vec = _mm256_add_ps(
+            alt_sum_b_vec,
+            _mm256_and_ps(b_vec, _mm256_castsi256_ps(alt_mask_i)),
+        );
+        alt_sum_fb_vec = _mm256_add_ps(
+            alt_sum_fb_vec,
+            _mm256_and_ps(fb_vec, _mm256_castsi256_ps(alt_mask_i)),
+        );
+        miss_sum_f_vec = _mm256_add_ps(
+            miss_sum_f_vec,
+            _mm256_and_ps(f_vec, _mm256_castsi256_ps(miss_mask_i)),
+        );
+        miss_sum_b_vec = _mm256_add_ps(
+            miss_sum_b_vec,
+            _mm256_and_ps(b_vec, _mm256_castsi256_ps(miss_mask_i)),
+        );
+        miss_sum_fb_vec = _mm256_add_ps(
+            miss_sum_fb_vec,
+            _mm256_and_ps(fb_vec, _mm256_castsi256_ps(miss_mask_i)),
+        );
+
+        k += 8;
+    }
+
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_f_vec);
+    let alt_sum_f = tmp.iter().sum::<f32>();
+    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_b_vec);
+    let alt_sum_b = tmp.iter().sum::<f32>();
+    _mm256_storeu_ps(tmp.as_mut_ptr(), alt_sum_fb_vec);
+    let alt_sum_fb = tmp.iter().sum::<f32>();
+    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_f_vec);
+    let miss_sum_f = tmp.iter().sum::<f32>();
+    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_b_vec);
+    let miss_sum_b = tmp.iter().sum::<f32>();
+    _mm256_storeu_ps(tmp.as_mut_ptr(), miss_sum_fb_vec);
+    let miss_sum_fb = tmp.iter().sum::<f32>();
+    (
+        alt_sum_f,
+        alt_sum_b,
+        alt_sum_fb,
+        alt_count,
+        miss_sum_f,
+        miss_sum_b,
+        miss_sum_fb,
+        miss_count,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ForwardAffine {
     a: f32,
@@ -2785,12 +3203,266 @@ trait ImputeKernel {
     fn marker_key(ctx: &Self::MarkerCtx) -> usize;
     fn marker_group_count(ctx: &Self::MarkerCtx) -> usize;
     fn group_alleles<'a>(ctx: &Self::MarkerCtx, dict_pattern_alleles: &'a [u8]) -> &'a [u8];
+
+    #[inline]
+    fn prepare_marker_with_pattern_sums(
+        &mut self,
+        ws: &mut ImputeWorkspace,
+        m: usize,
+        state_haps: &[RefHapId],
+        ref_columns: &[GenotypeColumn],
+        n_alleles: usize,
+        active_states: usize,
+        checkpoint_totals: Option<[f32; 3]>,
+        use_boundary_fb_products: bool,
+        pattern_sum_key: &mut usize,
+    ) -> Self::MarkerCtx {
+        let _ = checkpoint_totals;
+        let _ = use_boundary_fb_products;
+        let prepared =
+            self.prepare_marker(ws, m, state_haps, ref_columns, n_alleles, active_states);
+        let key = Self::marker_key(&prepared);
+        if key != *pattern_sum_key {
+            let n_groups = Self::marker_group_count(&prepared);
+            ws.ensure_pattern_sums(n_groups);
+            if use_boundary_fb_products {
+                fill_pattern_sums_with_products(
+                    &ws.state_patterns[..active_states],
+                    active_states,
+                    &ws.fwd[..active_states],
+                    &ws.bwd[..active_states],
+                    &ws.boundary_fb_products[..active_states],
+                    &mut ws.pattern_sum_f[..n_groups],
+                    &mut ws.pattern_sum_b[..n_groups],
+                    &mut ws.pattern_sum_fb[..n_groups],
+                    &mut ws.pattern_state_count[..n_groups],
+                );
+            } else {
+                fill_pattern_sums(
+                    &ws.state_patterns[..active_states],
+                    active_states,
+                    &ws.fwd[..active_states],
+                    &ws.bwd[..active_states],
+                    &mut ws.pattern_sum_f[..n_groups],
+                    &mut ws.pattern_sum_b[..n_groups],
+                    &mut ws.pattern_sum_fb[..n_groups],
+                    &mut ws.pattern_state_count[..n_groups],
+                );
+            }
+            *pattern_sum_key = key;
+        }
+        prepared
+    }
 }
 
 #[derive(Default)]
-struct DenseKernel;
+struct DenseKernel {
+    sparse_state_index: Vec<i32>,
+    sparse_state_index_ptr: *const RefHapId,
+    sparse_state_index_len: usize,
+    sparse_identity_order: bool,
+    pattern_sig_valid: bool,
+    pattern_sig_key: usize,
+    pattern_sig_state_ptr: *const RefHapId,
+    pattern_sig_active_states: usize,
+    dict_allele_sig_valid: bool,
+    dict_allele_sig_key: usize,
+    dict_allele_sig_offset: usize,
+    dict_allele_sig_n_patterns: usize,
+    dense_id_sig_valid: bool,
+    dense_id_sig_key: u64,
+    dense_id_sig_words: usize,
+    dense_id_sig_tail_bits: usize,
+    dense_id_bits: Vec<u64>,
+    dense_id_missing: Vec<u64>,
+}
 
 impl DenseKernel {
+    #[inline]
+    fn allele_to_pid(ref_allele: u8, n_alleles: usize, missing_pid: u16) -> usize {
+        if AlleleCode::from_raw(ref_allele).is_missing() {
+            missing_pid as usize
+        } else {
+            let idx = ref_allele as usize;
+            if idx < n_alleles {
+                idx
+            } else {
+                missing_pid as usize
+            }
+        }
+    }
+
+    #[inline]
+    fn ensure_sparse_state_index(&mut self, state_haps: &[RefHapId], active_states: usize) {
+        let ptr = state_haps.as_ptr();
+        if self.sparse_state_index_ptr == ptr && self.sparse_state_index_len == active_states {
+            return;
+        }
+        // Fast-path: full-panel identity ordering (state i == hap i).
+        // In this case we can index fwd/bwd directly by hap index and avoid
+        // materializing a hap->state map.
+        self.sparse_identity_order = state_haps
+            .iter()
+            .take(active_states)
+            .enumerate()
+            .all(|(state_idx, hap)| hap.as_usize() == state_idx);
+        if self.sparse_identity_order {
+            self.sparse_state_index.clear();
+            self.sparse_state_index_ptr = ptr;
+            self.sparse_state_index_len = active_states;
+            return;
+        }
+
+        let mut max_hap = 0usize;
+        for hap in state_haps.iter().take(active_states) {
+            max_hap = max_hap.max(hap.as_usize());
+        }
+        self.sparse_state_index.clear();
+        self.sparse_state_index.resize(max_hap + 1, -1);
+        for (state_idx, hap) in state_haps.iter().take(active_states).enumerate() {
+            self.sparse_state_index[hap.as_usize()] = state_idx as i32;
+        }
+        self.sparse_state_index_ptr = ptr;
+        self.sparse_state_index_len = active_states;
+    }
+
+    #[inline]
+    fn pattern_signature_matches(
+        &self,
+        key: usize,
+        state_haps: &[RefHapId],
+        active_states: usize,
+    ) -> bool {
+        self.pattern_sig_valid
+            && self.pattern_sig_key == key
+            && self.pattern_sig_state_ptr == state_haps.as_ptr()
+            && self.pattern_sig_active_states == active_states
+    }
+
+    #[inline]
+    fn pattern_signature_set(&mut self, key: usize, state_haps: &[RefHapId], active_states: usize) {
+        self.pattern_sig_valid = true;
+        self.pattern_sig_key = key;
+        self.pattern_sig_state_ptr = state_haps.as_ptr();
+        self.pattern_sig_active_states = active_states;
+    }
+
+    #[inline]
+    fn pattern_signature_invalidate(&mut self) {
+        self.pattern_sig_valid = false;
+        self.pattern_sig_key = 0;
+        self.pattern_sig_state_ptr = std::ptr::null();
+        self.pattern_sig_active_states = 0;
+    }
+
+    #[inline]
+    fn dict_allele_signature_matches(&self, key: usize, offset: usize, n_patterns: usize) -> bool {
+        self.dict_allele_sig_valid
+            && self.dict_allele_sig_key == key
+            && self.dict_allele_sig_offset == offset
+            && self.dict_allele_sig_n_patterns == n_patterns
+    }
+
+    #[inline]
+    fn dict_allele_signature_set(&mut self, key: usize, offset: usize, n_patterns: usize) {
+        self.dict_allele_sig_valid = true;
+        self.dict_allele_sig_key = key;
+        self.dict_allele_sig_offset = offset;
+        self.dict_allele_sig_n_patterns = n_patterns;
+    }
+
+    #[inline]
+    fn dict_allele_signature_invalidate(&mut self) {
+        self.dict_allele_sig_valid = false;
+        self.dict_allele_sig_key = 0;
+        self.dict_allele_sig_offset = 0;
+        self.dict_allele_sig_n_patterns = 0;
+    }
+
+    #[inline]
+    fn dense_identity_key(col: &DenseColumn, active_states: usize, n_alleles: usize) -> u64 {
+        let mut h = col.fingerprint();
+        h ^= (active_states as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        h ^= (n_alleles as u64).wrapping_mul(0x517cc1b727220a95);
+        h
+    }
+
+    #[inline]
+    fn dense_identity_match(&self, col: &DenseColumn, active_states: usize, key: u64) -> bool {
+        if !self.dense_id_sig_valid || self.dense_id_sig_key != key {
+            return false;
+        }
+        let words = (active_states.saturating_add(63)) >> 6;
+        if words != self.dense_id_sig_words {
+            return false;
+        }
+        let tail_bits = active_states & 63;
+        if tail_bits != self.dense_id_sig_tail_bits {
+            return false;
+        }
+        let bits = col.bits_raw();
+        let missing = col.missing_raw();
+        if words == 0 {
+            return true;
+        }
+        for i in 0..words.saturating_sub(1) {
+            let b = bits.get(i).copied().unwrap_or(0);
+            let m = missing.get(i).copied().unwrap_or(0);
+            if self.dense_id_bits[i] != b || self.dense_id_missing[i] != m {
+                return false;
+            }
+        }
+        let last = words - 1;
+        let mask = if tail_bits == 0 {
+            u64::MAX
+        } else {
+            (1u64 << tail_bits) - 1
+        };
+        let b_last = bits.get(last).copied().unwrap_or(0) & mask;
+        let m_last = missing.get(last).copied().unwrap_or(0) & mask;
+        self.dense_id_bits[last] == b_last && self.dense_id_missing[last] == m_last
+    }
+
+    #[inline]
+    fn dense_identity_capture(&mut self, col: &DenseColumn, active_states: usize, key: u64) {
+        let words = (active_states.saturating_add(63)) >> 6;
+        let tail_bits = active_states & 63;
+        if self.dense_id_bits.len() < words {
+            self.dense_id_bits.resize(words, 0);
+        }
+        if self.dense_id_missing.len() < words {
+            self.dense_id_missing.resize(words, 0);
+        }
+        let bits = col.bits_raw();
+        let missing = col.missing_raw();
+        if words > 0 {
+            for i in 0..words.saturating_sub(1) {
+                self.dense_id_bits[i] = bits.get(i).copied().unwrap_or(0);
+                self.dense_id_missing[i] = missing.get(i).copied().unwrap_or(0);
+            }
+            let last = words - 1;
+            let mask = if tail_bits == 0 {
+                u64::MAX
+            } else {
+                (1u64 << tail_bits) - 1
+            };
+            self.dense_id_bits[last] = bits.get(last).copied().unwrap_or(0) & mask;
+            self.dense_id_missing[last] = missing.get(last).copied().unwrap_or(0) & mask;
+        }
+        self.dense_id_sig_valid = true;
+        self.dense_id_sig_key = key;
+        self.dense_id_sig_words = words;
+        self.dense_id_sig_tail_bits = tail_bits;
+    }
+
+    #[inline]
+    fn dense_identity_invalidate(&mut self) {
+        self.dense_id_sig_valid = false;
+        self.dense_id_sig_key = 0;
+        self.dense_id_sig_words = 0;
+        self.dense_id_sig_tail_bits = 0;
+    }
+
     #[inline]
     fn prepare_dense_groups(
         ws: &mut ImputeWorkspace,
@@ -2849,10 +3521,26 @@ impl ImputeKernel for DenseKernel {
     const MAX_NON_MISSING_ALLELES: usize = AlleleCode::MISSING.raw() as usize;
 
     #[inline]
-    fn reset_forward(&mut self) {}
+    fn reset_forward(&mut self) {
+        self.sparse_state_index_ptr = std::ptr::null();
+        self.sparse_state_index_len = 0;
+        self.sparse_identity_order = false;
+        self.sparse_state_index.clear();
+        self.pattern_signature_invalidate();
+        self.dict_allele_signature_invalidate();
+        self.dense_identity_invalidate();
+    }
 
     #[inline]
-    fn reset_backward(&mut self) {}
+    fn reset_backward(&mut self) {
+        self.sparse_state_index_ptr = std::ptr::null();
+        self.sparse_state_index_len = 0;
+        self.sparse_identity_order = false;
+        self.sparse_state_index.clear();
+        self.pattern_signature_invalidate();
+        self.dict_allele_signature_invalidate();
+        self.dense_identity_invalidate();
+    }
 
     #[inline]
     fn forward_update(
@@ -2906,6 +3594,748 @@ impl ImputeKernel for DenseKernel {
     #[inline]
     fn group_alleles<'a>(ctx: &Self::MarkerCtx, dict_pattern_alleles: &'a [u8]) -> &'a [u8] {
         &dict_pattern_alleles[..ctx.n_groups]
+    }
+
+    #[inline]
+    fn prepare_marker_with_pattern_sums(
+        &mut self,
+        ws: &mut ImputeWorkspace,
+        m: usize,
+        state_haps: &[RefHapId],
+        ref_columns: &[GenotypeColumn],
+        n_alleles: usize,
+        active_states: usize,
+        checkpoint_totals: Option<[f32; 3]>,
+        use_boundary_fb_products: bool,
+        pattern_sum_key: &mut usize,
+    ) -> Self::MarkerCtx {
+        let n_groups = if n_alleles == 0 { 1 } else { n_alleles + 1 };
+        if ws.dict_pattern_alleles.len() < n_groups {
+            ws.dict_pattern_alleles
+                .resize(n_groups, AlleleCode::MISSING.raw());
+        }
+        for i in 0..n_alleles {
+            ws.dict_pattern_alleles[i] = i as u8;
+        }
+        ws.dict_pattern_alleles[n_groups - 1] = AlleleCode::MISSING.raw();
+        let missing_pid = (n_groups - 1) as u16;
+        ws.ensure_pattern_sums(n_groups);
+
+        match &ref_columns[m] {
+            GenotypeColumn::SeqCoded(col) => {
+                let hap_to_seq = col.hap_to_seq();
+                let key = hap_to_seq.as_ptr() as usize;
+                if !self.pattern_signature_matches(key, state_haps, active_states) {
+                    if let Some(cached) =
+                        ws.pattern_cache_lookup(key, state_haps.as_ptr(), active_states)
+                    {
+                        if cached.len == active_states {
+                            // Safety:
+                            // - cache entry was created from a `Vec<u16>` of this exact length.
+                            // - destination slice is valid and non-overlapping with cache storage.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    cached.ptr,
+                                    ws.state_patterns.as_mut_ptr(),
+                                    active_states,
+                                );
+                            }
+                        } else {
+                            fill_state_patterns_seqcoded(
+                                hap_to_seq,
+                                &state_haps[..active_states],
+                                &mut ws.state_patterns[..active_states],
+                            );
+                            let cached_patterns = ws.state_patterns[..active_states].to_vec();
+                            ws.pattern_cache_insert(
+                                key,
+                                state_haps.as_ptr(),
+                                active_states,
+                                &cached_patterns,
+                            );
+                        }
+                    } else {
+                        fill_state_patterns_seqcoded(
+                            hap_to_seq,
+                            &state_haps[..active_states],
+                            &mut ws.state_patterns[..active_states],
+                        );
+                        let cached_patterns = ws.state_patterns[..active_states].to_vec();
+                        ws.pattern_cache_insert(
+                            key,
+                            state_haps.as_ptr(),
+                            active_states,
+                            &cached_patterns,
+                        );
+                    }
+                    self.pattern_signature_set(key, state_haps, active_states);
+                }
+                if key != *pattern_sum_key {
+                    let n_patterns = col.seq_alleles().len();
+                    ws.ensure_pattern_sums(n_patterns);
+                    if use_boundary_fb_products {
+                        fill_pattern_sums_with_products(
+                            &ws.state_patterns[..active_states],
+                            active_states,
+                            &ws.fwd[..active_states],
+                            &ws.bwd[..active_states],
+                            &ws.boundary_fb_products[..active_states],
+                            &mut ws.pattern_sum_f[..n_patterns],
+                            &mut ws.pattern_sum_b[..n_patterns],
+                            &mut ws.pattern_sum_fb[..n_patterns],
+                            &mut ws.pattern_state_count[..n_patterns],
+                        );
+                    } else {
+                        fill_pattern_sums(
+                            &ws.state_patterns[..active_states],
+                            active_states,
+                            &ws.fwd[..active_states],
+                            &ws.bwd[..active_states],
+                            &mut ws.pattern_sum_f[..n_patterns],
+                            &mut ws.pattern_sum_b[..n_patterns],
+                            &mut ws.pattern_sum_fb[..n_patterns],
+                            &mut ws.pattern_state_count[..n_patterns],
+                        );
+                    }
+                    *pattern_sum_key = key;
+                }
+                let n_patterns = col.seq_alleles().len();
+                return PreparedGroups {
+                    key,
+                    n_groups: n_patterns,
+                    direct_alleles_ptr: col.seq_alleles().as_ptr(),
+                    direct_alleles_len: n_patterns,
+                };
+            }
+            GenotypeColumn::Dictionary(col, offset) => {
+                let key = col.as_ref() as *const DictionaryColumn as usize;
+                let n_patterns = col.n_patterns();
+                if !self.pattern_signature_matches(key, state_haps, active_states) {
+                    if let Some(cached) =
+                        ws.pattern_cache_lookup(key, state_haps.as_ptr(), active_states)
+                    {
+                        if cached.len == active_states {
+                            // Safety:
+                            // - cache entry was created from a `Vec<u16>` of this exact length.
+                            // - destination slice is valid and non-overlapping with cache storage.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    cached.ptr,
+                                    ws.state_patterns.as_mut_ptr(),
+                                    active_states,
+                                );
+                            }
+                        } else {
+                            fill_state_patterns_dict(
+                                col.as_ref(),
+                                &state_haps[..active_states],
+                                &mut ws.state_patterns[..active_states],
+                            );
+                            let cached_patterns = ws.state_patterns[..active_states].to_vec();
+                            ws.pattern_cache_insert(
+                                key,
+                                state_haps.as_ptr(),
+                                active_states,
+                                &cached_patterns,
+                            );
+                        }
+                    } else {
+                        fill_state_patterns_dict(
+                            col.as_ref(),
+                            &state_haps[..active_states],
+                            &mut ws.state_patterns[..active_states],
+                        );
+                        let cached_patterns = ws.state_patterns[..active_states].to_vec();
+                        ws.pattern_cache_insert(
+                            key,
+                            state_haps.as_ptr(),
+                            active_states,
+                            &cached_patterns,
+                        );
+                    }
+                    self.pattern_signature_set(key, state_haps, active_states);
+                }
+                if ws.dict_pattern_alleles.len() < n_patterns {
+                    ws.dict_pattern_alleles.resize(n_patterns, 0);
+                }
+                let dict_offset = *offset as usize;
+                if !self.dict_allele_signature_matches(key, dict_offset, n_patterns) {
+                    for pattern_idx in 0..n_patterns {
+                        ws.dict_pattern_alleles[pattern_idx] =
+                            col.pattern_allele(*offset, pattern_idx);
+                    }
+                    self.dict_allele_signature_set(key, dict_offset, n_patterns);
+                }
+                if key != *pattern_sum_key {
+                    ws.ensure_pattern_sums(n_patterns);
+                    if use_boundary_fb_products {
+                        fill_pattern_sums_with_products(
+                            &ws.state_patterns[..active_states],
+                            active_states,
+                            &ws.fwd[..active_states],
+                            &ws.bwd[..active_states],
+                            &ws.boundary_fb_products[..active_states],
+                            &mut ws.pattern_sum_f[..n_patterns],
+                            &mut ws.pattern_sum_b[..n_patterns],
+                            &mut ws.pattern_sum_fb[..n_patterns],
+                            &mut ws.pattern_state_count[..n_patterns],
+                        );
+                    } else {
+                        fill_pattern_sums(
+                            &ws.state_patterns[..active_states],
+                            active_states,
+                            &ws.fwd[..active_states],
+                            &ws.bwd[..active_states],
+                            &mut ws.pattern_sum_f[..n_patterns],
+                            &mut ws.pattern_sum_b[..n_patterns],
+                            &mut ws.pattern_sum_fb[..n_patterns],
+                            &mut ws.pattern_state_count[..n_patterns],
+                        );
+                    }
+                    *pattern_sum_key = key;
+                }
+                return PreparedGroups {
+                    key,
+                    n_groups: n_patterns,
+                    direct_alleles_ptr: std::ptr::null(),
+                    direct_alleles_len: 0,
+                };
+            }
+            GenotypeColumn::Dense(col) if col.bits_per_allele() == 1 && n_alleles <= 2 => {
+                self.pattern_signature_invalidate();
+                if let Some([sum_f_all, sum_b_all, sum_fb_all]) = checkpoint_totals {
+                    self.ensure_sparse_state_index(state_haps, active_states);
+                    if self.sparse_identity_order {
+                        let dense_key_u64 = Self::dense_identity_key(col, active_states, n_alleles);
+                        let dense_key = dense_key_u64 as usize;
+                        if *pattern_sum_key == dense_key
+                            && self.dense_identity_match(col, active_states, dense_key_u64)
+                        {
+                            return PreparedGroups {
+                                key: dense_key,
+                                n_groups,
+                                direct_alleles_ptr: std::ptr::null(),
+                                direct_alleles_len: 0,
+                            };
+                        }
+                        ws.pattern_sum_f[..n_groups].fill(0.0);
+                        ws.pattern_sum_b[..n_groups].fill(0.0);
+                        ws.pattern_sum_fb[..n_groups].fill(0.0);
+                        ws.pattern_state_count[..n_groups].fill(0.0);
+                        let bits = col.bits_raw();
+                        let missing = col.missing_raw();
+                        let fb_products = if use_boundary_fb_products {
+                            Some(&ws.boundary_fb_products[..active_states])
+                        } else {
+                            None
+                        };
+                        let (
+                            alt_sum_f,
+                            alt_sum_b,
+                            alt_sum_fb,
+                            alt_count,
+                            miss_sum_f,
+                            miss_sum_b,
+                            miss_sum_fb,
+                            miss_count,
+                        ) = {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if active_states >= 16 && std::is_x86_feature_detected!("avx512f") {
+                                    // Safety:
+                                    // - guarded by runtime feature check.
+                                    // - slices are valid for [0, active_states).
+                                    unsafe {
+                                        dense_identity_biallelic_sums_avx512(
+                                            active_states,
+                                            bits,
+                                            missing,
+                                            &ws.fwd[..active_states],
+                                            &ws.bwd[..active_states],
+                                            fb_products,
+                                        )
+                                    }
+                                } else if active_states >= 8
+                                    && std::is_x86_feature_detected!("avx2")
+                                {
+                                    // Safety:
+                                    // - guarded by runtime feature check.
+                                    // - slices are valid for [0, active_states).
+                                    unsafe {
+                                        dense_identity_biallelic_sums_avx2(
+                                            active_states,
+                                            bits,
+                                            missing,
+                                            &ws.fwd[..active_states],
+                                            &ws.bwd[..active_states],
+                                            fb_products,
+                                        )
+                                    }
+                                } else {
+                                    dense_identity_biallelic_sums_scalar(
+                                        active_states,
+                                        bits,
+                                        missing,
+                                        &ws.fwd[..active_states],
+                                        &ws.bwd[..active_states],
+                                        fb_products,
+                                    )
+                                }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                dense_identity_biallelic_sums_scalar(
+                                    active_states,
+                                    bits,
+                                    missing,
+                                    &ws.fwd[..active_states],
+                                    &ws.bwd[..active_states],
+                                    fb_products,
+                                )
+                            }
+                        };
+                        let ref_sum_f = (sum_f_all - alt_sum_f - miss_sum_f).max(0.0);
+                        let ref_sum_b = (sum_b_all - alt_sum_b - miss_sum_b).max(0.0);
+                        let ref_sum_fb = (sum_fb_all - alt_sum_fb - miss_sum_fb).max(0.0);
+                        let ref_count = active_states.saturating_sub(alt_count + miss_count);
+                        let ref_pid = Self::allele_to_pid(0, n_alleles, missing_pid);
+                        ws.pattern_sum_f[ref_pid] = ref_sum_f;
+                        ws.pattern_sum_b[ref_pid] = ref_sum_b;
+                        ws.pattern_sum_fb[ref_pid] = ref_sum_fb;
+                        ws.pattern_state_count[ref_pid] = ref_count as f32;
+                        let alt_pid = Self::allele_to_pid(1, n_alleles, missing_pid);
+                        ws.pattern_sum_f[alt_pid] = alt_sum_f;
+                        ws.pattern_sum_b[alt_pid] = alt_sum_b;
+                        ws.pattern_sum_fb[alt_pid] = alt_sum_fb;
+                        ws.pattern_state_count[alt_pid] = alt_count as f32;
+                        let miss_pid = missing_pid as usize;
+                        ws.pattern_sum_f[miss_pid] = miss_sum_f;
+                        ws.pattern_sum_b[miss_pid] = miss_sum_b;
+                        ws.pattern_sum_fb[miss_pid] = miss_sum_fb;
+                        ws.pattern_state_count[miss_pid] = miss_count as f32;
+                        *pattern_sum_key = dense_key;
+                        self.dense_identity_capture(col, active_states, dense_key_u64);
+                    } else {
+                        self.dense_identity_invalidate();
+                        ws.pattern_sum_f[..n_groups].fill(0.0);
+                        ws.pattern_sum_b[..n_groups].fill(0.0);
+                        ws.pattern_sum_fb[..n_groups].fill(0.0);
+                        ws.pattern_state_count[..n_groups].fill(0.0);
+                        // For subsetted/non-identity states, dense bitset scans can
+                        // over-touch panel space; stick to exact state-loop path.
+                        let n_haps = col.n_haplotypes();
+                        let bits = col.bits_raw();
+                        let missing = col.missing_raw();
+                        let mut cached_word_idx = usize::MAX;
+                        let mut cached_bits_word = 0u64;
+                        let mut cached_missing_word = 0u64;
+                        for (i, hap) in state_haps.iter().take(active_states).enumerate() {
+                            let idx = hap.as_usize();
+                            let ref_allele = if idx >= n_haps {
+                                AlleleCode::MISSING.raw()
+                            } else {
+                                let word_idx = idx >> 6;
+                                let bit_idx = idx & 63;
+                                if word_idx != cached_word_idx {
+                                    cached_word_idx = word_idx;
+                                    cached_bits_word = bits.get(word_idx).copied().unwrap_or(0);
+                                    cached_missing_word =
+                                        missing.get(word_idx).copied().unwrap_or(0);
+                                }
+                                if ((cached_missing_word >> bit_idx) & 1) != 0 {
+                                    AlleleCode::MISSING.raw()
+                                } else {
+                                    ((cached_bits_word >> bit_idx) & 1) as u8
+                                }
+                            };
+                            ws.state_alleles[i] = ref_allele;
+                            let pid = Self::allele_to_pid(ref_allele, n_alleles, missing_pid);
+                            ws.state_patterns[i] = pid as u16;
+                            let f = ws.fwd[i];
+                            let b = ws.bwd[i];
+                            ws.pattern_sum_f[pid] += f;
+                            ws.pattern_sum_b[pid] += b;
+                            ws.pattern_sum_fb[pid] += if use_boundary_fb_products {
+                                ws.boundary_fb_products[i]
+                            } else {
+                                f * b
+                            };
+                            ws.pattern_state_count[pid] += 1.0;
+                        }
+                        *pattern_sum_key = m.wrapping_add(1);
+                    }
+                } else {
+                    self.ensure_sparse_state_index(state_haps, active_states);
+                    if self.sparse_identity_order {
+                        let dense_key_u64 = Self::dense_identity_key(col, active_states, n_alleles);
+                        let dense_key = dense_key_u64 as usize;
+                        if *pattern_sum_key == dense_key
+                            && self.dense_identity_match(col, active_states, dense_key_u64)
+                        {
+                            return PreparedGroups {
+                                key: dense_key,
+                                n_groups,
+                                direct_alleles_ptr: std::ptr::null(),
+                                direct_alleles_len: 0,
+                            };
+                        }
+                        ws.pattern_sum_f[..n_groups].fill(0.0);
+                        ws.pattern_sum_b[..n_groups].fill(0.0);
+                        ws.pattern_sum_fb[..n_groups].fill(0.0);
+                        ws.pattern_state_count[..n_groups].fill(0.0);
+                        let bits = col.bits_raw();
+                        let missing = col.missing_raw();
+                        let fb_products = if use_boundary_fb_products {
+                            Some(&ws.boundary_fb_products[..active_states])
+                        } else {
+                            None
+                        };
+                        let (
+                            alt_sum_f,
+                            alt_sum_b,
+                            alt_sum_fb,
+                            alt_count,
+                            miss_sum_f,
+                            miss_sum_b,
+                            miss_sum_fb,
+                            miss_count,
+                        ) = {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if active_states >= 16 && std::is_x86_feature_detected!("avx512f") {
+                                    // Safety:
+                                    // - guarded by runtime feature check.
+                                    // - slices are valid for [0, active_states).
+                                    unsafe {
+                                        dense_identity_biallelic_sums_avx512(
+                                            active_states,
+                                            bits,
+                                            missing,
+                                            &ws.fwd[..active_states],
+                                            &ws.bwd[..active_states],
+                                            fb_products,
+                                        )
+                                    }
+                                } else if active_states >= 8
+                                    && std::is_x86_feature_detected!("avx2")
+                                {
+                                    // Safety:
+                                    // - guarded by runtime feature check.
+                                    // - slices are valid for [0, active_states).
+                                    unsafe {
+                                        dense_identity_biallelic_sums_avx2(
+                                            active_states,
+                                            bits,
+                                            missing,
+                                            &ws.fwd[..active_states],
+                                            &ws.bwd[..active_states],
+                                            fb_products,
+                                        )
+                                    }
+                                } else {
+                                    dense_identity_biallelic_sums_scalar(
+                                        active_states,
+                                        bits,
+                                        missing,
+                                        &ws.fwd[..active_states],
+                                        &ws.bwd[..active_states],
+                                        fb_products,
+                                    )
+                                }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                dense_identity_biallelic_sums_scalar(
+                                    active_states,
+                                    bits,
+                                    missing,
+                                    &ws.fwd[..active_states],
+                                    &ws.bwd[..active_states],
+                                    fb_products,
+                                )
+                            }
+                        };
+
+                        let mut sum_f_all = 0.0f32;
+                        let mut sum_b_all = 0.0f32;
+                        let mut sum_fb_all = 0.0f32;
+                        if let Some(fb) = fb_products {
+                            for i in 0..active_states {
+                                sum_f_all += ws.fwd[i];
+                                sum_b_all += ws.bwd[i];
+                                sum_fb_all += fb[i];
+                            }
+                        } else {
+                            for i in 0..active_states {
+                                let f = ws.fwd[i];
+                                let b = ws.bwd[i];
+                                sum_f_all += f;
+                                sum_b_all += b;
+                                sum_fb_all += f * b;
+                            }
+                        }
+                        let ref_sum_f = (sum_f_all - alt_sum_f - miss_sum_f).max(0.0);
+                        let ref_sum_b = (sum_b_all - alt_sum_b - miss_sum_b).max(0.0);
+                        let ref_sum_fb = (sum_fb_all - alt_sum_fb - miss_sum_fb).max(0.0);
+                        let ref_count = active_states.saturating_sub(alt_count + miss_count);
+                        let ref_pid = Self::allele_to_pid(0, n_alleles, missing_pid);
+                        ws.pattern_sum_f[ref_pid] = ref_sum_f;
+                        ws.pattern_sum_b[ref_pid] = ref_sum_b;
+                        ws.pattern_sum_fb[ref_pid] = ref_sum_fb;
+                        ws.pattern_state_count[ref_pid] = ref_count as f32;
+                        let alt_pid = Self::allele_to_pid(1, n_alleles, missing_pid);
+                        ws.pattern_sum_f[alt_pid] = alt_sum_f;
+                        ws.pattern_sum_b[alt_pid] = alt_sum_b;
+                        ws.pattern_sum_fb[alt_pid] = alt_sum_fb;
+                        ws.pattern_state_count[alt_pid] = alt_count as f32;
+                        let miss_pid = missing_pid as usize;
+                        ws.pattern_sum_f[miss_pid] = miss_sum_f;
+                        ws.pattern_sum_b[miss_pid] = miss_sum_b;
+                        ws.pattern_sum_fb[miss_pid] = miss_sum_fb;
+                        ws.pattern_state_count[miss_pid] = miss_count as f32;
+                        *pattern_sum_key = dense_key;
+                        self.dense_identity_capture(col, active_states, dense_key_u64);
+                    } else {
+                        self.dense_identity_invalidate();
+                        ws.pattern_sum_f[..n_groups].fill(0.0);
+                        ws.pattern_sum_b[..n_groups].fill(0.0);
+                        ws.pattern_sum_fb[..n_groups].fill(0.0);
+                        ws.pattern_state_count[..n_groups].fill(0.0);
+                        let n_haps = col.n_haplotypes();
+                        let bits = col.bits_raw();
+                        let missing = col.missing_raw();
+                        let mut cached_word_idx = usize::MAX;
+                        let mut cached_bits_word = 0u64;
+                        let mut cached_missing_word = 0u64;
+                        for (i, hap) in state_haps.iter().take(active_states).enumerate() {
+                            let idx = hap.as_usize();
+                            let ref_allele = if idx >= n_haps {
+                                AlleleCode::MISSING.raw()
+                            } else {
+                                let word_idx = idx >> 6;
+                                let bit_idx = idx & 63;
+                                if word_idx != cached_word_idx {
+                                    cached_word_idx = word_idx;
+                                    cached_bits_word = bits.get(word_idx).copied().unwrap_or(0);
+                                    cached_missing_word =
+                                        missing.get(word_idx).copied().unwrap_or(0);
+                                }
+                                if ((cached_missing_word >> bit_idx) & 1) != 0 {
+                                    AlleleCode::MISSING.raw()
+                                } else {
+                                    ((cached_bits_word >> bit_idx) & 1) as u8
+                                }
+                            };
+                            ws.state_alleles[i] = ref_allele;
+                            let pid = Self::allele_to_pid(ref_allele, n_alleles, missing_pid);
+                            ws.state_patterns[i] = pid as u16;
+                            let f = ws.fwd[i];
+                            let b = ws.bwd[i];
+                            ws.pattern_sum_f[pid] += f;
+                            ws.pattern_sum_b[pid] += b;
+                            ws.pattern_sum_fb[pid] += if use_boundary_fb_products {
+                                ws.boundary_fb_products[i]
+                            } else {
+                                f * b
+                            };
+                            ws.pattern_state_count[pid] += 1.0;
+                        }
+                        *pattern_sum_key = m.wrapping_add(1);
+                    }
+                }
+                return PreparedGroups {
+                    key: *pattern_sum_key,
+                    n_groups,
+                    direct_alleles_ptr: std::ptr::null(),
+                    direct_alleles_len: 0,
+                };
+            }
+            GenotypeColumn::Sparse(col) if n_alleles <= 2 => {
+                self.pattern_signature_invalidate();
+                self.dense_identity_invalidate();
+                self.ensure_sparse_state_index(state_haps, active_states);
+                ws.pattern_sum_f[..n_groups].fill(0.0);
+                ws.pattern_sum_b[..n_groups].fill(0.0);
+                ws.pattern_sum_fb[..n_groups].fill(0.0);
+                ws.pattern_state_count[..n_groups].fill(0.0);
+                let fb_products = if use_boundary_fb_products {
+                    Some(&ws.boundary_fb_products[..active_states])
+                } else {
+                    None
+                };
+                let carriers = col.carriers();
+                let mut carrier_sum_f = 0.0f32;
+                let mut carrier_sum_b = 0.0f32;
+                let mut carrier_sum_fb = 0.0f32;
+                let mut carrier_count = 0usize;
+                if let Some(fb) = fb_products {
+                    for carrier in carriers {
+                        let h = carrier.as_usize();
+                        let state_idx = if self.sparse_identity_order {
+                            if h >= active_states {
+                                continue;
+                            }
+                            Some(h)
+                        } else if h < self.sparse_state_index.len() {
+                            let mapped = self.sparse_state_index[h];
+                            if mapped >= 0 {
+                                Some(mapped as usize)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(state_idx) = state_idx {
+                            carrier_sum_f += ws.fwd[state_idx];
+                            carrier_sum_b += ws.bwd[state_idx];
+                            carrier_sum_fb += fb[state_idx];
+                            carrier_count += 1;
+                        }
+                    }
+                } else {
+                    for carrier in carriers {
+                        let h = carrier.as_usize();
+                        let state_idx = if self.sparse_identity_order {
+                            if h >= active_states {
+                                continue;
+                            }
+                            Some(h)
+                        } else if h < self.sparse_state_index.len() {
+                            let mapped = self.sparse_state_index[h];
+                            if mapped >= 0 {
+                                Some(mapped as usize)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(state_idx) = state_idx {
+                            let f = ws.fwd[state_idx];
+                            let b = ws.bwd[state_idx];
+                            carrier_sum_f += f;
+                            carrier_sum_b += b;
+                            carrier_sum_fb += f * b;
+                            carrier_count += 1;
+                        }
+                    }
+                }
+
+                let (sum_f_all, sum_b_all, sum_fb_all) = if let Some(totals) = checkpoint_totals {
+                    (totals[0], totals[1], totals[2])
+                } else {
+                    let mut total_f = 0.0f32;
+                    let mut total_b = 0.0f32;
+                    let mut total_fb = 0.0f32;
+                    if let Some(fb) = fb_products {
+                        for i in 0..active_states {
+                            total_f += ws.fwd[i];
+                            total_b += ws.bwd[i];
+                            total_fb += fb[i];
+                        }
+                    } else {
+                        for i in 0..active_states {
+                            let f = ws.fwd[i];
+                            let b = ws.bwd[i];
+                            total_f += f;
+                            total_b += b;
+                            total_fb += f * b;
+                        }
+                    }
+                    (total_f, total_b, total_fb)
+                };
+
+                let (
+                    ref_sum_f,
+                    ref_sum_b,
+                    ref_sum_fb,
+                    ref_count,
+                    alt_sum_f,
+                    alt_sum_b,
+                    alt_sum_fb,
+                    alt_count,
+                ) = if col.is_inverted() {
+                    (
+                        carrier_sum_f,
+                        carrier_sum_b,
+                        carrier_sum_fb,
+                        carrier_count,
+                        (sum_f_all - carrier_sum_f).max(0.0),
+                        (sum_b_all - carrier_sum_b).max(0.0),
+                        (sum_fb_all - carrier_sum_fb).max(0.0),
+                        active_states.saturating_sub(carrier_count),
+                    )
+                } else {
+                    (
+                        (sum_f_all - carrier_sum_f).max(0.0),
+                        (sum_b_all - carrier_sum_b).max(0.0),
+                        (sum_fb_all - carrier_sum_fb).max(0.0),
+                        active_states.saturating_sub(carrier_count),
+                        carrier_sum_f,
+                        carrier_sum_b,
+                        carrier_sum_fb,
+                        carrier_count,
+                    )
+                };
+                let ref_pid = Self::allele_to_pid(0, n_alleles, missing_pid);
+                ws.pattern_sum_f[ref_pid] = ref_sum_f;
+                ws.pattern_sum_b[ref_pid] = ref_sum_b;
+                ws.pattern_sum_fb[ref_pid] = ref_sum_fb;
+                ws.pattern_state_count[ref_pid] = ref_count as f32;
+                let alt_pid = Self::allele_to_pid(1, n_alleles, missing_pid);
+                ws.pattern_sum_f[alt_pid] = alt_sum_f;
+                ws.pattern_sum_b[alt_pid] = alt_sum_b;
+                ws.pattern_sum_fb[alt_pid] = alt_sum_fb;
+                ws.pattern_state_count[alt_pid] = alt_count as f32;
+            }
+            _ => {
+                self.pattern_signature_invalidate();
+                // Full-support fallback (multiallelic, dictionary-backed, etc.).
+                let prepared = Self::prepare_dense_groups(
+                    ws,
+                    m,
+                    state_haps,
+                    ref_columns,
+                    n_alleles,
+                    active_states,
+                );
+                if use_boundary_fb_products {
+                    fill_pattern_sums_with_products(
+                        &ws.state_patterns[..active_states],
+                        active_states,
+                        &ws.fwd[..active_states],
+                        &ws.bwd[..active_states],
+                        &ws.boundary_fb_products[..active_states],
+                        &mut ws.pattern_sum_f[..n_groups],
+                        &mut ws.pattern_sum_b[..n_groups],
+                        &mut ws.pattern_sum_fb[..n_groups],
+                        &mut ws.pattern_state_count[..n_groups],
+                    );
+                } else {
+                    fill_pattern_sums(
+                        &ws.state_patterns[..active_states],
+                        active_states,
+                        &ws.fwd[..active_states],
+                        &ws.bwd[..active_states],
+                        &mut ws.pattern_sum_f[..n_groups],
+                        &mut ws.pattern_sum_b[..n_groups],
+                        &mut ws.pattern_sum_fb[..n_groups],
+                        &mut ws.pattern_state_count[..n_groups],
+                    );
+                }
+                *pattern_sum_key = prepared.key;
+                return prepared;
+            }
+        }
+
+        *pattern_sum_key = m.wrapping_add(1);
+        PreparedGroups {
+            key: m.wrapping_add(1),
+            n_groups,
+            direct_alleles_ptr: std::ptr::null(),
+            direct_alleles_len: 0,
+        }
     }
 }
 
@@ -3208,6 +4638,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let n_states = state_haps.len();
     let n_markers = target_probs.n_markers();
     ws.resize(n_states, n_markers);
+    ws.pattern_cache_clear();
     let active_states = ws.active_states();
     assert!(active_states <= state_haps.len());
     let active_markers = ws.active_markers();
@@ -3342,6 +4773,17 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 for v in &ws.fwd[..active_states] {
                     fwd_sum_left += *v;
                 }
+                let mut bwd_sum_left = 0.0f32;
+                let mut fb_sum_left = 0.0f32;
+                ws.ensure_boundary_fb_products(active_states);
+                for i in 0..active_states {
+                    let b = ws.bwd[i];
+                    bwd_sum_left += b;
+                    let fb = ws.fwd[i] * b;
+                    ws.boundary_fb_products[i] = fb;
+                    fb_sum_left += fb;
+                }
+                let checkpoint_totals = Some([fwd_sum_left, bwd_sum_left, fb_sum_left]);
                 assert!(
                     { (fwd_sum_left - 1.0).abs() < 1e-3 || active_states == 0 },
                     "checkpoint forward mass drift before interior affine block (S_u assumption)"
@@ -3436,29 +4878,18 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             ws.ensure_smoothing_prior_counts(n_alleles);
                         }
 
-                        let prepared = kernel.prepare_marker(
+                        let prepared = kernel.prepare_marker_with_pattern_sums(
                             ws,
                             m,
                             state_haps,
                             ref_columns,
                             n_alleles,
                             active_states,
+                            checkpoint_totals,
+                            true,
+                            &mut pattern_sum_key,
                         );
                         let n_groups = K::marker_group_count(&prepared);
-                        if K::marker_key(&prepared) != pattern_sum_key {
-                            ws.ensure_pattern_sums(n_groups);
-                            fill_pattern_sums(
-                                &ws.state_patterns[..active_states],
-                                active_states,
-                                &ws.fwd[..active_states],
-                                &ws.bwd[..active_states],
-                                &mut ws.pattern_sum_f[..n_groups],
-                                &mut ws.pattern_sum_b[..n_groups],
-                                &mut ws.pattern_sum_fb[..n_groups],
-                                &mut ws.pattern_state_count[..n_groups],
-                            );
-                            pattern_sum_key = K::marker_key(&prepared);
-                        }
 
                         let a_bwd_m = coeffs.bwd_a[m - block_start] as f32;
                         let b_bwd_m = coeffs.bwd_b_coeff[m - block_start] as f32;
@@ -3625,10 +5056,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             smoothing_prior_total,
                                             &mut ws.allele_prior_scratch,
                                             probs.as_slice(),
-                                            ws.nearest_obs_retain
-                                                .get(m)
-                                                .copied()
-                                                .unwrap_or(0.0),
+                                            ws.nearest_obs_retain.get(m).copied().unwrap_or(0.0),
                                             target_probs.is_untyped_uniform_marker(m),
                                             subset_total_f32,
                                             missing_ref_mass_f32,
@@ -3895,10 +5323,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         smoothing_prior_total,
                                         &mut ws.allele_prior_scratch,
                                         probs.as_slice(),
-                                        ws.nearest_obs_retain
-                                            .get(m_rev)
-                                            .copied()
-                                            .unwrap_or(0.0),
+                                        ws.nearest_obs_retain.get(m_rev).copied().unwrap_or(0.0),
                                         target_probs.is_untyped_uniform_marker(m_rev),
                                         subset_total_f32,
                                         missing_ref_mass_f32,
@@ -4022,7 +5447,7 @@ fn run_hmm_generic(
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
     run_hmm_with_kernel(
-        DenseKernel,
+        DenseKernel::default(),
         state_haps,
         ref_columns,
         target_probs,
