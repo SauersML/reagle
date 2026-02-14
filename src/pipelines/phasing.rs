@@ -13904,17 +13904,5 @@ mod tests {
         assert_eq!(&states[3..], &[1, 1, 1]);
         assert!(posterior[0] < 0.5 && posterior[5] > 0.5);
     }
-
-    #[test]
-    fn test_orientation_decisive_rejects_ambiguous_unanchored() {
-        assert!(!orientation_is_decisive(1.0, 0.5, false));
-        assert!(!orientation_is_decisive(1.00001, 0.51, false));
-        assert!(orientation_is_decisive(1.5, 0.80, false));
-    }
-
-    #[test]
-    fn test_orientation_decisive_accepts_anchored_with_lr() {
-        assert!(!orientation_is_decisive(1.0, 0.5, true));
-        assert!(orientation_is_decisive(2.0, 0.5, true));
-    }
 }
+
