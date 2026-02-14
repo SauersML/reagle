@@ -102,7 +102,12 @@ impl TransitionMatrix {
         let r = self.recomb_rate;
         let lam = self.transition_lambda;
         // Use the same fixed-lambda transition family as the per-marker HMM recursion.
-        // This keeps boundary remapping and in-window transitions on identical physics.
+        // This keeps boundary remapping and in-window transitions on identical physics:
+        //   rho   = lambda + (1-lambda)*K/N
+        //   d     = (1-r) + r*rho
+        //   stay  = ((1-r) + r*lambda) / d
+        //   shift = (r*(1-lambda)/N) / d
+        // Here K = n_next and N = n_panel for the destination subset.
         let rho = lam + (1.0 - lam) * (k_next / n_panel);
         let denom_in = ((1.0 - r) + r * rho).max(1e-30);
         let stay_scale = ((1.0 - r) + r * lam) / denom_in;

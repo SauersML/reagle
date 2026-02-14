@@ -2140,16 +2140,28 @@ fn subset_transition_params_adaptive_q(
     let n = n_ref_haps.max(1) as f32;
     let k = active_states as f32;
     let lam = lambda.clamp(0.0, 1.0);
-    // Fixed-lambda subset transition family used throughout imputation:
-    //   rho  = lambda + (1-lambda) * K/N
-    //   d    = (1-r) + r*rho
-    //   stay = ((1-r) + r*lambda) / d
-    //   shift= (r*(1-lambda)/N) / d
+    // Fixed-lambda subset transition family used throughout imputation.
     //
-    // Affine update is:
+    // Affine update over represented states j=1..K:
     //   x'_j = stay*x_j + shift*sum_i x_i
-    // and preserves represented-state mass exactly because:
-    //   stay + K*shift = 1.
+    //
+    // Coefficients:
+    //   rho   = lambda + (1-lambda)*K/N
+    //   d     = (1-r) + r*rho
+    //   stay  = ((1-r) + r*lambda) / d
+    //   shift = (r*(1-lambda)/N) / d
+    //
+    // Derivation check (represented-state mass conservation):
+    //   sum_j x'_j = (stay + K*shift) * sum_i x_i
+    // and
+    //   stay + K*shift
+    //     = ((1-r)+r*lambda + r*(1-lambda)*K/N)/d
+    //     = ((1-r)+r*rho)/d
+    //     = 1.
+    //
+    // Note: diagonal/self transition probability in the implied matrix is
+    // (stay + shift), not stay alone, because the rank-1 additive term also
+    // contributes to the diagonal.
     let rho = lam + (1.0 - lam) * (k / n);
     let d = ((1.0 - r) + r * rho).max(1e-30);
     let stay = ((1.0 - r) + r * lam) / d;

@@ -6821,6 +6821,14 @@ impl crate::pipelines::ImputationPipeline {
                         }
                         // Effective sample size over donor weights on the FINAL selected state set:
                         //   Neff = (sum w)^2 / sum(w^2), with Neff in [1, K_ess].
+                        // (By Cauchy-Schwarz: (sum w)^2 <= K_ess * sum(w^2).)
+                        //
+                        // Map ESS to stickiness:
+                        //   ess_norm = (Neff - 1) / (K_ess - 1) in [0, 1]
+                        //   lambda   = LAMBDA_MAX * (1 - ess_norm)
+                        // so concentrated donor support (Neff -> 1) gives high lambda,
+                        // diffuse support (Neff -> K_ess) gives lambda -> 0 (canonical).
+                        //
                         // We normalize by K_ess (supported states), not raw K, to avoid
                         // artificial stickiness when many selected states have zero donor weight.
                         let k_ess_f = k_ess as f32;
