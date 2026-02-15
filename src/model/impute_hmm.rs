@@ -2312,7 +2312,7 @@ fn batched_transition_forward(
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
-    for m in start..end {
+    for m in start + 1..end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
             continue;
@@ -4931,18 +4931,17 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         let delta_coeff = forward_affine.b * backward_affine.add;
 
                         if prior_marker_idx == Some(m) {
+                            // Extract Forward (Alpha) state at prior marker, not Posterior (Gamma).
+                            // This ensures the next window (which overlaps into the future)
+                            // is seeded only with evidence from the past, avoiding double-counting.
                             let gamma = &mut ws.state_posterior_scratch[..active_states];
                             let mut sum = 0.0f32;
                             for i in 0..active_states {
+                                // Propagate F_left to F_m using affine coefficients.
                                 let u = ws.fwd[i];
-                                let v = ws.bwd[i];
-                                let g = (alpha_coeff * (u * v)
-                                    + beta_coeff * u
-                                    + gamma_coeff * v
-                                    + delta_coeff)
-                                    .max(0.0);
-                                gamma[i] = g;
-                                sum += g;
+                                let f_m = (a_fwd * u + fwd_add).max(0.0);
+                                gamma[i] = f_m;
+                                sum += f_m;
                             }
                             if sum > 0.0 {
                                 let inv = 1.0f32 / sum;
@@ -5180,10 +5179,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 } else {
                     let fwd_slice = &ws.fwd[..active_states];
                     if prior_marker_idx == Some(m_rev) {
+                        // Extract Forward (Alpha) state at prior marker, not Posterior (Gamma).
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
+                            let g = fwd_slice[i].max(0.0);
                             gamma[i] = g;
                             sum += g;
                         }
