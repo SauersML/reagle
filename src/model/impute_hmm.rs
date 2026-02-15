@@ -1436,8 +1436,8 @@ pub(crate) fn compute_nearest_observed_lambda(
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
+    recomb_intensity: f32,
 ) {
-    const BASE_CLUSTER_CM: f32 = 0.005;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);
@@ -1486,8 +1486,15 @@ pub(crate) fn compute_nearest_observed_lambda(
     // This is not "approximation error"; it is physical map-distance decay.
     // approximation/truncation diagnostics are handled separately downstream.
     //
-    // cluster_scale is a global calibration term for map-distance hazard.
-    let cluster_scale = (BASE_CLUSTER_CM / smoothing_cluster_cm.max(1e-6)).max(0.0);
+    // cluster_scale converts raw recombination hazard (accumulated -ln(1-p))
+    // into cluster-distance decay units.
+    //
+    // - left/right are accumulated hazard in units of `intensity * Morgans`.
+    // - we want lambda = distance_cM / smoothing_cluster_cm.
+    // - distance_cM = 100 * distance_Morgans = 100 * (hazard / intensity).
+    // - lambda = (100 * hazard / intensity) / smoothing_cluster_cm.
+    // - lambda = hazard * (100 / (intensity * smoothing_cluster_cm)).
+    let cluster_scale = 100.0 / (recomb_intensity * smoothing_cluster_cm).max(1e-12);
     const MIN_SAME_POS_LAMBDA: f32 = 0.05;
     for m in 0..n {
         let left = ws.nearest_obs_fwd[m];
@@ -4658,6 +4665,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     transition_lambda: f32,
     context: ImputeHmmContext,
     smoothing_cluster_cm: f32,
+    recomb_intensity: f32,
     external_nearest_obs_retain: Option<&[f32]>,
     ws: &mut ImputeWorkspace,
 ) -> Result<(Vec<AllelePosteriors>, Option<Vec<f32>>)> {
@@ -4712,7 +4720,13 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                 ws.nearest_obs_retain[copy_len..n].fill(0.0);
             }
         } else {
-            compute_nearest_observed_lambda(ws, target_probs, p_recomb, smoothing_cluster_cm);
+            compute_nearest_observed_lambda(
+                ws,
+                target_probs,
+                p_recomb,
+                smoothing_cluster_cm,
+                recomb_intensity,
+            );
         }
     } else {
         ws.nearest_obs_retain.clear();
