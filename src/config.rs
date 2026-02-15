@@ -123,6 +123,45 @@ pub struct Config {
     /// Print posterior genotype probabilities
     pub gp: bool,
 
+    /// Base fraction of state budget from carried priors.
+    pub state_mix_prior_frac: f32,
+
+    /// Base fraction of state budget from window-local LMS states.
+    pub state_mix_window_frac: f32,
+
+    /// Base fraction of state budget from donor shortlist.
+    pub state_mix_donor_frac: f32,
+
+    /// Base fraction of state budget from global core states.
+    pub state_mix_core_frac: f32,
+
+    /// Minimum prior fraction when non-empty priors are available.
+    pub state_mix_prior_boost_min_frac: f32,
+
+    /// Minimum donor fraction when non-empty priors are available.
+    pub state_mix_prior_boost_donor_min_frac: f32,
+
+    /// Maximum core fraction when non-empty priors are available.
+    pub state_mix_prior_boost_core_max_frac: f32,
+
+    /// Guaranteed prior floor fraction when non-empty priors are available.
+    pub state_mix_prior_floor_frac: f32,
+
+    /// Weak-signal threshold for informative ratio.
+    pub state_mix_weak_signal_threshold: f32,
+
+    /// Weak-signal prior fraction when priors are empty.
+    pub state_mix_weak_prior_frac: f32,
+
+    /// Weak-signal window fraction when priors are empty.
+    pub state_mix_weak_window_frac: f32,
+
+    /// Weak-signal donor fraction when priors are empty.
+    pub state_mix_weak_donor_frac: f32,
+
+    /// Weak-signal core fraction when priors are empty.
+    pub state_mix_weak_core_frac: f32,
+
     // ============ General Parameters ============
     /// Effective population size
     pub ne: f32,
@@ -182,6 +221,19 @@ struct TomlConfig {
     pub pbwt_batch_mb: Option<usize>,
     pub ap: Option<bool>,
     pub gp: Option<bool>,
+    pub state_mix_prior_frac: Option<f32>,
+    pub state_mix_window_frac: Option<f32>,
+    pub state_mix_donor_frac: Option<f32>,
+    pub state_mix_core_frac: Option<f32>,
+    pub state_mix_prior_boost_min_frac: Option<f32>,
+    pub state_mix_prior_boost_donor_min_frac: Option<f32>,
+    pub state_mix_prior_boost_core_max_frac: Option<f32>,
+    pub state_mix_prior_floor_frac: Option<f32>,
+    pub state_mix_weak_signal_threshold: Option<f32>,
+    pub state_mix_weak_prior_frac: Option<f32>,
+    pub state_mix_weak_window_frac: Option<f32>,
+    pub state_mix_weak_donor_frac: Option<f32>,
+    pub state_mix_weak_core_frac: Option<f32>,
 
     // General parameters
     pub ne: Option<f32>,
@@ -221,6 +273,19 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
+            state_mix_prior_frac: 0.20,
+            state_mix_window_frac: 0.35,
+            state_mix_donor_frac: 0.25,
+            state_mix_core_frac: 0.20,
+            state_mix_prior_boost_min_frac: 0.50,
+            state_mix_prior_boost_donor_min_frac: 0.10,
+            state_mix_prior_boost_core_max_frac: 0.10,
+            state_mix_prior_floor_frac: 0.50,
+            state_mix_weak_signal_threshold: 0.25,
+            state_mix_weak_prior_frac: 0.10,
+            state_mix_weak_window_frac: 0.10,
+            state_mix_weak_donor_frac: 0.30,
+            state_mix_weak_core_frac: 0.50,
             ne: 200000.0,
             err: None,
             em: true,
@@ -298,6 +363,45 @@ impl Config {
         }
         if let Some(value) = cfg.gp {
             self.gp = value;
+        }
+        if let Some(value) = cfg.state_mix_prior_frac {
+            self.state_mix_prior_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_window_frac {
+            self.state_mix_window_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_donor_frac {
+            self.state_mix_donor_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_core_frac {
+            self.state_mix_core_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_prior_boost_min_frac {
+            self.state_mix_prior_boost_min_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_prior_boost_donor_min_frac {
+            self.state_mix_prior_boost_donor_min_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_prior_boost_core_max_frac {
+            self.state_mix_prior_boost_core_max_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_prior_floor_frac {
+            self.state_mix_prior_floor_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_weak_signal_threshold {
+            self.state_mix_weak_signal_threshold = value;
+        }
+        if let Some(value) = cfg.state_mix_weak_prior_frac {
+            self.state_mix_weak_prior_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_weak_window_frac {
+            self.state_mix_weak_window_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_weak_donor_frac {
+            self.state_mix_weak_donor_frac = value;
+        }
+        if let Some(value) = cfg.state_mix_weak_core_frac {
+            self.state_mix_weak_core_frac = value;
         }
 
         if let Some(value) = cfg.ne {
@@ -467,6 +571,42 @@ impl Config {
 
         if self.mcmc_lr_samples == 0 {
             return Err(ReagleError::config("mcmc-lr-samples must be positive"));
+        }
+
+        let frac_fields = [
+            ("state_mix_prior_frac", self.state_mix_prior_frac),
+            ("state_mix_window_frac", self.state_mix_window_frac),
+            ("state_mix_donor_frac", self.state_mix_donor_frac),
+            ("state_mix_core_frac", self.state_mix_core_frac),
+            (
+                "state_mix_prior_boost_min_frac",
+                self.state_mix_prior_boost_min_frac,
+            ),
+            (
+                "state_mix_prior_boost_donor_min_frac",
+                self.state_mix_prior_boost_donor_min_frac,
+            ),
+            (
+                "state_mix_prior_boost_core_max_frac",
+                self.state_mix_prior_boost_core_max_frac,
+            ),
+            ("state_mix_prior_floor_frac", self.state_mix_prior_floor_frac),
+            (
+                "state_mix_weak_signal_threshold",
+                self.state_mix_weak_signal_threshold,
+            ),
+            ("state_mix_weak_prior_frac", self.state_mix_weak_prior_frac),
+            ("state_mix_weak_window_frac", self.state_mix_weak_window_frac),
+            ("state_mix_weak_donor_frac", self.state_mix_weak_donor_frac),
+            ("state_mix_weak_core_frac", self.state_mix_weak_core_frac),
+        ];
+        for (name, value) in frac_fields {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(ReagleError::config(format!(
+                    "{} must be a finite value in [0, 1], got {}",
+                    name, value
+                )));
+            }
         }
 
         // Validate ne > 0

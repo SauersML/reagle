@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import csv
 from datetime import datetime
 from pathlib import Path
 from glob import glob
@@ -508,6 +509,92 @@ def write_summary(tasks, outdir):
             )
 
 
+def parse_simple_toml(path):
+    cfg = {}
+    if not path.exists():
+        return cfg
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def write_combined_metrics(tasks, outdir):
+    metric_name = "chr21_fast_metrics.tsv"
+    rows = []
+    config_keys = set()
+    metric_keys = set()
+
+    for task in tasks:
+        metrics_path = task.exp_dir / metric_name
+        if not metrics_path.exists():
+            continue
+
+        cfg = parse_simple_toml(task.exp_dir / "reagle.toml")
+        for key in cfg.keys():
+            config_keys.add(key)
+
+        by_tool = {}
+        with metrics_path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for rec in reader:
+                tool = (rec.get("tool") or "").strip().lower()
+                if not tool:
+                    continue
+                by_tool[tool] = rec
+                for k in rec.keys():
+                    if k != "tool":
+                        metric_keys.add(k)
+
+        rows.append(
+            {
+                "task": task,
+                "cfg": cfg,
+                "metrics": by_tool,
+                "metrics_path": metrics_path,
+            }
+        )
+
+    if not rows:
+        return None
+
+    config_cols = sorted(config_keys)
+    metric_cols = sorted(metric_keys)
+    out_path = outdir / "combined_metrics.tsv"
+
+    header = ["id", "exp_dir", "status", "command", "metrics_path"]
+    header.extend("cfg__" + k for k in config_cols)
+    for tool in ("beagle", "reagle"):
+        header.extend("{}__{}".format(tool, k) for k in metric_cols)
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow(header)
+        for row in sorted(rows, key=lambda r: r["task"].idx):
+            task = row["task"]
+            status = "UNKNOWN"
+            if task.returncode is not None:
+                status = "OK" if task.returncode == 0 else "FAIL"
+            out = [
+                "{:04d}".format(task.idx),
+                str(task.exp_dir),
+                status,
+                task.cmd,
+                str(row["metrics_path"]),
+            ]
+            cfg = row["cfg"]
+            out.extend(cfg.get(k, "") for k in config_cols)
+            for tool in ("beagle", "reagle"):
+                m = row["metrics"].get(tool, {})
+                out.extend(m.get(k, "") for k in metric_cols)
+            writer.writerow(out)
+
+    return out_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run many experiment commands in parallel with live monitoring."
@@ -889,9 +976,12 @@ def main():
             time.sleep(max(0.2, args.poll_seconds))
 
     write_summary(tasks, outdir)
+    combined_metrics = write_combined_metrics(tasks, outdir)
     failed = [t for t in tasks if (t.returncode or 0) != 0]
     print("")
     print(f"Finished. Summary: {outdir / 'summary.tsv'}")
+    if combined_metrics is not None:
+        print(f"Combined metrics: {combined_metrics}")
     if failed:
         print(f"Failed experiments: {len(failed)}")
         return 2

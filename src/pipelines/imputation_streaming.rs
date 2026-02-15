@@ -256,11 +256,6 @@ const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
-const STATE_MIX_PRIOR_FRAC_NUM: usize = 20;
-const STATE_MIX_WINDOW_FRAC_NUM: usize = 35;
-const STATE_MIX_DONOR_FRAC_NUM: usize = 25;
-const STATE_MIX_CORE_FRAC_NUM: usize = 20;
-const STATE_MIX_FRAC_DEN: usize = 100;
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
@@ -3285,30 +3280,10 @@ fn build_imputation_plan(
                     }
                 }
                 if abyss_count == n_ref_haps {
-                    let keep = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-                        .min(n_ref_haps)
-                        .max(1);
-                    let top = select_top_k_allow_zero(&global_scores[i], keep);
-                    if top.is_empty() {
-                        warn!(
-                            "Abyss prescan produced no finite global scores for target hap {} (batch_idx={}, n_ref_haps={}, keep={}); disabling abyss for this hap",
-                            hap_idx,
-                            i,
-                            n_ref_haps,
-                            keep
-                        );
-                        // No finite/global score signal to rank by; do not choose
-                        // arbitrary reference indices. Keep all haps eligible.
-                        abyss.fill(false);
-                        abyss_count = 0;
-                    } else {
-                        for (h, _) in top {
-                            if *abyss.get(h).unwrap() {
-                                abyss.set(h, false);
-                                abyss_count = abyss_count.saturating_sub(1);
-                            }
-                        }
-                    }
+                    return Err(ReagleError::vcf(format!(
+                        "Abyss prescan masked all reference haplotypes for target hap {} (batch_idx={}, n_ref_haps={})",
+                        hap_idx, i, n_ref_haps
+                    )));
                 }
                 let window_scores_matrix = &scores_by_window[i];
                 if window_scores_matrix.len() != planning_handoff.len() {
@@ -3323,14 +3298,10 @@ fn build_imputation_plan(
                     .iter()
                     .copied()
                     .min()
-                    .unwrap_or(per_window_cap.max(1));
-                // Ensure abyss pruning does not collapse the active state set below the
-                // actual per-window HMM budget. In single-window scans, rank-hit based
-                // abyss selection can keep only a tiny top-k shell (e.g. 60 haplotypes),
-                // which severely underutilizes available memory budget and hurts
-                // imputation accuracy. We deterministically recover additional states
-                // from global scores up to the budgeted minimum.
-                let min_survivors = per_window_cap_min.min(n_ref_haps);
+                    .expect("planning_window_caps must be non-empty");
+                // Keep a small safety floor so abyss pruning cannot eliminate too
+                // much donor diversity for a target haplotype.
+                let min_survivors = 60usize.min(n_ref_haps);
                 let mut survivors = n_ref_haps.saturating_sub(abyss_count);
                 if survivors < min_survivors {
                     let ranked = select_top_k_allow_zero(&global_scores[i], n_ref_haps);
@@ -6211,6 +6182,31 @@ impl crate::pipelines::ImputationPipeline {
                 let mut warned_no_priors = false;
                 let mut warned_empty_map = false;
                 let mut posts_probs_buf: Vec<f32> = Vec::new();
+                let mix_prior_frac = self.config.state_mix_prior_frac.clamp(0.0, 1.0);
+                let mix_window_frac = self.config.state_mix_window_frac.clamp(0.0, 1.0);
+                let mix_donor_frac = self.config.state_mix_donor_frac.clamp(0.0, 1.0);
+                let mix_core_frac = self.config.state_mix_core_frac.clamp(0.0, 1.0);
+                let mix_prior_boost_min_frac = self
+                    .config
+                    .state_mix_prior_boost_min_frac
+                    .clamp(0.0, 1.0);
+                let mix_prior_boost_donor_min_frac = self
+                    .config
+                    .state_mix_prior_boost_donor_min_frac
+                    .clamp(0.0, 1.0);
+                let mix_prior_boost_core_max_frac = self
+                    .config
+                    .state_mix_prior_boost_core_max_frac
+                    .clamp(0.0, 1.0);
+                let mix_prior_floor_frac = self.config.state_mix_prior_floor_frac.clamp(0.0, 1.0);
+                let mix_weak_signal_threshold = self
+                    .config
+                    .state_mix_weak_signal_threshold
+                    .clamp(0.0, 1.0);
+                let mix_weak_prior_frac = self.config.state_mix_weak_prior_frac.clamp(0.0, 1.0);
+                let mix_weak_window_frac = self.config.state_mix_weak_window_frac.clamp(0.0, 1.0);
+                let mix_weak_donor_frac = self.config.state_mix_weak_donor_frac.clamp(0.0, 1.0);
+                let mix_weak_core_frac = self.config.state_mix_weak_core_frac.clamp(0.0, 1.0);
                 let posts_from_donors =
                     |donors: &[(RefHapId, f32)], probs_buf: &mut Vec<f32>| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
@@ -6385,30 +6381,76 @@ impl crate::pipelines::ImputationPipeline {
                             added
                         };
 
-                    let mut q_prior = k * STATE_MIX_PRIOR_FRAC_NUM / STATE_MIX_FRAC_DEN;
-                    let mut q_window = k * STATE_MIX_WINDOW_FRAC_NUM / STATE_MIX_FRAC_DEN;
-                    let mut q_donor = if donors.is_empty() {
-                        0
-                    } else {
-                        k * STATE_MIX_DONOR_FRAC_NUM / STATE_MIX_FRAC_DEN
+                    let quota4 = |k: usize, a: f32, b: f32, c: f32, d: f32| -> [usize; 4] {
+                        if k == 0 {
+                            return [0, 0, 0, 0];
+                        }
+                        let mut w = [a.max(0.0), b.max(0.0), c.max(0.0), d.max(0.0)];
+                        let sum = w[0] + w[1] + w[2] + w[3];
+                        if !sum.is_finite() || sum <= 0.0 {
+                            w = [1.0, 1.0, 1.0, 1.0];
+                        }
+                        let sum = w[0] + w[1] + w[2] + w[3];
+                        let mut q = [0usize; 4];
+                        let mut frac = [0.0f32; 4];
+                        let mut used = 0usize;
+                        for i in 0..4 {
+                            let exact = (k as f32) * (w[i] / sum);
+                            let base = exact.floor() as usize;
+                            q[i] = base;
+                            frac[i] = exact - base as f32;
+                            used += base;
+                        }
+                        while used < k {
+                            let mut best = 0usize;
+                            for i in 1..4 {
+                                if frac[i] > frac[best] {
+                                    best = i;
+                                }
+                            }
+                            q[best] += 1;
+                            frac[best] = -1.0;
+                            used += 1;
+                        }
+                        q
                     };
-                    let mut q_core = k * STATE_MIX_CORE_FRAC_NUM / STATE_MIX_FRAC_DEN;
+
+                    let [mut q_prior, mut q_window, mut q_donor, mut q_core] = quota4(
+                        k,
+                        mix_prior_frac,
+                        mix_window_frac,
+                        mix_donor_frac,
+                        mix_core_frac,
+                    );
+                    if donors.is_empty() {
+                        q_donor = 0;
+                    }
                     if has_nonempty_priors {
                         // Keep continuity strong across windows, but do not fully disable
                         // local donors (they remain useful at rare/local mismatches).
-                        q_prior = q_prior.max((k * 5) / 10);
-                        q_donor = q_donor.max((k * 1) / 10);
-                        q_core = q_core.min((k * 1) / 10);
+                        q_prior = q_prior.max((k as f32 * mix_prior_boost_min_frac).floor() as usize);
+                        if !donors.is_empty() {
+                            q_donor = q_donor.max(
+                                (k as f32 * mix_prior_boost_donor_min_frac).floor() as usize
+                            );
+                        }
+                        q_core = q_core.min((k as f32 * mix_prior_boost_core_max_frac).ceil() as usize);
                     }
-                    if informative_ratio <= 0.25 && !has_nonempty_priors {
+                    if informative_ratio <= mix_weak_signal_threshold && !has_nonempty_priors {
                         // In weak local signal, broaden the state set with global core
                         // diversity. PBWT donors can be brittle on sparse arrays and
                         // excluding rare carriers collapses AF.
-                        q_core = (k * 5) / 10;
-                        q_donor = (k * 3) / 10;
-                        q_window = (k * 1) / 10;
-                        let used = q_core + q_donor + q_window;
-                        q_prior = k.saturating_sub(used);
+                        let weak_q = quota4(
+                            k,
+                            mix_weak_prior_frac,
+                            mix_weak_window_frac,
+                            mix_weak_donor_frac,
+                            mix_weak_core_frac,
+                        );
+                        q_prior = weak_q[0];
+                        q_window = weak_q[1];
+                        q_donor = if donors.is_empty() { 0 } else { weak_q[2] };
+                        q_core = weak_q[3];
                     }
                     let mut used_q = q_prior + q_window + q_donor + q_core;
                     while used_q < k {
@@ -6432,7 +6474,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
 
                     let prior_floor = if has_nonempty_priors {
-                        (k / 2).min(prior_haps.len())
+                        ((k as f32 * mix_prior_floor_frac).floor() as usize).min(prior_haps.len())
                     } else {
                         0
                     };
