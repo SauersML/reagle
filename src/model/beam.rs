@@ -79,7 +79,7 @@ pub struct BeamCosts {
 
 impl BeamCosts {
     pub fn from_params(params: &ModelParams) -> Self {
-        let p_err = params.p_mismatch.max(1e-9).min(1.0 - 1e-9);
+        let p_err = params.p_mismatch.max(1e-9).min(0.499_999f32);
         let p_match = (1.0 - p_err) as f64;
         let p_mismatch = p_err as f64;
         let match_emit_cost = (-(p_match.ln()) * 1_000_000.0)
@@ -925,45 +925,17 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             self.config.beam_width.saturating_mul(4),
         );
 
-        // Pick best path
-        if let Some((best_idx, _)) = beam.iter().enumerate().min_by_key(|(_, p)| p.score) {
-            let mut phases = Vec::with_capacity(n_calls);
-            let mut idx = best_idx;
-            if let Some(ptrs) = trailing_ptrs.as_ref() {
-                idx = ptrs.get(idx).copied().unwrap_or(0) as usize;
-            }
-            for step in (0..n_calls).rev() {
-                if let Some(ptrs) = backptrs.get(step) {
-                    if let Some(packed) = ptrs.get(idx) {
-                        let bp = unpack_backptr(*packed);
-                        phases.push(bp.swapped);
-                        let prev_idx = bp.prev as usize;
-                        let mapped_prev = segment_ptrs
-                            .get(step)
-                            .and_then(|m| m.get(prev_idx))
-                            .copied()
-                            .unwrap_or(0) as usize;
-                        idx = mapped_prev;
-                        continue;
-                    }
-                }
-                phases.push(false);
-                idx = 0;
-            }
-            phases.reverse();
+        if !beam.is_empty() {
             let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
-            let phases = self.decode_swap_track(
-                &logsum_swapped,
-                &logsum_unswapped,
-                &condensed.call_sites,
-                &phases,
-            );
+            let mut posterior_decisions = Vec::with_capacity(n_calls);
             let has_input_anchor = sample_phase.has_input_phase_anchor();
-            for (i, phase_swapped) in phases.iter().enumerate() {
+            for i in 0..n_calls {
                 let call = &condensed.call_sites[i];
                 let m = call.marker.as_usize();
                 let p = p_swapped.get(i).copied().unwrap_or(0.5);
-                let conf = if *phase_swapped { p } else { 1.0 - p };
+                let phase_swapped = p >= 0.5;
+                posterior_decisions.push(phase_swapped);
+                let conf = if phase_swapped { p } else { 1.0 - p };
                 if !has_input_anchor {
                     sample_phase.set_phase_confidence(m, 0.5);
                     continue;
@@ -976,7 +948,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                     conf / (1.0 - conf)
                 };
                 if lr >= self.lr_threshold {
-                    if *phase_swapped {
+                    if phase_swapped {
                         sample_phase.swap_alleles(m);
                     }
                     sample_phase.mark_phased(m);
@@ -986,7 +958,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 }
             }
             return BeamPosteriors {
-                decisions: phases,
+                decisions: posterior_decisions,
                 p_swapped,
                 donor_mass,
             };
@@ -2617,5 +2589,17 @@ mod tests {
             high_conf_wrong < 300_000,
             "search prior should remain small relative to main model terms"
         );
+    }
+
+    #[test]
+    fn beam_costs_never_prefer_mismatch_over_match() {
+        let mut params = ModelParams::default();
+        params.p_mismatch = 0.95;
+        let costs = BeamCosts::from_params(&params);
+        assert!(
+            costs.mismatch_emit_cost >= costs.match_emit_cost,
+            "mismatch cost must not be lower than match cost"
+        );
+        assert!(costs.p_err < 0.5);
     }
 }
