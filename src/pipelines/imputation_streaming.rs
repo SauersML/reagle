@@ -276,6 +276,12 @@ const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
 // copy signal to the window end is at least epsilon.
 const HANDOFF_RETAIN_EPS: f64 = 1e-3;
 
+/// Extra markers appended past each piecewise segment's core boundary so the
+/// backward pass warms up before reaching the core region.  Zero RAM cost
+/// (ref_columns are already loaded for the full I/O window) and negligible
+/// speed cost (~10 extra forward-backward markers per segment boundary).
+const BACKWARD_HALO_MARKERS: usize = 10;
+
 /// Describes a piecewise HMM segment with an optional backward halo.
 ///
 /// Layout within the I/O window's marker array:
@@ -318,7 +324,7 @@ impl SegmentExtent {
     ) -> Self {
         assert!(core_start <= core_end);
         assert!(core_end <= n_window_markers);
-        let extended_end = n_window_markers;
+        let extended_end = (core_end + BACKWARD_HALO_MARKERS).min(n_window_markers);
         Self {
             core_start,
             core_end,
@@ -646,7 +652,7 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    -(p.ln())
 }
 
 #[inline]
@@ -7052,6 +7058,12 @@ impl crate::pipelines::ImputationPipeline {
                             let seg_plan = marker_plan_idx[seg_start];
                             let mut seg_end = seg_start + 1;
                             while seg_end < n_markers && marker_plan_idx[seg_end] == seg_plan {
+                                // Force a segment break at the overlap boundary so we can
+                                // cleanly inject the handoff prior at the start of the
+                                // new output region.
+                                if output_start > 0 && seg_end == output_start {
+                                    break;
+                                }
                                 seg_end += 1;
                             }
                             let seg_plan_start = seg_plan.min(plan_range_end.saturating_sub(1));
@@ -7089,6 +7101,13 @@ impl crate::pipelines::ImputationPipeline {
                             if extent.core_len() == 0 {
                                 continue;
                             }
+                            // If we have a handoff prior from the previous window, we should
+                            // skip the overlap-prefix segments (which are only for context)
+                            // and start processing exactly where the prior aligns.
+                            if priors.is_some() && extent.core_end <= output_start {
+                                continue;
+                            }
+
                             let (seg_plan_start, seg_plan_end) = extent.plan_range();
                             let mut state_haps = build_state_haps(
                                 hap_idx,

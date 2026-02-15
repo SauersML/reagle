@@ -4934,13 +4934,12 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                             let gamma = &mut ws.state_posterior_scratch[..active_states];
                             let mut sum = 0.0f32;
                             for i in 0..active_states {
+                                // Extract Forward (Alpha) probability only.
+                                // Affine forward map: F_m(i) = a_fwd * F_left(i) + b_fwd * sum(F_left)
+                                // We use this as the prior for the next window to avoid double-counting
+                                // backward evidence (Gamma) from the overlapping halo region.
                                 let u = ws.fwd[i];
-                                let v = ws.bwd[i];
-                                let g = (alpha_coeff * (u * v)
-                                    + beta_coeff * u
-                                    + gamma_coeff * v
-                                    + delta_coeff)
-                                    .max(0.0);
+                                let g = (forward_affine.a * u + forward_affine.b).max(0.0);
                                 gamma[i] = g;
                                 sum += g;
                             }
@@ -5183,7 +5182,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         let gamma = &mut ws.state_posterior_scratch[..active_states];
                         let mut sum = 0.0f32;
                         for i in 0..active_states {
-                            let g = (fwd_slice[i] * ws.bwd[i]).max(0.0);
+                            // Extract Forward (Alpha) probability only.
+                            // In this explicit non-affine path, fwd_slice is F_m (loaded from checkpoint).
+                            let g = fwd_slice[i].max(0.0);
                             gamma[i] = g;
                             sum += g;
                         }
