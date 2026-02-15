@@ -277,10 +277,6 @@ const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
 // probability per planning window, then split each I/O interval so the
 // cumulative Li-Stephens hazard per planning segment stays near this budget.
 const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
-// Overlap/handoff retention target: include the suffix where expected retained
-// copy signal to the window end is at least epsilon.
-const HANDOFF_RETAIN_EPS: f64 = 1e-3;
-
 /// Extra markers appended past each piecewise segment's core boundary so the
 /// backward pass warms up before reaching the core region.  Zero RAM cost
 /// (ref_columns are already loaded for the full I/O window) and negligible
@@ -456,22 +452,6 @@ fn recomb_lambda_from_p(p: f32) -> f64 {
     }
 }
 
-#[inline]
-fn overlap_start_from_hazard(output_start: usize, output_end: usize, p_recomb: &[f32]) -> usize {
-    if output_end <= output_start {
-        return output_start;
-    }
-    let eps = HANDOFF_RETAIN_EPS.clamp(1e-12, 0.5);
-    let target_lambda = -eps.ln();
-    let mut acc = 0.0f64;
-    for m in ((output_start + 1)..output_end).rev() {
-        acc += recomb_lambda_from_p(p_recomb.get(m).copied().unwrap_or(0.0));
-        if acc >= target_lambda {
-            return m.saturating_sub(1).max(output_start);
-        }
-    }
-    output_start
-}
 
 #[inline]
 fn compute_abyss_rank_cutoff(
@@ -5108,7 +5088,9 @@ impl crate::pipelines::ImputationPipeline {
         let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let smoothing_cluster_cm = self.config.cluster.max(1e-6);
-        let overlap_start = overlap_start_from_hazard(output_start, output_end, &p_recomb);
+        // Force output boundary to align with fixed window partitions.
+        // Dynamic hazard-based truncation causes gaps/mismatches with pre-loaded windows.
+        let overlap_start = output_end;
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -6039,7 +6021,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let prior_marker_idx = if output_end > 0 {
-            Some(overlap_start.saturating_sub(1))
+            Some(output_end.saturating_sub(1))
         } else {
             None
         };
@@ -9732,26 +9714,9 @@ impl crate::pipelines::ImputationPipeline {
             }
             output_markers.push(OutputMarker::Ref(ref_m));
         }
-
-        // Only emit trailing target markers if they fall strictly before the next window's start.
-        // If there is a reference marker immediately following this window (at output_end),
-        // we use its position as the exclusive upper bound.
-        let next_limit = if output_end < ref_markers.len() {
-            let m = ref_markers.marker(MarkerIdx::new(output_end as u32));
-            let chrom_name = ref_markers.chrom_name(m.chrom).unwrap_or("");
-            Some((normalize_chrom_local(chrom_name).to_string(), m.pos))
-        } else {
-            None
-        };
-
-        for (chrom, targets_by_pos) in target_only_by_pos {
-            for (pos, targets) in targets_by_pos {
-                if let Some((limit_chrom, limit_pos)) = &next_limit {
-                    if chrom == limit_chrom.as_str() && pos >= *limit_pos {
-                        continue;
-                    }
-                }
-                for t_idx in targets {
+        for targets_by_pos in target_only_by_pos.values() {
+            for targets in targets_by_pos.values() {
+                for &t_idx in targets {
                     if !emitted_target[t_idx] {
                         emitted_target[t_idx] = true;
                         output_markers.push(OutputMarker::Target(t_idx));
