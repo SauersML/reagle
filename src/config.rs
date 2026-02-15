@@ -123,6 +123,14 @@ pub struct Config {
     /// Print posterior genotype probabilities
     pub gp: bool,
 
+    /// Per-window prescan top-k for abyss ranking.
+    ///
+    /// Methodology note:
+    /// chr21 sweeps (10 target / 1000 ref) showed a quality sweet spot around
+    /// 25-30 for phase/IQS/Hellinger, while dosage R² peaked closer to ~50.
+    /// Defaulting to 50 prioritizes dosage-first workflows.
+    pub window_top_k: usize,
+
     /// Base fraction of state budget from carried priors.
     pub state_mix_prior_frac: f32,
 
@@ -221,6 +229,7 @@ struct TomlConfig {
     pub pbwt_batch_mb: Option<usize>,
     pub ap: Option<bool>,
     pub gp: Option<bool>,
+    pub window_top_k: Option<usize>,
     pub state_mix_prior_frac: Option<f32>,
     pub state_mix_window_frac: Option<f32>,
     pub state_mix_donor_frac: Option<f32>,
@@ -273,6 +282,7 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
+            window_top_k: 50,
             state_mix_prior_frac: 0.20,
             state_mix_window_frac: 0.35,
             state_mix_donor_frac: 0.25,
@@ -363,6 +373,9 @@ impl Config {
         }
         if let Some(value) = cfg.gp {
             self.gp = value;
+        }
+        if let Some(value) = cfg.window_top_k {
+            self.window_top_k = value;
         }
         if let Some(value) = cfg.state_mix_prior_frac {
             self.state_mix_prior_frac = value;
@@ -571,6 +584,9 @@ impl Config {
 
         if self.mcmc_lr_samples == 0 {
             return Err(ReagleError::config("mcmc-lr-samples must be positive"));
+        }
+        if self.window_top_k == 0 {
+            return Err(ReagleError::config("window_top_k must be positive"));
         }
 
         let frac_fields = [

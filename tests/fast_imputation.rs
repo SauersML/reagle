@@ -2372,6 +2372,7 @@ fn test_phasing_confidence() {
         pbwt_batch_mb: 256,
         ap: false,
         gp: false,
+        window_top_k: 60,
         state_mix_prior_frac: 0.20,
         state_mix_window_frac: 0.35,
         state_mix_donor_frac: 0.25,

@@ -1,0 +1,9 @@
+# Sweep WINDOW_TOP_K for chr21 reference comparison
+nthreads=4,window_top_k=5 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=10 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=20 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=30 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=60 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=90 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=150 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+nthreads=4,window_top_k=300 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture

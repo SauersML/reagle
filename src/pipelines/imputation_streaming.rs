@@ -250,7 +250,6 @@ const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
-const ABYSS_RANK_BASE: usize = 60;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
@@ -472,22 +471,15 @@ fn overlap_start_from_hazard(output_start: usize, output_end: usize, p_recomb: &
 #[inline]
 fn compute_abyss_rank_cutoff(
     n_ref_haps: usize,
-    per_window_cap_window: usize,
-    num_windows: usize,
+    window_top_k: usize,
 ) -> usize {
     if n_ref_haps == 0 {
         return 1;
     }
-    let base = ((n_ref_haps / 1000).max(ABYSS_RANK_BASE))
-        .min(n_ref_haps)
-        .max(1);
-    let windows = num_windows.max(1);
-    let target_union = per_window_cap_window.min(n_ref_haps).max(1);
-    // Ensure that, in expectation, the union over windows can cover at least
-    // the configured per-window cap. This prevents single-window scans from
-    // collapsing to ABYSS_RANK_BASE candidates.
-    let min_per_window = target_union.div_ceil(windows).max(1);
-    base.max(min_per_window).min(n_ref_haps).max(1)
+    // Keep this as a direct knob (clamped to panel size). We intentionally do
+    // not reintroduce a hidden min-per-window floor here; that previously made
+    // wide top-k sweeps look "flat" by collapsing many settings to one cutoff.
+    window_top_k.max(1).min(n_ref_haps)
 }
 
 fn estimate_state_budget(
@@ -2420,6 +2412,7 @@ fn build_imputation_plan(
     streaming_config: &StreamingConfig,
     gen_maps: &GeneticMaps,
     per_window_cap: usize,
+    window_top_k: usize,
     available_bytes: u64,
     imp_step_cm: f64,
     params: &crate::model::parameters::ModelParams,
@@ -2937,8 +2930,7 @@ fn build_imputation_plan(
 
                     let abyss_rank_cutoff = compute_abyss_rank_cutoff(
                         n_ref_haps,
-                        per_window_cap_window,
-                        per_window_caps.len(),
+                        window_top_k.max(1),
                     );
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
@@ -3175,8 +3167,7 @@ fn build_imputation_plan(
 
                     let abyss_rank_cutoff = compute_abyss_rank_cutoff(
                         n_ref_haps,
-                        per_window_cap_window,
-                        per_window_caps.len(),
+                        window_top_k.max(1),
                     );
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
@@ -3299,9 +3290,12 @@ fn build_imputation_plan(
                     .copied()
                     .min()
                     .expect("planning_window_caps must be non-empty");
-                // Keep a small safety floor so abyss pruning cannot eliminate too
-                // much donor diversity for a target haplotype.
-                let min_survivors = 60usize.min(n_ref_haps);
+                // Safety floor: prevent abyss pruning from collapsing donor diversity.
+                // Empirical note from chr21 top-k sweeps:
+                // - runtime was mostly insensitive across top-k in [20, 120]
+                // - lowering survivors affected metric tradeoffs (phase/IQS/Hellinger vs R²)
+                // This floor is therefore a quality/robustness control, not a speed control.
+                let min_survivors = 25usize.min(n_ref_haps);
                 let mut survivors = n_ref_haps.saturating_sub(abyss_count);
                 if survivors < min_survivors {
                     let ranked = select_top_k_allow_zero(&global_scores[i], n_ref_haps);
@@ -3967,6 +3961,7 @@ impl crate::pipelines::ImputationPipeline {
             &streaming_config,
             &gen_maps,
             per_window_cap,
+            self.config.window_top_k.max(1),
             if force_full_panel { 0 } else { avail_bytes },
             self.config.imp_step as f64,
             &self.params,
@@ -10032,31 +10027,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_abyss_rank_cutoff_single_window_respects_budget() {
+    fn test_compute_abyss_rank_cutoff_uses_window_top_k() {
         let n_ref_haps = 6546usize;
-        let per_window_cap = 2370usize;
-        let windows = 1usize;
-        let cutoff = compute_abyss_rank_cutoff(n_ref_haps, per_window_cap, windows);
-        assert_eq!(
-            cutoff, per_window_cap,
-            "single-window cutoff should match configured budget to avoid starvation"
-        );
+        let cutoff = compute_abyss_rank_cutoff(n_ref_haps, 60);
+        assert_eq!(cutoff, 60);
     }
 
     #[test]
-    fn test_compute_abyss_rank_cutoff_multi_window_scales_with_union_target() {
-        let n_ref_haps = 6546usize;
-        let per_window_cap = 2370usize;
-        let windows = 4usize;
-        let cutoff = compute_abyss_rank_cutoff(n_ref_haps, per_window_cap, windows);
-        let expected_min = per_window_cap.div_ceil(windows);
-        assert!(
-            cutoff >= expected_min,
-            "cutoff {} should be >= {} to permit union coverage",
-            cutoff,
-            expected_min
-        );
-        assert!(cutoff <= n_ref_haps);
+    fn test_compute_abyss_rank_cutoff_clamps_to_panel_size() {
+        let n_ref_haps = 200usize;
+        let cutoff = compute_abyss_rank_cutoff(n_ref_haps, 1000);
+        assert_eq!(cutoff, n_ref_haps);
     }
 
     #[test]

@@ -328,3 +328,29 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
         phase_total,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gt_class_unphased_is_hap_label_invariant() {
+        assert_eq!(gt_class_unphased("0|1"), Some(1));
+        assert_eq!(gt_class_unphased("1|0"), Some(1));
+        assert_eq!(gt_class_unphased("0/1"), Some(1));
+        assert_eq!(gt_class_unphased("1/0"), Some(1));
+    }
+
+    #[test]
+    fn iqs_fallback_path_is_hap_label_invariant() {
+        // When GP is missing, IQS falls back to GT class. The heterozygote
+        // class must remain identical under hap-label swap.
+        let t_class = gt_class_unphased("0|1").unwrap();
+        let i_class_a = gt_class_unphased("0|1").unwrap();
+        let i_class_b = gt_class_unphased("1|0").unwrap();
+        assert_eq!(t_class, 1);
+        assert_eq!(i_class_a, 1);
+        assert_eq!(i_class_b, 1);
+        assert_eq!(usize::from(i_class_a == t_class), usize::from(i_class_b == t_class));
+    }
+}
