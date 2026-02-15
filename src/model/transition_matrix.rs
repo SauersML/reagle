@@ -113,6 +113,7 @@ impl TransitionMatrix {
         let stay_scale = ((1.0 - r) + r * lam) / denom_in;
         let switch_each = (r * (1.0 - lam) / n_panel) / denom_in;
         let switch_from_overlap_each = overlap_mass * switch_each;
+        let dropped_entry_total = dropped_mass * switch_each * k_next;
         // For dropped states (not in next subset), conditioning on "state in next
         // subset" yields entry mass over next states. Default is uniform; caller
         // can provide a window-local entry prior pi for safer state introduction.
@@ -144,9 +145,9 @@ impl TransitionMatrix {
 
         for j in 0..self.n_next {
             let dropped_entry = if let Some(pi) = pi {
-                dropped_mass * pi[j]
+                dropped_entry_total * pi[j]
             } else {
-                dropped_mass / k_next.max(1.0)
+                dropped_entry_total / k_next.max(1.0)
             };
             next[j] =
                 stay_scale * overlap_mass_by_next[j] + switch_from_overlap_each + dropped_entry;
