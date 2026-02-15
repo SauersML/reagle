@@ -276,12 +276,6 @@ const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
 // copy signal to the window end is at least epsilon.
 const HANDOFF_RETAIN_EPS: f64 = 1e-3;
 
-/// Extra markers appended past each piecewise segment's core boundary so the
-/// backward pass warms up before reaching the core region.  Zero RAM cost
-/// (ref_columns are already loaded for the full I/O window) and negligible
-/// speed cost (~10 extra forward-backward markers per segment boundary).
-const BACKWARD_HALO_MARKERS: usize = 10;
-
 /// Describes a piecewise HMM segment with an optional backward halo.
 ///
 /// Layout within the I/O window's marker array:
@@ -324,7 +318,7 @@ impl SegmentExtent {
     ) -> Self {
         assert!(core_start <= core_end);
         assert!(core_end <= n_window_markers);
-        let extended_end = (core_end + BACKWARD_HALO_MARKERS).min(n_window_markers);
+        let extended_end = n_window_markers;
         Self {
             core_start,
             core_end,
@@ -1335,13 +1329,6 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
         return Vec::new();
     }
     select_top_k_heap(scores, k, true)
-}
-
-fn select_top_k_allow_zero(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
-    if k == 0 || scores.is_empty() {
-        return Vec::new();
-    }
-    select_top_k_heap(scores, k, false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3290,26 +3277,7 @@ fn build_imputation_plan(
                     .copied()
                     .min()
                     .expect("planning_window_caps must be non-empty");
-                // Safety floor: prevent abyss pruning from collapsing donor diversity.
-                // Empirical note from chr21 top-k sweeps:
-                // - runtime was mostly insensitive across top-k in [20, 120]
-                // - lowering survivors affected metric tradeoffs (phase/IQS/Hellinger vs R²)
-                // This floor is therefore a quality/robustness control, not a speed control.
-                let min_survivors = 25usize.min(n_ref_haps);
-                let mut survivors = n_ref_haps.saturating_sub(abyss_count);
-                if survivors < min_survivors {
-                    let ranked = select_top_k_allow_zero(&global_scores[i], n_ref_haps);
-                    for (h, _) in ranked {
-                        if survivors >= min_survivors {
-                            break;
-                        }
-                        if abyss[h] {
-                            abyss.set(h, false);
-                            abyss_count = abyss_count.saturating_sub(1);
-                            survivors += 1;
-                        }
-                    }
-                }
+
                 let (intervals, core) = if per_window_cap_min >= n_ref_haps {
                     // Keep abyss active even when we can fit the full panel:
                     // here abyss is a denoising prior over candidate donors,
