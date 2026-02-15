@@ -9,6 +9,12 @@ import re
 JULES_API_URL = "https://jules.googleapis.com"
 MAX_RETRIES = 2
 RETRY_DELAY = 60
+CI_WORKFLOW_FILE = "CI.yml"
+TARGET_JOB_STEP_PAIRS = [
+    ("reference-comparison", "Run reference comparison tests"),
+    ("reference-comparison-chr21", "Run chr21 reference comparison tests"),
+]
+MAX_STEP_LOG_LEN = 150000
 
 PROMPT_TEXT = """
 The goal is to have the best and most accurate imputation (and phasing) out of any tool, while being extraordinarily fast (and no OOM).
@@ -74,61 +80,158 @@ def run_command(cmd, check: bool = False):
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
-def filter_noise(logs: str) -> str:
-    """Remove noisy lines that don't help with debugging."""
-    noise_patterns = [
-        "Downloading crates ...",
-        "Downloaded ",
-        "Compiling proc-macro",
-        "Compiling unicode-",
-        "Compiling syn ",
-        "Compiling quote ",
-        "Compiling serde_derive",
-        "Compiling memchr",
-        "Compiling libc",
-        "Compiling cfg-if",
-        "Compiling autocfg",
-        "Finished ",
-        "Fresh ",
-    ]
+def github_api_get_json(repo: str, token: str, path: str, params=None):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{repo}{path}"
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub API GET failed ({response.status_code}) for {path}: {response.text[:800]}")
+    return response.json()
 
-    out = []
-    for line in logs.split("\n"):
-        if any(pat in line for pat in noise_patterns):
-            continue
-        out.append(line)
-    return "\n".join(out)
+
+def download_job_log(repo: str, token: str, job_id: int) -> str:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
+    response = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Failed to download job log for job {job_id} ({response.status_code}): {response.text[:800]}"
+        )
+    return strip_ansi(response.text)
+
+
+def extract_named_step_log(job_log: str, step_name: str) -> str:
+    lines = job_log.splitlines()
+    start_idx = None
+
+    target_marker = f"##[group]Run {step_name}"
+    generic_marker = f"Run {step_name}"
+
+    for i, line in enumerate(lines):
+        if target_marker in line or generic_marker in line:
+            start_idx = i
+            break
+
+    if start_idx is None:
+        return ""
+
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        if "##[group]Run " in lines[i]:
+            end_idx = i
+            break
+
+    extracted = "\n".join(lines[start_idx:end_idx]).strip()
+    if len(extracted) > MAX_STEP_LOG_LEN:
+        extracted = "..." + extracted[-MAX_STEP_LOG_LEN:]
+    return extracted
 
 
 def get_run_info():
-    """
-    Retrieves status and logs.
-    Expects LOCAL_LOG_FILE and LOCAL_BUILD_STATUS to be set by workflow.
-    """
-    print("\n--- Getting Run Info ---")
-    local_log_file = os.environ.get("LOCAL_LOG_FILE")
-    local_status = os.environ.get("LOCAL_BUILD_STATUS")
+    """Retrieve logs from the most recent completed CI run for target jobs/steps only."""
+    print("\n--- Getting Run Info From Existing CI ---")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    token = os.environ.get("GITHUB_TOKEN")
 
-    if local_log_file and local_status:
-        print(f"Using local log file: {local_log_file} with status: {local_status}")
+    if not repo or not token:
+        print("Missing GITHUB_REPOSITORY or GITHUB_TOKEN; cannot fetch CI logs.")
+        return "unknown", "No logs available."
+
+    try:
+        runs_data = github_api_get_json(
+            repo,
+            token,
+            f"/actions/workflows/{CI_WORKFLOW_FILE}/runs",
+            params={"status": "completed", "per_page": 20},
+        )
+    except Exception as e:
+        print(f"Failed to list CI runs: {e}")
+        return "unknown", f"Failed to list CI runs: {e}"
+
+    runs = runs_data.get("workflow_runs", [])
+    if not runs:
+        return "unknown", "No completed CI runs found."
+
+    selected_run = None
+    selected_jobs = None
+
+    for run in runs:
+        run_id = run.get("id")
+        if not run_id:
+            continue
         try:
-            with open(local_log_file, "r") as f:
-                raw_logs = f.read()
+            jobs_data = github_api_get_json(repo, token, f"/actions/runs/{run_id}/jobs", params={"per_page": 100})
+        except Exception:
+            continue
 
-            logs = filter_noise(strip_ansi(raw_logs))
+        jobs = jobs_data.get("jobs", [])
+        job_names = {job.get("name", "") for job in jobs}
+        required_job_names = {pair[0] for pair in TARGET_JOB_STEP_PAIRS}
+        if required_job_names.issubset(job_names):
+            selected_run = run
+            selected_jobs = jobs
+            break
 
-            max_len = 300000
-            if len(logs) > max_len:
-                print(f"Log size {len(logs)} exceeds {max_len}. Keeping last {max_len} characters.")
-                logs = "..." + logs[-max_len:]
+    if selected_run is None or selected_jobs is None:
+        return "unknown", "No recent completed CI run contains both required jobs."
 
-            return local_status, logs
+    jobs_by_name = {job.get("name", ""): job for job in selected_jobs}
+    snippets = []
+    selected_job_conclusions = []
+
+    for job_name, step_name in TARGET_JOB_STEP_PAIRS:
+        job = jobs_by_name.get(job_name)
+        if not job:
+            snippets.append(f"[{job_name} / {step_name}] Job not found in selected run.")
+            continue
+
+        selected_job_conclusions.append(job.get("conclusion", "unknown"))
+        job_id = job.get("id")
+        if not job_id:
+            snippets.append(f"[{job_name} / {step_name}] Missing job ID.")
+            continue
+
+        try:
+            raw_job_log = download_job_log(repo, token, job_id)
+            step_log = extract_named_step_log(raw_job_log, step_name)
+            if not step_log:
+                step_log = f"[No log section found for step: {step_name}]"
+            snippets.append(f"=== {job_name} :: {step_name} ===\n{step_log}")
         except Exception as e:
-            print(f"Error reading local log file: {e}")
-            return local_status, f"Error reading log file: {e}"
+            snippets.append(f"=== {job_name} :: {step_name} ===\n[Error fetching log: {e}]")
 
-    print("No local log file provided. This script is expected to run with LOCAL_LOG_FILE set.")
-    return "unknown", "No logs available."
+    if selected_job_conclusions and all(c == "success" for c in selected_job_conclusions):
+        build_status = "success"
+    else:
+        build_status = "failure"
+
+    run_url = selected_run.get("html_url", "")
+    run_id = selected_run.get("id", "")
+    run_conclusion = selected_run.get("conclusion", "unknown")
+    run_head_sha = selected_run.get("head_sha", "")
+
+    context_header = (
+        "SOURCE:\n"
+        f"- workflow: {CI_WORKFLOW_FILE}\n"
+        f"- run_id: {run_id}\n"
+        f"- run_url: {run_url}\n"
+        f"- run_conclusion: {run_conclusion}\n"
+        f"- run_head_sha: {run_head_sha}\n"
+        f"- selected_job_status: {build_status}\n"
+        "- selected_steps:\n"
+        "  - reference-comparison / Run reference comparison tests\n"
+        "  - reference-comparison-chr21 / Run chr21 reference comparison tests\n"
+    )
+
+    return build_status, context_header + "\n\n" + "\n\n".join(snippets)
 
 
 def verify_rust_build() -> bool:

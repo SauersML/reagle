@@ -43,34 +43,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-build-
 
-      - name: Build and Test (Capture Output)
-        id: verify
-        working-directory: .
-        run: |
-          echo "Building reagle..."
-          set +e
-
-          # Run cargo check and build, capture output
-          cargo check --all-targets 2>&1 | tee ../build.log
-          CHECK_CODE=${PIPESTATUS[0]}
-
-          if [ $CHECK_CODE -eq 0 ]; then
-            echo "Cargo check passed. Running tests..."
-            cargo test --release 2>&1 | tee -a ../build.log
-            TEST_CODE=${PIPESTATUS[0]}
-
-            if [ $TEST_CODE -eq 0 ]; then
-              echo "status=success" >> $GITHUB_OUTPUT
-            else
-              echo "status=failure" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "status=failure" >> $GITHUB_OUTPUT
-          fi
-
-          echo "--- Tail of build.log ---"
-          tail -n 30 ../build.log
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -83,6 +55,4 @@ jobs:
         env:
           JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LOCAL_LOG_FILE: build.log
-          LOCAL_BUILD_STATUS: ${{ steps.verify.outputs.status }}
         run: python scripts/jules_loop.py
