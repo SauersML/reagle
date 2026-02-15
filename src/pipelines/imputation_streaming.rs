@@ -4015,6 +4015,12 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPlanning);
             bb.set_op("Imputation planning: window caps");
         }
+        let n_ref_haps_for_plan = ref_data.n_ref_haps().max(1);
+        let params_for_plan = crate::model::parameters::ModelParams::for_imputation(
+            n_ref_haps_for_plan,
+            self.config.ne,
+            self.config.err,
+        );
         let plan = build_imputation_plan(
             &phased_target_path,
             &streaming_config,
@@ -4023,7 +4029,7 @@ impl crate::pipelines::ImputationPipeline {
             self.config.window_top_k.max(1),
             if force_full_panel { 0 } else { avail_bytes },
             self.config.imp_step as f64,
-            &self.params,
+            &params_for_plan,
             &ref_data,
             self.telemetry.as_ref(),
         )?;
@@ -10244,6 +10250,22 @@ mod tests {
         let n_ref_haps = 200usize;
         let cutoff = compute_abyss_rank_cutoff(n_ref_haps, 1000);
         assert_eq!(cutoff, n_ref_haps);
+    }
+
+    #[test]
+    fn test_build_planning_grid_respects_recomb_intensity() {
+        let io_handoff = vec![(0.0, 25.0), (25.0, 50.0), (50.0, 75.0), (75.0, 100.0)];
+        let mut low_intensity = ModelParams::new();
+        low_intensity.recomb_intensity = 0.5;
+        let mut high_intensity = ModelParams::new();
+        high_intensity.recomb_intensity = 10.0;
+
+        let (grid_low, _) = build_planning_grid_from_handoff(&io_handoff, &low_intensity);
+        let (grid_high, _) = build_planning_grid_from_handoff(&io_handoff, &high_intensity);
+
+        assert!(!grid_low.is_empty());
+        assert!(!grid_high.is_empty());
+        assert!(grid_high.len() > grid_low.len());
     }
 
     #[test]
