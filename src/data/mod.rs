@@ -19,7 +19,7 @@ pub mod ref_packed;
 pub mod storage;
 
 // Re-export commonly used types
-pub use haplotype::{HapIdx, SampleIdx};
+pub use haplotype::{HapIdx, HapSide, SampleIdx};
 pub use marker::{AnyMarkerSpace, MarkerIdx};
 
 use serde::{Deserialize, Serialize};

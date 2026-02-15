@@ -12,6 +12,12 @@ use std::sync::Arc;
 )]
 pub struct SampleIdx(pub u32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HapSide {
+    H1,
+    H2,
+}
+
 impl SampleIdx {
     pub fn new(idx: u32) -> Self {
         Self(idx)
@@ -29,6 +35,14 @@ impl SampleIdx {
     /// Get the second haplotype index for this sample (assumes diploid)
     pub fn hap2(self) -> HapIdx {
         HapIdx::new(self.0 * 2 + 1)
+    }
+
+    /// Get haplotype index for a specific side.
+    pub fn hap(self, side: HapSide) -> HapIdx {
+        match side {
+            HapSide::H1 => self.hap1(),
+            HapSide::H2 => self.hap2(),
+        }
     }
 }
 
@@ -86,6 +100,15 @@ impl HapIdx {
             HapIdx::new(self.0 + 1)
         } else {
             HapIdx::new(self.0 - 1)
+        }
+    }
+
+    /// Return whether this haplotype is H1 or H2 within the sample.
+    pub fn side(self) -> HapSide {
+        if self.is_first() {
+            HapSide::H1
+        } else {
+            HapSide::H2
         }
     }
 }

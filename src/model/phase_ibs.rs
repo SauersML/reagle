@@ -24,7 +24,7 @@
 //! included as high-priority neighbors, as they indicate recent common ancestry
 //! and strong phase concordance.
 
-use crate::data::haplotype::SampleIdx;
+use crate::data::haplotype::{HapSide, SampleIdx};
 use crate::model::ibs2::Ibs2;
 use crate::model::pbwt::{PbwtDivUpdater, PbwtIndex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -715,11 +715,14 @@ where
         }
 
         let exclude_sample = sample_idx != u32::MAX;
-        let hap1 = if exclude_sample { sample_idx * 2 } else { 0 };
-        let hap2 = if exclude_sample {
-            sample_idx * 2 + 1
+        let (hap1, hap2) = if exclude_sample {
+            let sample = SampleIdx::new(sample_idx);
+            (
+                sample.hap(HapSide::H1).0,
+                sample.hap(HapSide::H2).0,
+            )
         } else {
-            0
+            (0, 0)
         };
 
         let ref_start = self.reference_start_hap;

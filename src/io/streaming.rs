@@ -56,7 +56,7 @@ pub struct StateProbs {
     /// Layout: [hap][marker_idx][state]
     pub data: Vec<Vec<Vec<f32>>>,
     /// Indices of these markers (relative to the window start)
-    pub marker_indices: Vec<usize>,
+    pub marker_indices: Vec<WindowLocalMarkerIdx>,
     /// Number of states
     pub n_states: usize,
 }
@@ -66,6 +66,57 @@ impl StateProbs {}
 /// Global haplotype identifier (stable across windows).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct GlobalHapId(pub u32);
+
+/// Marker index relative to a window start (`0..window_len`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct WindowLocalMarkerIdx(pub usize);
+
+impl WindowLocalMarkerIdx {
+    #[inline]
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+
+    #[inline]
+    pub fn to_global(self, window_global_start: GlobalMarkerIdx) -> GlobalMarkerIdx {
+        GlobalMarkerIdx::new(window_global_start.as_usize() + self.0)
+    }
+
+    #[inline]
+    pub fn from_global(
+        global: GlobalMarkerIdx,
+        window_global_start: GlobalMarkerIdx,
+    ) -> Option<Self> {
+        global
+            .as_usize()
+            .checked_sub(window_global_start.as_usize())
+            .map(Self)
+    }
+}
+
+/// Global marker index along the streamed chromosome.
+///
+/// This is distinct from window-local marker indices (`0..window_len`) and
+/// prevents accidental local/global index mixing across window boundaries.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct GlobalMarkerIdx(pub usize);
+
+impl GlobalMarkerIdx {
+    #[inline]
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
 
 /// Haplotype-indexed state probabilities for soft-information handoff between windows.
 ///
@@ -196,10 +247,18 @@ pub struct PhasedOverlap {
     /// Per-target-haplotype priors indexed by reference haplotype ID
     /// This enables proper soft-information handoff when HMM states differ between windows
     pub hap_priors: Option<Vec<HaplotypePriors>>,
+    /// Orientation-conditioned handoff priors under keep-label hypothesis.
+    pub hap_priors_id: Option<Vec<HaplotypePriors>>,
+    /// Orientation-conditioned handoff priors under swapped-label hypothesis.
+    pub hap_priors_swap: Option<Vec<HaplotypePriors>>,
+    /// Per-sample orientation posterior mass for keep-label hypothesis.
+    pub orientation_weight_id: Option<Vec<f32>>,
+    /// Per-sample orientation posterior mass for swap-label hypothesis.
+    pub orientation_weight_swap: Option<Vec<f32>>,
 
     /// Global marker index used to export haplotype priors.
     /// This lets the next window verify it is projecting at the same physical marker.
-    pub prior_stage1_global_marker: Option<usize>,
+    pub prior_stage1_global_marker: Option<GlobalMarkerIdx>,
 
     /// Genetic position (cM) for the prior marker used to export haplotype priors.
     pub prior_stage1_gen_pos: Option<f64>,
@@ -224,6 +283,10 @@ impl PhasedOverlap {
             n_haps,
             state_probs: None,
             hap_priors: None,
+            hap_priors_id: None,
+            hap_priors_swap: None,
+            orientation_weight_id: None,
+            orientation_weight_swap: None,
             prior_stage1_global_marker: None,
             prior_stage1_gen_pos: None,
             phase_confidence: None,
@@ -245,13 +308,50 @@ impl PhasedOverlap {
         self.hap_priors.as_deref()
     }
 
+    /// Set orientation-conditioned haplotype priors for soft-information handoff.
+    pub fn set_orientation_hap_priors(
+        &mut self,
+        priors_id: Vec<HaplotypePriors>,
+        priors_swap: Vec<HaplotypePriors>,
+    ) {
+        debug_assert_eq!(priors_id.len(), self.n_haps);
+        debug_assert_eq!(priors_swap.len(), self.n_haps);
+        self.hap_priors_id = Some(priors_id);
+        self.hap_priors_swap = Some(priors_swap);
+    }
+
+    /// Get orientation-conditioned priors under keep-label hypothesis.
+    pub fn hap_priors_id(&self) -> Option<&[HaplotypePriors]> {
+        self.hap_priors_id.as_deref()
+    }
+
+    /// Get orientation-conditioned priors under swapped-label hypothesis.
+    pub fn hap_priors_swap(&self) -> Option<&[HaplotypePriors]> {
+        self.hap_priors_swap.as_deref()
+    }
+
+    /// Set per-sample orientation posterior weights.
+    pub fn set_orientation_weights(&mut self, weight_id: Vec<f32>, weight_swap: Vec<f32>) {
+        debug_assert_eq!(weight_id.len(), self.n_haps / 2);
+        debug_assert_eq!(weight_swap.len(), self.n_haps / 2);
+        self.orientation_weight_id = Some(weight_id);
+        self.orientation_weight_swap = Some(weight_swap);
+    }
+
+    /// Get per-sample orientation posterior weights.
+    pub fn orientation_weights(&self) -> Option<(&[f32], &[f32])> {
+        let id = self.orientation_weight_id.as_deref()?;
+        let sw = self.orientation_weight_swap.as_deref()?;
+        Some((id, sw))
+    }
+
     /// Set the global marker index at which haplotype priors were exported.
-    pub fn set_prior_stage1_global_marker(&mut self, marker: usize) {
+    pub fn set_prior_stage1_global_marker(&mut self, marker: GlobalMarkerIdx) {
         self.prior_stage1_global_marker = Some(marker);
     }
 
     /// Get the global marker index used for haplotype prior export.
-    pub fn prior_stage1_global_marker(&self) -> Option<usize> {
+    pub fn prior_stage1_global_marker(&self) -> Option<GlobalMarkerIdx> {
         self.prior_stage1_global_marker
     }
 

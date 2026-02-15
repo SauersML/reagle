@@ -30,7 +30,7 @@ use tracing::{info_span, instrument};
 
 use crate::config::Config;
 use crate::data::genetic_map::{GeneticMaps, MarkerMap};
-use crate::data::haplotype::{HapIdx, SampleIdx};
+use crate::data::haplotype::{HapIdx, HapSide, SampleIdx};
 use crate::data::marker::{AnyMarkerSpace, MarkerIdx};
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
@@ -38,8 +38,8 @@ use crate::data::storage::{GenotypeColumn, GenotypeMatrix, GenotypeView, Mutable
 use crate::error::Result;
 use crate::io::bref3::Bref3Reader;
 use crate::io::streaming::{
-    GlobalHapId, HaplotypePriors, PhasedOverlap, StateProbs, StreamWindow, StreamingConfig,
-    StreamingVcfReader,
+    GlobalHapId, GlobalMarkerIdx, HaplotypePriors, PhasedOverlap, StateProbs, StreamWindow,
+    StreamingConfig, StreamingVcfReader,
 };
 use crate::io::vcf::{VcfReader, VcfWriter};
 use crate::model::ibs2::Ibs2;
@@ -1038,10 +1038,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
             let local = hap_idx % 2;
             if sample_idx != cached_sample_idx {
                 cached_sample_idx = sample_idx;
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let sample = SampleIdx::from(sample_idx);
+                let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
+                let a2 = geno.get(orig_m, sample.hap(HapSide::H2));
                 let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a2 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a1 != a2;
@@ -1204,10 +1203,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     continue;
                 }
                 let sample_idx = hap_idx / 2;
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let sample = SampleIdx::from(sample_idx);
+                let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
+                let a2 = geno.get(orig_m, sample.hap(HapSide::H2));
                 let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a2 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a1 != a2;
@@ -1317,10 +1315,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
             let local = hap_idx % 2;
             if sample_idx != cached_sample_idx {
                 cached_sample_idx = sample_idx;
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let sample = SampleIdx::from(sample_idx);
+                let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
+                let a2 = geno.get(orig_m, sample.hap(HapSide::H2));
                 let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a2 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a1 != a2;
@@ -1483,10 +1480,9 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     continue;
                 }
                 let sample_idx = hap_idx / 2;
-                let hap1 = sample_idx * 2;
-                let hap2 = hap1 + 1;
-                let a1 = geno.get(orig_m, HapIdx::new(hap1 as u32));
-                let a2 = geno.get(orig_m, HapIdx::new(hap2 as u32));
+                let sample = SampleIdx::from(sample_idx);
+                let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
+                let a2 = geno.get(orig_m, sample.hap(HapSide::H2));
                 let is_het = a1 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a2 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a1 != a2;
@@ -1674,7 +1670,7 @@ fn max_block_len_from_starts(block_starts: &[usize], n_markers: usize) -> usize 
 pub struct Stage2OverlapHandoff {
     state_probs: Option<StateProbs>,
     hap_priors: Option<Vec<HaplotypePriors>>,
-    prior_stage1_global_marker: Option<usize>,
+    prior_stage1_global_marker: Option<GlobalMarkerIdx>,
     prior_stage1_gen_pos: Option<f64>,
 }
 
@@ -3434,6 +3430,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 &maf,
                 rare_threshold,
                 None,
+                GlobalMarkerIdx::new(0),
                 None,
             );
             tracing::trace!(
@@ -3601,6 +3598,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 &window.genotypes,
                 &gen_maps,
                 window.phased_overlap.as_ref(),
+                GlobalMarkerIdx::new(window.global_start),
                 Some(window.output_end),
             )?;
 
@@ -3793,6 +3791,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         target_gt: &GenotypeMatrix,
         gen_maps: &GeneticMaps,
         phased_overlap: Option<&PhasedOverlap>,
+        window_global_start: GlobalMarkerIdx,
         next_overlap_start: Option<usize>,
     ) -> Result<(
         GenotypeMatrix<crate::data::storage::phase_state::Phased>,
@@ -4363,6 +4362,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 &maf,
                 rare_threshold,
                 phased_overlap,
+                window_global_start,
                 next_overlap_start,
             );
             if let Some(bb) = &self.telemetry {
@@ -4431,8 +4431,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         (0..n_samples)
             .map(|s| {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+                let sample = SampleIdx::from(s);
+                let hap1 = sample.hap(HapSide::H1);
+                let hap2 = sample.hap(HapSide::H2);
 
                 // Use bulk haplotype access instead of per-marker get()
                 let alleles1 = geno.haplotype(hap1);
@@ -4531,8 +4532,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
         (0..n_samples)
             .map(|s| {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+                let sample = SampleIdx::from(s);
+                let hap1 = sample.hap(HapSide::H1);
+                let hap2 = sample.hap(HapSide::H2);
 
                 // Use bulk haplotype access instead of per-marker get()
                 // geno.haplotype() returns u8::MAX for missing positions
@@ -4578,8 +4580,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let n_markers = geno.n_markers();
 
         for (s, sp) in sample_phases.iter().enumerate() {
-            let hap1 = HapIdx::new((s * 2) as u32);
-            let hap2 = HapIdx::new((s * 2 + 1) as u32);
+            let sample = SampleIdx::from(s);
+            let hap1 = sample.hap(HapSide::H1);
+            let hap2 = sample.hap(HapSide::H2);
 
             for m in 0..n_markers {
                 let a1 = sp.allele1(m);
@@ -4821,8 +4824,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
             for s in 0..(n_haps / 2) {
-                let hap1 = s * 2;
-                let hap2 = s * 2 + 1;
+                let sample = SampleIdx::from(s);
+                let hap1 = sample.hap(HapSide::H1).as_usize();
+                let hap2 = sample.hap(HapSide::H2).as_usize();
                 for m in 0..n_markers {
                     let orig_m = marker_map.map(|map| map[m]).unwrap_or(m);
                     let phased = phase_mask.and_then(|mask| mask.get(orig_m, s)).unwrap_or(0);
@@ -4845,6 +4849,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         }
         if n_markers <= 60 {
             let sample = 0usize;
+            let sample_haps = SampleIdx::from(sample);
             let mut phased_count = 0usize;
             let mut unphased_hets = 0usize;
             for m in 0..n_markers {
@@ -4852,8 +4857,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 if phased != 0 {
                     phased_count += 1;
                 }
-                let a1 = target_geno.get(m, HapIdx::new((sample * 2) as u32));
-                let a2 = target_geno.get(m, HapIdx::new((sample * 2 + 1) as u32));
+                let a1 = target_geno.get(m, sample_haps.hap(HapSide::H1));
+                let a2 = target_geno.get(m, sample_haps.hap(HapSide::H2));
                 if phased == 0
                     && a1 != crate::data::storage::AlleleCode::MISSING.raw()
                     && a2 != crate::data::storage::AlleleCode::MISSING.raw()
@@ -5024,8 +5029,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let out: Vec<crate::model::states::ThreadedHaps<CombinedHapSpace>> = (0..n_samples)
             .into_par_iter()
             .map(|s| {
-                let hap1 = s * 2;
-                let hap2 = s * 2 + 1;
+                let sample = SampleIdx::from(s);
+                let hap1 = sample.hap(HapSide::H1).as_usize();
+                let hap2 = sample.hap(HapSide::H2).as_usize();
                 let mut dense_merge_buffer = vec![f32::NEG_INFINITY; n_ref_haps.max(1)];
                 let mut touched_indices: Vec<usize> =
                     Vec::with_capacity(per_window_cap.saturating_mul(PBWT_PER_WINDOW_MULT).max(1));
@@ -5174,8 +5180,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     }
                 }
                 if ref_has_panel && PBWT_ANCHOR_TOP_HAPS > 0 {
-                    let hap1 = s * 2;
-                    let hap2 = s * 2 + 1;
+                    let sample = SampleIdx::from(s);
+                    let hap1 = sample.hap(HapSide::H1).as_usize();
+                    let hap2 = sample.hap(HapSide::H2).as_usize();
                     let p_err_anchor = self.params.p_mismatch;
                     let p_no_err_anchor = 1.0 - p_err_anchor;
                     let mut anchor_scores = vec![0.0f32; n_ref_haps];
@@ -6974,6 +6981,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         maf: &[f32],
         rare_threshold: f32,
         previous_overlap: Option<&PhasedOverlap>,
+        window_global_start: GlobalMarkerIdx,
         next_overlap_start: Option<usize>,
     ) -> Option<Stage2OverlapHandoff> {
         let n_markers = geno.n_markers();
@@ -7098,7 +7106,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Vec<Stage2Decision>,
             Option<Vec<Vec<Vec<f32>>>>,
             Option<[HaplotypePriors; 2]>,
-            Option<usize>,
+            Option<GlobalMarkerIdx>,
             Option<f64>,
         );
 
@@ -7283,13 +7291,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     let mut bwd1 = Vec::new();
                     let (init_prior1_storage, init_prior2_storage) =
                         if let Some(overlap) = previous_overlap {
-                            let h1_idx = s * 2;
-                            let h2_idx = s * 2 + 1;
+                            let sample = SampleIdx::from(s);
+                            let h1_idx = sample.hap(HapSide::H1).as_usize();
+                            let h2_idx = sample.hap(HapSide::H2).as_usize();
                             let prior_stage1_idx =
                                 overlap
                                     .prior_stage1_global_marker()
                                     .and_then(|prior_marker| {
-                                        hi_freq_markers.iter().position(|&m| m == prior_marker)
+                                        let prior_local = prior_marker
+                                            .as_usize()
+                                            .checked_sub(window_global_start.as_usize())?;
+                                        hi_freq_markers.iter().position(|&m| m == prior_local)
                                     });
 
                             // Use handoff priors only when they anchor exactly to the first
@@ -7461,7 +7473,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     &state_haps,
                                     PRIOR_EXPORT_MAX_DROPPED_MASS,
                                 );
-                                let marker = hi_freq_markers.get(stage1_idx).copied();
+                                let marker = hi_freq_markers.get(stage1_idx).copied().map(|m| {
+                                    GlobalMarkerIdx::new(window_global_start.as_usize() + m)
+                                });
                                 let gen_pos = hi_freq_gen_positions.get(stage1_idx).copied();
                                 (Some([prior1, prior2]), marker, gen_pos)
                             } else {
@@ -7682,7 +7696,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 carriers,
                                 context_markers,
                                 carrier_panel_haps.max(1),
-                                s * 2,
+                                SampleIdx::from(s).hap(HapSide::H1).as_usize(),
                                 obs_conf,
                                 self.params.p_mismatch,
                                 &get_allele,
@@ -7706,7 +7720,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 carriers,
                                 context_markers,
                                 carrier_panel_haps.max(1),
-                                s * 2 + 1,
+                                SampleIdx::from(s).hap(HapSide::H2).as_usize(),
                                 obs_conf,
                                 self.params.p_mismatch,
                                 &get_allele,
@@ -7910,7 +7924,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         } else {
             None
         };
-        let mut next_prior_global_marker: Option<usize> = None;
+        let mut next_prior_global_marker: Option<GlobalMarkerIdx> = None;
         let mut next_prior_gen_pos: Option<f64> = None;
 
         // Apply phase changes and imputations to SamplePhase
@@ -9701,31 +9715,23 @@ fn sample_dynamic_mcmc(
     struct LocalMarkerIdx(usize);
 
     #[derive(Clone, Copy)]
-    enum HapSide {
-        H1,
-        H2,
-    }
-
-    #[derive(Clone, Copy)]
     struct RecipientTarget {
-        sample_idx: u32,
+        sample_idx: SampleIdx,
         side: HapSide,
     }
 
     impl RecipientTarget {
         #[inline]
         fn hap_idx(self) -> u32 {
-            let h1 = self.sample_idx.saturating_mul(2);
-            match self.side {
-                HapSide::H1 => h1,
-                HapSide::H2 => h1.saturating_add(1),
-            }
+            self.sample_idx.hap(self.side).0
         }
 
         #[inline]
         fn self_pair(self) -> (u32, u32) {
-            let h1 = self.sample_idx.saturating_mul(2);
-            (h1, h1.saturating_add(1))
+            (
+                self.sample_idx.hap(HapSide::H1).0,
+                self.sample_idx.hap(HapSide::H2).0,
+            )
         }
     }
 
@@ -9784,12 +9790,13 @@ fn sample_dynamic_mcmc(
     }
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+    let recipient_sample = SampleIdx::new(sample_idx);
     let recipient_h1 = RecipientTarget {
-        sample_idx,
+        sample_idx: recipient_sample,
         side: HapSide::H1,
     };
     let recipient_h2 = RecipientTarget {
-        sample_idx,
+        sample_idx: recipient_sample,
         side: HapSide::H2,
     };
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
@@ -9806,7 +9813,6 @@ fn sample_dynamic_mcmc(
         a1 != crate::data::storage::AlleleCode::MISSING.raw()
             || a2 != crate::data::storage::AlleleCode::MISSING.raw()
     });
-    let recipient_sample = SampleIdx::new(sample_idx);
     let recipient_stability = sample_phase_stability[sample_idx as usize].clamp(0.0, 1.0);
     let mut ibs2_by_other: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
     for seg in ibs2.segments(recipient_sample) {
@@ -12314,8 +12320,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // We avoid swapping single markers to preserve local LD structure.
         for (current_m, next_m) in markers_to_fix {
             for s in 0..n_samples {
-                let hap1 = HapIdx::new((s * 2) as u32);
-                let hap2 = HapIdx::new((s * 2 + 1) as u32);
+                let sample = SampleIdx::from(s);
+                let hap1 = sample.hap(HapSide::H1);
+                let hap2 = sample.hap(HapSide::H2);
 
                 let curr_a1 = current_phased.allele(MarkerIdx::new(current_m as u32), hap1);
                 let curr_a2 = current_phased.allele(MarkerIdx::new(current_m as u32), hap2);
@@ -12363,8 +12370,9 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         });
 
         for s in 0..n_samples {
-            let hap1 = HapIdx::new((s * 2) as u32);
-            let hap2 = HapIdx::new((s * 2 + 1) as u32);
+            let sample = SampleIdx::from(s);
+            let hap1 = sample.hap(HapSide::H1);
+            let hap2 = sample.hap(HapSide::H2);
 
             let mut mask = BitVec::repeat(false, n_markers);
             for m in 0..n_markers {
@@ -12475,8 +12483,9 @@ mod tests {
             }
         }
 
-        let hero_hap_idx = hero_sample_idx * 2;
-        let anti_hap_idx = hero_hap_idx + 1;
+        let hero = SampleIdx::from(hero_sample_idx);
+        let hero_hap_idx = hero.hap(HapSide::H1).as_usize();
+        let anti_hap_idx = hero.hap(HapSide::H2).as_usize();
         for m in 0..n_markers {
             let a = hero_pattern[m];
             ref_haps[hero_hap_idx][m] = a;
@@ -12856,7 +12865,13 @@ mod tests {
         let mut pipeline = PhasingPipeline::<crate::data::AnyMarkerSpace>::new(config, None);
 
         // Run phasing (with no overlap from previous window)
-        let result = pipeline.phase_in_memory_with_overlap(&gt, &gen_maps, None, None);
+        let result = pipeline.phase_in_memory_with_overlap(
+            &gt,
+            &gen_maps,
+            None,
+            GlobalMarkerIdx::new(0),
+            None,
+        );
 
         assert!(result.is_ok());
         let (phased, _) = result.unwrap();
@@ -13665,15 +13680,16 @@ mod tests {
             let mut anchors_by_hap: Vec<Vec<(usize, u8, u8)>> = vec![Vec::new(); 2];
             let phase_mask = target_gt.phase_mask();
             for s in 0..1usize {
-                let hap1 = s * 2;
-                let hap2 = hap1 + 1;
+                let sample = SampleIdx::from(s);
+                let hap1 = sample.hap(HapSide::H1).as_usize();
+                let hap2 = sample.hap(HapSide::H2).as_usize();
                 for m in 0..n_markers {
                     let phased = phase_mask.and_then(|mask| mask.get(m, s)).unwrap_or(0);
                     if phased == 0 {
                         continue;
                     }
-                    let a1 = target_geno.get(m, HapIdx::new(hap1 as u32));
-                    let a2 = target_geno.get(m, HapIdx::new(hap2 as u32));
+                    let a1 = target_geno.get(m, sample.hap(HapSide::H1));
+                    let a2 = target_geno.get(m, sample.hap(HapSide::H2));
                     if a1 == crate::data::storage::AlleleCode::MISSING.raw()
                         || a2 == crate::data::storage::AlleleCode::MISSING.raw()
                         || a1 == a2
@@ -14158,8 +14174,9 @@ mod tests {
         let n_ref_haps = n_ref_samples * 2;
         let n_total_haps = n_target_haps + n_ref_haps;
         let target_sample_idx = 0usize;
-        let target_h1 = target_sample_idx * 2;
-        let target_h2 = target_h1 + 1;
+        let target = SampleIdx::from(target_sample_idx);
+        let target_h1 = target.hap(HapSide::H1).as_usize();
+        let target_h2 = target.hap(HapSide::H2).as_usize();
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11CE4091);
         let mut alleles_flat = vec![0u8; n_markers * n_total_haps];

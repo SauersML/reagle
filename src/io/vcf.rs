@@ -14,7 +14,7 @@ use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
 use tracing::info_span;
 
-use crate::data::haplotype::Samples;
+use crate::data::haplotype::{HapSide, SampleIdx, Samples};
 use crate::data::marker::{Allele, Marker, MarkerIdx, Markers};
 use crate::data::storage::matrix::PlMatrix;
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix, PhaseState, compress_block};
@@ -459,8 +459,9 @@ impl VcfReader {
                     // Filter alleles to only include non-excluded samples
                     let mut filtered_alleles = Vec::with_capacity(include_indices.len() * 2);
                     for &sample_idx in include_indices {
-                        let hap1_idx = sample_idx * 2;
-                        let hap2_idx = sample_idx * 2 + 1;
+                        let sample = SampleIdx::from(sample_idx);
+                        let hap1_idx = sample.hap(HapSide::H1).as_usize();
+                        let hap2_idx = sample.hap(HapSide::H2).as_usize();
                         if hap1_idx < alleles.len() && hap2_idx < alleles.len() {
                             filtered_alleles.push(alleles[hap1_idx]);
                             filtered_alleles.push(alleles[hap2_idx]);
