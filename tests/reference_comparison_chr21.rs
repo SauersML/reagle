@@ -13,10 +13,9 @@ use reagle::{Config, ImputationPipeline};
 use serial_test::serial;
 
 mod common;
+use common::{cache_dir, download_if_missing, generate_test_data};
 #[path = "common/reference_metrics.rs"]
 mod reference_metrics;
-
-use common::{cache_dir, download_if_missing, generate_test_data};
 use reference_metrics::compute_fast_metrics;
 
 const BEAGLE_JAR_URL: &str =

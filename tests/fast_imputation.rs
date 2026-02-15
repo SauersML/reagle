@@ -2,7 +2,6 @@ use reagle::Nucleotide;
 use reagle::config::Config;
 use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
-use reagle::io::streaming::GlobalMarkerIdx;
 
 // Serialize tests to prevent OOM from parallel execution
 use ::noodles::bgzf::io as bgzf_io;
@@ -2524,10 +2523,8 @@ fn test_phasing_confidence() {
 
     // Run phasing in memory
     let result = pipeline.phase_in_memory_with_overlap(
-        &target_gt,
-        &gen_maps,
-        None,
-        GlobalMarkerIdx(0), // Global start index
+        &target_gt, &gen_maps, None, // No overlap from previous window
+        reagle::io::streaming::GlobalMarkerIdx::new(0),
         None,
     );
 
