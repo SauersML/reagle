@@ -73,22 +73,57 @@ fn parse_het_phase(gt: &str) -> Option<bool> {
     }
 }
 
+fn next_vcf_data_line<R: BufRead>(reader: &mut R, line: &mut String) -> usize {
+    loop {
+        line.clear();
+        let n = reader.read_line(line).expect("read VCF line");
+        if n == 0 {
+            return 0;
+        }
+        if !line.starts_with('#') {
+            return n;
+        }
+    }
+}
+
+fn format_field_idx(format_col: &str, needle: &str) -> Option<usize> {
+    format_col.split(':').position(|f| f == needle)
+}
+
+fn sample_field<'a>(sample_col: &'a str, idx: Option<usize>) -> &'a str {
+    idx.and_then(|i| sample_col.split(':').nth(i)).unwrap_or(".")
+}
+
+fn parse_gp_probs(raw: &str) -> Option<[f64; 3]> {
+    if raw == "." || raw.is_empty() {
+        return None;
+    }
+    let mut it = raw.split(',');
+    let a = it.next()?.parse::<f64>().ok()?;
+    let b = it.next()?.parse::<f64>().ok()?;
+    let c = it.next()?.parse::<f64>().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some([a, b, c])
+}
+
 pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics {
-    let mut truth_cmd = Command::new("bcftools");
+    let mut truth_cmd = Command::new("gzip");
     truth_cmd
-        .args(["query", "-f", "%CHROM\t%POS[\t%GT]\n"])
+        .args(["-dc"])
         .arg(truth_vcf)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut truth_proc = truth_cmd.spawn().expect("spawn bcftools query (truth)");
+        .stderr(Stdio::inherit());
+    let mut truth_proc = truth_cmd.spawn().expect("spawn gzip (truth)");
 
-    let mut imp_cmd = Command::new("bcftools");
+    let mut imp_cmd = Command::new("gzip");
     imp_cmd
-        .args(["query", "-f", "%CHROM\t%POS[\t%GT\t%DS\t%GP]\n"])
+        .args(["-dc"])
         .arg(imputed_vcf)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut imp_proc = imp_cmd.spawn().expect("spawn bcftools query (imputed)");
+        .stderr(Stdio::inherit());
+    let mut imp_proc = imp_cmd.spawn().expect("spawn gzip (imputed)");
 
     let truth_out = truth_proc.stdout.take().expect("truth stdout");
     let imp_out = imp_proc.stdout.take().expect("imputed stdout");
@@ -126,11 +161,8 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
         .unwrap_or(50_000);
 
     loop {
-        truth_line.clear();
-        imp_line.clear();
-
-        let tr_n = truth_reader.read_line(&mut truth_line).expect("read truth line");
-        let im_n = imp_reader.read_line(&mut imp_line).expect("read imputed line");
+        let tr_n = next_vcf_data_line(&mut truth_reader, &mut truth_line);
+        let im_n = next_vcf_data_line(&mut imp_reader, &mut imp_line);
         if tr_n == 0 && im_n == 0 {
             break;
         }
@@ -141,19 +173,20 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
 
         let t_cols: Vec<&str> = truth_line.trim_end().split('\t').collect();
         let i_cols: Vec<&str> = imp_line.trim_end().split('\t').collect();
-        assert!(t_cols.len() >= 3, "malformed truth query row");
-        assert!(i_cols.len() >= 5, "malformed imputed query row");
+        assert!(t_cols.len() >= 10, "malformed truth VCF row");
+        assert!(i_cols.len() >= 10, "malformed imputed VCF row");
         assert_eq!(t_cols[0], i_cols[0], "CHROM mismatch between truth/imputed");
         assert_eq!(t_cols[1], i_cols[1], "POS mismatch between truth/imputed");
 
-        let n_samples_truth = t_cols.len() - 2;
-        let n_triplets = i_cols.len() - 2;
-        assert_eq!(
-            n_triplets % 3,
-            0,
-            "imputed query row sample field count not divisible by 3"
-        );
-        let n_samples_imp = n_triplets / 3;
+        let t_gt_idx = format_field_idx(t_cols[8], "GT");
+        let i_gt_idx = format_field_idx(i_cols[8], "GT");
+        let i_ds_idx = format_field_idx(i_cols[8], "DS");
+        let i_gp_idx = format_field_idx(i_cols[8], "GP");
+        assert!(t_gt_idx.is_some(), "truth row missing GT in FORMAT");
+        assert!(i_gt_idx.is_some(), "imputed row missing GT in FORMAT");
+
+        let n_samples_truth = t_cols.len() - 9;
+        let n_samples_imp = i_cols.len() - 9;
         assert_eq!(
             n_samples_truth, n_samples_imp,
             "truth/imputed sample counts differ"
@@ -171,11 +204,12 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
         let mut site_correct_mass = 0.0f64;
         let mut site_n = 0.0f64;
         for sample_idx in 0..n_samples_truth {
-            let t_gt = t_cols[2 + sample_idx];
-            let base = 2 + sample_idx * 3;
-            let i_gt = i_cols[base];
-            let i_ds = i_cols[base + 1];
-            let i_gp = i_cols[base + 2];
+            let t_sample = t_cols[9 + sample_idx];
+            let i_sample = i_cols[9 + sample_idx];
+            let t_gt = sample_field(t_sample, t_gt_idx);
+            let i_gt = sample_field(i_sample, i_gt_idx);
+            let i_ds = sample_field(i_sample, i_ds_idx);
+            let i_gp = sample_field(i_sample, i_gp_idx);
 
             let t_ds = dosage_from_gt(t_gt);
             let i_ds_val = i_ds.parse::<f64>().ok();
@@ -191,18 +225,7 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
             }
 
             if let Some(t_class) = gt_class_unphased(t_gt) {
-                let i_probs = if i_gp != "." {
-                    let probs: Vec<f64> = i_gp.split(',').filter_map(|x| x.parse().ok()).collect();
-                    if probs.len() == 3 {
-                        Some(probs)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(probs) = i_probs {
+                if let Some(probs) = parse_gp_probs(i_gp) {
                     site_truth_counts[t_class] += 1.0;
                     site_imputed_marginals[0] += probs[0];
                     site_imputed_marginals[1] += probs[1];
@@ -220,15 +243,12 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
             }
 
             if let Some(t_class) = gt_class_unphased(t_gt) {
-                if i_gp != "." {
-                    let probs: Vec<f64> = i_gp.split(',').filter_map(|x| x.parse().ok()).collect();
-                    if probs.len() == 3 {
-                        let p_true = probs[t_class].clamp(0.0, 1.0);
-                        let bc = p_true.sqrt();
-                        let h = (1.0 - bc).max(0.0).sqrt();
-                        hellinger_sum += h;
-                        hellinger_n += 1;
-                    }
+                if let Some(probs) = parse_gp_probs(i_gp) {
+                    let p_true = probs[t_class].clamp(0.0, 1.0);
+                    let bc = p_true.sqrt();
+                    let h = (1.0 - bc).max(0.0).sqrt();
+                    hellinger_sum += h;
+                    hellinger_n += 1;
                 }
             }
 
@@ -277,10 +297,10 @@ pub fn compute_fast_metrics(truth_vcf: &Path, imputed_vcf: &Path) -> FastMetrics
         }
     }
 
-    let truth_status = truth_proc.wait().expect("wait truth bcftools");
-    assert!(truth_status.success(), "truth bcftools query failed");
-    let imp_status = imp_proc.wait().expect("wait imputed bcftools");
-    assert!(imp_status.success(), "imputed bcftools query failed");
+    let truth_status = truth_proc.wait().expect("wait truth gzip");
+    assert!(truth_status.success(), "truth VCF decompression failed");
+    let imp_status = imp_proc.wait().expect("wait imputed gzip");
+    assert!(imp_status.success(), "imputed VCF decompression failed");
 
     let r_squared = running_r2(r2_n, r2_sum_t, r2_sum_i, r2_sum_tt, r2_sum_ii, r2_sum_ti);
 

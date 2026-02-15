@@ -1482,28 +1482,6 @@ impl VcfWriter {
             }
         }
 
-        #[inline(always)]
-        fn best_gt_from_gp(n_alleles: usize, gp: &[f32]) -> (u8, u8) {
-            let mut best = (0u8, 0u8);
-            let mut best_prob = -1.0f32;
-            let mut idx = 0usize;
-            for j in 0..n_alleles {
-                for i in 0..=j {
-                    let p = gp.get(idx).copied().unwrap_or(0.0);
-                    if p > best_prob {
-                        best_prob = p;
-                        if i == j {
-                            best = (i as u8, i as u8);
-                        } else {
-                            best = (i as u8, j as u8);
-                        }
-                    }
-                    idx += 1;
-                }
-            }
-            best
-        }
-
         let get_posteriors_ref = get_posteriors.as_ref();
         let get_genotype_posteriors_ref = get_genotype_posteriors.as_ref();
         let chunk_size = 4096usize.max(1);
@@ -1585,9 +1563,7 @@ impl VcfWriter {
                                 let expected = n_alleles * (n_alleles + 1) / 2;
                                 if gp.len() == expected { Some(gp) } else { None }
                             });
-                    let (a1, a2) = if let Some(ref gp) = gp_override {
-                        best_gt_from_gp(n_alleles, gp)
-                    } else if let Some((ref p1, ref p2)) = posteriors {
+                    let (a1, a2) = if let Some((ref p1, ref p2)) = posteriors {
                         if n_alleles <= 2 {
                             let p1_alt = p1.prob(1);
                             let p2_alt = p2.prob(1);

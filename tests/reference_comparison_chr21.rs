@@ -20,24 +20,20 @@ const BEAGLE_JAR_URL: &str =
     "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
 
 fn count_records(vcf_gz: &Path) -> usize {
-    let output = Command::new("bash")
-        .arg("-lc")
-        .arg(format!(
-            "bcftools view -H '{}' | wc -l",
-            vcf_gz.to_string_lossy()
-        ))
+    let output = Command::new("gzip")
+        .args(["-dc", vcf_gz.to_string_lossy().as_ref()])
         .output()
-        .expect("Run bcftools view -H");
+        .expect("Run gzip -dc");
     assert!(
         output.status.success(),
-        "Failed to count records in {}: {}",
+        "Failed to decompress {}: {}",
         vcf_gz.display(),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<usize>()
-        .expect("Parse record count")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .count()
 }
 
 fn run_beagle_imputation(beagle_jar: &Path, ref_vcf: &Path, target_vcf: &Path, out_prefix: &Path) -> f64 {
