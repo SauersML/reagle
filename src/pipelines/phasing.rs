@@ -3250,6 +3250,10 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
             let n_burnin = self.config.burnin;
             let n_iterations = self.config.iterations;
             let total_iterations = n_burnin + n_iterations;
+            if let Some(bb) = &self.telemetry {
+                bb.set_total_iterations(total_iterations as u64);
+                bb.set_current_iteration(0);
+            }
             let mut stable_main_iters = 0usize;
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
@@ -5756,7 +5760,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                     Some(&anchor_h1),
                                     Some(&anchor_h2),
                                     sample_seed,
-                                    self.config.mcmc_burnin,
                                     self.config.mcmc_lr_samples,
                                     sample_p_no_err,
                                     sample_p_err,
@@ -9697,6 +9700,35 @@ fn sample_dynamic_mcmc(
     #[derive(Clone, Copy)]
     struct LocalMarkerIdx(usize);
 
+    #[derive(Clone, Copy)]
+    enum HapSide {
+        H1,
+        H2,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RecipientTarget {
+        sample_idx: u32,
+        side: HapSide,
+    }
+
+    impl RecipientTarget {
+        #[inline]
+        fn hap_idx(self) -> u32 {
+            let h1 = self.sample_idx.saturating_mul(2);
+            match self.side {
+                HapSide::H1 => h1,
+                HapSide::H2 => h1.saturating_add(1),
+            }
+        }
+
+        #[inline]
+        fn self_pair(self) -> (u32, u32) {
+            let h1 = self.sample_idx.saturating_mul(2);
+            (h1, h1.saturating_add(1))
+        }
+    }
+
     #[inline]
     fn adaptive_dynamic_state_target(
         max_states: usize,
@@ -9752,7 +9784,14 @@ fn sample_dynamic_mcmc(
     }
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-    let hap1_idx = sample_idx * 2;
+    let recipient_h1 = RecipientTarget {
+        sample_idx,
+        side: HapSide::H1,
+    };
+    let recipient_h2 = RecipientTarget {
+        sample_idx,
+        side: HapSide::H2,
+    };
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = (0..n_markers).any(|m| {
@@ -9913,7 +9952,7 @@ fn sample_dynamic_mcmc(
         recipient_stability,
     );
     let mut initial_neighbors =
-        phase_ibs.find_neighbors(hap1_idx, center_init, ibs2, initial_state_target);
+        phase_ibs.find_neighbors(recipient_h1.hap_idx(), center_init, ibs2, initial_state_target);
     if !initial_neighbors.is_empty() {
         let mut filtered = Vec::with_capacity(initial_neighbors.len());
         for &h in &initial_neighbors {
@@ -10133,10 +10172,12 @@ fn sample_dynamic_mcmc(
         neighbors: &mut Vec<u32>,
         n_states: usize,
         n_haps: u32,
-        hap1_idx: u32,
+        target: RecipientTarget,
         sample_uncertainty: f32,
         rng: &mut impl rand::Rng,
     ) {
+        let target_hap_idx = target.hap_idx();
+        let (self_h1, self_h2) = target.self_pair();
         if n_haps == 0 {
             neighbors.clear();
             return;
@@ -10146,7 +10187,7 @@ fn sample_dynamic_mcmc(
         // This avoids an infinite loop for single-sample or haploid inputs.
         if n_haps <= 2 {
             neighbors.clear();
-            let self_hap = hap1_idx.min(n_haps.saturating_sub(1));
+            let self_hap = target_hap_idx.min(n_haps.saturating_sub(1));
             neighbors.push(self_hap);
             return;
         }
@@ -10154,7 +10195,7 @@ fn sample_dynamic_mcmc(
         let target = n_states.min((n_haps.saturating_sub(2)) as usize).max(1);
         let mut seen: HashSet<u32> = HashSet::with_capacity(target.saturating_mul(2).max(8));
         neighbors.retain(|&h| {
-            h != hap1_idx && h != hap1_idx + 1 && (h as usize) < n_haps as usize && seen.insert(h)
+            h != self_h1 && h != self_h2 && (h as usize) < n_haps as usize && seen.insert(h)
         });
         if neighbors.len() > target {
             neighbors.truncate(target);
@@ -10166,7 +10207,7 @@ fn sample_dynamic_mcmc(
 
         while neighbors.len() < target {
             let h = rng.random_range(0..n_haps);
-            if h == hap1_idx || h == hap1_idx + 1 {
+            if h == self_h1 || h == self_h2 {
                 continue;
             }
             if seen.insert(h) {
@@ -10187,7 +10228,7 @@ fn sample_dynamic_mcmc(
         };
         for _ in 0..mix_count {
             let h = rng.random_range(0..n_haps);
-            if h == hap1_idx || h == hap1_idx + 1 {
+            if h == self_h1 || h == self_h2 {
                 continue;
             }
             if !seen.insert(h) {
@@ -10204,20 +10245,21 @@ fn sample_dynamic_mcmc(
         neighbors: &mut Vec<u32>,
         n_states: usize,
         n_haps: u32,
-        hap1_idx: u32,
+        target: RecipientTarget,
         marker_idx: LocalMarkerIdx,
         sample_uncertainty: f32,
         rng: &mut impl rand::Rng,
         allow_donor_at_marker: &impl Fn(u32, LocalMarkerIdx) -> bool,
     ) {
+        let (self_h1, self_h2) = target.self_pair();
         if n_haps <= 2 {
             return;
         }
         let target = n_states.min((n_haps.saturating_sub(2)) as usize).max(1);
         let mut seen: HashSet<u32> = HashSet::with_capacity(target.saturating_mul(2).max(8));
         neighbors.retain(|&h| {
-            h != hap1_idx
-                && h != hap1_idx + 1
+            h != self_h1
+                && h != self_h2
                 && (h as usize) < n_haps as usize
                 && allow_donor_at_marker(h, marker_idx)
                 && seen.insert(h)
@@ -10238,7 +10280,7 @@ fn sample_dynamic_mcmc(
         while neighbors.len() < target && attempts < max_attempts {
             attempts += 1;
             let h = rng.random_range(0..n_haps);
-            if h == hap1_idx || h == hap1_idx + 1 {
+            if h == self_h1 || h == self_h2 {
                 continue;
             }
             if !allow_donor_at_marker(h, marker_idx) {
@@ -10345,11 +10387,14 @@ fn sample_dynamic_mcmc(
     let mut donor_alleles_buf: Vec<u8> = Vec::new();
     let mut seen_buf: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut collect_dynamic_neighbors =
-        |path_ref: &[u32],
+        |target: RecipientTarget,
+         path_ref: &[u32],
          query_hap: &[u8],
          target_states: usize,
          mcmc_step: usize,
          out: &mut Vec<u32>| {
+            let target_hap_idx = target.hap_idx();
+            let (self_h1, self_h2) = target.self_pair();
             seen_buf.clear();
             candidates_buf.clear();
             let burnin_steps = (n_mcmc_steps / 2).max(1);
@@ -10373,7 +10418,7 @@ fn sample_dynamic_mcmc(
                         phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, search_states);
                     local.push(ref_hap);
                     for h in local {
-                        if h == hap1_idx || h == hap1_idx + 1 {
+                        if h == self_h1 || h == self_h2 {
                             continue;
                         }
                         if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
@@ -10387,9 +10432,9 @@ fn sample_dynamic_mcmc(
                 // Inject target-driven neighbors so the state-space can recover
                 // from poor latent trajectories during burn-in/mixing.
                 let mut genotype_neighbors =
-                    phase_ibs.find_neighbors(hap1_idx, m, ibs2, inject_target);
+                    phase_ibs.find_neighbors(target_hap_idx, m, ibs2, inject_target);
                 for h in genotype_neighbors.drain(..) {
-                    if h == hap1_idx || h == hap1_idx + 1 {
+                    if h == self_h1 || h == self_h2 {
                         continue;
                     }
                     if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
@@ -10485,7 +10530,14 @@ fn sample_dynamic_mcmc(
             phase_conf[center_marker],
             recipient_stability,
         );
-        collect_dynamic_neighbors(&path1_ref, &h1_alleles, state_target, step, &mut neighbors);
+        collect_dynamic_neighbors(
+            recipient_h1,
+            &path1_ref,
+            &h1_alleles,
+            state_target,
+            step,
+            &mut neighbors,
+        );
         let ref_hap = path1_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
             && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
@@ -10500,7 +10552,7 @@ fn sample_dynamic_mcmc(
             &mut neighbors,
             state_target,
             n_haps,
-            hap1_idx,
+            recipient_h1,
             sample_uncertainty,
             &mut rng,
         );
@@ -10510,7 +10562,7 @@ fn sample_dynamic_mcmc(
                 &mut neighbors,
                 state_target,
                 n_haps,
-                hap1_idx,
+                recipient_h1,
                 LocalMarkerIdx(center_marker),
                 sample_uncertainty,
                 &mut rng,
@@ -10615,7 +10667,14 @@ fn sample_dynamic_mcmc(
         // === Sample H2 | (G, H1_new) ===
 
         // 1. Select neighbors for H2 with H2-conditioned scoring (not H1's sequence).
-        collect_dynamic_neighbors(&path2_ref, &h2_alleles, state_target, step, &mut neighbors);
+        collect_dynamic_neighbors(
+            recipient_h2,
+            &path2_ref,
+            &h2_alleles,
+            state_target,
+            step,
+            &mut neighbors,
+        );
         let ref_hap = path2_ref.get(center_marker).copied().unwrap_or(0);
         if (ref_hap as usize) < phase_ibs.n_haps()
             && allow_donor_at_marker(ref_hap, LocalMarkerIdx(center_marker))
@@ -10630,7 +10689,7 @@ fn sample_dynamic_mcmc(
             &mut neighbors,
             state_target,
             n_haps,
-            hap1_idx,
+            recipient_h2,
             sample_uncertainty,
             &mut rng,
         );
@@ -10640,7 +10699,7 @@ fn sample_dynamic_mcmc(
                 &mut neighbors,
                 state_target,
                 n_haps,
-                hap1_idx,
+                recipient_h2,
                 LocalMarkerIdx(center_marker),
                 sample_uncertainty,
                 &mut rng,
@@ -11228,7 +11287,6 @@ fn sample_swap_bits_mosaic<RefSpace>(
     anchor_hap1: Option<&[u8]>,
     anchor_hap2: Option<&[u8]>,
     seed: u64,
-    burnin: usize,
     lr_samples_param: usize,
     p_no_err: f32,
     p_err: f32,
@@ -11415,7 +11473,7 @@ fn sample_swap_bits_mosaic<RefSpace>(
     }
 
     let complexity_steps = (het_positions.len() / 64).min(4);
-    let burnin_steps = burnin.saturating_add(complexity_steps).clamp(2, 6);
+    let burnin_steps = 2usize.saturating_add(complexity_steps).clamp(2, 6);
     for _ in 0..burnin_steps {
         chain.step();
     }
@@ -12483,7 +12541,6 @@ mod tests {
             excludemarkers: None,
             burnin: 3,
             iterations: 12,
-            mcmc_burnin: 1,
             dynamic_k: 32,
             mcmc_steps: 3,
             mcmc_lr_samples: 32,
@@ -12757,7 +12814,6 @@ mod tests {
             excludemarkers: None,
             burnin: 2,
             iterations: 2,
-            mcmc_burnin: 1,
             dynamic_k: 32,
             mcmc_steps: 3,
             mcmc_lr_samples: 32,
@@ -13246,7 +13302,6 @@ mod tests {
             Some(&anchor_h1),
             Some(&anchor_h2),
             123,
-            0,
             32,
             p_no_err,
             p_err,

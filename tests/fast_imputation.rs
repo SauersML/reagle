@@ -514,7 +514,6 @@ fn test_dynamic_phasing_continuity_stress() {
     config.ne = 10_000.0;
     config.burnin = 2;
     config.iterations = 3;
-    config.mcmc_burnin = 1;
     config.mcmc_steps = 3;
     config.window = 40.0;
     config.overlap = 2.0;
@@ -2358,7 +2357,6 @@ fn test_phasing_confidence() {
         excludemarkers: None,
         burnin: 5,
         iterations: 10,
-        mcmc_burnin: 3,
         dynamic_k: 32,
         mcmc_steps: 10,
         mcmc_lr_samples: 32,

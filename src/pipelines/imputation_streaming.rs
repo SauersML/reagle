@@ -2479,6 +2479,7 @@ fn build_imputation_plan(
     let mut batch_start = 0usize;
     let batches_total = (n_target_haps + batch_size - 1) / batch_size;
     let prescan_start = std::time::Instant::now();
+    let abyss_fallback_log_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Keep LMS allocation path; full-panel mode can degrade calibration
     // when donor-guided and overlap handoff logic are active.
@@ -3261,6 +3262,8 @@ fn build_imputation_plan(
             .par_iter()
             .enumerate()
             .map(|(i, &hap_idx)| {
+                let abyss_fallback_log_counter =
+                    std::sync::Arc::clone(&abyss_fallback_log_counter);
                 let mut abyss = bitvec![u64, Lsb0; 0; n_ref_haps];
                 let mut abyss_count = 0usize;
                 for h in 0..n_ref_haps {
@@ -3269,12 +3272,6 @@ fn build_imputation_plan(
                         abyss.set(h, true);
                         abyss_count += 1;
                     }
-                }
-                if abyss_count == n_ref_haps {
-                    return Err(ReagleError::vcf(format!(
-                        "Abyss prescan masked all reference haplotypes for target hap {} (batch_idx={}, n_ref_haps={})",
-                        hap_idx, i, n_ref_haps
-                    )));
                 }
                 let window_scores_matrix = &scores_by_window[i];
                 if window_scores_matrix.len() != planning_handoff.len() {
@@ -3298,6 +3295,16 @@ fn build_imputation_plan(
                 let min_survivors = 25usize.min(n_ref_haps);
                 let mut survivors = n_ref_haps.saturating_sub(abyss_count);
                 if survivors < min_survivors {
+                    if survivors == 0
+                        && abyss_fallback_log_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            < 5
+                    {
+                        eprintln!(
+                            "Pre-scan warning: abyss masked all reference haplotypes for target hap {} (batch_idx={}); forcing donor floor={}",
+                            hap_idx, i, min_survivors
+                        );
+                    }
                     let ranked = select_top_k_allow_zero(&global_scores[i], n_ref_haps);
                     for (h, _) in ranked {
                         if survivors >= min_survivors {
@@ -3307,6 +3314,18 @@ fn build_imputation_plan(
                             abyss.set(h, false);
                             abyss_count = abyss_count.saturating_sub(1);
                             survivors += 1;
+                        }
+                    }
+                    if survivors < min_survivors {
+                        for h in 0..n_ref_haps {
+                            if survivors >= min_survivors {
+                                break;
+                            }
+                            if abyss[h] {
+                                abyss.set(h, false);
+                                abyss_count = abyss_count.saturating_sub(1);
+                                survivors += 1;
+                            }
                         }
                     }
                 }
@@ -9521,23 +9540,10 @@ impl crate::pipelines::ImputationPipeline {
             None
         };
 
-        // Preserve target-only markers that share positions with reference markers
-        // but are not allele-aligned. These are still genotyped target variants.
-        let mut ref_pos_set: std::collections::HashMap<String, std::collections::HashSet<u32>> =
-            std::collections::HashMap::new();
-        for ref_m in output_start..output_end {
-            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
-            let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let chrom_key = normalize_chrom_local(ref_chrom).to_string();
-            ref_pos_set
-                .entry(chrom_key)
-                .or_default()
-                .insert(ref_marker.pos);
-        }
-
+        // Preserve all target-only markers in this target window.
         let mut target_only_by_pos: std::collections::HashMap<
             String,
-            std::collections::HashMap<u32, Vec<usize>>,
+            std::collections::BTreeMap<u32, Vec<usize>>,
         > = std::collections::HashMap::new();
         for t_idx in 0..target_win.n_markers() {
             let target_m = MarkerIdx::new(t_idx as u32);
@@ -9550,17 +9556,12 @@ impl crate::pipelines::ImputationPipeline {
                 .chrom_name(t_marker.chrom)
                 .unwrap_or("");
             let chrom_key = normalize_chrom_local(t_chrom).to_string();
-            if ref_pos_set
-                .get(chrom_key.as_str())
-                .is_some_and(|set| set.contains(&t_marker.pos))
-            {
-                target_only_by_pos
-                    .entry(chrom_key)
-                    .or_default()
-                    .entry(t_marker.pos)
-                    .or_default()
-                    .push(t_idx);
-            }
+            target_only_by_pos
+                .entry(chrom_key)
+                .or_default()
+                .entry(t_marker.pos)
+                .or_default()
+                .push(t_idx);
         }
 
         if target_only_by_pos.is_empty() {
@@ -9586,18 +9587,32 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let mut output_markers: Vec<OutputMarker> = Vec::new();
+        let mut emitted_target = vec![false; target_win.n_markers()];
         for ref_m in output_start..output_end {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            if let Some(targets) = target_only_by_pos
-                .get(normalize_chrom_local(ref_chrom))
-                .and_then(|m| m.get(&ref_marker.pos))
-            {
-                for &t_idx in targets {
-                    output_markers.push(OutputMarker::Target(t_idx));
+            let chrom_key = normalize_chrom_local(ref_chrom);
+            if let Some(targets_by_pos) = target_only_by_pos.get(chrom_key) {
+                for targets in targets_by_pos.range(..=ref_marker.pos).map(|(_, v)| v) {
+                    for &t_idx in targets {
+                        if !emitted_target[t_idx] {
+                            emitted_target[t_idx] = true;
+                            output_markers.push(OutputMarker::Target(t_idx));
+                        }
+                    }
                 }
             }
             output_markers.push(OutputMarker::Ref(ref_m));
+        }
+        for targets_by_pos in target_only_by_pos.values() {
+            for targets in targets_by_pos.values() {
+                for &t_idx in targets {
+                    if !emitted_target[t_idx] {
+                        emitted_target[t_idx] = true;
+                        output_markers.push(OutputMarker::Target(t_idx));
+                    }
+                }
+            }
         }
 
         let mut out_markers = crate::data::marker::Markers::<RefMarkerSpace>::new();
@@ -10131,6 +10146,83 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_imputed_window_preserves_target_only_marker_with_unique_position() {
+        let chrom = ChromIdx::new(0);
+        let ref_markers = build_markers(chrom, &[10, 30]);
+        let target_markers = build_markers(chrom, &[20]);
+
+        // One sample (2 haps): marker 20 => 0|1.
+        let target_cols = vec![vec![0u8, 1u8]];
+        let target_win = build_phased_matrix_from_columns(target_markers, 1, target_cols, &[2]);
+
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![None; ref_markers.len()],
+            target_to_ref: vec![None; target_win.n_markers()],
+            allele_mappings: vec![None; target_win.n_markers()],
+        };
+
+        let n_alleles_per_marker: Vec<usize> = (0..ref_markers.len())
+            .map(|m| {
+                let marker = ref_markers.marker(MarkerIdx::new(m as u32));
+                1 + marker.alt_alleles.len()
+            })
+            .collect();
+        let mut quality = ImputationQuality::new(&n_alleles_per_marker);
+
+        let output_start = 0;
+        let output_end = ref_markers.len();
+        let all_results = vec![SampleImputationResult {
+            sample_idx: 0,
+            hap_alt_probs: (
+                Some(vec![0.0; output_end - output_start]),
+                Some(vec![0.0; output_end - output_start]),
+            ),
+            hap_posteriors: (None, None),
+        }];
+
+        let tmp = NamedTempFile::new().expect("temp vcf");
+        {
+            let mut writer =
+                VcfWriter::create(tmp.path(), target_win.samples_arc()).expect("writer");
+            writer
+                .write_header_extended(&ref_markers, true, false, false)
+                .expect("write header");
+
+            let pipeline = ImputationPipeline::new(Config::default(), None);
+            let ref_is_biallelic = vec![true; ref_markers.len()];
+            pipeline
+                .write_imputed_window_streaming(
+                    &ref_markers,
+                    &target_win,
+                    None,
+                    None::<&GenotypeMatrix<Phased, crate::data::AnyMarkerSpace>>,
+                    &alignment,
+                    &mut writer,
+                    &mut quality,
+                    &ref_is_biallelic,
+                    output_start,
+                    output_end,
+                    output_start,
+                    &all_results,
+                    None,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("write window");
+        }
+
+        let text = std::fs::read_to_string(tmp.path()).expect("read output");
+        let positions: Vec<u32> = text
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split('\t').nth(1))
+            .map(|p| p.parse::<u32>().expect("POS parse"))
+            .collect();
+        assert_eq!(positions, vec![10, 20, 30]);
     }
 
     #[test]
