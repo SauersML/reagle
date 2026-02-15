@@ -4997,10 +4997,7 @@ impl crate::pipelines::ImputationPipeline {
         let target_pl_matrix = target_pl.unwrap_or(target_win);
         let err_floor = 0.0001f32;
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
-        // Use a robust smoothing window size (e.g. 5.0 cM) even if the I/O
-        // window is small, to ensure consistent regularization strength
-        // regardless of processing chunk size.
-        let smoothing_cluster_cm = self.config.cluster.max(5.0);
+        let smoothing_cluster_cm = self.config.cluster.max(1e-6);
         let overlap_start = overlap_start_from_hazard(output_start, output_end, &p_recomb);
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
