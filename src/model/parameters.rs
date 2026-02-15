@@ -18,7 +18,7 @@ pub struct ModelParams {
 
     /// Number of HMM states (reference haplotypes to consider)
     /// Default for phasing: 280
-    /// Default for imputation: 1600
+    /// Imputation state count is selected by the imputation pipeline.
     pub n_states: usize,
 
     /// Number of burnin iterations
@@ -37,8 +37,6 @@ pub struct ModelParams {
 impl ModelParams {
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
-    /// Default imputation states
-    pub const DEFAULT_IMPUTE_STATES: usize = 1600;
 
     /// Default burnin iterations
     pub const DEFAULT_BURNIN: usize = 3;
@@ -106,7 +104,8 @@ impl ModelParams {
         Self {
             p_mismatch,
             recomb_intensity,
-            n_states: Self::DEFAULT_IMPUTE_STATES.min(n_ref_haps.saturating_sub(2)),
+            // The imputation pipeline computes/adapts state count separately.
+            n_states: n_ref_haps.saturating_sub(2).max(1),
             burnin: Self::DEFAULT_BURNIN,
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY,
@@ -446,9 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn test_for_imputation_uses_imputation_state_default() {
+    fn test_for_imputation_uses_all_copying_states_by_default() {
         let params = ModelParams::for_imputation(10_000, 100_000.0, None);
-        assert_eq!(params.n_states, ModelParams::DEFAULT_IMPUTE_STATES);
+        assert_eq!(params.n_states, 9_998);
 
         let small_panel = ModelParams::for_imputation(200, 100_000.0, None);
         assert_eq!(small_panel.n_states, 198);
