@@ -414,7 +414,9 @@ jobs:
         with:
           name: eagleimp-phasing-results
           path: |
+            tests/data/eagleimp_phased*.vcf.gz
             tests/data/eagleimp_phased*.vcf.gz.csi
+            tests/data/eagleimp_phased*.vcf.gz.tbi
           retention-days: 1
 
   # Job 4f: Beagle phasing-only (FULL chr22)
