@@ -8743,9 +8743,10 @@ fn build_haploid_constrained_emit_profile(
             //
             //   emit = g * raw + (1-g) * 0.5
             //
-            // when raw_required = raw_opposite = 0.5:
-            //   emit_req = g * 0.5 + (1-g) * 0.5 = 0.5
-            //   emit_opp = 0.5
+            // when raw_required = raw_opposite = neutral_emit
+            //   where neutral_emit = 0.5 * (p_no_err + p_err):
+            //   emit_req = g * neutral_emit + (1-g) * 0.5
+            //   emit_opp = g * neutral_emit + (1-g) * 0.5
             //
             // so the ratio stays 1:1 regardless of g.  This creates a
             // circular dependency: q = 0.5 -> flat emission -> random
