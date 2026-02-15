@@ -6039,7 +6039,7 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let prior_marker_idx = if output_end > 0 {
-            Some(output_end.saturating_sub(1))
+            Some(overlap_start.saturating_sub(1))
         } else {
             None
         };
@@ -9732,9 +9732,26 @@ impl crate::pipelines::ImputationPipeline {
             }
             output_markers.push(OutputMarker::Ref(ref_m));
         }
-        for targets_by_pos in target_only_by_pos.values() {
-            for targets in targets_by_pos.values() {
-                for &t_idx in targets {
+
+        // Only emit trailing target markers if they fall strictly before the next window's start.
+        // If there is a reference marker immediately following this window (at output_end),
+        // we use its position as the exclusive upper bound.
+        let next_limit = if output_end < ref_markers.len() {
+            let m = ref_markers.marker(MarkerIdx::new(output_end as u32));
+            let chrom_name = ref_markers.chrom_name(m.chrom).unwrap_or("");
+            Some((normalize_chrom_local(chrom_name).to_string(), m.pos))
+        } else {
+            None
+        };
+
+        for (chrom, targets_by_pos) in target_only_by_pos {
+            for (pos, targets) in targets_by_pos {
+                if let Some((limit_chrom, limit_pos)) = &next_limit {
+                    if chrom == limit_chrom.as_str() && pos >= *limit_pos {
+                        continue;
+                    }
+                }
+                for t_idx in targets {
                     if !emitted_target[t_idx] {
                         emitted_target[t_idx] = true;
                         output_markers.push(OutputMarker::Target(t_idx));
