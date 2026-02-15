@@ -13978,6 +13978,230 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_mcmc_sparse_target_has_nonempty_init_neighbors() {
+        use crate::model::ibs2::Ibs2;
+        use crate::model::phase_ibs::BidirectionalPhaseIbs;
+        use rand::{Rng, SeedableRng};
+
+        let n_markers = 300usize;
+        let n_target_samples = 32usize;
+        let n_target_haps = n_target_samples * 2;
+        let n_ref_haps = 512usize;
+        let n_total_haps = n_target_haps + n_ref_haps;
+        let sparse_sample = 0usize;
+        let sparse_h1 = sparse_sample * 2;
+        let sparse_h2 = sparse_h1 + 1;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE42);
+        let mut alleles_flat = vec![0u8; n_markers * n_total_haps];
+        for m in 0..n_markers {
+            let row = &mut alleles_flat[m * n_total_haps..(m + 1) * n_total_haps];
+            for a in row.iter_mut().take(n_target_haps) {
+                *a = if rng.random_bool(0.5) { 1 } else { 0 };
+            }
+            for a in row.iter_mut().skip(n_target_haps) {
+                *a = if rng.random_bool(0.5) { 1 } else { 0 };
+            }
+            // Sparse target: unresolved hets at 1/10 marker density.
+            if m % 10 == 0 {
+                row[sparse_h1] = 0;
+                row[sparse_h2] = 1;
+            } else {
+                let a = if rng.random_bool(0.5) { 1 } else { 0 };
+                row[sparse_h1] = a;
+                row[sparse_h2] = a;
+            }
+        }
+
+        let subset_to_global: Vec<usize> = (0..n_markers).collect();
+        let mut phase_ibs = BidirectionalPhaseIbs::build_for_subset_flat(
+            alleles_flat,
+            n_total_haps,
+            n_markers,
+            &subset_to_global,
+        );
+        // Match production behavior for phased target+reference mode.
+        phase_ibs.set_reference_start_hap(n_target_haps as u32);
+        let ibs2 = Ibs2::empty(n_target_samples);
+
+        let mut seq1 = vec![0u8; n_markers];
+        let mut seq2 = vec![0u8; n_markers];
+        let mut het_positions = Vec::new();
+        for m in 0..n_markers {
+            if m % 10 == 0 {
+                seq1[m] = 0;
+                seq2[m] = 1;
+                het_positions.push(m);
+            } else {
+                let a = if rng.random_bool(0.5) { 1 } else { 0 };
+                seq1[m] = a;
+                seq2[m] = a;
+            }
+        }
+        assert!(
+            !het_positions.is_empty(),
+            "sparse target should have unresolved hets"
+        );
+
+        let center = n_markers / 2;
+        let init_neighbors =
+            phase_ibs.find_neighbors((sparse_sample * 2) as u32, center, &ibs2, 48);
+        assert!(
+            !init_neighbors.is_empty(),
+            "dynamic MCMC init neighbors unexpectedly empty"
+        );
+
+        let conf = vec![1.0f32; n_markers];
+        let phase_conf = vec![0.9f32; n_markers];
+        let sample_phase_stability = vec![0.5f32; n_target_samples];
+        let p_recomb = vec![0.001f32; n_markers];
+        let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
+
+        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_dynamic_mcmc(
+            n_markers,
+            48, // dynamic_k in production defaults
+            &p_recomb,
+            &seq1,
+            &seq2,
+            &conf,
+            &phase_conf,
+            &phase_ibs,
+            &ibs2,
+            &subset_to_global,
+            sparse_sample as u32,
+            &sample_phase_stability,
+            &het_positions,
+            1234567,
+            8, // production-like default mcmc steps
+            0.999,
+            0.001,
+            None,
+            None,
+            None,
+            None,
+            &mut workspace,
+        );
+
+        assert_eq!(swap_bits.len(), het_positions.len());
+        assert_eq!(swap_lr.len(), het_positions.len());
+        assert_eq!(swap_probs.len(), het_positions.len());
+        assert_eq!(swap_probs_conf.len(), het_positions.len());
+        assert_eq!(paths.path1.len(), n_markers);
+        assert_eq!(paths.path2.len(), n_markers);
+    }
+
+    #[test]
+    fn test_dynamic_mcmc_one_target_with_4091_ref_samples_has_nonempty_init_neighbors() {
+        use crate::model::ibs2::Ibs2;
+        use crate::model::phase_ibs::BidirectionalPhaseIbs;
+        use rand::{Rng, SeedableRng};
+
+        let n_markers = 256usize;
+        let n_target_samples = 20usize;
+        let n_target_haps = n_target_samples * 2;
+        let n_ref_samples = 4091usize;
+        let n_ref_haps = n_ref_samples * 2;
+        let n_total_haps = n_target_haps + n_ref_haps;
+        let target_sample_idx = 0usize;
+        let target_h1 = target_sample_idx * 2;
+        let target_h2 = target_h1 + 1;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11CE4091);
+        let mut alleles_flat = vec![0u8; n_markers * n_total_haps];
+        for m in 0..n_markers {
+            let row = &mut alleles_flat[m * n_total_haps..(m + 1) * n_total_haps];
+            // Randomize all target samples first.
+            for a in row.iter_mut().take(n_target_haps) {
+                *a = if rng.random_bool(0.5) { 1 } else { 0 };
+            }
+            // One target sample with sparse heterozygous pattern.
+            if m % 10 == 0 {
+                row[target_h1] = 0;
+                row[target_h2] = 1;
+            } else {
+                let a = if rng.random_bool(0.5) { 1 } else { 0 };
+                row[target_h1] = a;
+                row[target_h2] = a;
+            }
+            for a in row.iter_mut().skip(n_target_haps) {
+                *a = if rng.random_bool(0.5) { 1 } else { 0 };
+            }
+        }
+
+        let subset_to_global: Vec<usize> = (0..n_markers).collect();
+        let mut phase_ibs = BidirectionalPhaseIbs::build_for_subset_flat(
+            alleles_flat,
+            n_total_haps,
+            n_markers,
+            &subset_to_global,
+        );
+        // Production behavior for target+reference PBWT: dynamic MCMC should draw only ref donors.
+        phase_ibs.set_reference_start_hap(n_target_haps as u32);
+
+        let ibs2 = Ibs2::empty(n_target_samples);
+        let center = n_markers / 2;
+        let init_neighbors = phase_ibs.find_neighbors(target_h1 as u32, center, &ibs2, 48);
+        assert!(
+            !init_neighbors.is_empty(),
+            "expected non-empty init neighbors with 4091 ref samples"
+        );
+
+        let mut seq1 = vec![0u8; n_markers];
+        let mut seq2 = vec![0u8; n_markers];
+        let mut het_positions = Vec::new();
+        for m in 0..n_markers {
+            if m % 10 == 0 {
+                seq1[m] = 0;
+                seq2[m] = 1;
+                het_positions.push(m);
+            } else {
+                let a = if rng.random_bool(0.5) { 1 } else { 0 };
+                seq1[m] = a;
+                seq2[m] = a;
+            }
+        }
+        assert!(!het_positions.is_empty());
+
+        let conf = vec![1.0f32; n_markers];
+        let phase_conf = vec![0.9f32; n_markers];
+        let sample_phase_stability = vec![0.5f32; n_target_samples];
+        let p_recomb = vec![0.001f32; n_markers];
+        let mut workspace = crate::utils::workspace::ThreadWorkspace::new(64, 0);
+
+        let (swap_bits, swap_lr, swap_probs, swap_probs_conf, paths) = sample_dynamic_mcmc(
+            n_markers,
+            48,
+            &p_recomb,
+            &seq1,
+            &seq2,
+            &conf,
+            &phase_conf,
+            &phase_ibs,
+            &ibs2,
+            &subset_to_global,
+            target_sample_idx as u32,
+            &sample_phase_stability,
+            &het_positions,
+            0xBEEF1234,
+            8,
+            0.999,
+            0.001,
+            None,
+            None,
+            None,
+            None,
+            &mut workspace,
+        );
+
+        assert_eq!(swap_bits.len(), het_positions.len());
+        assert_eq!(swap_lr.len(), het_positions.len());
+        assert_eq!(swap_probs.len(), het_positions.len());
+        assert_eq!(swap_probs_conf.len(), het_positions.len());
+        assert_eq!(paths.path1.len(), n_markers);
+        assert_eq!(paths.path2.len(), n_markers);
+    }
+
+    #[test]
     fn test_find_best_constant_pair() {
         use crate::data::storage::MutableGenotypes;
         use crate::model::states::ThreadedHaps;

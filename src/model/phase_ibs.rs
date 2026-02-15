@@ -385,7 +385,6 @@ where
         };
         let mut neighbors = Vec::with_capacity(n_candidates * 2 + 10);
         let sample = SampleIdx::new(hap_idx / 2);
-
         let ref_start = self.reference_start_hap;
         let mut ibs2_fallback: Vec<u32> = Vec::new();
 
@@ -416,24 +415,13 @@ where
             }
         }
 
-        let fwd_neighbors = self.find_fwd_neighbors(hap_idx, marker_idx, n_candidates);
-        let bwd_neighbors = self.find_bwd_neighbors(hap_idx, marker_idx, n_candidates);
+        let fwd_neighbors =
+            self.find_fwd_neighbors(hap_idx, marker_idx, n_candidates, sample, ref_start);
+        let bwd_neighbors =
+            self.find_bwd_neighbors(hap_idx, marker_idx, n_candidates, sample, ref_start);
 
-        for h in fwd_neighbors {
-            if h != hap_idx && h / 2 != sample.0 {
-                if ref_start.map_or(true, |start| h >= start) {
-                    neighbors.push(h);
-                }
-            }
-        }
-
-        for h in bwd_neighbors {
-            if h != hap_idx && h / 2 != sample.0 {
-                if ref_start.map_or(true, |start| h >= start) {
-                    neighbors.push(h);
-                }
-            }
-        }
+        neighbors.extend(fwd_neighbors);
+        neighbors.extend(bwd_neighbors);
 
         if ref_start.is_some() && neighbors.len() < n_candidates {
             for h in ibs2_fallback {
@@ -492,7 +480,14 @@ where
         }
     }
 
-    fn find_fwd_neighbors(&self, hap_idx: u32, marker_idx: usize, n_candidates: usize) -> Vec<u32> {
+    fn find_fwd_neighbors(
+        &self,
+        hap_idx: u32,
+        marker_idx: usize,
+        n_candidates: usize,
+        sample: SampleIdx,
+        ref_start: Option<u32>,
+    ) -> Vec<u32> {
         if marker_idx >= self.n_markers || (hap_idx as usize) >= self.n_haps {
             return Vec::new();
         }
@@ -531,13 +526,19 @@ where
                     max_div_up = max_div_up.max(div_up);
                     u -= 1;
                     let h = ppa[u].to_u32();
-                    if h != hap_idx {
+                    if h != hap_idx
+                        && h / 2 != sample.0
+                        && ref_start.map_or(true, |start| h >= start)
+                    {
                         result.push(h);
                     }
                 } else {
                     max_div_down = max_div_down.max(div_down);
                     let h = ppa[v].to_u32();
-                    if h != hap_idx {
+                    if h != hap_idx
+                        && h / 2 != sample.0
+                        && ref_start.map_or(true, |start| h >= start)
+                    {
                         result.push(h);
                     }
                     v += 1;
@@ -547,13 +548,19 @@ where
             while result.len() < n_candidates && u > 0 {
                 u -= 1;
                 let h = ppa[u].to_u32();
-                if h != hap_idx {
+                if h != hap_idx
+                    && h / 2 != sample.0
+                    && ref_start.map_or(true, |start| h >= start)
+                {
                     result.push(h);
                 }
             }
             while result.len() < n_candidates && v < self.n_haps {
                 let h = ppa[v].to_u32();
-                if h != hap_idx {
+                if h != hap_idx
+                    && h / 2 != sample.0
+                    && ref_start.map_or(true, |start| h >= start)
+                {
                     result.push(h);
                 }
                 v += 1;
@@ -563,7 +570,14 @@ where
         })
     }
 
-    fn find_bwd_neighbors(&self, hap_idx: u32, marker_idx: usize, n_candidates: usize) -> Vec<u32> {
+    fn find_bwd_neighbors(
+        &self,
+        hap_idx: u32,
+        marker_idx: usize,
+        n_candidates: usize,
+        sample: SampleIdx,
+        ref_start: Option<u32>,
+    ) -> Vec<u32> {
         if marker_idx >= self.n_markers || (hap_idx as usize) >= self.n_haps {
             return Vec::new();
         }
@@ -602,13 +616,19 @@ where
                     min_div_up = min_div_up.min(div_up);
                     u -= 1;
                     let h = ppa[u].to_u32();
-                    if h != hap_idx {
+                    if h != hap_idx
+                        && h / 2 != sample.0
+                        && ref_start.map_or(true, |start| h >= start)
+                    {
                         result.push(h);
                     }
                 } else {
                     min_div_down = min_div_down.min(div_down);
                     let h = ppa[v].to_u32();
-                    if h != hap_idx {
+                    if h != hap_idx
+                        && h / 2 != sample.0
+                        && ref_start.map_or(true, |start| h >= start)
+                    {
                         result.push(h);
                     }
                     v += 1;
@@ -618,13 +638,19 @@ where
             while result.len() < n_candidates && u > 0 {
                 u -= 1;
                 let h = ppa[u].to_u32();
-                if h != hap_idx {
+                if h != hap_idx
+                    && h / 2 != sample.0
+                    && ref_start.map_or(true, |start| h >= start)
+                {
                     result.push(h);
                 }
             }
             while result.len() < n_candidates && v < self.n_haps {
                 let h = ppa[v].to_u32();
-                if h != hap_idx {
+                if h != hap_idx
+                    && h / 2 != sample.0
+                    && ref_start.map_or(true, |start| h >= start)
+                {
                     result.push(h);
                 }
                 v += 1;
@@ -1220,6 +1246,36 @@ mod tests {
         assert!(
             !neigh.iter().any(|&h| h < 4),
             "neighbors must honor ref_start: {:?}",
+            neigh
+        );
+    }
+
+    #[test]
+    fn find_neighbors_ref_aware_collection_avoids_empty_on_target_cluster() {
+        // Homogeneous marker with target haps first and reference haps last.
+        // Without over-fetch, local neighbors near hap 0 are all target and are
+        // dropped by ref_start filtering; with over-fetch we should recover refs.
+        let n_haps = 12usize; // target: 0..7, ref: 8..11
+        let n_markers = 1usize;
+        let subset_to_global = vec![0usize];
+        let alleles_flat = flatten_rows(&[&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]);
+        let mut pbwt = BidirectionalPhaseIbsImpl::<u16>::build_for_subset_flat(
+            alleles_flat,
+            n_haps,
+            n_markers,
+            &subset_to_global,
+        );
+        pbwt.set_reference_start_hap(8);
+        let ibs2 = Ibs2::empty(n_haps / 2);
+
+        let neigh = pbwt.find_neighbors(0, 0, &ibs2, 2);
+        assert!(
+            !neigh.is_empty(),
+            "expected at least one reference neighbor after ref_start filtering"
+        );
+        assert!(
+            neigh.iter().all(|&h| h >= 8),
+            "neighbors must all be reference haps when ref_start is set: {:?}",
             neigh
         );
     }
