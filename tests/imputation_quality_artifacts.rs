@@ -95,6 +95,7 @@ fn run_imputation_quality_test(scope: TestScope) {
 
     if scope.is_fractional() {
         let subset_key = stable_key(&[
+            "subset-v2-overlap".to_string(),
             "subset".to_string(),
             scope.label.to_string(),
             scope.chr22_fraction_num.to_string(),
@@ -113,6 +114,8 @@ fn run_imputation_quality_test(scope: TestScope) {
         } else {
             println!("[{}] computing 10% chr22 bounds", scope.label);
             let (region, start, end) = compute_chr22_fraction_region(
+                &ref_vcf,
+                &input_vcf,
                 &truth_vcf,
                 scope.chr22_fraction_num,
                 scope.chr22_fraction_den,
@@ -359,12 +362,32 @@ fn cache_subset_inputs(
     copy_with_index(truth_vcf, &dir.join("truth.vcf.gz"));
 }
 
-fn compute_chr22_fraction_region(vcf: &Path, num: usize, den: usize) -> (String, i64, i64) {
+fn compute_chr22_fraction_region(
+    ref_vcf: &Path,
+    input_vcf: &Path,
+    truth_vcf: &Path,
+    num: usize,
+    den: usize,
+) -> (String, i64, i64) {
     assert!(num > 0, "fraction numerator must be > 0");
     assert!(den > 0, "fraction denominator must be > 0");
     assert!(num <= den, "fraction must be <= 1");
 
-    let (min_pos, max_pos) = query_chr22_bounds(vcf);
+    let (ref_min, ref_max) = query_chr22_bounds(ref_vcf);
+    let (input_min, input_max) = query_chr22_bounds(input_vcf);
+    let (truth_min, truth_max) = query_chr22_bounds(truth_vcf);
+    let min_pos = ref_min.max(input_min).max(truth_min);
+    let max_pos = ref_max.min(input_max).min(truth_max);
+    assert!(
+        min_pos <= max_pos,
+        "No overlapping chr22 interval across ref/input/truth: ref={}-{} input={}-{} truth={}-{}",
+        ref_min,
+        ref_max,
+        input_min,
+        input_max,
+        truth_min,
+        truth_max
+    );
     let span = max_pos - min_pos + 1;
     let scaled_span = ((span as i128 * num as i128) + den as i128 - 1) / den as i128;
     let target_span = std::cmp::max(1_i64, scaled_span as i64);

@@ -604,13 +604,8 @@ fn adaptive_untyped_prior_mix(
 ) -> f32 {
     // Global panel-frequency floor for completely untyped sites.
     //
-    // Motivation:
-    // - With dense typed context, we want near-zero floor so local LD dominates.
-    // - In high-missingness windows (or post-phasing uncertainty), we need a
-    //   stronger floor to prevent ALT drift on sparse/noisy evidence.
-    //
-    // The resulting floor is intentionally conservative for well-observed data
-    // and becomes aggressive only when observed_ratio drops.
+    // This floor should be small and primarily prevent degenerate collapse.
+    // Local HMM evidence should remain dominant whenever available.
     let typed = observed_ratio.clamp(0.0, 1.0);
     let missing = 1.0 - typed;
 
@@ -631,8 +626,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.01 + 0.22 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.35)
+    let floor = 0.002 + 0.08 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
 #[inline]

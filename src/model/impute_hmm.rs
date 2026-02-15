@@ -1604,7 +1604,9 @@ fn smooth_allele_posteriors_subset(
     //   delta' = delta / (1 + alpha)
     // so this step is explicit shrinkage of deviation from pi.
     let base_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
-    let prior_mass = base_mass * (1.0 + 1.75 * confidence_boost);
+    // Keep entropy boost modest; large multipliers over-shrink rare ALT signal
+    // when subset support is sparse.
+    let prior_mass = base_mass * (1.0 + 0.5 * confidence_boost);
     if prior_mass <= 0.0 {
         return;
     }
@@ -1701,8 +1703,10 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
+    // Conservative adaptive blend: panel priors should stabilize pathological
+    // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (missing_mass * combined_error * (1.0 + 1.5 * sparsity_boost)).clamp(0.0, 0.85);
+        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1762,7 +1766,7 @@ fn apply_adaptive_panel_blend(
     if floor_mix > 0.0 {
         // Floor step: enforce a small allele floor from panel probabilities so
         // extremely sparse subsets cannot assign hard zeros too early.
-        let scaled_floor = floor_mix.clamp(0.0, 0.6);
+        let scaled_floor = floor_mix.clamp(0.0, 0.15);
         if scaled_floor > 0.0 {
             for (i, prob) in allele_probs.iter_mut().enumerate() {
                 let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -1803,7 +1807,7 @@ fn apply_adaptive_panel_blend(
         // Symmetric convex blend:
         //   p <- (1-w) * p + w * panel
         // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 1.25 * disagreement)).clamp(0.0, 0.9);
+        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.45);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -1879,10 +1883,10 @@ fn build_skip_untyped_mask(
                     .copied()
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
-                // retain threshold:
-                //   retain < 0.005  <=>  "deep untyped" under current map model.
-                // lower threshold -> fewer substitutions; higher -> more.
-                retain < 0.005
+                // Retain threshold for panel substitution on deep-untyped sites.
+                // Keep this strict: substitution is a last resort when transition
+                // information is essentially absent.
+                retain < 0.0005
             })
             .collect(),
     )
