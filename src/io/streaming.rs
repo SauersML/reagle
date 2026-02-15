@@ -863,13 +863,8 @@ impl StreamingVcfReader {
         for candidate in candidates {
             let mut candidate_indices = Vec::new();
             for (i, bm) in self.buffer.iter().enumerate() {
-                let chrom_name = self
-                    .markers_meta
-                    .chrom_name(bm.marker.chrom)
-                    .unwrap_or("");
-                if chrom_name == candidate
-                    && bm.marker.pos >= start_pos
-                    && bm.marker.pos <= end_pos
+                let chrom_name = self.markers_meta.chrom_name(bm.marker.chrom).unwrap_or("");
+                if chrom_name == candidate && bm.marker.pos >= start_pos && bm.marker.pos <= end_pos
                 {
                     candidate_indices.push(i);
                 }
@@ -1011,7 +1006,10 @@ impl StreamingVcfReader {
         };
 
         while let Some(front) = self.buffer.front() {
-            let front_chrom = self.markers_meta.chrom_name(front.marker.chrom).unwrap_or("");
+            let front_chrom = self
+                .markers_meta
+                .chrom_name(front.marker.chrom)
+                .unwrap_or("");
             let drop_for_region = if let Some(sel) = selected_chrom.as_deref() {
                 front_chrom != sel || front.marker.pos < start_pos
             } else {

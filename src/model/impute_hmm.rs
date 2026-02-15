@@ -504,6 +504,7 @@ pub struct TargetAlleleProbs {
     probs: Vec<f32>,
     uniform: Vec<bool>,
     observed: Vec<bool>,
+    marker_error_rates: Option<Vec<f32>>,
     panel_priors: Option<Arc<Vec<AllelePosteriors>>>,
     min_untyped_prior_mix: f32,
 }
@@ -538,6 +539,7 @@ impl TargetAlleleProbs {
             probs,
             uniform,
             observed,
+            marker_error_rates: None,
             panel_priors,
             min_untyped_prior_mix: min_untyped_prior_mix.clamp(0.0, 0.9),
         }
@@ -585,6 +587,23 @@ impl TargetAlleleProbs {
     #[inline]
     pub fn panel_priors(&self) -> Option<&[AllelePosteriors]> {
         self.panel_priors.as_deref().map(|v| v.as_slice())
+    }
+
+    #[inline]
+    pub fn set_marker_error_rates(&mut self, marker_error_rates: Vec<f32>) {
+        if marker_error_rates.len() == self.n_markers() {
+            self.marker_error_rates = Some(marker_error_rates);
+        } else {
+            self.marker_error_rates = None;
+        }
+    }
+
+    #[inline]
+    pub fn marker_error_rate(&self, marker_idx: usize) -> Option<f32> {
+        self.marker_error_rates
+            .as_ref()
+            .and_then(|v| v.get(marker_idx).copied())
+            .map(|v| v.clamp(1e-6, 0.5))
     }
 
     #[inline]
@@ -2956,7 +2975,7 @@ fn forward_update_impl<C: RefColumnLike>(
     ref_columns: &[C],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
-    current_error: f32,
+    base_error_rate: f32,
     active_states: usize,
     transition_haps: usize,
     transition_lambda: f32,
@@ -2964,6 +2983,7 @@ fn forward_update_impl<C: RefColumnLike>(
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
+    let marker_error = target_probs.marker_error_rate(m).unwrap_or(base_error_rate);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -2983,7 +3003,7 @@ fn forward_update_impl<C: RefColumnLike>(
         fill_emissions(
             &ref_alleles,
             probs,
-            current_error,
+            marker_error,
             &mut ws.emission_by_allele,
             &mut ws.emissions[..active_states],
         );
@@ -3025,7 +3045,7 @@ fn forward_update_seqcoded(
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
-    current_error: f32,
+    base_error_rate: f32,
     active_states: usize,
     transition_haps: usize,
     transition_lambda: f32,
@@ -3034,6 +3054,7 @@ fn forward_update_seqcoded(
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
+    let marker_error = target_probs.marker_error_rate(m).unwrap_or(base_error_rate);
 
     let col = seqcoded_col(&ref_columns[m]);
     let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
@@ -3050,7 +3071,7 @@ fn forward_update_seqcoded(
         fill_pattern_emissions(
             seq_patterns.seq_alleles,
             probs,
-            current_error,
+            marker_error,
             &mut ws.emission_by_allele,
             &mut ws.pattern_emissions,
         );
@@ -3096,7 +3117,7 @@ fn forward_update_dict(
     ref_columns: &[GenotypeColumn],
     target_probs: &TargetAlleleProbs,
     p_recomb: &[f32],
-    current_error: f32,
+    base_error_rate: f32,
     active_states: usize,
     transition_haps: usize,
     transition_lambda: f32,
@@ -3105,6 +3126,7 @@ fn forward_update_dict(
     let probs = target_probs.probs_for_marker_trusted(m);
     let uniform = target_probs.is_uniform_marker(m);
     let recomb_rate = marker_recomb_rate(p_recomb, m);
+    let marker_error = target_probs.marker_error_rate(m).unwrap_or(base_error_rate);
 
     let mut next_sum = if uniform {
         transition_only_forward_update(
@@ -3126,7 +3148,7 @@ fn forward_update_dict(
         fill_pattern_emissions(
             dict_patterns.pattern_alleles,
             probs,
-            current_error,
+            marker_error,
             &mut ws.emission_by_allele,
             &mut ws.pattern_emissions,
         );
@@ -5413,10 +5435,13 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                         transition_lambda,
                     );
                 } else {
+                    let marker_error = target_probs
+                        .marker_error_rate(m_rev)
+                        .unwrap_or(current_error);
                     fill_pattern_emissions(
                         group_alleles,
                         probs,
-                        current_error,
+                        marker_error,
                         &mut ws.emission_by_allele,
                         &mut ws.pattern_emissions,
                     );
