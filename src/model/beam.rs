@@ -1373,6 +1373,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.marker,
             hap1_al,
             recomb_prob,
+            pbwt_version,
             active_pool,
             pool_alleles,
             &mut scratch.hap1_allele,
@@ -1384,6 +1385,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             call.marker,
             hap2_al,
             recomb_prob,
+            pbwt_version,
             active_pool,
             pool_alleles,
             &mut scratch.hap2_allele,
@@ -1409,8 +1411,10 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 } else {
                     0
                 };
-                let score = score_no_flip + flip_penalty;
-                let model_score = model_score_no_flip + flip_penalty;
+                let orient_search_cost =
+                    i64::from(self.orientation_search_prior_cost(swapped, call.phase_conf));
+                let score = score_no_flip + flip_penalty + orient_search_cost;
+                let model_score = model_score_no_flip + flip_penalty + orient_search_cost;
                 let logp = -(model_score as f64) / 1_000_000.0;
                 // Posterior orientation mass at a marker should include the local
                 // orientation confidence prior c:
@@ -1460,6 +1464,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         marker: MarkerIdx,
         targ_allele: u8,
         recomb_prob: f32,
+        pbwt_version: u32,
         active_pool: &ActivePool,
         pool_alleles: &[u8],
         out: &mut Vec<(usize, i32, i32, i32)>,
@@ -1515,8 +1520,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
 
         let n_total = self.packed_ref.n_ref_haps().max(1);
+        let switch_prob = self
+            .adjust_switch_prob_from_pbwt(recomb_prob, active_pool, targ_allele, hap, pbwt_version)
+            .clamp(1e-9, 1.0 - 1e-9);
         let k_subset = cand.len().max(1) as f32;
-        let (stay_gap, shift) = subset_linear_exact_k(recomb_prob, k_subset, n_total);
+        let (stay_gap, shift) = subset_linear_exact_k(switch_prob, k_subset, n_total);
         let stay_prob = (stay_gap + shift).clamp(1e-12, 1.0 - 1e-12);
         let switch_prob = shift.clamp(1e-12, 1.0 - 1e-12);
         let stay_cost = (-(f64::from(stay_prob).ln()) * 1_000_000.0)
@@ -1587,6 +1595,54 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             .ref_allele_targ(marker, hap)
             .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
         self.emission_cost_for_ref_allele(ref_allele, targ_allele)
+    }
+
+    #[inline]
+    fn adjust_switch_prob_from_pbwt(
+        &self,
+        base_switch_prob: f32,
+        active_pool: &ActivePool,
+        allele: u8,
+        current_hap: usize,
+        pbwt_version: u32,
+    ) -> f32 {
+        let base = base_switch_prob.clamp(1e-9, 1.0 - 1e-9) as f64;
+        let Some(meta) = active_pool.pbwt_meta(allele, current_hap, pbwt_version) else {
+            return base_switch_prob;
+        };
+        let len = meta.match_len_morgans.max(0.0) as f64;
+        let cluster = meta.cluster_size.max(1.0) as f64;
+
+        // Positive signal => stronger evidence to stay with current donor.
+        let len_signal = (len / 0.0025).ln_1p();
+        let density_penalty = 0.35 * (cluster / 4.0).ln_1p();
+        let stay_signal = (len_signal - density_penalty).clamp(-4.0, 4.0);
+
+        // Move switching log-odds modestly to avoid brittle over-anchoring.
+        let base_logit = (base / (1.0 - base)).ln();
+        let logit_bias = (-0.9 * stay_signal).clamp(-2.5, 2.5);
+        let adj_logit = base_logit + logit_bias;
+        let adj = 1.0 / (1.0 + (-adj_logit).exp());
+        adj.clamp(1e-9, 1.0 - 1e-9) as f32
+    }
+
+    #[inline]
+    fn orientation_search_prior_cost(&self, swapped: bool, phase_conf: f32) -> i32 {
+        let c = if phase_conf.is_finite() {
+            phase_conf.clamp(1e-6, 1.0 - 1e-6)
+        } else {
+            0.5
+        };
+        let informativeness = ((c - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+        if informativeness <= 0.5 {
+            return 0;
+        }
+        let prior = if swapped { 1.0 - c } else { c } as f64;
+        let weight = ((informativeness - 0.5) / 0.5) as f64;
+        let scaled_nats = (-prior.ln()) * (0.05 * weight * weight);
+        (scaled_nats * 1_000_000.0)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
 
     #[inline]
@@ -2511,5 +2567,55 @@ mod tests {
             phaser.decode_swap_track(&logsum_swapped, &logsum_unswapped, &calls, &fallback);
 
         assert_eq!(decoded, vec![false, false, false, false, false]);
+    }
+
+    #[test]
+    fn pbwt_adjusted_switch_prob_discourages_switch_for_strong_match() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+
+        let mut pool = ActivePool::new(ref_gt.n_haplotypes());
+        let hap = 1usize;
+        let version = 42u32;
+        let base = 0.02f32;
+        let no_meta = phaser.adjust_switch_prob_from_pbwt(base, &pool, 0, hap, version);
+
+        pool.set_pbwt_meta(0, hap, 0, 2.0, 0.03, version);
+        let strong_meta = phaser.adjust_switch_prob_from_pbwt(base, &pool, 0, hap, version);
+        assert!(strong_meta < no_meta, "expected stronger stay preference");
+
+        pool.set_pbwt_meta(0, hap, 0, 64.0, 0.0001, version);
+        let weak_meta = phaser.adjust_switch_prob_from_pbwt(base, &pool, 0, hap, version);
+        assert!(
+            weak_meta > strong_meta,
+            "expected weaker match to allow more switching"
+        );
+    }
+
+    #[test]
+    fn orientation_search_prior_cost_is_small_and_confidence_sensitive() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+
+        let neutral = phaser.orientation_search_prior_cost(false, 0.5);
+        let high_conf_correct = phaser.orientation_search_prior_cost(false, 0.99);
+        let high_conf_wrong = phaser.orientation_search_prior_cost(true, 0.99);
+        assert_eq!(neutral, 0);
+        assert!(high_conf_correct >= 0);
+        assert!(high_conf_wrong > high_conf_correct);
+        assert!(
+            high_conf_wrong < 300_000,
+            "search prior should remain small relative to main model terms"
+        );
     }
 }
