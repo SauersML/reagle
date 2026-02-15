@@ -9596,7 +9596,7 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(stats) = quality.get_mut(marker_idx) {
                         for s in 0..n_samples {
                             let (v1, v2) = get_hap_probs(marker_idx, s);
-                            let (v1, v2) = if !stats.is_imputed {
+                            let (v1, v2) = if !stats.is_imputed && !correct_errors {
                                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
                                     (a1 as f32, a2 as f32)
                                 } else if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
@@ -9616,7 +9616,7 @@ impl crate::pipelines::ImputationPipeline {
                     quality.get(marker_idx).map(|stats| stats.is_imputed)
                 {
                     for s in 0..n_samples {
-                        update_multiallelic(quality, marker_idx, s, !is_imputed);
+                        update_multiallelic(quality, marker_idx, s, !is_imputed && !correct_errors);
                     }
                 }
             }
@@ -9630,7 +9630,7 @@ impl crate::pipelines::ImputationPipeline {
                     if let Some(stats) = quality.get_mut(marker_idx) {
                         for s in 0..n_samples {
                             let (v1, v2) = get_hap_probs(marker_idx, s);
-                            let (v1, v2) = if !stats.is_imputed {
+                            let (v1, v2) = if !stats.is_imputed && !correct_errors {
                                 if let Some((a1, a2)) = get_genotyped_alleles(marker_idx, s) {
                                     (a1 as f32, a2 as f32)
                                 } else if let Some(gp) = get_genotype_posteriors(marker_idx, s) {
@@ -9650,7 +9650,7 @@ impl crate::pipelines::ImputationPipeline {
                     quality.get(marker_idx).map(|stats| stats.is_imputed)
                 {
                     for s in 0..n_samples {
-                        update_multiallelic(quality, marker_idx, s, !is_imputed);
+                        update_multiallelic(quality, marker_idx, s, !is_imputed && !correct_errors);
                     }
                 }
             }

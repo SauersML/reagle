@@ -855,10 +855,29 @@ impl StreamingVcfReader {
             return Ok(None);
         }
 
+        // Choose a single chromosome representation per query window.
+        // This prevents mixing aliases such as "chr22" and "22" when both
+        // exist in a malformed input and preserves monotonic output ordering.
+        let mut selected_chrom: Option<String> = None;
         let mut indices = Vec::new();
-        for (i, bm) in self.buffer.iter().enumerate() {
-            if bm.marker.pos >= start_pos && bm.marker.pos <= end_pos {
-                indices.push(i);
+        for candidate in candidates {
+            let mut candidate_indices = Vec::new();
+            for (i, bm) in self.buffer.iter().enumerate() {
+                let chrom_name = self
+                    .markers_meta
+                    .chrom_name(bm.marker.chrom)
+                    .unwrap_or("");
+                if chrom_name == candidate
+                    && bm.marker.pos >= start_pos
+                    && bm.marker.pos <= end_pos
+                {
+                    candidate_indices.push(i);
+                }
+            }
+            if !candidate_indices.is_empty() {
+                selected_chrom = Some(candidate.clone());
+                indices = candidate_indices;
+                break;
             }
         }
         if indices.is_empty() {
@@ -874,6 +893,12 @@ impl StreamingVcfReader {
             }
             return Ok(None);
         }
+        // Guarantee local positional ordering even if the source VCF is malformed.
+        indices.sort_unstable_by(|&a, &b| {
+            let pa = self.buffer[a].marker.pos;
+            let pb = self.buffer[b].marker.pos;
+            pa.cmp(&pb).then_with(|| a.cmp(&b))
+        });
 
         let first_idx = indices[0];
         let last_idx = *indices.last().unwrap();
@@ -985,14 +1010,19 @@ impl StreamingVcfReader {
             phased_overlap: None,
         };
 
-        while self
-            .buffer
-            .front()
-            .map(|m| m.marker.pos < start_pos)
-            .unwrap_or(false)
-        {
-            self.buffer.pop_front();
-            self.global_marker_idx += 1;
+        while let Some(front) = self.buffer.front() {
+            let front_chrom = self.markers_meta.chrom_name(front.marker.chrom).unwrap_or("");
+            let drop_for_region = if let Some(sel) = selected_chrom.as_deref() {
+                front_chrom != sel || front.marker.pos < start_pos
+            } else {
+                front.marker.pos < start_pos
+            };
+            if drop_for_region {
+                self.buffer.pop_front();
+                self.global_marker_idx += 1;
+            } else {
+                break;
+            }
         }
         self.window_num += 1;
 
@@ -1417,6 +1447,7 @@ fn parse_gt(gt: &str) -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::marker::MarkerIdx;
 
     #[test]
     fn test_parse_gt() {
@@ -1451,5 +1482,51 @@ mod tests {
         let config = StreamingConfig::default();
         assert_eq!(config.window_cm, 40.0);
         assert_eq!(config.overlap_cm, 2.0);
+    }
+
+    #[test]
+    fn test_load_window_prefers_primary_chrom_alias() {
+        let vcf = b"##fileformat=VCFv4.2\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n\
+chr22\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n\
+chr22\t200\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n\
+22\t150\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n\
+22\t250\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n";
+        let reader = Box::new(std::io::BufReader::new(std::io::Cursor::new(vcf)));
+        let mut sv = StreamingVcfReader::from_reader(
+            reader,
+            GeneticMaps::default(),
+            StreamingConfig::default(),
+        )
+        .expect("reader");
+        let win = sv
+            .load_window_for_region(&["chr22".to_string(), "22".to_string()], 100, 250)
+            .expect("query")
+            .expect("window");
+        assert_eq!(win.genotypes.n_markers(), 2);
+        assert_eq!(win.genotypes.marker(MarkerIdx::new(0)).pos, 100);
+        assert_eq!(win.genotypes.marker(MarkerIdx::new(1)).pos, 200);
+    }
+
+    #[test]
+    fn test_load_window_fallback_to_secondary_alias() {
+        let vcf = b"##fileformat=VCFv4.2\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n\
+22\t150\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n\
+22\t250\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\n";
+        let reader = Box::new(std::io::BufReader::new(std::io::Cursor::new(vcf)));
+        let mut sv = StreamingVcfReader::from_reader(
+            reader,
+            GeneticMaps::default(),
+            StreamingConfig::default(),
+        )
+        .expect("reader");
+        let win = sv
+            .load_window_for_region(&["chr22".to_string(), "22".to_string()], 100, 300)
+            .expect("query")
+            .expect("window");
+        assert_eq!(win.genotypes.n_markers(), 2);
+        assert_eq!(win.genotypes.marker(MarkerIdx::new(0)).pos, 150);
+        assert_eq!(win.genotypes.marker(MarkerIdx::new(1)).pos, 250);
     }
 }

@@ -1515,8 +1515,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
         except Exception as e:
             print(f"Warning: Could not inspect FORMAT fields from records: {e}")
     
-    # Decide parsing mode based on header availability
-    degraded_required = False
+    # Decide parsing mode based on header/record availability.
+    # DS is required for robust dosage metrics; GP is optional.
+    degraded_missing_ds = False
+    degraded_missing_gp = False
     if has_ds and has_gp:
         imputed_format_mode = "full"
         imputed_cmd = imputed_cmd_full
@@ -1524,27 +1526,26 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     elif has_ds and not has_gp:
         imputed_format_mode = "ds_only"
         imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%DS]\\n' {imputed_vcf}"
-        if require_ds_gp:
-            print("WARNING: GP missing in header; proceeding with GT:DS only.")
-            degraded_required = True
-        else:
-            print(f"Using GT:DS format for {imputed_vcf}")
+        degraded_missing_gp = bool(require_ds_gp)
+        print("WARNING: GP missing in header; proceeding with GT:DS only.")
     elif has_gp and not has_ds:
         imputed_format_mode = "gp_only"
         imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT:%GP]\\n' {imputed_vcf}"
-        if require_ds_gp:
-            print("WARNING: DS missing in header; proceeding with GT:GP only.")
-            degraded_required = True
-        else:
-            print(f"Using GT:GP format for {imputed_vcf}")
+        degraded_missing_ds = bool(require_ds_gp)
+        print("WARNING: DS missing in header; proceeding with GT:GP only.")
     else:
         imputed_format_mode = "gt_only"
         imputed_cmd = f"bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%GT]\\n' {imputed_vcf}"
-        if require_ds_gp:
-            print("WARNING: DS/GP missing in header; proceeding with GT only.")
-            degraded_required = True
-        else:
-            print(f"Using GT-only format for {imputed_vcf}")
+        degraded_missing_ds = bool(require_ds_gp)
+        degraded_missing_gp = bool(require_ds_gp)
+        print("WARNING: DS/GP missing in header; proceeding with GT only.")
+
+    degraded_required = degraded_missing_ds
+    print(
+        f"FORMAT capability summary: mode={imputed_format_mode}, "
+        f"DS={has_ds}, GP={has_gp}, "
+        f"degraded_missing_ds={degraded_missing_ds}, degraded_missing_gp={degraded_missing_gp}"
+    )
     
     imputed_iter = _stream_vcf_lines(imputed_cmd)
 
@@ -2422,6 +2423,11 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
     metrics["sites_skipped_missing_required_matched"] = skipped_missing_required_matched
     metrics["sites_skipped_missing_required_imputed_only"] = skipped_missing_required_imputed_only
     metrics["degraded_missing_ds_gp"] = degraded_required
+    metrics["degraded_missing_ds"] = degraded_missing_ds
+    metrics["degraded_missing_gp"] = degraded_missing_gp
+    metrics["imputed_has_ds"] = has_ds
+    metrics["imputed_has_gp"] = has_gp
+    metrics["imputed_format_mode"] = imputed_format_mode
     metrics["ref_af_missing_sites"] = ref_af_missing
     metrics["ref_af_sites"] = ref_af_sites
 
@@ -2533,6 +2539,10 @@ def calculate_metrics(truth_vcf, imputed_vcf, output_prefix, input_vcf=None, ref
             skipped_imputed_only = metrics.get('sites_skipped_missing_required_imputed_only', 0)
             print(f"     - Matched sites skipped: {skipped_matched:,}")
             print(f"     - Imputed-only sites skipped: {skipped_imputed_only:,}")
+        if metrics.get("degraded_missing_ds"):
+            print("   DS unavailable: dosage-driven metrics may be degraded")
+        if metrics.get("degraded_missing_gp"):
+            print("   GP unavailable: GP-only metrics (e.g., Hellinger) are omitted")
         
         ref_alt_mismatch = metrics.get('ref_alt_mismatch', 0)
         ref_alt_swapped = metrics.get('ref_alt_swapped', 0)
@@ -3595,6 +3605,7 @@ def stage_metrics():
 
     all_metrics = {}
     degraded_any = False
+    degraded_tools = []
     for name, vcf in results.items():
         print(f"\n{'=' * 50}")
         print(f"{name.upper()} RESULTS")
@@ -3609,6 +3620,7 @@ def stage_metrics():
             all_metrics[name] = metrics
             if metrics and metrics.get("degraded_missing_ds_gp"):
                 degraded_any = True
+                degraded_tools.append(name)
         else:
             print(f"{name} output not found")
             all_metrics[name] = None
@@ -3708,8 +3720,10 @@ def stage_metrics():
         print("\nERROR: All metrics calculations failed!")
         sys.exit(1)
     if degraded_any:
-        print("\nERROR: Required DS/GP missing; metrics computed with degraded inputs.")
-        sys.exit(1)
+        print(
+            "\nWARNING: One or more tools were missing DS and may have degraded dosage metrics: "
+            + ", ".join(sorted(degraded_tools))
+        )
 
     print("\nMetrics stage completed successfully.")
 
@@ -4382,6 +4396,8 @@ def stage_metrics_chr(chrom):
     ]
     
     degraded_any = False
+    degraded_tools = []
+    failed_any = False
     for prefix, filename in tools:
         imputed_path = data_dir / filename
         if imputed_path.exists():
@@ -4403,15 +4419,24 @@ def stage_metrics_chr(chrom):
                             m = json.load(f)
                         if m.get("degraded_missing_ds_gp"):
                             degraded_any = True
+                            degraded_tools.append(prefix)
                     except Exception:
                         pass
             except Exception as e:
                 print(f"Error: {e}")
-                degraded_any = True
+                failed_any = True
 
-    if degraded_any:
-        print("ERROR: One or more tools missing DS/GP; metrics computed with degraded inputs.")
+    if failed_any:
+        print("ERROR: One or more tool metric calculations failed.")
         sys.exit(1)
+    if degraded_any:
+        print(
+            "WARNING: One or more tools were missing DS and may have degraded dosage metrics: "
+            + ", ".join(sorted(degraded_tools))
+        )
+        print("Metrics were still generated.")
+    else:
+        print("Metrics stage completed successfully.")
 
 
 def stage_summary():
