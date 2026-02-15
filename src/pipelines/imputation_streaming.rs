@@ -1234,22 +1234,23 @@ fn compute_target_freqs_packed<TargetSpace, RefSpace>(
         let mut total = 0u32;
         if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
             let col = &ref_columns[ref_m.as_usize()];
-            if let Some((zeros, ones, missing)) = col.counts_biallelic() {
+            if let Some((zeros, ones, _)) = col.counts_biallelic() {
                 let map0 = alignment.reverse_map_allele(m, 0);
                 let map1 = alignment.reverse_map_allele(m, 1);
                 if map0 != crate::data::storage::AlleleCode::MISSING.raw() {
                     let idx = map0 as usize;
                     if idx < counts.len() {
                         counts[idx] += zeros as u32;
+                        total += zeros as u32;
                     }
                 }
                 if map1 != crate::data::storage::AlleleCode::MISSING.raw() {
                     let idx = map1 as usize;
                     if idx < counts.len() {
                         counts[idx] += ones as u32;
+                        total += ones as u32;
                     }
                 }
-                total = (n_ref_haps.saturating_sub(missing)) as u32;
             } else {
                 for rh in 0..n_ref_haps {
                     let ref_a = col.allele(rh);
@@ -1275,6 +1276,37 @@ fn compute_target_freqs_packed<TargetSpace, RefSpace>(
         freqs.push(out);
     }
     freqs
+}
+
+#[inline]
+fn posterior_slot_for_output_marker(
+    posteriors_len: usize,
+    output_start: usize,
+    output_end: usize,
+    ref_m: usize,
+) -> Option<usize> {
+    if ref_m < output_start || ref_m >= output_end {
+        return None;
+    }
+    let output_markers = output_end.saturating_sub(output_start);
+    if posteriors_len == output_markers {
+        return Some(ref_m - output_start);
+    }
+    if posteriors_len >= output_end {
+        return Some(ref_m);
+    }
+    None
+}
+
+#[inline]
+fn hap_nonref_dosage_from_posterior(post: &AllelePosteriors) -> f32 {
+    match post {
+        AllelePosteriors::Biallelic(p_alt) => p_alt.clamp(0.0, 1.0),
+        AllelePosteriors::Multiallelic(probs) => {
+            let p_ref = probs.first().copied().unwrap_or(1.0);
+            (1.0 - p_ref).clamp(0.0, 1.0)
+        }
+    }
 }
 
 #[inline]
@@ -4015,6 +4047,15 @@ impl crate::pipelines::ImputationPipeline {
             bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPlanning);
             bb.set_op("Imputation planning: window caps");
         }
+        let n_ref_for_params = ref_data.n_ref_haps().max(1);
+        self.params = crate::model::parameters::ModelParams::for_imputation(
+            n_ref_for_params,
+            self.config.ne,
+            self.config.err,
+        );
+        self.params.recomb_intensity = (0.04 * self.config.ne / n_ref_for_params as f32)
+            .min(ModelParams::MAX_RECOMB_INTENSITY)
+            .max(1e-6);
         let plan = build_imputation_plan(
             &phased_target_path,
             &streaming_config,
@@ -7563,7 +7604,7 @@ impl crate::pipelines::ImputationPipeline {
                         // Preserve direct target evidence at observed markers. Imputation
                         // should not overwrite measured genotype probabilities at typed
                         // sites, otherwise dosage correlation is artificially degraded.
-                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                        for ref_m in output_start..output_end {
                             if !input_probs.is_observed_marker(ref_m) {
                                 continue;
                             }
@@ -7571,6 +7612,24 @@ impl crate::pipelines::ImputationPipeline {
                             if probs.is_empty() {
                                 continue;
                             }
+                            let out_idx = posterior_slot_for_output_marker(
+                                posteriors.len(),
+                                output_start,
+                                output_end,
+                                ref_m,
+                            )
+                            .ok_or_else(|| {
+                                ReagleError::vcf(format!(
+                                    "Posterior slot missing for typed marker overwrite: window={} sample={} hap={} posteriors_len={} output_start={} output_end={} ref_m={}",
+                                    window_idx,
+                                    s,
+                                    hap_idx.as_usize(),
+                                    posteriors.len(),
+                                    output_start,
+                                    output_end,
+                                    ref_m
+                                ))
+                            })?;
                             posteriors[out_idx] = if probs.len() == 2 {
                                 AllelePosteriors::Biallelic(probs.get(1).copied().unwrap_or(0.0))
                             } else {
@@ -7778,31 +7837,7 @@ impl crate::pipelines::ImputationPipeline {
 
                 let (hap1_alt_probs, hap1_sparse_posts) = split_hap_posteriors(&mut hap1_posts);
                 let (hap2_alt_probs, hap2_sparse_posts) = split_hap_posteriors(&mut hap2_posts);
-                let mut hap_alt_probs = (hap1_alt_probs, hap2_alt_probs);
-                if let Some(writer) = alt_prob_store_writer.as_ref() {
-                    if let Some(values) = hap_alt_probs.0.as_ref() {
-                        AltProbDiskStoreBuilder::write_hap_probs_at(
-                            writer.as_ref(),
-                            n_target_samples,
-                            output_markers,
-                            s,
-                            0,
-                            values,
-                        )?;
-                        hap_alt_probs.0 = None;
-                    }
-                    if let Some(values) = hap_alt_probs.1.as_ref() {
-                        AltProbDiskStoreBuilder::write_hap_probs_at(
-                            writer.as_ref(),
-                            n_target_samples,
-                            output_markers,
-                            s,
-                            1,
-                            values,
-                        )?;
-                        hap_alt_probs.1 = None;
-                    }
-                }
+                let hap_alt_probs = (hap1_alt_probs, hap2_alt_probs);
 
                     Ok(ImputeResult {
                         result: SampleImputationResult {
@@ -9334,12 +9369,7 @@ impl crate::pipelines::ImputationPipeline {
             let dosage = if let Some(result) = result_by_sample.get(sample_idx).and_then(|r| *r) {
                 let hap_dosage = |hap: usize| -> f32 {
                     if let Some(p) = result.hap_posterior(hap, local_m) {
-                        return match p {
-                            AllelePosteriors::Biallelic(p_alt) => *p_alt,
-                            AllelePosteriors::Multiallelic(probs) => {
-                                probs.iter().enumerate().map(|(i, p)| i as f32 * p).sum()
-                            }
-                        };
+                        return hap_nonref_dosage_from_posterior(p);
                     }
                     if n_alleles <= 2 {
                         if let Some(alt) = get_result_alt_prob(result, hap, local_m) {
@@ -9989,7 +10019,7 @@ mod tests {
     use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
     use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
+    use crate::data::marker::{Allele, AlleleMapping, Marker, Markers, Nucleotide};
     use crate::data::storage::GenotypeColumn;
     use crate::data::storage::phase_state::{Phased, Unphased};
     use crate::io::bref3::StreamingRefVcfReader;
@@ -10217,6 +10247,65 @@ mod tests {
         assert!(w_id.is_finite() && w_swap.is_finite());
         assert!((sum - 1.0).abs() < 1e-6);
         assert!(w_id > w_swap);
+    }
+
+    #[test]
+    fn test_posterior_slot_for_output_marker_handles_full_window_and_trimmed_output() {
+        assert_eq!(posterior_slot_for_output_marker(50, 100, 150, 100), Some(0));
+        assert_eq!(
+            posterior_slot_for_output_marker(50, 100, 150, 149),
+            Some(49)
+        );
+        assert_eq!(
+            posterior_slot_for_output_marker(200, 100, 150, 100),
+            Some(100)
+        );
+        assert_eq!(
+            posterior_slot_for_output_marker(200, 100, 150, 149),
+            Some(149)
+        );
+        assert_eq!(posterior_slot_for_output_marker(120, 100, 150, 149), None);
+        assert_eq!(posterior_slot_for_output_marker(50, 100, 150, 99), None);
+    }
+
+    #[test]
+    fn test_hap_nonref_dosage_multiallelic_is_nonref_mass_not_allele_index_expectation() {
+        let certain_alt2 =
+            AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(vec![0.0, 0.0, 1.0]));
+        let mixed =
+            AllelePosteriors::Multiallelic(std::sync::Arc::<[f32]>::from(vec![0.2, 0.3, 0.5]));
+        assert!((hap_nonref_dosage_from_posterior(&certain_alt2) - 1.0).abs() < 1e-6);
+        assert!((hap_nonref_dosage_from_posterior(&mixed) - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compute_target_freqs_biallelic_uses_mapped_mass_denominator() {
+        let chrom = ChromIdx::new(0);
+        let target_markers = build_markers(chrom, &[100]);
+        let target_gt =
+            build_phased_matrix_from_columns(target_markers, 1, vec![vec![0, 0]], &[2usize]);
+        let ref_columns = vec![PackedRefColumn::Bits {
+            bits: 1,
+            n_haps: 4,
+            words: vec![0b0110],
+            missing: vec![0],
+        }];
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![Some(MarkerIdx::<crate::data::AnyMarkerSpace>::new(0))],
+            target_to_ref: vec![Some(MarkerIdx::<crate::data::AnyMarkerSpace>::new(0))],
+            allele_mappings: vec![Some(AlleleMapping::new(vec![0, -1], 2, false, false))],
+        };
+        let freqs = compute_target_freqs_packed(&target_gt, &ref_columns, 4, &alignment);
+        let f0 = freqs
+            .first()
+            .and_then(|v| v.first())
+            .copied()
+            .unwrap_or(0.0);
+        assert!(
+            (f0 - 1.0).abs() < 1e-6,
+            "expected mapped denominator to yield P(allele0)=1, got {}",
+            f0
+        );
     }
 
     #[test]
