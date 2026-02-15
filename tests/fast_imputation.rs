@@ -2523,7 +2523,10 @@ fn test_phasing_confidence() {
 
     // Run phasing in memory
     let result = pipeline.phase_in_memory_with_overlap(
-        &target_gt, &gen_maps, None, // No overlap from previous window
+        &target_gt,
+        &gen_maps,
+        None, // No overlap from previous window
+        reagle::io::streaming::GlobalMarkerIdx::new(0),
         None,
     );
 
