@@ -179,7 +179,7 @@ fn test_reference_comparison_full_chr21_ref1000_target10() {
         beagle_runtime_sec, reagle_runtime_sec
     );
     println!(
-        "BEAGLE: sites={} genotypes={} r2={:?} iqs={:?} hellinger={:?} switch={:?} ({}/{}) phase_conc={:?} ({}/{})",
+        "BEAGLE: sites={} genotypes={} r2={:?} iqs={:?} hellinger={:?} SER={:?} ({}/{}) phase_conc={:?} ({}/{})",
         beagle_metrics.sites_compared,
         beagle_metrics.genotypes_compared,
         beagle_metrics.r_squared,
@@ -193,7 +193,7 @@ fn test_reference_comparison_full_chr21_ref1000_target10() {
         beagle_metrics.phase_total
     );
     println!(
-        "REAGLE: sites={} genotypes={} r2={:?} iqs={:?} hellinger={:?} switch={:?} ({}/{}) phase_conc={:?} ({}/{})",
+        "REAGLE: sites={} genotypes={} r2={:?} iqs={:?} hellinger={:?} SER={:?} ({}/{}) phase_conc={:?} ({}/{})",
         reagle_metrics.sites_compared,
         reagle_metrics.genotypes_compared,
         reagle_metrics.r_squared,

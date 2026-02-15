@@ -9714,29 +9714,63 @@ impl crate::pipelines::ImputationPipeline {
 
         let mut output_markers: Vec<OutputMarker> = Vec::new();
         let mut emitted_target = vec![false; target_win.n_markers()];
+        let mut chrom_rank: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (idx, name) in ref_markers.chrom_names().iter().enumerate() {
+            chrom_rank.insert(normalize_chrom_local(name.as_ref()).to_string(), idx);
+        }
+        let mut target_only_linear: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut target_only_cursor: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (chrom_key, by_pos) in &target_only_by_pos {
+            let mut v: Vec<usize> = Vec::new();
+            for targets in by_pos.values() {
+                v.extend(targets.iter().copied());
+            }
+            target_only_cursor.insert(chrom_key.clone(), 0);
+            target_only_linear.insert(chrom_key.clone(), v);
+        }
+
         for ref_m in output_start..output_end {
             let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
             let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let chrom_key = normalize_chrom_local(ref_chrom);
-            if let Some(targets_by_pos) = target_only_by_pos.get(chrom_key) {
-                for targets in targets_by_pos.range(..=ref_marker.pos).map(|(_, v)| v) {
-                    for &t_idx in targets {
-                        if !emitted_target[t_idx] {
-                            emitted_target[t_idx] = true;
-                            output_markers.push(OutputMarker::Target(t_idx));
-                        }
+            let chrom_key = normalize_chrom_local(ref_chrom).to_string();
+            if let (Some(list), Some(cursor)) = (
+                target_only_linear.get(&chrom_key),
+                target_only_cursor.get_mut(&chrom_key),
+            ) {
+                while *cursor < list.len() {
+                    let t_idx = list[*cursor];
+                    let t_pos = target_win.marker(MarkerIdx::new(t_idx as u32)).pos;
+                    if t_pos > ref_marker.pos {
+                        break;
                     }
-                }
-            }
-            output_markers.push(OutputMarker::Ref(ref_m));
-        }
-        for targets_by_pos in target_only_by_pos.values() {
-            for targets in targets_by_pos.values() {
-                for &t_idx in targets {
                     if !emitted_target[t_idx] {
                         emitted_target[t_idx] = true;
                         output_markers.push(OutputMarker::Target(t_idx));
                     }
+                    *cursor += 1;
+                }
+            }
+            output_markers.push(OutputMarker::Ref(ref_m));
+        }
+
+        let mut chrom_keys: Vec<String> = target_only_linear.keys().cloned().collect();
+        chrom_keys.sort_by(|a, b| {
+            let ra = chrom_rank.get(a).copied().unwrap_or(usize::MAX);
+            let rb = chrom_rank.get(b).copied().unwrap_or(usize::MAX);
+            ra.cmp(&rb).then_with(|| a.cmp(b))
+        });
+        for chrom_key in chrom_keys {
+            let Some(list) = target_only_linear.get(&chrom_key) else {
+                continue;
+            };
+            let cursor = target_only_cursor.get(&chrom_key).copied().unwrap_or(0);
+            for &t_idx in list.iter().skip(cursor) {
+                if !emitted_target[t_idx] {
+                    emitted_target[t_idx] = true;
+                    output_markers.push(OutputMarker::Target(t_idx));
                 }
             }
         }
