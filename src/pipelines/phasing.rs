@@ -8683,13 +8683,11 @@ fn build_haploid_constrained_emit_profile(
     geno_a2: u8,
     fixed_allele: u8,
     geno_conf: f32,
-    phase_conf: f32,
     p_no_err: f32,
     p_err: f32,
 ) -> HaploidConstrainedEmitProfile {
     let missing = crate::data::storage::AlleleCode::MISSING.raw();
     let g = geno_conf.clamp(0.0, 1.0);
-    let q = phase_conf.clamp(0.0, 1.0);
     let neutral_emit = 0.5 * (p_no_err + p_err);
     let missing_emit = blend_with_genotype_conf(neutral_emit, g);
     if geno_a1 == missing || geno_a2 == missing {
@@ -8716,10 +8714,53 @@ fn build_haploid_constrained_emit_profile(
             } else {
                 geno_a1
             };
-            // Marginalize over partner orientation uncertainty:
-            // q = P(current fixed_allele assignment is correct).
-            let raw_required = q * p_no_err + (1.0 - q) * p_err;
-            let raw_opposite = q * p_err + (1.0 - q) * p_no_err;
+            // Hard Gibbs conditioning on the held-constant partner haplotype.
+            //
+            // In the Gibbs sampler we alternate: hold H_partner at its
+            // current allele, then run FFBS on H_this.  Because the
+            // partner is held constant, the constraint is deterministic:
+            //
+            //   P(emit required | state copies required) = p_no_err
+            //   P(emit opposite | state copies required) = p_err
+            //
+            // Previously this was softened by phase_conf q in [0,1]:
+            //
+            //   raw_required = q * p_no_err + (1 - q) * p_err
+            //   raw_opposite = q * p_err    + (1 - q) * p_no_err
+            //
+            // The emission ratio is:
+            //
+            //   raw_required / raw_opposite
+            //     = [q * p_no_err + (1-q) * p_err]
+            //     / [q * p_err    + (1-q) * p_no_err]
+            //
+            // At q = 0.5 (the initial value for every unphased het):
+            //
+            //   raw_required = raw_opposite = 0.5 * (p_no_err + p_err)
+            //
+            // so the ratio collapses to 1:1 — zero discriminating signal.
+            // After genotype-confidence blending with weight g:
+            //
+            //   emit = g * raw + (1-g) * 0.5
+            //
+            // when raw_required = raw_opposite = 0.5:
+            //   emit_req = g * 0.5 + (1-g) * 0.5 = 0.5
+            //   emit_opp = 0.5
+            //
+            // so the ratio stays 1:1 regardless of g.  This creates a
+            // circular dependency: q = 0.5 -> flat emission -> random
+            // phase samples -> q remains 0.5.  The sampler is trapped
+            // at the uninformative equilibrium and never converges,
+            // producing SER ~ 0.35 (coin-flip phasing).
+            //
+            // With hard conditioning the ratio is p_no_err / p_err
+            // ~ 199 (for typical error rate 0.005), giving the FFBS
+            // the full signal it needs to resolve phase from iteration 1.
+            //
+            // Label-switching identifiability is handled separately by
+            // the orientation HMM (decode_orientation_hmm), not here.
+            let raw_required = p_no_err;
+            let raw_opposite = p_err;
             return HaploidConstrainedEmitProfile {
                 all_one: false,
                 primary_allele: required,
@@ -9524,7 +9565,6 @@ fn ffbs_haploid_constrained(
     geno_a1: &[u8],
     geno_a2: &[u8],
     conf: &[f32],
-    phase_conf: &[f32],
     fixed_allele: &[u8], // Allele assigned to OTHER haplotype (u8::MAX = no constraint)
     neighbors: &[u32],   // Selected neighbor haplotype indices
     phase_ibs: &BidirectionalPhaseIbs,
@@ -9539,7 +9579,6 @@ fn ffbs_haploid_constrained(
         || n_states == 0
         || neighbors.is_empty()
         || conf.len() < n_markers
-        || phase_conf.len() < n_markers
         || geno_a1.len() < n_markers
         || geno_a2.len() < n_markers
         || fixed_allele.len() < n_markers
@@ -9566,7 +9605,6 @@ fn ffbs_haploid_constrained(
         geno_a2[0],
         fixed_allele[0],
         conf[0],
-        phase_conf[0],
         p_no_err,
         p_err,
     );
@@ -9595,7 +9633,6 @@ fn ffbs_haploid_constrained(
             geno_a2[m],
             fixed_allele[m],
             conf[m],
-            phase_conf[m],
             p_no_err,
             p_err,
         );
@@ -10615,7 +10652,6 @@ fn sample_dynamic_mcmc(
             seq1,
             seq2,
             conf,
-            phase_conf,
             &fixed_allele,
             &neighbors,
             phase_ibs,
@@ -10752,7 +10788,6 @@ fn sample_dynamic_mcmc(
             seq1,
             seq2,
             conf,
-            phase_conf,
             &fixed_allele,
             &neighbors,
             phase_ibs,
@@ -12421,7 +12456,6 @@ mod tests {
         geno_a2: u8,
         fixed_allele: u8,
         geno_conf: f32,
-        phase_conf: f32,
         p_no_err: f32,
         p_err: f32,
     ) -> f32 {
@@ -12430,7 +12464,6 @@ mod tests {
             geno_a2,
             fixed_allele,
             geno_conf,
-            phase_conf,
             p_no_err,
             p_err,
         )
@@ -12961,7 +12994,7 @@ mod tests {
         let conf = 1.0;
 
         // H2 = 0, so H1 must = 1. Reference has 1 -> high emission
-        let emit_match = emit_haploid_constrained(1, 0, 1, 0, conf, 1.0, p_no_err, p_err);
+        let emit_match = emit_haploid_constrained(1, 0, 1, 0, conf, p_no_err, p_err);
         assert!(
             emit_match > 0.9,
             "Expected high emission when ref matches required allele, got {}",
@@ -12969,7 +13002,7 @@ mod tests {
         );
 
         // H2 = 0, so H1 must = 1. Reference has 0 -> low emission
-        let emit_mismatch = emit_haploid_constrained(0, 0, 1, 0, conf, 1.0, p_no_err, p_err);
+        let emit_mismatch = emit_haploid_constrained(0, 0, 1, 0, conf, p_no_err, p_err);
         assert!(
             emit_mismatch < 0.1,
             "Expected low emission when ref doesn't match, got {}",
@@ -12977,7 +13010,7 @@ mod tests {
         );
 
         // At homozygous site (fixed_allele = u8::MAX), H1 must match genotype
-        let emit_hom = emit_haploid_constrained(0, 0, 0, u8::MAX, conf, 1.0, p_no_err, p_err);
+        let emit_hom = emit_haploid_constrained(0, 0, 0, u8::MAX, conf, p_no_err, p_err);
         assert!(
             emit_hom > 0.9,
             "Expected high emission at hom site when ref matches, got {}",
@@ -12985,7 +13018,7 @@ mod tests {
         );
 
         let emit_hom_mismatch =
-            emit_haploid_constrained(1, 0, 0, u8::MAX, conf, 1.0, p_no_err, p_err);
+            emit_haploid_constrained(1, 0, 0, u8::MAX, conf, p_no_err, p_err);
         assert!(
             emit_hom_mismatch < 0.1,
             "Expected low emission at hom when ref doesn't match, got {}",
@@ -13000,11 +13033,11 @@ mod tests {
         let p_err = 0.001;
 
         // Full confidence: emission should be ~p_no_err
-        let emit_full_conf = emit_haploid_constrained(1, 0, 1, 0, 1.0, 1.0, p_no_err, p_err);
+        let emit_full_conf = emit_haploid_constrained(1, 0, 1, 0, 1.0, p_no_err, p_err);
         assert!((emit_full_conf - p_no_err).abs() < 0.01);
 
         // Zero confidence: emission should be 0.5
-        let emit_zero_conf = emit_haploid_constrained(1, 0, 1, 0, 0.0, 1.0, p_no_err, p_err);
+        let emit_zero_conf = emit_haploid_constrained(1, 0, 1, 0, 0.0, p_no_err, p_err);
         assert!(
             (emit_zero_conf - 0.5).abs() < 0.01,
             "Expected 0.5 with zero confidence, got {}",
@@ -13012,7 +13045,7 @@ mod tests {
         );
 
         // Half confidence: emission should be blend
-        let emit_half_conf = emit_haploid_constrained(1, 0, 1, 0, 0.5, 1.0, p_no_err, p_err);
+        let emit_half_conf = emit_haploid_constrained(1, 0, 1, 0, 0.5, p_no_err, p_err);
         let expected = 0.5 * p_no_err + 0.5 * 0.5;
         assert!(
             (emit_half_conf - expected).abs() < 0.01,
@@ -13027,7 +13060,7 @@ mod tests {
         let p_no_err = 0.999;
         let p_err = 0.001;
         let conf = 1.0;
-        let emit = emit_haploid_constrained(u8::MAX, 0, 1, 0, conf, 1.0, p_no_err, p_err);
+        let emit = emit_haploid_constrained(u8::MAX, 0, 1, 0, conf, p_no_err, p_err);
         assert!(
             (emit - 0.5).abs() < 1e-6,
             "Missing reference allele should be neutral, got {}",
@@ -13041,9 +13074,9 @@ mod tests {
         let p_err = 0.001;
         let conf = 1.0;
         // fixed_allele=2 is inconsistent with genotype {0,1}, so either allele should match.
-        let emit_ref0 = emit_haploid_constrained(0, 0, 1, 2, conf, 1.0, p_no_err, p_err);
-        let emit_ref1 = emit_haploid_constrained(1, 0, 1, 2, conf, 1.0, p_no_err, p_err);
-        let emit_ref2 = emit_haploid_constrained(2, 0, 1, 2, conf, 1.0, p_no_err, p_err);
+        let emit_ref0 = emit_haploid_constrained(0, 0, 1, 2, conf, p_no_err, p_err);
+        let emit_ref1 = emit_haploid_constrained(1, 0, 1, 2, conf, p_no_err, p_err);
+        let emit_ref2 = emit_haploid_constrained(2, 0, 1, 2, conf, p_no_err, p_err);
         assert!(
             emit_ref0 > 0.9,
             "Expected relaxed-match for ref=0, got {}",
@@ -13058,34 +13091,6 @@ mod tests {
             emit_ref2 < 0.1,
             "Expected mismatch for ref=2, got {}",
             emit_ref2
-        );
-    }
-
-    #[test]
-    fn test_emit_haploid_constrained_marginalizes_phase_orientation() {
-        let p_no_err = 0.999f32;
-        let p_err = 0.001f32;
-        let geno_conf = 1.0f32;
-
-        // For genotype 0/1 with fixed partner allele 0:
-        // - phase_conf=0.5 should make ref=0 and ref=1 equally likely.
-        let emit_ref1_half = emit_haploid_constrained(1, 0, 1, 0, geno_conf, 0.5, p_no_err, p_err);
-        let emit_ref0_half = emit_haploid_constrained(0, 0, 1, 0, geno_conf, 0.5, p_no_err, p_err);
-        assert!(
-            (emit_ref1_half - emit_ref0_half).abs() < 1e-6,
-            "Expected equal emissions at phase_conf=0.5, got ref1={} ref0={}",
-            emit_ref1_half,
-            emit_ref0_half
-        );
-
-        // As phase confidence increases, required allele should become preferred.
-        let emit_ref1_high = emit_haploid_constrained(1, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
-        let emit_ref0_high = emit_haploid_constrained(0, 0, 1, 0, geno_conf, 0.9, p_no_err, p_err);
-        assert!(
-            emit_ref1_high > emit_ref0_high,
-            "Expected required allele preferred at high phase confidence, got ref1={} ref0={}",
-            emit_ref1_high,
-            emit_ref0_high
         );
     }
 
