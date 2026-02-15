@@ -8,8 +8,6 @@
 //! - Reference panel (N samples from HGDP+1KG)
 //! - Target samples (M samples held out)
 //! - Sparse target (target filtered to GSA sites)
-pub mod reference_metrics;
-
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

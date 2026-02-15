@@ -5,6 +5,7 @@ use reagle::data::haplotype::SampleIdx;
 use reagle::data::marker::MarkerIdx;
 use reagle::io::vcf::VcfReader;
 use reagle::pipelines::phasing::PhasingPipeline;
+use reagle::io::streaming::GlobalMarkerIdx;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
@@ -667,7 +668,7 @@ fn test_symmetric_evidence_phase_confidence_low() {
 
     let gen_maps = GeneticMaps::new();
     let (phased, _) = pipeline
-        .phase_in_memory_with_overlap(&target_gt, &gen_maps, None, None)
+        .phase_in_memory_with_overlap(&target_gt, &gen_maps, None, GlobalMarkerIdx(0), None)
         .expect("phase_in_memory_with_overlap");
 
     assert!(
@@ -791,7 +792,7 @@ fn test_phase_confidence_brier_score_noisy_input() {
 
         let gen_maps = GeneticMaps::new();
         let (phased, _) = pipeline
-            .phase_in_memory_with_overlap(&target_gt, &gen_maps, None, None)
+            .phase_in_memory_with_overlap(&target_gt, &gen_maps, None, GlobalMarkerIdx(0), None)
             .expect("phase_in_memory_with_overlap");
 
         let hap1 = SampleIdx::new(0).hap1();
