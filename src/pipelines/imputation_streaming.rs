@@ -1136,7 +1136,7 @@ fn distribute_scores_to_planning_bins(
         }
         for &(hap, score) in per_io_scores {
             let v = score * scale;
-            if v.is_finite() && v > 0.0 {
+            if v.is_finite() {
                 planning_scores[p].push((hap, v));
             }
         }
@@ -1150,7 +1150,7 @@ fn aggregate_window_sparse_scores(window_scores: &mut [Vec<(usize, f32)>]) {
         }
         let mut acc: HashMap<usize, f32> = HashMap::with_capacity(ws.len() * 2);
         for &(hap, score) in ws.iter() {
-            if score.is_finite() && score > 0.0 {
+            if score.is_finite() {
                 acc.entry(hap).and_modify(|s| *s += score).or_insert(score);
             }
         }
@@ -1169,7 +1169,7 @@ fn build_sparse_scores(
 
     for (w, list) in window_scores.iter().enumerate() {
         for &(hap, score) in list.iter() {
-            if score <= 0.0 || !score.is_finite() {
+            if !score.is_finite() {
                 continue;
             }
             // BitSlice::get returns Option<BitRef>, deref to bool
@@ -1300,7 +1300,7 @@ fn select_top_k_adaptive_with_support(
         BinaryHeap::with_capacity(upper_k.saturating_add(1));
     let mut support = 0usize;
     for (idx, &score) in scores.iter().enumerate() {
-        if !score.is_finite() || score <= 0.0 {
+        if !score.is_finite() {
             continue;
         }
         support = support.saturating_add(1);
@@ -1334,7 +1334,7 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
-    select_top_k_heap(scores, k, true)
+    select_top_k_heap(scores, k, false)
 }
 
 fn select_top_k_allow_zero(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
@@ -1517,9 +1517,6 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
                 continue;
             }
             let weight = prescan_match_weight(freq, min_freq);
-            if weight <= 0.0 {
-                continue;
-            }
             let bins = ref_bins.get(targ_idx);
             let Some(bins) = bins else { continue };
             for &i in rows {
@@ -1715,9 +1712,6 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
                 pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
@@ -1801,9 +1795,6 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
                 pbwt_bwd.select_donors_into(&beams_bwd[i], k_per_hap, &mut donors_buf);
                 for &d in donors_buf.iter() {
                     let idx = d as usize;
@@ -3265,16 +3256,16 @@ fn build_imputation_plan(
                 let mut abyss_count = 0usize;
                 for h in 0..n_ref_haps {
                     let score = best_window_scores[i][h];
-                    if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
+                    if window_rank_hits[i][h] == 0 || !score.is_finite() {
                         abyss.set(h, true);
                         abyss_count += 1;
                     }
                 }
                 if abyss_count == n_ref_haps {
-                    return Err(ReagleError::vcf(format!(
-                        "Abyss prescan masked all reference haplotypes for target hap {} (batch_idx={}, n_ref_haps={})",
-                        hap_idx, i, n_ref_haps
-                    )));
+                    // Fallback: if all reference haplotypes are masked (e.g. no aligned markers),
+                    // unmask everything to allow the pipeline to proceed (e.g. for genotyped pass-through).
+                    abyss.fill(false);
+                    abyss_count = 0;
                 }
                 let window_scores_matrix = &scores_by_window[i];
                 if window_scores_matrix.len() != planning_handoff.len() {
@@ -9947,9 +9938,6 @@ mod tests {
                     continue;
                 }
                 let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
-                    continue;
-                }
                 let bins = ref_bins.get(targ as usize);
                 let Some(bins) = bins else { continue };
                 for &rh in bins {
