@@ -472,10 +472,7 @@ fn overlap_start_from_hazard(output_start: usize, output_end: usize, p_recomb: &
 }
 
 #[inline]
-fn compute_abyss_rank_cutoff(
-    n_ref_haps: usize,
-    window_top_k: usize,
-) -> usize {
+fn compute_abyss_rank_cutoff(n_ref_haps: usize, window_top_k: usize) -> usize {
     if n_ref_haps == 0 {
         return 1;
     }
@@ -1303,11 +1300,16 @@ fn adaptive_top_m_window_from_support(
 }
 
 #[inline]
-fn adaptive_top_m_upper_bound(base_top_m: usize, per_window_cap_window: usize, n_ref_haps: usize) -> usize {
+fn adaptive_top_m_upper_bound(
+    base_top_m: usize,
+    per_window_cap_window: usize,
+    n_ref_haps: usize,
+) -> usize {
     if base_top_m == 0 {
         return per_window_cap_window.max(1).min(n_ref_haps.max(1));
     }
-    let boosted = base_top_m.saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM) / PRESCAN_TOPM_WEAK_MULT_DEN;
+    let boosted =
+        base_top_m.saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM) / PRESCAN_TOPM_WEAK_MULT_DEN;
     boosted
         .max(per_window_cap_window.max(1))
         .min(n_ref_haps.max(1))
@@ -1348,7 +1350,8 @@ fn select_top_k_adaptive_with_support(
             heap.push(Reverse(candidate));
         }
     }
-    let top_m = adaptive_top_m_window_from_support(support, base_top_m, per_window_cap_window, n_ref_haps);
+    let top_m =
+        adaptive_top_m_window_from_support(support, base_top_m, per_window_cap_window, n_ref_haps);
     let mut ranked: Vec<(usize, f32)> = heap
         .into_iter()
         .map(|Reverse(r)| (r.idx, r.score))
@@ -2959,10 +2962,8 @@ fn build_imputation_plan(
                         }
                     }
 
-                    let abyss_rank_cutoff = compute_abyss_rank_cutoff(
-                        n_ref_haps,
-                        window_top_k.max(1),
-                    );
+                    let abyss_rank_cutoff =
+                        compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
@@ -3196,10 +3197,8 @@ fn build_imputation_plan(
                         }
                     }
 
-                    let abyss_rank_cutoff = compute_abyss_rank_cutoff(
-                        n_ref_haps,
-                        window_top_k.max(1),
-                    );
+                    let abyss_rank_cutoff =
+                        compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
@@ -8561,7 +8560,9 @@ impl crate::pipelines::ImputationPipeline {
                 );
             }
             if let Some((p1, p2)) = item.priors {
-                let base = sample_idx_from_usize(sample_idx).hap(HapSide::H1).as_usize();
+                let base = sample_idx_from_usize(sample_idx)
+                    .hap(HapSide::H1)
+                    .as_usize();
                 if base + 1 < next_priors_id_vec.len() {
                     next_priors_id_vec[base] = p1.clone();
                     next_priors_id_vec[base + 1] = p2.clone();
@@ -10220,14 +10221,8 @@ mod tests {
 
     #[test]
     fn test_compose_boundary_message_id_swap_symmetry() {
-        let p1 = HaplotypePriors::new(
-            vec![GlobalHapId(1), GlobalHapId(3)],
-            vec![0.75, 0.25],
-        );
-        let p2 = HaplotypePriors::new(
-            vec![GlobalHapId(2), GlobalHapId(3)],
-            vec![0.60, 0.40],
-        );
+        let p1 = HaplotypePriors::new(vec![GlobalHapId(1), GlobalHapId(3)], vec![0.75, 0.25]);
+        let p2 = HaplotypePriors::new(vec![GlobalHapId(2), GlobalHapId(3)], vec![0.60, 0.40]);
         let m12 = compose_boundary_message(&p1, &p2, 0.3);
         let m21 = compose_boundary_message(&p2, &p1, 0.7);
         assert_eq!(m12.ids(), m21.ids());

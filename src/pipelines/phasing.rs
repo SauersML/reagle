@@ -761,11 +761,7 @@ fn conservative_orientation_consensus(p_fwd: f32, p_bwd: f32) -> f32 {
     let df = (pf - 0.5).abs();
     let db = (pb - 0.5).abs();
     let d = df.min(db);
-    if fwd_swap {
-        0.5 + d
-    } else {
-        0.5 - d
-    }
+    if fwd_swap { 0.5 + d } else { 0.5 - d }
 }
 
 fn build_sparse_scores(
@@ -6033,18 +6029,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 "[stage1 mode] dynamic_mcmc=true n_hi_freq={} samples={}",
                 n_hi_freq, n_samples
             );
-            let phase_ibs = if let (Some(ref_gt), Some(alignment)) =
-                (&self.reference_gt, &self.alignment)
-            {
-                Some(self.build_bidirectional_pbwt_subset_with_ref(
-                    ref_geno,
-                    ref_gt.as_ref(),
-                    alignment,
-                    hi_freq_to_orig,
-                ))
-            } else {
-                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
-            };
+            let phase_ibs =
+                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                    Some(self.build_bidirectional_pbwt_subset_with_ref(
+                        ref_geno,
+                        ref_gt.as_ref(),
+                        alignment,
+                        hi_freq_to_orig,
+                    ))
+                } else {
+                    Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
+                };
 
             // Collect typed phase decisions per sample. Orientation updates are explicit.
             let prior_paths = &mcmc_paths[..];
@@ -7100,6 +7095,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         // Result container for next window's state probs
         // We will collect this from parallel iteration.
         // It needs to be ordered by haplotype.
+        #[derive(Default, Clone, Copy)]
+        struct Stage2SingletonTelemetry {
+            singleton_private_sites: usize,
+            singleton_span_tie: usize,
+            singleton_pref_disagree_with_bridge: usize,
+        }
 
         // Return type from parallel map
         type PhaseResult = (
@@ -7108,6 +7109,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
             Option<[HaplotypePriors; 2]>,
             Option<GlobalMarkerIdx>,
             Option<f64>,
+            Stage2SingletonTelemetry,
         );
 
         let n_samples = n_haps / 2;
@@ -7189,6 +7191,17 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         geno: ref_geno,
                         subset: hi_freq_markers,
                     }
+                };
+            let stage2_span_pbwt =
+                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
+                    self.build_bidirectional_pbwt_subset_with_ref(
+                        ref_geno,
+                        ref_gt.as_ref(),
+                        alignment,
+                        hi_freq_markers,
+                    )
+                } else {
+                    self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_markers, n_haps)
                 };
 
             let get_allele_global = |marker: usize, hap: usize| -> u8 {
@@ -7520,6 +7533,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
 
                     let mut decisions: Vec<Stage2Decision> = Vec::new();
                     let mut phase_evidence: Vec<PhaseEvidence> = Vec::new();
+                    let mut singleton_telemetry = Stage2SingletonTelemetry::default();
 
                     // Inline helper macro for imputing a single allele
                     // Matches Java Stage2Baum.imputeAllele()
@@ -7867,21 +7881,41 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         // Private/singleton-like sites are weakly identifiable under
                         // pure copying. Apply a low-confidence coalescent heuristic:
                         // place the non-reference allele on the haplotype with weaker
-                        // local panel match (less copied from panel backbone).
+                        // local panel match (shorter PBWT scaffold span to panel).
                         let singleton_private = is_rare_marker
                             && carriers.is_empty()
                             && ((a1 == 0 && a2 > 0) || (a2 == 0 && a1 > 0));
                         if singleton_private {
-                            let match1 = top_bridge_haplotype(&bridge_probs1)
-                                .map(|(_, p, _)| p)
-                                .unwrap_or(0.5);
-                            let match2 = top_bridge_haplotype(&bridge_probs2)
-                                .map(|(_, p, _)| p)
-                                .unwrap_or(0.5);
+                            singleton_telemetry.singleton_private_sites += 1;
+                            let h1_idx = SampleIdx::from(s).hap(HapSide::H1).as_usize() as u32;
+                            let h2_idx = SampleIdx::from(s).hap(HapSide::H2).as_usize() as u32;
+                            let span1_a = stage2_span_pbwt.best_match_span(h1_idx, mkr_a);
+                            let span2_a = stage2_span_pbwt.best_match_span(h2_idx, mkr_a);
+                            let span1_b = stage2_span_pbwt.best_match_span(h1_idx, mkr_b);
+                            let span2_b = stage2_span_pbwt.best_match_span(h2_idx, mkr_b);
+                            let span1 = span1_a.max(span1_b);
+                            let span2 = span2_a.max(span2_b);
+                            if span1 == span2 {
+                                singleton_telemetry.singleton_span_tie += 1;
+                            }
                             let alt_on_h1 = a1 > 0 && a2 == 0;
-                            let prefer_h1 = match1 <= match2;
+                            let prefer_h1 = span1 <= span2;
+                            let bridge_prefer_h1 = top_bridge_haplotype(&bridge_probs1)
+                                .map(|(_, p1, _)| p1)
+                                .unwrap_or(0.5)
+                                <= top_bridge_haplotype(&bridge_probs2)
+                                    .map(|(_, p2, _)| p2)
+                                    .unwrap_or(0.5);
+                            if prefer_h1 != bridge_prefer_h1 {
+                                singleton_telemetry.singleton_pref_disagree_with_bridge += 1;
+                            }
                             let support_same = if alt_on_h1 { prefer_h1 } else { !prefer_h1 };
-                            let bias = (0.02 + 0.10 * (match1 - match2).abs()).clamp(0.02, 0.12);
+                            let span_delta = if span1 + span2 > 0 {
+                                (span1 as f32 - span2 as f32).abs() / (span1 + span2) as f32
+                            } else {
+                                0.0
+                            };
+                            let bias = (0.02 + 0.10 * span_delta).clamp(0.02, 0.12);
                             if support_same {
                                 log_same += bias;
                             } else {
@@ -7914,6 +7948,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         next_hap_priors,
                         next_prior_global_marker,
                         next_prior_gen_pos,
+                        singleton_telemetry,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -7931,14 +7966,23 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         let mut total_switches = 0;
         let mut total_phased = 0;
         let mut total_imputed = 0;
+        let mut total_singleton_private_sites = 0usize;
+        let mut total_singleton_span_tie = 0usize;
+        let mut total_singleton_pref_disagree_with_bridge = 0usize;
 
         // Stage 2 runs after all iterations, so lr_threshold is typically 1.0.
         // We still require decisive orientation for anchor-free samples.
         let lr_threshold = self.params.lr_threshold;
 
-        for (s, (decisions, _, next_hap_priors, prior_marker, prior_gen_pos)) in
-            phase_results.into_iter().enumerate()
+        for (
+            s,
+            (decisions, _, next_hap_priors, prior_marker, prior_gen_pos, singleton_telemetry),
+        ) in phase_results.into_iter().enumerate()
         {
+            total_singleton_private_sites += singleton_telemetry.singleton_private_sites;
+            total_singleton_span_tie += singleton_telemetry.singleton_span_tie;
+            total_singleton_pref_disagree_with_bridge +=
+                singleton_telemetry.singleton_pref_disagree_with_bridge;
             if let Some(all) = all_next_hap_priors.as_mut() {
                 if let Some(priors_pair) = next_hap_priors {
                     all.push(priors_pair[0].clone());
@@ -8002,6 +8046,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
         eprintln!(
             "Stage 2: Applied {} phase switches, {} markers phased, {} markers imputed (scaffold bridge)",
             total_switches, total_phased, total_imputed
+        );
+        eprintln!(
+            "Stage 2 singleton/private telemetry: sites={} span_ties={} span_vs_bridge_pref_disagree={}",
+            total_singleton_private_sites,
+            total_singleton_span_tie,
+            total_singleton_pref_disagree_with_bridge
         );
 
         let next_state_probs = None;
@@ -10003,8 +10053,12 @@ fn sample_dynamic_mcmc(
         phase_conf[center_init],
         recipient_stability,
     );
-    let mut initial_neighbors =
-        phase_ibs.find_neighbors(recipient_h1.hap_idx(), center_init, ibs2, initial_state_target);
+    let mut initial_neighbors = phase_ibs.find_neighbors(
+        recipient_h1.hap_idx(),
+        center_init,
+        ibs2,
+        initial_state_target,
+    );
     if !initial_neighbors.is_empty() {
         let mut filtered = Vec::with_capacity(initial_neighbors.len());
         for &h in &initial_neighbors {
@@ -13026,8 +13080,7 @@ mod tests {
             emit_hom
         );
 
-        let emit_hom_mismatch =
-            emit_haploid_constrained(1, 0, 0, u8::MAX, conf, p_no_err, p_err);
+        let emit_hom_mismatch = emit_haploid_constrained(1, 0, 0, u8::MAX, conf, p_no_err, p_err);
         assert!(
             emit_hom_mismatch < 0.1,
             "Expected low emission at hom when ref doesn't match, got {}",
@@ -13046,9 +13099,7 @@ mod tests {
         let geno_conf = 1.0;
 
         // Genotype {0, 1}, partner holds allele 0 => required = 1, opposite = 0.
-        let profile = build_haploid_constrained_emit_profile(
-            0, 1, 0, geno_conf, p_no_err, p_err,
-        );
+        let profile = build_haploid_constrained_emit_profile(0, 1, 0, geno_conf, p_no_err, p_err);
 
         let emit_required = profile.emit(1); // reference carries required allele
         let emit_opposite = profile.emit(0); // reference carries opposite allele

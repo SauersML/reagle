@@ -78,7 +78,12 @@ fn get_remote_sample_list(source_url: &str) -> Vec<String> {
 }
 
 /// Stream a region from remote HGDP+1KG BCF with sample subset
-fn stream_region_from_remote(samples_file: &Path, region: &str, source_url: &str, output_vcf: &Path) {
+fn stream_region_from_remote(
+    samples_file: &Path,
+    region: &str,
+    source_url: &str,
+    output_vcf: &Path,
+) {
     eprintln!(
         "Streaming region {} from remote HGDP+1KG to {:?}...",
         region, output_vcf

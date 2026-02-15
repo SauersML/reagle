@@ -6,8 +6,8 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::{env, fs};
 use std::time::Instant;
+use std::{env, fs};
 
 use reagle::{Config, ImputationPipeline};
 use serial_test::serial;
@@ -38,7 +38,12 @@ fn count_records(vcf_gz: &Path) -> usize {
         .count()
 }
 
-fn run_beagle_imputation(beagle_jar: &Path, ref_vcf: &Path, target_vcf: &Path, out_prefix: &Path) -> f64 {
+fn run_beagle_imputation(
+    beagle_jar: &Path,
+    ref_vcf: &Path,
+    target_vcf: &Path,
+    out_prefix: &Path,
+) -> f64 {
     let start = Instant::now();
     let status = Command::new("java")
         .arg("-Xmx16g")
@@ -150,15 +155,27 @@ fn test_reference_comparison_full_chr21_ref1000_target10() {
     let beagle_out = work_dir.path().join("beagle_out");
     let reagle_out = work_dir.path().join("reagle_out");
 
-    let beagle_runtime_sec =
-        run_beagle_imputation(&beagle_jar, &data.ref_vcf, &data.target_sparse_vcf, &beagle_out);
+    let beagle_runtime_sec = run_beagle_imputation(
+        &beagle_jar,
+        &data.ref_vcf,
+        &data.target_sparse_vcf,
+        &beagle_out,
+    );
     let reagle_runtime_sec =
         run_reagle_imputation(&data.ref_vcf, &data.target_sparse_vcf, &reagle_out);
 
     let beagle_vcf = beagle_out.with_extension("vcf.gz");
     let reagle_vcf = reagle_out.with_extension("vcf.gz");
-    assert!(beagle_vcf.exists(), "Missing BEAGLE output {}", beagle_vcf.display());
-    assert!(reagle_vcf.exists(), "Missing Reagle output {}", reagle_vcf.display());
+    assert!(
+        beagle_vcf.exists(),
+        "Missing BEAGLE output {}",
+        beagle_vcf.display()
+    );
+    assert!(
+        reagle_vcf.exists(),
+        "Missing Reagle output {}",
+        reagle_vcf.display()
+    );
 
     let beagle_n = count_records(&beagle_vcf);
     let reagle_n = count_records(&reagle_vcf);

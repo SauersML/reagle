@@ -19,7 +19,14 @@ pub struct FastMetrics {
     pub phase_total: usize,
 }
 
-fn running_r2(n: f64, sum_t: f64, sum_i: f64, sum_tt: f64, sum_ii: f64, sum_ti: f64) -> Option<f64> {
+fn running_r2(
+    n: f64,
+    sum_t: f64,
+    sum_i: f64,
+    sum_tt: f64,
+    sum_ii: f64,
+    sum_ti: f64,
+) -> Option<f64> {
     if n <= 1.0 {
         return None;
     }
@@ -91,7 +98,8 @@ fn format_field_idx(format_col: &str, needle: &str) -> Option<usize> {
 }
 
 fn sample_field<'a>(sample_col: &'a str, idx: Option<usize>) -> &'a str {
-    idx.and_then(|i| sample_col.split(':').nth(i)).unwrap_or(".")
+    idx.and_then(|i| sample_col.split(':').nth(i))
+        .unwrap_or(".")
 }
 
 fn parse_gp_probs(raw: &str) -> Option<[f64; 3]> {
@@ -371,6 +379,9 @@ mod tests {
         assert_eq!(t_class, 1);
         assert_eq!(i_class_a, 1);
         assert_eq!(i_class_b, 1);
-        assert_eq!(usize::from(i_class_a == t_class), usize::from(i_class_b == t_class));
+        assert_eq!(
+            usize::from(i_class_a == t_class),
+            usize::from(i_class_b == t_class)
+        );
     }
 }

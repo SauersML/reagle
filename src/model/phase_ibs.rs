@@ -548,19 +548,13 @@ where
             while result.len() < n_candidates && u > 0 {
                 u -= 1;
                 let h = ppa[u].to_u32();
-                if h != hap_idx
-                    && h / 2 != sample.0
-                    && ref_start.map_or(true, |start| h >= start)
-                {
+                if h != hap_idx && h / 2 != sample.0 && ref_start.map_or(true, |start| h >= start) {
                     result.push(h);
                 }
             }
             while result.len() < n_candidates && v < self.n_haps {
                 let h = ppa[v].to_u32();
-                if h != hap_idx
-                    && h / 2 != sample.0
-                    && ref_start.map_or(true, |start| h >= start)
-                {
+                if h != hap_idx && h / 2 != sample.0 && ref_start.map_or(true, |start| h >= start) {
                     result.push(h);
                 }
                 v += 1;
@@ -638,19 +632,13 @@ where
             while result.len() < n_candidates && u > 0 {
                 u -= 1;
                 let h = ppa[u].to_u32();
-                if h != hap_idx
-                    && h / 2 != sample.0
-                    && ref_start.map_or(true, |start| h >= start)
-                {
+                if h != hap_idx && h / 2 != sample.0 && ref_start.map_or(true, |start| h >= start) {
                     result.push(h);
                 }
             }
             while result.len() < n_candidates && v < self.n_haps {
                 let h = ppa[v].to_u32();
-                if h != hap_idx
-                    && h / 2 != sample.0
-                    && ref_start.map_or(true, |start| h >= start)
-                {
+                if h != hap_idx && h / 2 != sample.0 && ref_start.map_or(true, |start| h >= start) {
                     result.push(h);
                 }
                 v += 1;
@@ -717,10 +705,7 @@ where
         let exclude_sample = sample_idx != u32::MAX;
         let (hap1, hap2) = if exclude_sample {
             let sample = SampleIdx::new(sample_idx);
-            (
-                sample.hap(HapSide::H1).0,
-                sample.hap(HapSide::H2).0,
-            )
+            (sample.hap(HapSide::H1).0, sample.hap(HapSide::H2).0)
         } else {
             (0, 0)
         };

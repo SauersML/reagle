@@ -57,3 +57,6 @@ chr22.fa.gz
 # Temporary probe/imputation cache artifacts
 .tmp/ensemble_probe/
 .tmp/imputation_quality_artifacts/cache/
+
+# Local benchmark output
+chr21_fast_metrics.tsv

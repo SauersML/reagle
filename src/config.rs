@@ -598,13 +598,19 @@ impl Config {
                 "state_mix_prior_boost_core_max_frac",
                 self.state_mix_prior_boost_core_max_frac,
             ),
-            ("state_mix_prior_floor_frac", self.state_mix_prior_floor_frac),
+            (
+                "state_mix_prior_floor_frac",
+                self.state_mix_prior_floor_frac,
+            ),
             (
                 "state_mix_weak_signal_threshold",
                 self.state_mix_weak_signal_threshold,
             ),
             ("state_mix_weak_prior_frac", self.state_mix_weak_prior_frac),
-            ("state_mix_weak_window_frac", self.state_mix_weak_window_frac),
+            (
+                "state_mix_weak_window_frac",
+                self.state_mix_weak_window_frac,
+            ),
             ("state_mix_weak_donor_frac", self.state_mix_weak_donor_frac),
             ("state_mix_weak_core_frac", self.state_mix_weak_core_frac),
         ];

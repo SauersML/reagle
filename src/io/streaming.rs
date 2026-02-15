@@ -70,17 +70,7 @@ pub struct GlobalHapId(pub u32);
 
 /// Marker index relative to a window start (`0..window_len`).
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    Default,
-    Serialize,
-    Deserialize,
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize,
 )]
 pub struct WindowLocalMarkerIdx(pub usize);
 
@@ -123,17 +113,7 @@ impl WindowLocalMarkerIdx {
 /// This is distinct from window-local marker indices (`0..window_len`) and
 /// prevents accidental local/global index mixing across window boundaries.
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    Default,
-    Serialize,
-    Deserialize,
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize,
 )]
 pub struct GlobalMarkerIdx(pub usize);
 
@@ -334,10 +314,7 @@ impl PhasedOverlap {
     }
 
     /// Set orientation-conditioned haplotype priors for soft-information handoff.
-    pub fn set_orientation_hap_priors(
-        &mut self,
-        priors_id: Vec<HaplotypePriors>,
-    ) {
+    pub fn set_orientation_hap_priors(&mut self, priors_id: Vec<HaplotypePriors>) {
         debug_assert_eq!(priors_id.len(), self.n_haps);
         self.hap_priors_id = Some(priors_id);
     }

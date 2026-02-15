@@ -98,11 +98,7 @@ impl std::fmt::Debug for TestFiles {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        write!(
-            f,
-            "TestFiles {{ work_dir: {:?} }}",
-            data_dir
-        )
+        write!(f, "TestFiles {{ work_dir: {:?} }}", data_dir)
     }
 }
 

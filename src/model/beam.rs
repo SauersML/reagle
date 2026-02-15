@@ -1902,7 +1902,10 @@ fn posterior_path_weights(beam: &[BeamPath]) -> (Vec<f64>, f64) {
     (weights, z)
 }
 
-fn rank_donor_mass(mass_by_hap: std::collections::HashMap<usize, f64>, max_out: usize) -> Vec<(usize, f32)> {
+fn rank_donor_mass(
+    mass_by_hap: std::collections::HashMap<usize, f64>,
+    max_out: usize,
+) -> Vec<(usize, f32)> {
     if max_out == 0 {
         return Vec::new();
     }
@@ -1917,7 +1920,11 @@ fn rank_donor_mass(mass_by_hap: std::collections::HashMap<usize, f64>, max_out: 
     ranked
 }
 
-fn rank_donor_mass_dense(mass_by_hap: &[f64], touched: &[usize], max_out: usize) -> Vec<(usize, f32)> {
+fn rank_donor_mass_dense(
+    mass_by_hap: &[f64],
+    touched: &[usize],
+    max_out: usize,
+) -> Vec<(usize, f32)> {
     if max_out == 0 {
         return Vec::new();
     }
@@ -1948,7 +1955,8 @@ fn donor_posterior_mass_terminal(
     const DENSE_ACCUM_MAX_HAPS: usize = 32 * 1024;
     if n_ref_haps <= DENSE_ACCUM_MAX_HAPS {
         let mut mass_by_hap = vec![0.0f64; n_ref_haps];
-        let mut touched: Vec<usize> = Vec::with_capacity(beam.len().saturating_mul(2).min(n_ref_haps));
+        let mut touched: Vec<usize> =
+            Vec::with_capacity(beam.len().saturating_mul(2).min(n_ref_haps));
         for (p, &w) in beam.iter().zip(weights.iter()) {
             let post_half = 0.5 * (w / z);
             if p.hap1 < n_ref_haps {
@@ -2261,15 +2269,7 @@ mod tests {
         let backptrs = vec![vec![pack_backptr(0, false)], vec![pack_backptr(0, false)]];
         let segment_ptrs = vec![vec![0u32], vec![0u32]];
 
-        let ranked = donor_posterior_mass(
-            &beam,
-            &step_haps,
-            &backptrs,
-            &segment_ptrs,
-            None,
-            3,
-            3,
-        );
+        let ranked = donor_posterior_mass(&beam, &step_haps, &backptrs, &segment_ptrs, None, 3, 3);
         assert_eq!(ranked.first().map(|(h, _)| *h), Some(0));
         assert!(ranked.iter().any(|(h, _)| *h == 1));
         assert!(ranked.iter().any(|(h, _)| *h == 2));
@@ -2295,15 +2295,7 @@ mod tests {
         let backptrs = vec![vec![pack_backptr(0, false)], vec![pack_backptr(0, false)]];
         let segment_ptrs = vec![vec![0u32], vec![0u32]];
 
-        let ranked = donor_posterior_mass(
-            &beam,
-            &step_haps,
-            &backptrs,
-            &segment_ptrs,
-            None,
-            3,
-            3,
-        );
+        let ranked = donor_posterior_mass(&beam, &step_haps, &backptrs, &segment_ptrs, None, 3, 3);
         assert!(!ranked.is_empty());
         assert!(ranked.iter().any(|(h, _)| *h == 1));
         assert!(ranked.iter().any(|(h, _)| *h == 2));
