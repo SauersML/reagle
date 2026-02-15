@@ -6133,7 +6133,11 @@ impl crate::pipelines::ImputationPipeline {
             .map_err(|e| {
                 ReagleError::vcf(format!("Failed to build HMM worker thread pool: {}", e))
             })?;
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<ImputeResult>>();
+        // Bound in-flight per-sample payloads (posteriors + alt-probs) to avoid
+        // unbounded producer memory growth under Rayon skew.
+        let result_queue_cap = hmm_threads.max(1).saturating_mul(2);
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<Result<ImputeResult>>(result_queue_cap);
         hmm_pool.install(|| {
             (0..n_target_samples)
                 .into_par_iter()
