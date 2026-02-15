@@ -7053,7 +7053,7 @@ impl crate::pipelines::ImputationPipeline {
                     };
                 let compute_transition_lambda =
                     |state_haps: &[RefHapId], donors: &[(RefHapId, f32)]| -> f32 {
-                        const LAMBDA_MAX: f32 = 0.98;
+                        const LAMBDA_MAX: f32 = 0.94;
                         if state_haps.is_empty() {
                             return 0.0;
                         }
