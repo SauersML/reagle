@@ -14,7 +14,10 @@ use serial_test::serial;
 
 mod common;
 use common::{cache_dir, download_if_missing, generate_test_data};
-use common::reference_metrics::compute_fast_metrics;
+
+#[path = "common/reference_metrics.rs"]
+mod reference_metrics;
+use reference_metrics::compute_fast_metrics;
 
 const BEAGLE_JAR_URL: &str =
     "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar";
@@ -81,8 +84,8 @@ fn run_reagle_imputation(ref_vcf: &Path, target_vcf: &Path, out_prefix: &Path) -
 }
 
 fn write_metrics_artifact(
-    beagle: &common::reference_metrics::FastMetrics,
-    reagle: &common::reference_metrics::FastMetrics,
+    beagle: &reference_metrics::FastMetrics,
+    reagle: &reference_metrics::FastMetrics,
     beagle_runtime_sec: f64,
     reagle_runtime_sec: f64,
 ) {
