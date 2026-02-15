@@ -774,7 +774,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             config,
             costs: BeamCosts::from_params(params),
             packed_ref,
-            lr_threshold: params.initial_lr,
+            lr_threshold: if params.lr_threshold.is_finite() {
+                params.lr_threshold
+            } else {
+                params.initial_lr
+            },
         }
     }
 
@@ -2601,5 +2605,35 @@ mod tests {
             "mismatch cost must not be lower than match cost"
         );
         assert!(costs.p_err < 0.5);
+    }
+
+    #[test]
+    fn beam_phaser_uses_runtime_lr_threshold_when_finite() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let mut params = ModelParams::default();
+        params.initial_lr = 10_000.0;
+        params.lr_threshold = 2.5;
+        let phaser = BeamPhaser::new(&packed_ref, &params, BeamConfig::default());
+        assert!((phaser.lr_threshold - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn beam_phaser_falls_back_to_initial_lr_when_runtime_is_infinite() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let mut params = ModelParams::default();
+        params.initial_lr = 1234.0;
+        params.lr_threshold = f32::INFINITY;
+        let phaser = BeamPhaser::new(&packed_ref, &params, BeamConfig::default());
+        assert!((phaser.lr_threshold - 1234.0).abs() < 1e-6);
     }
 }
