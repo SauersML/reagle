@@ -2312,7 +2312,7 @@ fn batched_transition_forward(
     let mut a = 1.0f64;
     let mut b = 0.0f64;
     let mut touched = false;
-    for m in start..end {
+    for m in (start + 1)..end {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
             continue;
@@ -2382,7 +2382,7 @@ fn batched_transition_backward(
     let mut a = 1.0f64;
     let mut b_coeff = 0.0f64;
     let mut touched = false;
-    for m in (start..end).rev() {
+    for m in (start..=end).rev() {
         let recomb_rate = marker_recomb_rate(p_recomb, m);
         if recomb_rate <= 0.0 {
             continue;

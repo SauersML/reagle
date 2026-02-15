@@ -405,15 +405,6 @@ impl SegmentExtent {
 
     /// HMM-local index for the prior/handoff marker (last core marker).
     ///
-    /// State posteriors at this index are used to build `chained_priors` for
-    /// the next segment.  This deliberately points to the last *core* marker,
-    /// not the last halo marker, so the handoff reflects the core region's
-    /// posterior rather than the less-constrained halo tail.
-    #[inline]
-    fn handoff_hmm_idx(&self) -> usize {
-        self.core_len().saturating_sub(1)
-    }
-
     /// The boundary recombination rate for boundary mapping (at core_start).
     #[inline]
     fn boundary_recomb(&self, full_p_recomb: &[f32]) -> f32 {
@@ -652,7 +643,7 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    -(p.ln())
+    ((1.0 - p) / p).ln().max(0.0)
 }
 
 #[inline]
@@ -7218,13 +7209,20 @@ impl crate::pipelines::ImputationPipeline {
                                 let ws = ws_opt.as_mut().unwrap();
                                 let effective_error_rate =
                                     calibrated_emission_error(&seg_input_probs, error_rate);
+                                let seg_capture_idx = prior_marker_idx.and_then(|idx| {
+                                    if idx >= extent.core_start && idx < extent.extended_end {
+                                        Some(idx - extent.core_start)
+                                    } else {
+                                        None
+                                    }
+                                });
                                 run_impute_hmm(
                                     &state_haps,
                                     seg_ref_columns,
                                     &seg_input_probs,
                                     &seg_p_recomb,
                                     effective_error_rate,
-                                    Some(extent.handoff_hmm_idx()),
+                                    seg_capture_idx,
                                     seg_state_priors.as_deref(),
                                     &ref_allele_freqs,
                                     n_transition_haps,
