@@ -384,11 +384,13 @@ impl SegmentExtent {
         let mut offsets = Vec::with_capacity(hmm_len + 1);
         let mut probs = Vec::new();
         let mut observed = Vec::with_capacity(hmm_len);
+        let mut marker_errors = Vec::with_capacity(hmm_len);
         offsets.push(0);
         for m in self.core_start..self.extended_end {
             probs.extend_from_slice(input_probs.probs_for_marker(m));
             offsets.push(probs.len());
             observed.push(input_probs.is_observed_marker(m));
+            marker_errors.push(input_probs.marker_error_rate(m).unwrap_or(0.0));
         }
         let panel_priors = input_probs.panel_priors().map(|panel| {
             let mut local = Vec::with_capacity(hmm_len);
@@ -397,13 +399,17 @@ impl SegmentExtent {
             }
             std::sync::Arc::new(local)
         });
-        TargetAlleleProbs::new(
+        let mut out = TargetAlleleProbs::new(
             offsets,
             probs,
             observed,
             panel_priors,
             input_probs.min_untyped_prior_mix(),
-        )
+        );
+        if marker_errors.iter().any(|&v| v > 0.0) {
+            out.set_marker_error_rates(marker_errors);
+        }
+        out
     }
 
     /// HMM-local index for the prior/handoff marker (last core marker).
@@ -584,6 +590,41 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // maximum sharpening to avoid sparse-array collapse.
     let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
+}
+
+#[inline]
+fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_rate: f32) -> f32 {
+    let base = base_error_rate.clamp(1e-6, 0.5);
+    if !observed || probs.is_empty() {
+        return base;
+    }
+    let mut max_prob = 0.0f32;
+    let mut entropy = 0.0f32;
+    let mut n_alleles = 0usize;
+    for &p in probs {
+        if !p.is_finite() || p <= 0.0 {
+            continue;
+        }
+        n_alleles += 1;
+        if p > max_prob {
+            max_prob = p;
+        }
+        entropy -= p * p.ln();
+    }
+    if n_alleles == 0 {
+        return base;
+    }
+    let max_entropy = (n_alleles.max(2) as f32).ln();
+    let entropy_norm = if max_entropy > 0.0 {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let scaled = base * (1.6 - 1.2 * confidence);
+    let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
+    let blended = 0.7 * scaled + 0.3 * residual;
+    blended.clamp((base * 0.15).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -981,13 +1022,16 @@ struct PbwtPrescanWindowDiag {
     non_finite_gen_pos: usize,
 }
 
-fn add_typed_anchor_sampling<SpaceA, SpaceB>(
+fn add_typed_anchor_sampling_resolved(
     sampling: &mut [bool],
     gen_positions: &[f64],
-    alignment: &MarkerAlignment<SpaceA, SpaceB>,
+    typed_resolution: &[Option<TypedMarkerResolution>],
     step_cm: f64,
 ) {
-    let n = sampling.len().min(gen_positions.len());
+    let n = sampling
+        .len()
+        .min(gen_positions.len())
+        .min(typed_resolution.len());
     if n == 0 {
         return;
     }
@@ -996,10 +1040,7 @@ fn add_typed_anchor_sampling<SpaceA, SpaceB>(
     let mut anchors_per_bin: HashMap<i64, usize> = HashMap::new();
 
     for m in 0..n {
-        if !sampling[m] {
-            continue;
-        }
-        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_none() {
+        if !sampling[m] || typed_resolution[m].is_none() {
             continue;
         }
         let bin = ((gen_positions[m] - first) / step).floor() as i64;
@@ -1008,7 +1049,7 @@ fn add_typed_anchor_sampling<SpaceA, SpaceB>(
     }
 
     for m in 0..n {
-        if alignment.target_to_ref(MarkerIdx::new(m as u32)).is_none() || sampling[m] {
+        if typed_resolution[m].is_none() || sampling[m] {
             continue;
         }
         let bin = ((gen_positions[m] - first) / step).floor() as i64;
@@ -1217,66 +1258,6 @@ fn build_sparse_scores(
     (candidate_haps, scores_by_hap)
 }
 
-fn compute_target_freqs_packed<TargetSpace, RefSpace>(
-    target_gt: &GenotypeMatrix<Phased, TargetSpace>,
-    ref_columns: &[PackedRefColumn],
-    n_ref_haps: usize,
-    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
-) -> Vec<Vec<f32>> {
-    let n_markers = target_gt.n_markers();
-    let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(n_markers);
-    for m in 0..n_markers {
-        let n_alleles = target_gt
-            .markers()
-            .marker(MarkerIdx::new(m as u32))
-            .n_alleles();
-        let mut counts = vec![0u32; n_alleles.max(1)];
-        let mut total = 0u32;
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            let col = &ref_columns[ref_m.as_usize()];
-            if let Some((zeros, ones, missing)) = col.counts_biallelic() {
-                let map0 = alignment.reverse_map_allele(m, 0);
-                let map1 = alignment.reverse_map_allele(m, 1);
-                if map0 != crate::data::storage::AlleleCode::MISSING.raw() {
-                    let idx = map0 as usize;
-                    if idx < counts.len() {
-                        counts[idx] += zeros as u32;
-                    }
-                }
-                if map1 != crate::data::storage::AlleleCode::MISSING.raw() {
-                    let idx = map1 as usize;
-                    if idx < counts.len() {
-                        counts[idx] += ones as u32;
-                    }
-                }
-                total = (n_ref_haps.saturating_sub(missing)) as u32;
-            } else {
-                for rh in 0..n_ref_haps {
-                    let ref_a = col.allele(rh);
-                    let mapped = alignment.reverse_map_allele(m, ref_a);
-                    if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
-                        continue;
-                    }
-                    let idx = mapped as usize;
-                    if idx < counts.len() {
-                        counts[idx] += 1;
-                        total += 1;
-                    }
-                }
-            }
-        }
-        let mut out = vec![0.0f32; counts.len()];
-        if total > 0 {
-            let inv = 1.0 / total as f32;
-            for (i, c) in counts.into_iter().enumerate() {
-                out[i] = c as f32 * inv;
-            }
-        }
-        freqs.push(out);
-    }
-    freqs
-}
-
 #[inline]
 fn adaptive_top_m_window_from_support(
     support: usize,
@@ -1437,21 +1418,225 @@ fn should_use_exact_prescan(n_ref_haps: usize, batch_len: usize, n_markers: usiz
     ops <= EXACT_PRESCAN_MAX_OPS
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedMarkerMapKind {
+    Alignment,
+    PositionalBiallelicMatch,
+    PositionalBiallelicSwap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypedMarkerResolution {
+    target_idx: usize,
+    map_kind: TypedMarkerMapKind,
+}
+
+impl TypedMarkerResolution {
+    #[inline]
+    fn is_positional_fallback(self) -> bool {
+        !matches!(self.map_kind, TypedMarkerMapKind::Alignment)
+    }
+}
+
+fn build_target_marker_position_index<TargetSpace>(
+    target_markers: &Markers<TargetSpace>,
+) -> HashMap<String, HashMap<u32, Vec<usize>>> {
+    let mut out: HashMap<String, HashMap<u32, Vec<usize>>> = HashMap::new();
+    for t_idx in 0..target_markers.len() {
+        let marker = target_markers.marker(MarkerIdx::new(t_idx as u32));
+        let chrom = target_markers.chrom_name(marker.chrom).unwrap_or("");
+        let chrom_key = normalize_chrom_local(chrom).to_string();
+        out.entry(chrom_key)
+            .or_default()
+            .entry(marker.pos)
+            .or_default()
+            .push(t_idx);
+    }
+    out
+}
+
+fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
+    target_markers: &Markers<TargetSpace>,
+    ref_markers: &Markers<RefSpace>,
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+) -> Vec<Option<TypedMarkerResolution>> {
+    let target_pos_index = build_target_marker_position_index(target_markers);
+    let mut out = vec![None; ref_markers.len()];
+    for (ref_m, slot) in out.iter_mut().enumerate() {
+        if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
+            *slot = Some(TypedMarkerResolution {
+                target_idx: target_m.as_usize(),
+                map_kind: TypedMarkerMapKind::Alignment,
+            });
+            continue;
+        }
+
+        let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
+        if ref_marker.n_alleles() != 2 {
+            continue;
+        }
+        let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
+        let candidates = target_pos_index
+            .get(normalize_chrom_local(ref_chrom))
+            .and_then(|m| m.get(&ref_marker.pos));
+        let Some(candidates) = candidates else {
+            continue;
+        };
+        let Some(ref_alt) = ref_marker.alt_alleles.first() else {
+            continue;
+        };
+        let mut candidate: Option<TypedMarkerResolution> = None;
+        for &target_idx in candidates {
+            let target_marker = target_markers.marker(MarkerIdx::new(target_idx as u32));
+            if target_marker.n_alleles() != 2 {
+                continue;
+            }
+            let Some(target_alt) = target_marker.alt_alleles.first() else {
+                continue;
+            };
+            let same = ref_marker.ref_allele == target_marker.ref_allele && ref_alt == target_alt;
+            let swapped =
+                ref_marker.ref_allele == *target_alt && *ref_alt == target_marker.ref_allele;
+            if !same && !swapped {
+                continue;
+            }
+            let map_kind = if swapped {
+                TypedMarkerMapKind::PositionalBiallelicSwap
+            } else {
+                TypedMarkerMapKind::PositionalBiallelicMatch
+            };
+            if candidate.is_some() {
+                candidate = None;
+                break;
+            }
+            candidate = Some(TypedMarkerResolution {
+                target_idx,
+                map_kind,
+            });
+        }
+        *slot = candidate;
+    }
+    out
+}
+
+#[inline]
+fn map_target_allele_to_ref<TargetSpace, RefSpace>(
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    resolution: TypedMarkerResolution,
+    raw: u8,
+) -> Option<u8> {
+    if raw == crate::data::storage::AlleleCode::MISSING.raw() {
+        return None;
+    }
+    match resolution.map_kind {
+        TypedMarkerMapKind::Alignment => {
+            let mapping = alignment
+                .allele_mappings
+                .get(resolution.target_idx)
+                .and_then(|m| m.as_ref());
+            if let Some(mapping) = mapping {
+                if (raw as usize) < mapping.targ_to_ref.len() {
+                    let mapped = mapping.targ_to_ref[raw as usize];
+                    u8::try_from(mapped).ok()
+                } else {
+                    None
+                }
+            } else {
+                Some(raw)
+            }
+        }
+        TypedMarkerMapKind::PositionalBiallelicMatch => match raw {
+            0 | 1 => Some(raw),
+            _ => None,
+        },
+        TypedMarkerMapKind::PositionalBiallelicSwap => match raw {
+            0 => Some(1),
+            1 => Some(0),
+            _ => None,
+        },
+    }
+}
+
+#[inline]
+fn map_target_probs_to_ref<TargetSpace, RefSpace>(
+    alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    resolution: TypedMarkerResolution,
+    target_probs: &[f32],
+    n_ref_alleles: usize,
+    out: &mut Vec<f32>,
+) -> bool {
+    out.clear();
+    out.resize(n_ref_alleles.max(1), 0.0);
+    match resolution.map_kind {
+        TypedMarkerMapKind::Alignment => {
+            let mapping = alignment
+                .allele_mappings
+                .get(resolution.target_idx)
+                .and_then(|m| m.as_ref());
+            if let Some(mapping) = mapping {
+                for (t_idx, &p) in target_probs.iter().enumerate() {
+                    if t_idx >= mapping.targ_to_ref.len() || !p.is_finite() || p <= 0.0 {
+                        continue;
+                    }
+                    let mapped = mapping.targ_to_ref[t_idx];
+                    if mapped >= 0 && (mapped as usize) < out.len() {
+                        out[mapped as usize] += p;
+                    }
+                }
+            } else if target_probs.len() == out.len() {
+                out.copy_from_slice(target_probs);
+            } else {
+                return false;
+            }
+        }
+        TypedMarkerMapKind::PositionalBiallelicMatch => {
+            if out.len() != 2 || target_probs.len() < 2 {
+                return false;
+            }
+            out[0] = target_probs[0];
+            out[1] = target_probs[1];
+        }
+        TypedMarkerMapKind::PositionalBiallelicSwap => {
+            if out.len() != 2 || target_probs.len() < 2 {
+                return false;
+            }
+            out[0] = target_probs[1];
+            out[1] = target_probs[0];
+        }
+    }
+    let mut sum = 0.0f32;
+    for p in out.iter_mut() {
+        if !p.is_finite() || *p < 0.0 {
+            *p = 0.0;
+        }
+        sum += *p;
+    }
+    if sum <= 0.0 {
+        return false;
+    }
+    let inv = 1.0 / sum;
+    for p in out.iter_mut() {
+        *p *= inv;
+    }
+    true
+}
+
 fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     batch_haps: &[usize],
     target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_markers: &Markers<RefSpace>,
     ref_columns: &[PackedRefColumn],
     n_ref_haps: usize,
     alignment: &MarkerAlignment<TargetSpace, RefSpace>,
     global_scores: &mut [Vec<f32>],
     window_scores: &mut [Vec<f32>],
 ) {
-    let n_markers = target_gt.n_markers();
+    let n_markers = ref_columns.len().min(ref_markers.len());
     if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
         return;
     }
-
-    let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
+    let resolutions =
+        build_ref_typed_marker_resolutions(target_gt.markers(), ref_markers, alignment);
     let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); batch_haps.len()];
@@ -1459,21 +1644,19 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
     let mut query_rows_by_allele: Vec<Vec<usize>> = Vec::new();
     let mut pending_updates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); batch_haps.len()];
-    let mut map_lut = [crate::data::storage::AlleleCode::MISSING.raw(); 256];
-    let mut map_lut_seen = [false; 256];
 
     for m in 0..n_markers {
-        for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            query_alleles[i] =
-                target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-        }
-
-        let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) else {
+        let Some(resolution) = resolutions.get(m).copied().flatten() else {
             continue;
         };
+        let target_marker_idx = MarkerIdx::new(resolution.target_idx as u32);
+        for (i, &hap_idx) in batch_haps.iter().enumerate() {
+            let raw = target_gt.allele(target_marker_idx, HapIdx::new(hap_idx as u32));
+            query_alleles[i] = map_target_allele_to_ref(alignment, resolution, raw)
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+        }
 
-        let n_alleles = target_gt
-            .markers()
+        let n_alleles = ref_markers
             .marker(MarkerIdx::new(m as u32))
             .n_alleles()
             .max(1);
@@ -1500,30 +1683,22 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             bins.clear();
         }
 
-        let col = &ref_columns[ref_m.as_usize()];
+        let col = &ref_columns[m];
         col.fill_alleles(&mut ref_alleles);
-        map_lut_seen.fill(false);
+        let mut ref_non_missing = 0usize;
         for (rh, &ref_a) in ref_alleles.iter().enumerate() {
             if ref_a == crate::data::storage::AlleleCode::MISSING.raw() {
                 continue;
             }
-            let lut_idx = ref_a as usize;
-            let mapped = if map_lut_seen[lut_idx] {
-                map_lut[lut_idx]
-            } else {
-                let v = alignment.reverse_map_allele(m, ref_a);
-                map_lut[lut_idx] = v;
-                map_lut_seen[lut_idx] = true;
-                v
-            };
-            if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
-                continue;
-            }
-            let idx = mapped as usize;
+            ref_non_missing += 1;
+            let idx = ref_a as usize;
             if idx >= ref_bins.len() {
                 ref_bins.resize_with(idx + 1, Vec::new);
             }
             ref_bins[idx].push(rh as u32);
+        }
+        if ref_non_missing == 0 {
+            continue;
         }
 
         // Exact grouped update with deferred sparse accumulation:
@@ -1541,10 +1716,9 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             if rows.is_empty() {
                 continue;
             }
-            let freq = freqs
-                .get(m)
-                .and_then(|f| f.get(targ_idx))
-                .copied()
+            let freq = ref_bins
+                .get(targ_idx)
+                .map(|bins| bins.len() as f32 / ref_non_missing as f32)
                 .unwrap_or(0.0);
             if freq <= 0.0 {
                 continue;
@@ -1631,6 +1805,7 @@ fn assert_score_mats_close(a: &[Vec<f32>], b: &[Vec<f32>], tol: f32) {
 fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     batch_haps: &[usize],
     target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+    ref_markers: &Markers<RefSpace>,
     ref_columns: &[PackedRefColumn],
     n_ref_haps: usize,
     alignment: &MarkerAlignment<TargetSpace, RefSpace>,
@@ -1640,20 +1815,22 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     global_scores: &mut [Vec<f32>],
     window_scores: &mut [Vec<f32>],
 ) -> PbwtPrescanWindowDiag {
-    let n_markers = target_gt.n_markers();
+    let n_markers = ref_columns.len().min(ref_markers.len());
     if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
         return PbwtPrescanWindowDiag::default();
     }
+    let resolutions =
+        build_ref_typed_marker_resolutions(target_gt.markers(), ref_markers, alignment);
 
     let mut gen_positions = Vec::with_capacity(n_markers);
     for m in 0..n_markers {
-        let marker = target_gt.markers().marker(MarkerIdx::new(m as u32));
-        let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
+        let marker = ref_markers.marker(MarkerIdx::new(m as u32));
+        let chrom_name = ref_markers.chrom_name(marker.chrom).unwrap_or("");
         let gen_pos = gen_maps.gen_pos_by_name(chrom_name, marker.pos);
         gen_positions.push(gen_pos);
     }
     let mut sampling = build_sampling_points(&gen_positions, step_cm, PBWT_MIN_MARKER_STEP);
-    add_typed_anchor_sampling(&mut sampling, &gen_positions, alignment, step_cm);
+    add_typed_anchor_sampling_resolved(&mut sampling, &gen_positions, &resolutions, step_cm);
     let sampled_markers = sampling.iter().filter(|&&b| b).count();
     let mut min_gen_pos = f64::INFINITY;
     let mut max_gen_pos = f64::NEG_INFINITY;
@@ -1679,8 +1856,6 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     if !max_gen_pos.is_finite() {
         max_gen_pos = 0.0;
     }
-    let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
-
     let mut pbwt_fwd = ReferencePbwt::new(n_ref_haps);
     let mut beams_fwd: Vec<RankBeam> = (0..batch_haps.len())
         .map(|_| RankBeam::full(n_ref_haps as u32))
@@ -1688,25 +1863,28 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     let mut ref_alleles = vec![0u8; n_ref_haps];
     let mut query_alleles = vec![PbwtStrictAllele::missing(); batch_haps.len()];
     let mut donors_buf: Vec<u32> = Vec::new();
+    let mut allele_counts: Vec<u32> = Vec::new();
 
     let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
     for m in 0..n_markers {
+        let resolution = resolutions.get(m).copied().flatten();
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let qa = target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+            let qa = if let Some(resolution) = resolution {
+                let raw = target_gt.allele(
+                    MarkerIdx::new(resolution.target_idx as u32),
+                    HapIdx::new(hap_idx as u32),
+                );
+                map_target_allele_to_ref(alignment, resolution, raw)
+                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
+            } else {
+                crate::data::storage::AlleleCode::MISSING.raw()
+            };
             query_alleles[i] =
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            let col = &ref_columns[ref_m.as_usize()];
-            col.fill_alleles(&mut ref_alleles);
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_alleles[rh];
-                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-            }
-        } else {
-            ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
-        }
+        let col = &ref_columns[m];
+        col.fill_alleles(&mut ref_alleles);
 
         let mut max_allele = 1u8;
         for &a in ref_alleles.iter() {
@@ -1731,6 +1909,20 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             &mut beams_fwd,
         );
 
+        allele_counts.clear();
+        allele_counts.resize(n_alleles, 0);
+        let mut present = 0u32;
+        for &a in ref_alleles.iter() {
+            if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                continue;
+            }
+            let idx = a as usize;
+            if idx < allele_counts.len() {
+                allele_counts[idx] += 1;
+                present += 1;
+            }
+        }
+
         if sampling[m] {
             for (i, _) in batch_haps.iter().enumerate() {
                 if query_alleles[i].is_missing() {
@@ -1739,11 +1931,11 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 let targ = query_alleles[i]
                     .as_allele()
                     .expect("non-missing strict query allele should be concrete");
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
+                let freq = if present > 0 {
+                    allele_counts.get(targ as usize).copied().unwrap_or(0) as f32 / present as f32
+                } else {
+                    0.0
+                };
                 if freq <= 0.0 {
                     continue;
                 }
@@ -1778,21 +1970,23 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         .map(|_| RankBeam::full(n_ref_haps as u32))
         .collect();
     for (rev_step, m) in (0..n_markers).rev().enumerate() {
+        let resolution = resolutions.get(m).copied().flatten();
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let qa = target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
+            let qa = if let Some(resolution) = resolution {
+                let raw = target_gt.allele(
+                    MarkerIdx::new(resolution.target_idx as u32),
+                    HapIdx::new(hap_idx as u32),
+                );
+                map_target_allele_to_ref(alignment, resolution, raw)
+                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
+            } else {
+                crate::data::storage::AlleleCode::MISSING.raw()
+            };
             query_alleles[i] =
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
-        if let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) {
-            let col = &ref_columns[ref_m.as_usize()];
-            col.fill_alleles(&mut ref_alleles);
-            for rh in 0..n_ref_haps {
-                let ref_a = ref_alleles[rh];
-                ref_alleles[rh] = alignment.reverse_map_allele(m, ref_a);
-            }
-        } else {
-            ref_alleles.fill(crate::data::storage::AlleleCode::MISSING.raw());
-        }
+        let col = &ref_columns[m];
+        col.fill_alleles(&mut ref_alleles);
 
         let mut max_allele = 1u8;
         for &a in ref_alleles.iter() {
@@ -1817,6 +2011,20 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             &mut beams_bwd,
         );
 
+        allele_counts.clear();
+        allele_counts.resize(n_alleles, 0);
+        let mut present = 0u32;
+        for &a in ref_alleles.iter() {
+            if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                continue;
+            }
+            let idx = a as usize;
+            if idx < allele_counts.len() {
+                allele_counts[idx] += 1;
+                present += 1;
+            }
+        }
+
         if sampling[m] {
             for (i, _) in batch_haps.iter().enumerate() {
                 if query_alleles[i].is_missing() {
@@ -1825,11 +2033,11 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 let targ = query_alleles[i]
                     .as_allele()
                     .expect("non-missing strict query allele should be concrete");
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
-                    .unwrap_or(0.0);
+                let freq = if present > 0 {
+                    allele_counts.get(targ as usize).copied().unwrap_or(0) as f32 / present as f32
+                } else {
+                    0.0
+                };
                 if freq <= 0.0 {
                     continue;
                 }
@@ -1873,6 +2081,22 @@ fn normalize_chrom_local(name: &str) -> &str {
         &name[3..]
     } else {
         name
+    }
+}
+
+#[inline]
+fn push_needed_allele(
+    needed: &mut Vec<(u8, f32)>,
+    seen_alleles: &mut std::collections::HashSet<u8>,
+    allele_idx: usize,
+    weight: f32,
+) {
+    if allele_idx > u8::MAX as usize {
+        return;
+    }
+    let allele = allele_idx as u8;
+    if seen_alleles.insert(allele) {
+        needed.push((allele, weight.max(0.0)));
     }
 }
 
@@ -2925,6 +3149,7 @@ fn build_imputation_plan(
                         score_window_batch_exact_packed(
                             &batch_haps,
                             &phased_target,
+                            &ref_window.markers,
                             ref_columns,
                             n_ref_haps,
                             &alignment,
@@ -2936,6 +3161,7 @@ fn build_imputation_plan(
                         let diag = score_window_batch_pbwt_packed(
                             &batch_haps,
                             &phased_target,
+                            &ref_window.markers,
                             ref_columns,
                             n_ref_haps,
                             &alignment,
@@ -3160,6 +3386,7 @@ fn build_imputation_plan(
                         score_window_batch_exact_packed(
                             &batch_haps,
                             &phased_target,
+                            &ref_window.markers,
                             &ref_window.columns,
                             n_ref_haps,
                             &alignment,
@@ -3171,6 +3398,7 @@ fn build_imputation_plan(
                         let diag = score_window_batch_pbwt_packed(
                             &batch_haps,
                             &phased_target,
+                            &ref_window.markers,
                             &ref_window.columns,
                             n_ref_haps,
                             &alignment,
@@ -4224,81 +4452,29 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_pos_to_indices: std::collections::HashMap<
-                        String,
-                        std::collections::HashMap<u32, Vec<usize>>,
-                    > = std::collections::HashMap::new();
-                    for t_idx in 0..target_window.genotypes.n_markers() {
-                        let t_marker = target_window
-                            .genotypes
-                            .markers()
-                            .marker(MarkerIdx::new(t_idx as u32));
-                        let t_chrom = target_window
-                            .genotypes
-                            .markers()
-                            .chrom_name(t_marker.chrom)
-                            .unwrap_or("");
-                        let chrom_key = normalize_chrom_local(t_chrom).to_string();
-                        target_pos_to_indices
-                            .entry(chrom_key)
-                            .or_default()
-                            .entry(t_marker.pos)
-                            .or_default()
-                            .push(t_idx);
-                    }
+                    let resolved_ref_targets = build_ref_typed_marker_resolutions(
+                        target_window.genotypes.markers(),
+                        &ref_window.markers,
+                        &alignment,
+                    );
                     let mut dbg_pos_present = 0usize;
                     let mut dbg_aligned_present = 0usize;
                     let mut dbg_pos_not_aligned = 0usize;
                     let mut dbg_pos_not_aligned_sites: Vec<(String, u64)> = Vec::new();
-                    for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
+                    for (ref_m, resolved) in resolved_ref_targets.iter().copied().enumerate() {
                         let ref_marker = ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
                         let ref_chrom = ref_window
                             .markers
                             .chrom_name(ref_marker.chrom)
                             .unwrap_or("");
-                        let has_biallelic_swap_or_match =
-                            if target_idx.is_none() && ref_marker.n_alleles() == 2 {
-                                if let Some(candidates) = target_pos_to_indices
-                                    .get(normalize_chrom_local(ref_chrom))
-                                    .and_then(|m| m.get(&ref_marker.pos))
-                                {
-                                    let ref0 = ref_marker.ref_allele.to_string();
-                                    let ref1 = ref_marker
-                                        .alt_alleles
-                                        .first()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_default();
-                                    let n_matches = candidates
-                                        .iter()
-                                        .filter(|&&t_idx| {
-                                            let t_marker = target_window
-                                                .genotypes
-                                                .markers()
-                                                .marker(MarkerIdx::new(t_idx as u32));
-                                            if t_marker.n_alleles() != 2 {
-                                                return false;
-                                            }
-                                            let t0 = t_marker.ref_allele.to_string();
-                                            let t1 = t_marker
-                                                .alt_alleles
-                                                .first()
-                                                .map(|a| a.to_string())
-                                                .unwrap_or_default();
-                                            (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
-                                        })
-                                        .count();
-                                    n_matches > 0
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-                        let is_present = target_idx.is_some() || has_biallelic_swap_or_match;
+                        let is_present = resolved.is_some();
                         window_quality.set_imputed(ref_m, !is_present);
                         if is_present {
                             dbg_pos_present += 1;
-                            if target_idx.is_some() {
+                            if matches!(
+                                resolved.map(|r| r.map_kind),
+                                Some(TypedMarkerMapKind::Alignment)
+                            ) {
                                 dbg_aligned_present += 1;
                             } else {
                                 dbg_pos_not_aligned += 1;
@@ -4568,73 +4744,13 @@ impl crate::pipelines::ImputationPipeline {
                         })
                         .collect();
                     let mut window_quality = ImputationQuality::new(&n_alleles_per_marker);
-                    let mut target_pos_to_indices: std::collections::HashMap<
-                        String,
-                        std::collections::HashMap<u32, Vec<usize>>,
-                    > = std::collections::HashMap::new();
-                    for t_idx in 0..target_window.genotypes.n_markers() {
-                        let t_marker = target_window
-                            .genotypes
-                            .markers()
-                            .marker(MarkerIdx::new(t_idx as u32));
-                        let t_chrom = target_window
-                            .genotypes
-                            .markers()
-                            .chrom_name(t_marker.chrom)
-                            .unwrap_or("");
-                        let chrom_key = normalize_chrom_local(t_chrom).to_string();
-                        target_pos_to_indices
-                            .entry(chrom_key)
-                            .or_default()
-                            .entry(t_marker.pos)
-                            .or_default()
-                            .push(t_idx);
-                    }
-                    for (ref_m, target_idx) in alignment.ref_to_target.iter().enumerate() {
-                        let ref_marker = ref_window.markers.marker(MarkerIdx::new(ref_m as u32));
-                        let ref_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_marker.chrom)
-                            .unwrap_or("");
-                        let has_biallelic_swap_or_match =
-                            if target_idx.is_none() && ref_marker.n_alleles() == 2 {
-                                if let Some(candidates) = target_pos_to_indices
-                                    .get(normalize_chrom_local(ref_chrom))
-                                    .and_then(|m| m.get(&ref_marker.pos))
-                                {
-                                    let ref0 = ref_marker.ref_allele.to_string();
-                                    let ref1 = ref_marker
-                                        .alt_alleles
-                                        .first()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_default();
-                                    let n_matches = candidates
-                                        .iter()
-                                        .filter(|&&t_idx| {
-                                            let t_marker = target_window
-                                                .genotypes
-                                                .markers()
-                                                .marker(MarkerIdx::new(t_idx as u32));
-                                            if t_marker.n_alleles() != 2 {
-                                                return false;
-                                            }
-                                            let t0 = t_marker.ref_allele.to_string();
-                                            let t1 = t_marker
-                                                .alt_alleles
-                                                .first()
-                                                .map(|a| a.to_string())
-                                                .unwrap_or_default();
-                                            (ref0 == t0 && ref1 == t1) || (ref0 == t1 && ref1 == t0)
-                                        })
-                                        .count();
-                                    n_matches > 0
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-                        let is_present = target_idx.is_some() || has_biallelic_swap_or_match;
+                    let resolved_ref_targets = build_ref_typed_marker_resolutions(
+                        target_window.genotypes.markers(),
+                        &ref_window.markers,
+                        &alignment,
+                    );
+                    for (ref_m, resolved) in resolved_ref_targets.iter().enumerate() {
+                        let is_present = resolved.is_some();
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
@@ -5096,6 +5212,21 @@ impl crate::pipelines::ImputationPipeline {
         let err_rate = self.params.p_mismatch.max(err_floor).clamp(1e-6, 0.5);
         let smoothing_cluster_cm = self.config.cluster.max(1e-6);
         let overlap_start = overlap_start_from_hazard(output_start, output_end, &p_recomb);
+        let resolved_ref_targets =
+            build_ref_typed_marker_resolutions(target_win.markers(), ref_markers, alignment);
+        if should_log {
+            let positional_fallback = resolved_ref_targets
+                .iter()
+                .filter_map(|v| *v)
+                .filter(|r| r.is_positional_fallback())
+                .count();
+            if positional_fallback > 0 {
+                eprintln!(
+                    "    [alignment fallback] hmm/prescan positional_typed_markers={}",
+                    positional_fallback
+                );
+            }
+        }
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -5111,6 +5242,8 @@ impl crate::pipelines::ImputationPipeline {
             let mut probs2: Vec<f32> = Vec::new();
             let mut observed1: Vec<bool> = Vec::with_capacity(n_ref_markers);
             let mut observed2: Vec<bool> = Vec::with_capacity(n_ref_markers);
+            let mut marker_errors1: Vec<f32> = Vec::with_capacity(n_ref_markers);
+            let mut marker_errors2: Vec<f32> = Vec::with_capacity(n_ref_markers);
             // Reuse scratch buffers across markers to avoid allocator churn in the hot loop.
             let mut aligned1: Vec<f32> = Vec::new();
             let mut aligned2: Vec<f32> = Vec::new();
@@ -5143,7 +5276,7 @@ impl crate::pipelines::ImputationPipeline {
                 (max - min) <= 1e-6
             };
 
-            for (ref_m, target_m_idx) in alignment.ref_to_target.iter().enumerate() {
+            for (ref_m, resolved) in resolved_ref_targets.iter().copied().enumerate() {
                 let n_alleles = ref_markers.marker(MarkerIdx::new(ref_m as u32)).n_alleles();
                 let mut observed1_marker = false;
                 let mut observed2_marker = false;
@@ -5152,8 +5285,8 @@ impl crate::pipelines::ImputationPipeline {
                 let mut use1 = false;
                 let mut use2 = false;
 
-                if let Some(target_m_idx) = target_m_idx {
-                    let target_m = target_m_idx.as_usize();
+                if let Some(resolution) = resolved {
+                    let target_m = resolution.target_idx;
                     let conf_base = target_pl_matrix
                         .sample_confidence_f32(MarkerIdx::new(target_m as u32), sample_idx);
                     let mut conf1 = conf_base;
@@ -5175,29 +5308,10 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
-                    let (mapped1, mapped2) = if let Some(mapping) = alignment
-                        .allele_mappings
-                        .get(target_m)
-                        .and_then(|m| m.as_ref())
-                    {
-                        let mapped1 = if (allele1 as usize) < mapping.targ_to_ref.len() {
-                            let r = mapping.targ_to_ref[allele1 as usize];
-                            u8::try_from(r)
-                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
-                        } else {
-                            crate::data::storage::AlleleCode::MISSING.raw()
-                        };
-                        let mapped2 = if (allele2 as usize) < mapping.targ_to_ref.len() {
-                            let r = mapping.targ_to_ref[allele2 as usize];
-                            u8::try_from(r)
-                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
-                        } else {
-                            crate::data::storage::AlleleCode::MISSING.raw()
-                        };
-                        (mapped1, mapped2)
-                    } else {
-                        (allele1, allele2)
-                    };
+                    let mapped1 = map_target_allele_to_ref(alignment, resolution, allele1)
+                        .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                    let mapped2 = map_target_allele_to_ref(alignment, resolution, allele2)
+                        .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
 
                     let is_diploid = target_samples.is_diploid(SampleIdx::new(sample_idx as u32));
                     let has_hard = mapped1 != crate::data::storage::AlleleCode::MISSING.raw()
@@ -5237,10 +5351,6 @@ impl crate::pipelines::ImputationPipeline {
                     let pl =
                         target_pl_matrix.sample_pl(MarkerIdx::new(target_m as u32), sample_idx);
                     let has_pl = pl.map_or(false, |vals| !vals.is_empty());
-                    let mapping = alignment
-                        .allele_mappings
-                        .get(target_m)
-                        .and_then(|m| m.as_ref());
 
                     // If the input is unphased, avoid conditioning on a partner
                     // allele. Use unconditional allele probabilities from PL
@@ -5252,11 +5362,17 @@ impl crate::pipelines::ImputationPipeline {
                                 if allele_probs_uncond_from_pl(pl, None, &mut pl_probs_buf)
                                     .is_some()
                                 {
-                                    if pl_probs_buf.len() == n_alleles {
+                                    if map_target_probs_to_ref(
+                                        alignment,
+                                        resolution,
+                                        &pl_probs_buf,
+                                        n_alleles,
+                                        &mut mapped_buf,
+                                    ) {
                                         aligned1.clear();
                                         aligned2.clear();
-                                        aligned1.extend_from_slice(&pl_probs_buf);
-                                        aligned2.extend_from_slice(&pl_probs_buf);
+                                        aligned1.extend_from_slice(&mapped_buf);
+                                        aligned2.extend_from_slice(&mapped_buf);
                                         use1 = true;
                                         use2 = true;
                                     }
@@ -5330,28 +5446,15 @@ impl crate::pipelines::ImputationPipeline {
                                             }
                                             if weight_sum > 0.0 {
                                                 normalize_probs(&mut pl_probs_buf);
-                                                if let Some(mapping) = mapping {
-                                                    mapped_buf.clear();
-                                                    mapped_buf.resize(n_alleles, 0.0);
-                                                    for (t_idx, &p) in
-                                                        pl_probs_buf.iter().enumerate()
-                                                    {
-                                                        if t_idx < mapping.targ_to_ref.len() {
-                                                            let r = mapping.targ_to_ref[t_idx];
-                                                            if r >= 0 && (r as usize) < n_alleles {
-                                                                mapped_buf[r as usize] += p;
-                                                            }
-                                                        }
-                                                    }
-                                                    if normalize_probs(&mut mapped_buf) {
-                                                        out.clear();
-                                                        out.extend_from_slice(&mapped_buf);
-                                                        *used = true;
-                                                        used_conditional = true;
-                                                    }
-                                                } else if pl_probs_buf.len() == n_alleles {
+                                                if map_target_probs_to_ref(
+                                                    alignment,
+                                                    resolution,
+                                                    &pl_probs_buf,
+                                                    n_alleles,
+                                                    &mut mapped_buf,
+                                                ) {
                                                     out.clear();
-                                                    out.extend_from_slice(&pl_probs_buf);
+                                                    out.extend_from_slice(&mapped_buf);
                                                     *used = true;
                                                     used_conditional = true;
                                                 }
@@ -5366,25 +5469,15 @@ impl crate::pipelines::ImputationPipeline {
                                             )
                                             .is_some()
                                         {
-                                            if let Some(mapping) = mapping {
-                                                mapped_buf.clear();
-                                                mapped_buf.resize(n_alleles, 0.0);
-                                                for (t_idx, &p) in pl_probs_buf.iter().enumerate() {
-                                                    if t_idx < mapping.targ_to_ref.len() {
-                                                        let r = mapping.targ_to_ref[t_idx];
-                                                        if r >= 0 && (r as usize) < n_alleles {
-                                                            mapped_buf[r as usize] += p;
-                                                        }
-                                                    }
-                                                }
-                                                if normalize_probs(&mut mapped_buf) {
-                                                    out.clear();
-                                                    out.extend_from_slice(&mapped_buf);
-                                                    *used = true;
-                                                }
-                                            } else if pl_probs_buf.len() == n_alleles {
+                                            if map_target_probs_to_ref(
+                                                alignment,
+                                                resolution,
+                                                &pl_probs_buf,
+                                                n_alleles,
+                                                &mut mapped_buf,
+                                            ) {
                                                 out.clear();
-                                                out.extend_from_slice(&pl_probs_buf);
+                                                out.extend_from_slice(&mapped_buf);
                                                 *used = true;
                                             }
                                         } else if !used_conditional {
@@ -5456,27 +5549,15 @@ impl crate::pipelines::ImputationPipeline {
                                             }
                                             if weight_sum > 0.0 {
                                                 normalize_probs(&mut pl_probs_buf);
-                                                if let Some(mapping) = mapping {
-                                                    mapped_buf.clear();
-                                                    mapped_buf.resize(n_alleles, 0.0);
-                                                    for (t_idx, &p) in
-                                                        pl_probs_buf.iter().enumerate()
-                                                    {
-                                                        if t_idx < mapping.targ_to_ref.len() {
-                                                            let r = mapping.targ_to_ref[t_idx];
-                                                            if r >= 0 && (r as usize) < n_alleles {
-                                                                mapped_buf[r as usize] += p;
-                                                            }
-                                                        }
-                                                    }
-                                                    if normalize_probs(&mut mapped_buf) {
-                                                        out.clear();
-                                                        out.extend_from_slice(&mapped_buf);
-                                                        *used = true;
-                                                    }
-                                                } else if pl_probs_buf.len() == n_alleles {
+                                                if map_target_probs_to_ref(
+                                                    alignment,
+                                                    resolution,
+                                                    &pl_probs_buf,
+                                                    n_alleles,
+                                                    &mut mapped_buf,
+                                                ) {
                                                     out.clear();
-                                                    out.extend_from_slice(&pl_probs_buf);
+                                                    out.extend_from_slice(&mapped_buf);
                                                     *used = true;
                                                 }
                                             }
@@ -5597,6 +5678,16 @@ impl crate::pipelines::ImputationPipeline {
                 probs2.extend_from_slice(&aligned2);
                 observed1.push(observed1_marker);
                 observed2.push(observed2_marker);
+                marker_errors1.push(marker_emission_error_from_probs(
+                    &aligned1,
+                    observed1_marker,
+                    err_rate,
+                ));
+                marker_errors2.push(marker_emission_error_from_probs(
+                    &aligned2,
+                    observed2_marker,
+                    err_rate,
+                ));
                 offsets1.push(probs1.len());
                 offsets2.push(probs2.len());
             }
@@ -5633,12 +5724,13 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            (
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1),
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2),
-                last_info1,
-                last_info2,
-            )
+            let mut input1 =
+                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            input1.set_marker_error_rates(marker_errors1);
+            let mut input2 =
+                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            input2.set_marker_error_rates(marker_errors2);
+            (input1, input2, last_info1, last_info2)
         };
 
         let n_target_haps = n_target_samples * 2;
@@ -5720,19 +5812,15 @@ impl crate::pipelines::ImputationPipeline {
                     .marker(MarkerIdx::new(ref_m as u32))
                     .n_alleles()
                     .max(1);
-                let target_m_opt = alignment.ref_to_target.get(ref_m).and_then(|v| *v);
+                let target_m_opt = resolved_ref_targets.get(ref_m).copied().flatten();
 
                 pbwt.prepare_step(&ref_alleles, n_alleles);
                 for (haps, beams, query_alleles, query_info_weight, _, peer_idx_by_hap, scratch) in
                     batches.iter_mut()
                 {
-                    if let Some(target_m) = target_m_opt {
-                        let target_idx = target_m.as_usize();
+                    if let Some(resolution) = target_m_opt {
+                        let target_idx = resolution.target_idx;
                         let target_marker = MarkerIdx::new(target_idx as u32);
-                        let mapping = alignment
-                            .allele_mappings
-                            .get(target_idx)
-                            .and_then(|m| m.as_ref());
 
                         let mut cached_sample_idx = usize::MAX;
                         let mut cached_query_pair =
@@ -5763,24 +5851,10 @@ impl crate::pipelines::ImputationPipeline {
                                         a2 = crate::data::storage::AlleleCode::MISSING.raw();
                                     }
                                 }
-                                let map_to_ref = |a: u8| -> u8 {
-                                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
-                                        return crate::data::storage::AlleleCode::MISSING.raw();
-                                    }
-                                    if let Some(mapping) = mapping {
-                                        if (a as usize) < mapping.targ_to_ref.len() {
-                                            let r = mapping.targ_to_ref[a as usize];
-                                            if let Ok(mapped) = u8::try_from(r) {
-                                                return mapped;
-                                            }
-                                        }
-                                        crate::data::storage::AlleleCode::MISSING.raw()
-                                    } else {
-                                        a
-                                    }
-                                };
-                                let mapped1 = map_to_ref(a1);
-                                let mapped2 = map_to_ref(a2);
+                                let mapped1 = map_target_allele_to_ref(alignment, resolution, a1)
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                                let mapped2 = map_target_allele_to_ref(alignment, resolution, a2)
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                                 let is_het = mapped1
                                     != crate::data::storage::AlleleCode::MISSING.raw()
                                     && mapped2 != crate::data::storage::AlleleCode::MISSING.raw()
@@ -6656,30 +6730,120 @@ impl crate::pipelines::ImputationPipeline {
                             if probs.is_empty() {
                                 continue;
                             }
-                            let mut best_idx = 0usize;
-                            let mut best_p = f32::NEG_INFINITY;
-                            for (idx, &p) in probs.iter().enumerate() {
-                                if p.is_finite() && p > best_p {
-                                    best_p = p;
-                                    best_idx = idx;
+                            let col = &local_ref_columns[m];
+                            let mut ranked: Vec<(usize, f32)> = probs
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(idx, &p)| {
+                                    if p.is_finite() && p > 0.0 {
+                                        Some((idx, p))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if ranked.is_empty() {
+                                continue;
+                            }
+                            ranked.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.0.cmp(&b.0))
+                            });
+                            let mut needed: Vec<(u8, f32)> = Vec::new();
+                            let mut seen_alleles: std::collections::HashSet<u8> =
+                                std::collections::HashSet::new();
+
+                            if probs.len() == 2 {
+                                let p0 = probs[0].max(0.0);
+                                let p1 = probs[1].max(0.0);
+                                if p0 >= 0.2 && p1 >= 0.2 {
+                                    push_needed_allele(&mut needed, &mut seen_alleles, 0, p0);
+                                    push_needed_allele(&mut needed, &mut seen_alleles, 1, p1);
+                                } else {
+                                    let top = if p1 > p0 { 1usize } else { 0usize };
+                                    push_needed_allele(
+                                        &mut needed,
+                                        &mut seen_alleles,
+                                        top,
+                                        probs[top],
+                                    );
+                                }
+                                let alt_freq = if col.n_haplotypes() > 0 {
+                                    col.alt_count() as f32 / col.n_haplotypes() as f32
+                                } else {
+                                    0.0
+                                };
+                                let alt_supported = probs[1].max(0.0);
+                                if alt_freq <= 0.02 && alt_supported >= 0.05 {
+                                    push_needed_allele(
+                                        &mut needed,
+                                        &mut seen_alleles,
+                                        1,
+                                        alt_supported.max(0.25),
+                                    );
+                                }
+                            } else {
+                                let mut cumulative = 0.0f32;
+                                for &(allele_idx, p) in &ranked {
+                                    if p < 0.2 {
+                                        continue;
+                                    }
+                                    push_needed_allele(
+                                        &mut needed,
+                                        &mut seen_alleles,
+                                        allele_idx,
+                                        p,
+                                    );
+                                    cumulative += p;
+                                    if cumulative >= 0.9 {
+                                        break;
+                                    }
+                                }
+                                if needed.is_empty() {
+                                    let (allele_idx, p) = ranked[0];
+                                    push_needed_allele(
+                                        &mut needed,
+                                        &mut seen_alleles,
+                                        allele_idx,
+                                        p,
+                                    );
+                                    cumulative = p;
+                                }
+                                for &(allele_idx, p) in &ranked {
+                                    if cumulative >= 0.9 || needed.len() >= 3 {
+                                        break;
+                                    }
+                                    if allele_idx > u8::MAX as usize {
+                                        continue;
+                                    }
+                                    let allele = allele_idx as u8;
+                                    if seen_alleles.contains(&allele) {
+                                        continue;
+                                    }
+                                    push_needed_allele(
+                                        &mut needed,
+                                        &mut seen_alleles,
+                                        allele_idx,
+                                        p,
+                                    );
+                                    cumulative += p;
                                 }
                             }
-                            if best_p <= 0.0 || best_idx > u8::MAX as usize {
-                                continue;
+
+                            for (allele, weight) in needed {
+                                if is_represented_in_states(state_haps, col, allele) {
+                                    continue;
+                                }
+                                collect_carriers_for_allele(col, allele, k, &mut carriers_buf);
+                                if carriers_buf.is_empty() {
+                                    continue;
+                                }
+                                constraints.push(Constraint {
+                                    carriers: carriers_buf.clone(),
+                                    weight,
+                                });
                             }
-                            let allele = best_idx as u8;
-                            let col = &local_ref_columns[m];
-                            if is_represented_in_states(state_haps, col, allele) {
-                                continue;
-                            }
-                            collect_carriers_for_allele(col, allele, k, &mut carriers_buf);
-                            if carriers_buf.is_empty() {
-                                continue;
-                            }
-                            constraints.push(Constraint {
-                                carriers: carriers_buf.clone(),
-                                weight: best_p,
-                            });
                         }
 
                         if constraints.is_empty() {
@@ -7914,13 +8078,9 @@ impl crate::pipelines::ImputationPipeline {
                     scratch,
                 ) in batches.iter_mut()
                 {
-                    if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
-                        let target_idx = target_m.as_usize();
+                    if let Some(resolution) = resolved_ref_targets.get(ref_m).copied().flatten() {
+                        let target_idx = resolution.target_idx;
                         let target_marker = MarkerIdx::new(target_idx as u32);
-                        let mapping = alignment
-                            .allele_mappings
-                            .get(target_idx)
-                            .and_then(|m| m.as_ref());
 
                         let mut cached_sample_idx = usize::MAX;
                         let mut cached_query_pair =
@@ -7950,24 +8110,10 @@ impl crate::pipelines::ImputationPipeline {
                                         a2 = crate::data::storage::AlleleCode::MISSING.raw();
                                     }
                                 }
-                                let map_to_ref = |a: u8| -> u8 {
-                                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
-                                        return crate::data::storage::AlleleCode::MISSING.raw();
-                                    }
-                                    if let Some(mapping) = mapping {
-                                        if (a as usize) < mapping.targ_to_ref.len() {
-                                            let r = mapping.targ_to_ref[a as usize];
-                                            if let Ok(mapped) = u8::try_from(r) {
-                                                return mapped;
-                                            }
-                                        }
-                                        crate::data::storage::AlleleCode::MISSING.raw()
-                                    } else {
-                                        a
-                                    }
-                                };
-                                let mapped1 = map_to_ref(a1);
-                                let mapped2 = map_to_ref(a2);
+                                let mapped1 = map_target_allele_to_ref(alignment, resolution, a1)
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+                                let mapped2 = map_target_allele_to_ref(alignment, resolution, a2)
+                                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
                                 let is_het = mapped1
                                     != crate::data::storage::AlleleCode::MISSING.raw()
                                     && mapped2 != crate::data::storage::AlleleCode::MISSING.raw()
@@ -8814,167 +8960,20 @@ impl crate::pipelines::ImputationPipeline {
         let target_pl = target_pl.unwrap_or(target_win);
         let pos_fallback_used = std::sync::atomic::AtomicUsize::new(0);
         let pos_fallback_map_fail = std::sync::atomic::AtomicUsize::new(0);
-        let mut target_pos_to_indices: std::collections::HashMap<
-            String,
-            std::collections::HashMap<u32, Vec<usize>>,
-        > = std::collections::HashMap::new();
-        for t_idx in 0..target_win.n_markers() {
-            let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
-            let t_chrom = target_win
-                .markers()
-                .chrom_name(t_marker.chrom)
-                .unwrap_or("");
-            let chrom_key = normalize_chrom_local(t_chrom).to_string();
-            target_pos_to_indices
-                .entry(chrom_key)
-                .or_default()
-                .entry(t_marker.pos)
-                .or_default()
-                .push(t_idx);
-        }
-
-        let resolve_target_marker_by_alleles = |ref_marker_idx: usize| -> Option<usize> {
-            let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
-            if ref_marker.n_alleles() != 2 {
-                return None;
-            }
-            let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
-            let candidates = target_pos_to_indices
-                .get(normalize_chrom_local(ref_chrom))
-                .and_then(|m| m.get(&ref_marker.pos))?;
-
-            let ref0 = ref_marker.ref_allele.to_string();
-            let ref1 = ref_marker.alt_alleles.first()?.to_string();
-            let mut matches: Vec<usize> = Vec::new();
-            for &t_idx in candidates {
-                let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
-                if t_marker.n_alleles() != 2 {
-                    continue;
-                }
-                let t0 = t_marker.ref_allele.to_string();
-                let t1 = t_marker.alt_alleles.first().map(|a| a.to_string());
-                if let Some(t1) = t1 {
-                    let same = ref0 == t0 && ref1 == t1;
-                    let swapped = ref0 == t1 && ref1 == t0;
-                    if same || swapped {
-                        matches.push(t_idx);
-                    }
-                }
-            }
-            if matches.len() == 1 {
-                Some(matches[0])
-            } else {
-                None
-            }
-        };
-        let mut target_marker_pos_cache: Vec<Option<usize>> = vec![None; ref_markers.len()];
-        for (ref_marker_idx, slot) in target_marker_pos_cache.iter_mut().enumerate() {
-            *slot = resolve_target_marker_by_alleles(ref_marker_idx);
-        }
-        let pick_target_marker_by_alleles = |ref_marker_idx: usize| {
-            target_marker_pos_cache
-                .get(ref_marker_idx)
-                .copied()
-                .flatten()
-        };
+        let resolved_ref_targets =
+            build_ref_typed_marker_resolutions(target_win.markers(), ref_markers, alignment);
         let marker_is_imputed: Vec<bool> =
             quality.marker_stats.iter().map(|s| s.is_imputed).collect();
-
-        let map_pos_fallback_allele =
-            |ref_marker_idx: usize, target_idx: usize, raw: u8| -> Option<u8> {
-                if raw == crate::data::storage::AlleleCode::MISSING.raw() {
-                    return None;
-                }
-                let ref_marker = ref_markers.marker(MarkerIdx::new(ref_marker_idx as u32));
-                let target_marker = target_win.marker(MarkerIdx::new(target_idx as u32));
-                if ref_marker.n_alleles() != 2 || target_marker.n_alleles() != 2 {
-                    return None;
-                }
-                let ref0 = ref_marker.ref_allele.to_string();
-                let ref1 = ref_marker.alt_alleles.first()?.to_string();
-                let t0 = target_marker.ref_allele.to_string();
-                let t1 = target_marker.alt_alleles.first()?.to_string();
-                let same = ref0 == t0 && ref1 == t1;
-                let swapped = ref0 == t1 && ref1 == t0;
-                match raw {
-                    0 => {
-                        if same {
-                            Some(0)
-                        } else if swapped {
-                            Some(1)
-                        } else {
-                            None
-                        }
-                    }
-                    1 => {
-                        if same {
-                            Some(1)
-                        } else if swapped {
-                            Some(0)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            };
 
         let get_genotyped_alleles = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
             let sample = sample_idx_from_usize(sample_idx);
             let h1 = sample.hap(HapSide::H1);
             let h2 = sample.hap(HapSide::H2);
-            if let Some(target_m) = alignment.target_marker(MarkerIdx::new(marker_idx as u32)) {
-                if let Some(missing) = target_missing {
-                    let miss_a1 = missing.allele(target_m, h1);
-                    let miss_a2 = missing.allele(target_m, h2);
-                    if miss_a1 == crate::data::storage::AlleleCode::MISSING.raw()
-                        || miss_a2 == crate::data::storage::AlleleCode::MISSING.raw()
-                    {
-                        return None;
-                    }
-                }
-                let raw_a1 = target_win.allele(target_m, h1);
-                let raw_a2 = target_win.allele(target_m, h2);
-                if raw_a1 == crate::data::storage::AlleleCode::MISSING.raw()
-                    || raw_a2 == crate::data::storage::AlleleCode::MISSING.raw()
-                {
-                    return None;
-                }
-                let mapping = alignment
-                    .allele_mappings
-                    .get(target_m.as_usize())
-                    .and_then(|m| m.as_ref());
-                let map_allele = |a: u8| -> u8 {
-                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
-                        return crate::data::storage::AlleleCode::MISSING.raw();
-                    }
-                    if let Some(m) = mapping {
-                        if (a as usize) < m.targ_to_ref.len() {
-                            let r = m.targ_to_ref[a as usize];
-                            u8::try_from(r)
-                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
-                        } else {
-                            crate::data::storage::AlleleCode::MISSING.raw()
-                        }
-                    } else {
-                        a
-                    }
-                };
-                let a1 = map_allele(raw_a1);
-                let a2 = map_allele(raw_a2);
-                if a1 == crate::data::storage::AlleleCode::MISSING.raw()
-                    || a2 == crate::data::storage::AlleleCode::MISSING.raw()
-                {
-                    return None;
-                }
-                return Some((a1, a2));
+            let resolution = resolved_ref_targets.get(marker_idx).copied().flatten()?;
+            if resolution.is_positional_fallback() {
+                pos_fallback_used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-
-            // Position-only fallback for unaligned markers: preserve target hard calls
-            // when there is a unique marker at the same position.
-            let target_idx = pick_target_marker_by_alleles(marker_idx)?;
-            pos_fallback_used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let target_m = MarkerIdx::new(target_idx as u32);
+            let target_m = MarkerIdx::new(resolution.target_idx as u32);
             if let Some(missing) = target_missing {
                 let miss_a1 = missing.allele(target_m, h1);
                 let miss_a2 = missing.allele(target_m, h2);
@@ -8991,14 +8990,14 @@ impl crate::pipelines::ImputationPipeline {
             {
                 return None;
             }
-            let a1 = match map_pos_fallback_allele(marker_idx, target_idx, raw_a1) {
+            let a1 = match map_target_allele_to_ref(alignment, resolution, raw_a1) {
                 Some(v) => v,
                 None => {
                     pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
             };
-            let a2 = match map_pos_fallback_allele(marker_idx, target_idx, raw_a2) {
+            let a2 = match map_target_allele_to_ref(alignment, resolution, raw_a2) {
                 Some(v) => v,
                 None => {
                     pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9016,14 +9015,11 @@ impl crate::pipelines::ImputationPipeline {
             if ref_marker.n_alleles() != 2 {
                 return None;
             }
-
-            let aligned_target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32));
-            let target_m = if let Some(tm) = aligned_target_m {
-                tm
-            } else {
-                let target_idx = pick_target_marker_by_alleles(marker_idx)?;
-                MarkerIdx::new(target_idx as u32)
-            };
+            let resolution = resolved_ref_targets.get(marker_idx).copied().flatten()?;
+            if resolution.is_positional_fallback() {
+                pos_fallback_used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let target_m = MarkerIdx::new(resolution.target_idx as u32);
 
             if let Some(missing) = target_missing {
                 if missing.allele(target_m, h1) == crate::data::storage::AlleleCode::MISSING.raw()
@@ -9041,54 +9037,21 @@ impl crate::pipelines::ImputationPipeline {
             {
                 return None;
             }
-
-            let d = if let Some(tm) = aligned_target_m {
-                let mapping = alignment
-                    .allele_mappings
-                    .get(tm.as_usize())
-                    .and_then(|m| m.as_ref());
-                let map_allele = |a: u8| -> u8 {
-                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
-                        return crate::data::storage::AlleleCode::MISSING.raw();
-                    }
-                    if let Some(m) = mapping {
-                        if (a as usize) < m.targ_to_ref.len() {
-                            let r = m.targ_to_ref[a as usize];
-                            u8::try_from(r)
-                                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
-                        } else {
-                            crate::data::storage::AlleleCode::MISSING.raw()
-                        }
-                    } else {
-                        a
-                    }
-                };
-                let ra1 = map_allele(a1);
-                let ra2 = map_allele(a2);
-                if ra1 == crate::data::storage::AlleleCode::MISSING.raw()
-                    || ra2 == crate::data::storage::AlleleCode::MISSING.raw()
-                {
+            let ra1 = match map_target_allele_to_ref(alignment, resolution, a1) {
+                Some(v) => v,
+                None => {
+                    pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
-                ((ra1 > 0) as u8 + (ra2 > 0) as u8) as f32
-            } else {
-                let target_idx = target_m.as_usize();
-                let ra1 = match map_pos_fallback_allele(marker_idx, target_idx, a1) {
-                    Some(v) => v,
-                    None => {
-                        pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return None;
-                    }
-                };
-                let ra2 = match map_pos_fallback_allele(marker_idx, target_idx, a2) {
-                    Some(v) => v,
-                    None => {
-                        pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return None;
-                    }
-                };
-                (ra1 + ra2) as f32
             };
+            let ra2 = match map_target_allele_to_ref(alignment, resolution, a2) {
+                Some(v) => v,
+                None => {
+                    pos_fallback_map_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            };
+            let d = (ra1 + ra2) as f32;
             if samples.is_diploid(SampleIdx::new(sample_idx as u32)) {
                 Some(d)
             } else {
@@ -10048,18 +10011,19 @@ mod tests {
     fn score_window_batch_exact_packed_naive<TargetSpace, RefSpace>(
         batch_haps: &[usize],
         target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+        ref_markers: &Markers<RefSpace>,
         ref_columns: &[PackedRefColumn],
         n_ref_haps: usize,
         alignment: &MarkerAlignment<TargetSpace, RefSpace>,
         global_scores: &mut [Vec<f32>],
         window_scores: &mut [Vec<f32>],
     ) {
-        let n_markers = target_gt.n_markers();
+        let n_markers = ref_columns.len().min(ref_markers.len());
         if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
             return;
         }
-
-        let freqs = compute_target_freqs_packed(target_gt, ref_columns, n_ref_haps, alignment);
+        let resolutions =
+            build_ref_typed_marker_resolutions(target_gt.markers(), ref_markers, alignment);
         let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
         let mut query_alleles =
@@ -10067,17 +10031,19 @@ mod tests {
         let mut ref_bins: Vec<Vec<u32>> = Vec::new();
 
         for m in 0..n_markers {
-            for (i, &hap_idx) in batch_haps.iter().enumerate() {
-                query_alleles[i] =
-                    target_gt.allele(MarkerIdx::new(m as u32), HapIdx::new(hap_idx as u32));
-            }
-
-            let Some(ref_m) = alignment.target_to_ref(MarkerIdx::new(m as u32)) else {
+            let Some(resolution) = resolutions.get(m).copied().flatten() else {
                 continue;
             };
+            for (i, &hap_idx) in batch_haps.iter().enumerate() {
+                let raw = target_gt.allele(
+                    MarkerIdx::new(resolution.target_idx as u32),
+                    HapIdx::new(hap_idx as u32),
+                );
+                query_alleles[i] = map_target_allele_to_ref(alignment, resolution, raw)
+                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            }
 
-            let n_alleles = target_gt
-                .markers()
+            let n_alleles = ref_markers
                 .marker(MarkerIdx::new(m as u32))
                 .n_alleles()
                 .max(1);
@@ -10088,21 +10054,22 @@ mod tests {
                 bins.clear();
             }
 
-            let col = &ref_columns[ref_m.as_usize()];
+            let col = &ref_columns[m];
+            let mut present = 0usize;
             for rh in 0..n_ref_haps {
                 let ref_a = col.allele(rh);
                 if ref_a == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
-                let mapped = alignment.reverse_map_allele(m, ref_a);
-                if mapped == crate::data::storage::AlleleCode::MISSING.raw() {
-                    continue;
-                }
-                let idx = mapped as usize;
+                present += 1;
+                let idx = ref_a as usize;
                 if idx >= ref_bins.len() {
                     ref_bins.resize_with(idx + 1, Vec::new);
                 }
                 ref_bins[idx].push(rh as u32);
+            }
+            if present == 0 {
+                continue;
             }
 
             for (i, _) in batch_haps.iter().enumerate() {
@@ -10110,10 +10077,9 @@ mod tests {
                 if targ == crate::data::storage::AlleleCode::MISSING.raw() {
                     continue;
                 }
-                let freq = freqs
-                    .get(m)
-                    .and_then(|f| f.get(targ as usize))
-                    .copied()
+                let freq = ref_bins
+                    .get(targ as usize)
+                    .map(|bins| bins.len() as f32 / present as f32)
                     .unwrap_or(0.0);
                 if freq <= 0.0 {
                     continue;
@@ -10507,6 +10473,7 @@ mod tests {
         score_window_batch_exact_packed_naive(
             &batch_haps,
             &target_gt,
+            &ref_markers,
             &packed_cols,
             n_ref_haps,
             &alignment,
@@ -10516,6 +10483,7 @@ mod tests {
         score_window_batch_exact_packed(
             &batch_haps,
             &target_gt,
+            &ref_markers,
             &packed_cols,
             n_ref_haps,
             &alignment,
