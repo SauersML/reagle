@@ -83,10 +83,7 @@ pub struct Config {
     /// MCMC burn-in sweeps (lets the chain mix before sampling)
     pub mcmc_burnin: usize,
 
-    /// Enable SHAPEIT5-style dynamic MCMC (re-selects states each step)
-    pub dynamic_mcmc: bool,
-
-    /// Dynamic MCMC neighbor cap (K). Only used when dynamic_mcmc = true.
+    /// Dynamic MCMC neighbor cap (K).
     pub dynamic_k: usize,
 
     /// Number of MCMC steps per outer iteration (for dynamic MCMC)
@@ -170,7 +167,6 @@ struct TomlConfig {
     pub burnin: Option<usize>,
     pub iterations: Option<usize>,
     pub mcmc_burnin: Option<usize>,
-    pub dynamic_mcmc: Option<bool>,
     pub dynamic_k: Option<usize>,
     pub mcmc_steps: Option<usize>,
     pub mcmc_lr_samples: Option<usize>,
@@ -212,7 +208,6 @@ impl Default for Config {
             burnin: 6,
             iterations: 12,
             mcmc_burnin: 2,
-            dynamic_mcmc: true,
             dynamic_k: 48,
             mcmc_steps: 8,
             mcmc_lr_samples: 32,
@@ -263,9 +258,6 @@ impl Config {
         }
         if let Some(value) = cfg.mcmc_burnin {
             self.mcmc_burnin = value;
-        }
-        if let Some(value) = cfg.dynamic_mcmc {
-            self.dynamic_mcmc = value;
         }
         if let Some(value) = cfg.dynamic_k {
             self.dynamic_k = value;

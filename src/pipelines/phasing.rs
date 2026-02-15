@@ -2474,10 +2474,8 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
         // With N Gibbs steps the max achievable LR is (N+0.5)/0.5 = 2N+1.
         // Setting initial_lr just above this ensures only "perfect evidence"
         // hets lock right after burnin, with gradual relaxation thereafter.
-        if self.config.dynamic_mcmc {
-            let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
-            self.params.initial_lr = (1.2 * max_lr).max(4.0);
-        }
+        let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
+        self.params.initial_lr = (1.2 * max_lr).max(4.0);
 
         eprintln!(
             "Phasing parameters: p_mismatch={}, recomb_intensity={}, n_states={} (requested phase_states={})",
@@ -3845,10 +3843,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 }
             }
         }
-        if self.config.dynamic_mcmc {
-            let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
-            self.params.initial_lr = (1.2 * max_lr).max(4.0);
-        }
+        let max_lr = 2.0 * self.config.mcmc_steps as f32 + 1.0;
+        self.params.initial_lr = (1.2 * max_lr).max(4.0);
 
         // Initialize genotypes preserving actual allele values including missing (u8::MAX)
         let mut geno = MutableGenotypes::from_fn(n_markers, n_haps, |m, h| {
@@ -6023,44 +6019,28 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 };
 
             // 2. Build bidirectional PBWT on high-frequency markers only
-            let use_dynamic_mcmc = self.config.dynamic_mcmc;
             eprintln!(
-                "[stage1 mode] dynamic_mcmc={} n_hi_freq={} samples={}",
-                use_dynamic_mcmc, n_hi_freq, n_samples
+                "[stage1 mode] dynamic_mcmc=true n_hi_freq={} samples={}",
+                n_hi_freq, n_samples
             );
-            let phase_ibs = if use_dynamic_mcmc {
-                if let (Some(ref_gt), Some(alignment)) = (&self.reference_gt, &self.alignment) {
-                    Some(self.build_bidirectional_pbwt_subset_with_ref(
-                        ref_geno,
-                        ref_gt.as_ref(),
-                        alignment,
-                        hi_freq_to_orig,
-                    ))
-                } else {
-                    Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
-                }
+            let phase_ibs = if let (Some(ref_gt), Some(alignment)) =
+                (&self.reference_gt, &self.alignment)
+            {
+                Some(self.build_bidirectional_pbwt_subset_with_ref(
+                    ref_geno,
+                    ref_gt.as_ref(),
+                    alignment,
+                    hi_freq_to_orig,
+                ))
             } else {
-                None
+                Some(self.build_bidirectional_pbwt_subset(ref_geno, hi_freq_to_orig, n_haps))
             };
 
-            // Collect typed phase decisions per sample. Orientation updates are explicit:
-            // either relative swaps (static MCMC) or absolute hap1 alignment (dynamic MCMC).
+            // Collect typed phase decisions per sample. Orientation updates are explicit.
             let prior_paths = &mcmc_paths[..];
             let telemetry = self.telemetry.clone();
-            let block_starts: Arc<[usize]> = if use_dynamic_mcmc {
-                Arc::from([])
-            } else {
-                blocks_to_starts(stage1_blocks, n_hi_freq)
-                    .into_boxed_slice()
-                    .into()
-            };
             if let Some(bb) = telemetry.as_ref() {
-                let k = if self.config.dynamic_mcmc {
-                    self.config.dynamic_k.max(1)
-                } else {
-                    0
-                };
-                bb.set_dynamic_mcmc(self.config.dynamic_mcmc, k);
+                bb.set_dynamic_mcmc(true, self.config.dynamic_k.max(1));
                 bb.reset_dyn_neighbors();
             }
             let sample_phase_stability: Vec<f32> = sample_phases
@@ -6386,7 +6366,7 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         };
 
                         let t_mcmc_start = Instant::now();
-                        let (mut swap_bits, mut swap_lr, mut swap_probs, mut swap_probs_conf, new_paths) = if use_dynamic_mcmc {
+                        let (mut swap_bits, mut swap_lr, mut swap_probs, mut swap_probs_conf, new_paths) = {
                             let dyn_k_max = self.config.dynamic_k.max(1).min(n_states.max(1));
                             let dyn_k_min = dyn_k_max.min(PBWT_ADAPTIVE_K_FLOOR).max(1);
                             let sample_uncertainty =
@@ -6546,95 +6526,6 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 path2: new_paths.path2.into_iter().map(CombinedHapId::from).collect(),
                             };
                             (swap_bits, swap_lr, swap_probs, swap_probs_conf, Some(global_paths))
-                        } else {
-                            // Classic Beagle-style: static state space MCMC with thread-local workspace
-                            let ref_provider = if self.config.profile {
-                                info_span!("prep_allele_provider", sample = s).in_scope(|| {
-                                    RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
-                                })
-                            } else {
-                                RefAlleleProvider::new(subset_view, threaded_haps.as_ref())
-                            };
-
-                            let local_prior_raw = prior_paths[s]
-                                .as_ref()
-                                .and_then(|gp| {
-                                    global_to_local_paths(gp, threaded_haps.as_ref(), n_hi_freq)
-                                });
-                            let (anchor_h1_full, anchor_h2_full) = build_anchor_constraints(sp);
-                            let has_anchors = anchor_h1_full.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw())
-                                || anchor_h2_full.iter().any(|&a| a != crate::data::storage::AlleleCode::MISSING.raw());
-                            let local_prior = if has_anchors {
-                                None
-                            } else {
-                                local_prior_raw.as_ref()
-                            };
-                            let mut anchor_h1 = Vec::with_capacity(n_hi_freq);
-                            let mut anchor_h2 = Vec::with_capacity(n_hi_freq);
-                            for &m in hi_freq_to_orig {
-                                anchor_h1.push(anchor_h1_full[m]);
-                                anchor_h2.push(anchor_h2_full[m]);
-                            }
-
-                            let block_starts = block_starts.clone();
-                            let result = if self.config.profile {
-                                info_span!("run_mcmc_math", sample = s).in_scope(|| {
-                                    sample_swap_bits_mosaic(
-                                        n_hi_freq,
-                                        n_states,
-                                        stage1_p_recomb,
-                                        &seq1,
-                                        &seq2,
-                                        &sample_conf,
-                                        ref_provider,
-                                        Some(PlProvider {
-                                            gt: target_gt,
-                                            sample: s,
-                                            subset_to_orig: Some(hi_freq_to_orig),
-                                        }),
-                                        block_starts,
-                                        &het_positions,
-                                        local_prior,
-                                        Some(&anchor_h1),
-                                        Some(&anchor_h2),
-                                        sample_seed,
-                                        self.config.mcmc_burnin,
-                                        self.config.mcmc_lr_samples,
-                                        sample_p_no_err,
-                                        sample_p_err,
-                                        ws,
-                                    )
-                                })
-                            } else {
-                                sample_swap_bits_mosaic(
-                                    n_hi_freq,
-                                    n_states,
-                                    stage1_p_recomb,
-                                    &seq1,
-                                    &seq2,
-                                    &sample_conf,
-                                    ref_provider,
-                                    Some(PlProvider {
-                                        gt: target_gt,
-                                        sample: s,
-                                        subset_to_orig: Some(hi_freq_to_orig),
-                                    }),
-                                    block_starts,
-                                    &het_positions,
-                                    local_prior,
-                                    Some(&anchor_h1),
-                                    Some(&anchor_h2),
-                                    sample_seed,
-                                    self.config.mcmc_burnin,
-                                    self.config.mcmc_lr_samples,
-                                    sample_p_no_err,
-                                    sample_p_err,
-                                    ws,
-                                )
-                            };
-                            let global_paths =
-                                local_to_global_paths(&result.4, threaded_haps.as_ref(), n_hi_freq);
-                            (result.0, result.1, result.2, result.3, Some(global_paths))
                         };
 
                         let t_mcmc = t_mcmc_start.elapsed();
@@ -6660,81 +6551,70 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                         }
                         let swap_probs_sum: f32 = swap_probs.iter().sum();
                         assert!(swap_probs_sum.is_finite());
-                        let orientation = if use_dynamic_mcmc {
-                            if has_phase_anchors {
-                                let mut desired_hap1: Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)> =
-                                    Vec::with_capacity(het_positions.len());
-                                if let Some(paths) = new_paths.as_ref() {
-                                    for &idx in &het_positions {
-                                        let a1 = seq1[idx];
-                                        let a2 = seq2[idx];
-                                        if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
-                                            continue;
-                                        }
-                                        let h1 = paths
-                                            .path1
-                                            .get(idx)
-                                            .copied()
-                                            .map(|h| h.as_u32())
-                                            .unwrap_or(u32::MAX);
-                                        let h2 = paths
-                                            .path2
-                                            .get(idx)
-                                            .copied()
-                                            .map(|h| h.as_u32())
-                                            .unwrap_or(u32::MAX);
-                                        let desired = if h1 == u32::MAX || h2 == u32::MAX {
-                                            // Preserve current orientation if path is unavailable at this marker.
+                        let orientation = if has_phase_anchors {
+                            let mut desired_hap1: Vec<(HiFreqMarkerIdx, AbsoluteHap1Allele)> =
+                                Vec::with_capacity(het_positions.len());
+                            if let Some(paths) = new_paths.as_ref() {
+                                for &idx in &het_positions {
+                                    let a1 = seq1[idx];
+                                    let a2 = seq2[idx];
+                                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() || a2 == crate::data::storage::AlleleCode::MISSING.raw() || a1 == a2 {
+                                        continue;
+                                    }
+                                    let h1 = paths
+                                        .path1
+                                        .get(idx)
+                                        .copied()
+                                        .map(|h| h.as_u32())
+                                        .unwrap_or(u32::MAX);
+                                    let h2 = paths
+                                        .path2
+                                        .get(idx)
+                                        .copied()
+                                        .map(|h| h.as_u32())
+                                        .unwrap_or(u32::MAX);
+                                    let desired = if h1 == u32::MAX || h2 == u32::MAX {
+                                        // Preserve current orientation if path is unavailable at this marker.
+                                        a1
+                                    } else {
+                                        let marker_idx = MarkerIdx::new(idx as u32);
+                                        let haps = [HapIdx::new(h1), HapIdx::new(h2)];
+                                        let mut row =
+                                            [crate::data::storage::AlleleCode::MISSING.raw(); 2];
+                                        subset_view.fill_batch(marker_idx, &haps, &mut row);
+                                        let r1 = row[0];
+                                        let r2 = row[1];
+                                        if r1 == a1 && r2 == a2 {
+                                            a1
+                                        } else if r1 == a2 && r2 == a1 {
+                                            a2
+                                        } else if r1 == a1 || r1 == a2 {
+                                            r1
+                                        } else if r2 == a1 {
+                                            a2
+                                        } else if r2 == a2 {
                                             a1
                                         } else {
-                                            let marker_idx = MarkerIdx::new(idx as u32);
-                                            let haps = [HapIdx::new(h1), HapIdx::new(h2)];
-                                            let mut row = [crate::data::storage::AlleleCode::MISSING.raw(); 2];
-                                            subset_view.fill_batch(marker_idx, &haps, &mut row);
-                                            let r1 = row[0];
-                                            let r2 = row[1];
-                                            if r1 == a1 && r2 == a2 {
-                                                a1
-                                            } else if r1 == a2 && r2 == a1 {
-                                                a2
-                                            } else if r1 == a1 || r1 == a2 {
-                                                r1
-                                            } else if r2 == a1 {
-                                                a2
-                                            } else if r2 == a2 {
-                                                a1
-                                            } else {
-                                                a1
-                                            }
-                                        };
-                                        desired_hap1
-                                            .push((HiFreqMarkerIdx(idx), AbsoluteHap1Allele(desired)));
-                                    }
+                                            a1
+                                        }
+                                    };
+                                    desired_hap1
+                                        .push((HiFreqMarkerIdx(idx), AbsoluteHap1Allele(desired)));
                                 }
-                                Stage1OrientationUpdate::AbsoluteHap1(desired_hap1)
-                            } else {
-                                let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
-                                let lr_threshold = self.params.lr_threshold;
-                                for (map_idx, &pos) in het_positions.iter().enumerate() {
-                                    let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
-                                    let p_swap_decoded =
-                                        *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
-                                    let p_swap_raw =
-                                        *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
-                                    if lr >= lr_threshold && p_swap_raw > 0.5 {
-                                        swap_mask[pos] = RelativeSwapBit(true);
-                                    }
-                                }
-                                Stage1OrientationUpdate::RelativeSwapMask(swap_mask)
                             }
+                            Stage1OrientationUpdate::AbsoluteHap1(desired_hap1)
                         } else {
                             let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
+                            let lr_threshold = self.params.lr_threshold;
                             for (map_idx, &pos) in het_positions.iter().enumerate() {
+                                let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
                                 let p_swap_decoded =
                                     *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
                                 let p_swap_raw =
                                     *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
-                                swap_mask[pos] = RelativeSwapBit(p_swap_raw > 0.5);
+                                if lr >= lr_threshold && p_swap_raw > 0.5 {
+                                    swap_mask[pos] = RelativeSwapBit(true);
+                                }
                             }
                             Stage1OrientationUpdate::RelativeSwapMask(swap_mask)
                         };
@@ -12604,7 +12484,6 @@ mod tests {
             burnin: 3,
             iterations: 12,
             mcmc_burnin: 1,
-            dynamic_mcmc: false,
             dynamic_k: 32,
             mcmc_steps: 3,
             mcmc_lr_samples: 32,
@@ -12865,7 +12744,6 @@ mod tests {
             burnin: 2,
             iterations: 2,
             mcmc_burnin: 1,
-            dynamic_mcmc: false,
             dynamic_k: 32,
             mcmc_steps: 3,
             mcmc_lr_samples: 32,

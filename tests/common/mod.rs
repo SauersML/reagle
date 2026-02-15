@@ -8,6 +8,7 @@
 //! - Reference panel (N samples from HGDP+1KG)
 //! - Target samples (M samples held out)
 //! - Sparse target (target filtered to GSA sites)
+pub mod reference_metrics;
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// URLs for test data
-const HGDP_1KG_CHR22_URL: &str = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr22.filtered.SNV_INDEL.phased.shapeit5.bcf";
+const HGDP_1KG_BCF_URL_TEMPLATE: &str = "https://storage.googleapis.com/gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr{chrom}.filtered.SNV_INDEL.phased.shapeit5.bcf";
 const GSA_SITES_URL: &str =
     "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
 
@@ -51,11 +52,16 @@ pub fn download_if_missing(url: &str, dest: &Path) -> bool {
     }
 }
 
+fn hgdp_1kg_chrom_url(chrom: &str) -> String {
+    let chr = chrom.trim_start_matches("chr");
+    HGDP_1KG_BCF_URL_TEMPLATE.replace("{chrom}", chr)
+}
+
 /// Get sample list from remote HGDP+1KG BCF (streams header only)
-fn get_remote_sample_list() -> Vec<String> {
+fn get_remote_sample_list(source_url: &str) -> Vec<String> {
     // bcftools can read directly from URL - only fetches header for sample list
     let output = Command::new("bcftools")
-        .args(["query", "-l", HGDP_1KG_CHR22_URL])
+        .args(["query", "-l", source_url])
         .output()
         .expect("bcftools query -l from remote URL");
 
@@ -74,7 +80,7 @@ fn get_remote_sample_list() -> Vec<String> {
 }
 
 /// Stream a region from remote HGDP+1KG BCF with sample subset
-fn stream_region_from_remote(samples_file: &Path, region: &str, output_vcf: &Path) {
+fn stream_region_from_remote(samples_file: &Path, region: &str, source_url: &str, output_vcf: &Path) {
     eprintln!(
         "Streaming region {} from remote HGDP+1KG to {:?}...",
         region, output_vcf
@@ -93,7 +99,7 @@ fn stream_region_from_remote(samples_file: &Path, region: &str, output_vcf: &Pat
             "z",
             "-o",
             output_vcf.to_str().unwrap(),
-            HGDP_1KG_CHR22_URL,
+            source_url,
         ])
         .status()
         .expect("bcftools view from remote");
@@ -152,7 +158,47 @@ pub struct TestData {
     pub ref_vcf: PathBuf,
     pub target_vcf: PathBuf,
     pub target_sparse_vcf: PathBuf,
-    pub work_dir: tempfile::TempDir,
+}
+
+fn has_index(vcf: &Path) -> bool {
+    PathBuf::from(format!("{}.csi", vcf.display())).exists()
+        || PathBuf::from(format!("{}.tbi", vcf.display())).exists()
+}
+
+fn ensure_index(vcf: &Path) {
+    if has_index(vcf) {
+        return;
+    }
+    let status = Command::new("bcftools")
+        .args(["index", "-f"])
+        .arg(vcf)
+        .status()
+        .expect("Index VCF");
+    assert!(status.success(), "Failed to index {}", vcf.display());
+}
+
+fn sanitize_for_path(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn dataset_cache_dir(ref_samples: usize, target_samples: usize, region: &str) -> PathBuf {
+    let key = format!(
+        "ref{}_target{}_{}",
+        ref_samples,
+        target_samples,
+        sanitize_for_path(region)
+    );
+    let dir = cache_dir().join("generated").join(key);
+    fs::create_dir_all(&dir).expect("Create generated cache dir");
+    dir
 }
 
 /// Generate test data from HGDP+1KG panel (streams region, doesn't download full file)
@@ -161,10 +207,31 @@ pub struct TestData {
 /// - target_samples: number of samples to hold out as target
 /// - region: genomic region to extract (e.g., "chr22:16000000-17000000")
 pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &str) -> TestData {
-    let work_dir = tempfile::tempdir().expect("Create temp dir");
+    let work_dir = dataset_cache_dir(ref_samples, target_samples, region);
+    let chrom = region.split(':').next().unwrap_or("chr22");
+    let source_url = hgdp_1kg_chrom_url(chrom);
+
+    let ref_vcf = work_dir.join("ref.vcf.gz");
+    let target_vcf = work_dir.join("target.vcf.gz");
+    let target_sparse_vcf = work_dir.join("target_sparse.vcf.gz");
+
+    if ref_vcf.exists() && target_vcf.exists() && target_sparse_vcf.exists() {
+        ensure_index(&ref_vcf);
+        ensure_index(&target_vcf);
+        ensure_index(&target_sparse_vcf);
+        eprintln!(
+            "Using cached generated dataset: {}",
+            work_dir.to_string_lossy()
+        );
+        return TestData {
+            ref_vcf,
+            target_vcf,
+            target_sparse_vcf,
+        };
+    }
 
     // Get sample list from remote (only fetches header)
-    let all_samples = get_remote_sample_list();
+    let all_samples = get_remote_sample_list(&source_url);
 
     let total_needed = ref_samples + target_samples;
     if all_samples.len() < total_needed {
@@ -186,26 +253,23 @@ pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &st
         .collect();
 
     // Write sample lists
-    let ref_samples_file = work_dir.path().join("ref_samples.txt");
-    let target_samples_file = work_dir.path().join("target_samples.txt");
+    let ref_samples_file = work_dir.join("ref_samples.txt");
+    let target_samples_file = work_dir.join("target_samples.txt");
 
     fs::write(&ref_samples_file, ref_sample_list.join("\n")).expect("Write ref samples");
     fs::write(&target_samples_file, target_sample_list.join("\n")).expect("Write target samples");
 
     // Stream reference panel from remote (only downloads the region we need)
-    let ref_vcf = work_dir.path().join("ref.vcf.gz");
-    stream_region_from_remote(&ref_samples_file, region, &ref_vcf);
+    stream_region_from_remote(&ref_samples_file, region, &source_url, &ref_vcf);
 
     // Stream target from remote
-    let target_vcf = work_dir.path().join("target.vcf.gz");
-    stream_region_from_remote(&target_samples_file, region, &target_vcf);
+    stream_region_from_remote(&target_samples_file, region, &source_url, &target_vcf);
 
     // Create sparse target (filter to GSA sites)
-    let target_sparse_vcf = work_dir.path().join("target_sparse.vcf.gz");
-    let gsa_positions = load_gsa_positions("22");
+    let gsa_positions = load_gsa_positions(chrom);
 
     // Create regions file for GSA sites in this region
-    let gsa_regions_file = work_dir.path().join("gsa_regions.txt");
+    let gsa_regions_file = work_dir.join("gsa_regions.txt");
     {
         let mut f = File::create(&gsa_regions_file).expect("Create GSA regions");
         let region_parts: Vec<&str> = region.split(':').collect();
@@ -243,16 +307,13 @@ pub fn generate_test_data(ref_samples: usize, target_samples: usize, region: &st
         .expect("bcftools view sparse");
     assert!(status.success(), "Failed to create sparse target");
 
-    Command::new("bcftools")
-        .args(["index", "-f"])
-        .arg(&target_sparse_vcf)
-        .status()
-        .expect("Index sparse");
+    ensure_index(&target_sparse_vcf);
+    ensure_index(&ref_vcf);
+    ensure_index(&target_vcf);
 
     TestData {
         ref_vcf,
         target_vcf,
         target_sparse_vcf,
-        work_dir,
     }
 }

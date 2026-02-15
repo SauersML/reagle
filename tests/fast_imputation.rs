@@ -510,7 +510,6 @@ fn test_dynamic_phasing_continuity_stress() {
     config.r#ref = Some(ref_file.path().to_path_buf());
     config.out = out_prefix.clone();
 
-    config.dynamic_mcmc = true;
     config.phase_states = 20;
     config.ne = 10_000.0;
     config.burnin = 2;
@@ -2360,7 +2359,6 @@ fn test_phasing_confidence() {
         burnin: 5,
         iterations: 10,
         mcmc_burnin: 3,
-        dynamic_mcmc: false,
         dynamic_k: 32,
         mcmc_steps: 10,
         mcmc_lr_samples: 32,

@@ -1,0 +1,14 @@
+[net]
+# Use system git for dependency fetches. This is more robust on HPC nodes than libgit2.
+git-fetch-with-cli = true
+
+[resolver]
+# When no Cargo.lock is present, avoid selecting crate versions that require
+# a newer Rust than the current toolchain on this node.
+incompatible-rust-versions = "fallback"
+
+[env]
+# The user global git config rewrites https://github.com/* -> git@github.com:*,
+# which breaks on nodes without SSH agent credentials.
+# Ignore global git config for cargo-driven git fetches in this repo.
+GIT_CONFIG_GLOBAL = { value = "/dev/null", force = true }

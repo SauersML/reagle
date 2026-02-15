@@ -1,0 +1,20 @@
+# Use with:
+# python3 scripts/experiment_runner.py --commands scripts/chr21_experiments.commands --base-toml reagle.toml
+#
+# Format:
+# key=val,key2=val ::: command
+#
+# Baseline
+nthreads=4 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+
+# More state depth and MCMC stabilization
+nthreads=4,dynamic_k=64,mcmc_steps=10,mcmc_lr_samples=48 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+
+# Larger phase state set
+nthreads=4,phase_states=512,dynamic_k=64,mcmc_steps=10,mcmc_lr_samples=48 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+
+# Finer imputation stepping
+nthreads=4,imp_step=0.05,imp_nsteps=9,imp_segment=8.0 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture
+
+# Combined stronger search + finer imputation
+nthreads=4,phase_states=512,dynamic_k=64,mcmc_steps=10,mcmc_lr_samples=48,imp_step=0.05,imp_nsteps=9,imp_segment=8.0 ::: REFERENCE_METRICS_PROGRESS_EVERY=20000 cargo test --release --test reference_comparison_chr21 -- --nocapture

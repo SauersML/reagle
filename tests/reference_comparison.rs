@@ -91,11 +91,17 @@ struct TestFiles {
 
 impl std::fmt::Debug for TestFiles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Access test_data to prevent "unused field" - shows temp dir path
+        // Show generated dataset directory path.
+        let data_dir = self
+            .test_data
+            .ref_vcf
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
         write!(
             f,
             "TestFiles {{ work_dir: {:?} }}",
-            self.test_data.work_dir.path()
+            data_dir
         )
     }
 }
