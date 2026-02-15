@@ -4533,6 +4533,7 @@ impl crate::pipelines::ImputationPipeline {
                         } = window_results;
                         next_handoff = handoff;
                         next_overlap_opt = Some(self.extract_imputed_overlap_streaming(
+                            &ref_window.markers,
                             &phased_target,
                             &alignment,
                             ref_window.output_start,
@@ -4601,6 +4602,7 @@ impl crate::pipelines::ImputationPipeline {
 
                     let mut next_overlap = next_overlap_opt.unwrap_or_else(|| {
                         self.extract_imputed_overlap_streaming(
+                            &ref_window.markers,
                             &phased_target,
                             &alignment,
                             ref_window.output_start,
@@ -4784,6 +4786,7 @@ impl crate::pipelines::ImputationPipeline {
                         } = window_results;
                         next_handoff = handoff;
                         next_overlap_opt = Some(self.extract_imputed_overlap_streaming(
+                            &ref_window.markers,
                             &phased_target,
                             &alignment,
                             ref_window.output_start,
@@ -4852,6 +4855,7 @@ impl crate::pipelines::ImputationPipeline {
 
                     let mut next_overlap = next_overlap_opt.unwrap_or_else(|| {
                         self.extract_imputed_overlap_streaming(
+                            &ref_window.markers,
                             &phased_target,
                             &alignment,
                             ref_window.output_start,
@@ -8299,8 +8303,9 @@ impl crate::pipelines::ImputationPipeline {
                                allele: u8|
          -> Option<f32> { result.hap_prob(hap, local_m, allele) };
         let get_anchor_obs = |sample_idx: usize, ref_m: usize| -> Option<(u8, u8, f32)> {
-            let target_m = alignment.target_marker(MarkerIdx::new(ref_m as u32))?;
-            let target_idx = target_m.as_usize();
+            let resolution = resolved_ref_targets.get(ref_m).copied().flatten()?;
+            let target_m = MarkerIdx::new(resolution.target_idx as u32);
+            let target_idx = resolution.target_idx;
             let input_phased = phase_mask
                 .and_then(|mask| mask.get(target_idx, sample_idx))
                 .map(|v| v != 0)
@@ -8326,28 +8331,10 @@ impl crate::pipelines::ImputationPipeline {
             {
                 return None;
             }
-            let mapping = alignment
-                .allele_mappings
-                .get(target_idx)
-                .and_then(|m| m.as_ref());
-            let map_allele = |a: u8| -> u8 {
-                if a == crate::data::storage::AlleleCode::MISSING.raw() {
-                    return crate::data::storage::AlleleCode::MISSING.raw();
-                }
-                if let Some(m) = mapping {
-                    if (a as usize) < m.targ_to_ref.len() {
-                        let r = m.targ_to_ref[a as usize];
-                        if let Ok(mapped) = u8::try_from(r) {
-                            return mapped;
-                        }
-                    }
-                    crate::data::storage::AlleleCode::MISSING.raw()
-                } else {
-                    a
-                }
-            };
-            let mut a1 = map_allele(raw_a1);
-            let mut a2 = map_allele(raw_a2);
+            let mut a1 = map_target_allele_to_ref(alignment, resolution, raw_a1)
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+            let mut a2 = map_target_allele_to_ref(alignment, resolution, raw_a2)
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
             if a1 == crate::data::storage::AlleleCode::MISSING.raw()
                 || a2 == crate::data::storage::AlleleCode::MISSING.raw()
                 || a1 == a2
@@ -8784,6 +8771,7 @@ impl crate::pipelines::ImputationPipeline {
     }
     fn extract_imputed_overlap_streaming<TargetSpace, RefSpace>(
         &self,
+        ref_markers: &crate::data::marker::Markers<RefSpace>,
         target_win: &GenotypeMatrix<Phased, TargetSpace>,
         alignment: &MarkerAlignment<TargetSpace, RefSpace>,
         output_start: usize,
@@ -8814,6 +8802,8 @@ impl crate::pipelines::ImputationPipeline {
                     alt_prob_store.and_then(|store| store.get(result.sample_idx, hap, local_m))
                 })
             };
+        let resolved_ref_targets =
+            build_ref_typed_marker_resolutions(target_win.markers(), ref_markers, alignment);
         for h in 0..n_haps {
             let sample_idx = h / 2;
             let hap_idx = h % 2;
@@ -8849,7 +8839,8 @@ impl crate::pipelines::ImputationPipeline {
                         continue;
                     }
                 }
-                if let Some(target_m) = alignment.target_marker(MarkerIdx::new(ref_m as u32)) {
+                if let Some(resolution) = resolved_ref_targets.get(ref_m).copied().flatten() {
+                    let target_m = MarkerIdx::new(resolution.target_idx as u32);
                     alleles[h * overlap_size + local_m] =
                         target_win.allele(target_m, HapIdx::new(h as u32));
                 }
@@ -9139,7 +9130,8 @@ impl crate::pipelines::ImputationPipeline {
         let error_rate = self.params.p_mismatch;
         let use_hard_call_fallback = !correct_errors;
         let get_genotype_posteriors = |marker_idx: usize, sample_idx: usize| -> Option<Vec<f32>> {
-            let target_m = alignment.target_marker(MarkerIdx::new(marker_idx as u32))?;
+            let resolution = resolved_ref_targets.get(marker_idx).copied().flatten()?;
+            let target_m = MarkerIdx::new(resolution.target_idx as u32);
             // If the target genotype is missing at this marker, defer to imputation
             // posteriors instead of GL/PL-derived genotype probabilities.
             if get_genotyped_alleles(marker_idx, sample_idx).is_none() {
@@ -9156,10 +9148,6 @@ impl crate::pipelines::ImputationPipeline {
                     let n_ref_alleles = ref_markers
                         .marker(MarkerIdx::new(marker_idx as u32))
                         .n_alleles();
-                    let mapping = alignment
-                        .allele_mappings
-                        .get(target_m.as_usize())
-                        .and_then(|m| m.as_ref());
                     let mut target_gp: Vec<f32> = Vec::new();
                     let n = genotype_probs_from_pl(pl, None, &mut target_gp)?;
                     if n != n_pl_alleles {
@@ -9172,24 +9160,20 @@ impl crate::pipelines::ImputationPipeline {
                         for i in 0..=j {
                             let p = target_gp.get(idx).copied().unwrap_or(0.0);
                             idx += 1;
-                            let ri: i8 = if let Some(mapping) = mapping {
-                                mapping.targ_to_ref.get(i).copied().unwrap_or(-1)
-                            } else if i <= i8::MAX as usize {
-                                i as i8
+                            let ri = if i <= u8::MAX as usize {
+                                map_target_allele_to_ref(alignment, resolution, i as u8)
                             } else {
-                                -1
+                                None
                             };
-                            let rj: i8 = if let Some(mapping) = mapping {
-                                mapping.targ_to_ref.get(j).copied().unwrap_or(-1)
-                            } else if j <= i8::MAX as usize {
-                                j as i8
+                            let rj = if j <= u8::MAX as usize {
+                                map_target_allele_to_ref(alignment, resolution, j as u8)
                             } else {
-                                -1
+                                None
                             };
-                            if ri < 0 || rj < 0 {
-                                continue;
-                            }
-                            let (ri, rj) = (ri as usize, rj as usize);
+                            let (ri, rj) = match (ri, rj) {
+                                (Some(ri), Some(rj)) => (ri as usize, rj as usize),
+                                _ => continue,
+                            };
                             if ri >= n_ref_alleles || rj >= n_ref_alleles {
                                 continue;
                             }
@@ -10493,5 +10477,106 @@ mod tests {
 
         assert_score_mats_close(&global_a, &global_b, 1e-6);
         assert_score_mats_close(&window_a, &window_b, 1e-6);
+    }
+
+    #[test]
+    fn test_typed_marker_resolution_positional_swap_maps_alleles() {
+        let chrom = ChromIdx::new(0);
+        let mut target_markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        target_markers.add_chrom("chr1");
+        target_markers.push(Marker::new(
+            chrom,
+            10,
+            Some("t0".into()),
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        let target_gt = build_phased_matrix_from_columns(target_markers, 1, vec![vec![0, 1]], &[2]);
+
+        let mut ref_markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        ref_markers.add_chrom("chr1");
+        ref_markers.push(Marker::new(
+            chrom,
+            10,
+            Some("r0".into()),
+            Allele::Base(Nucleotide::C),
+            vec![Allele::Base(Nucleotide::A)],
+        ));
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![None],
+            target_to_ref: vec![None],
+            allele_mappings: vec![None],
+        };
+
+        let resolved =
+            build_ref_typed_marker_resolutions(target_gt.markers(), &ref_markers, &alignment);
+        let r = resolved[0].expect("expected positional fallback resolution");
+        assert_eq!(r.target_idx, 0);
+        assert_eq!(r.map_kind, TypedMarkerMapKind::PositionalBiallelicSwap);
+        assert_eq!(map_target_allele_to_ref(&alignment, r, 0), Some(1));
+        assert_eq!(map_target_allele_to_ref(&alignment, r, 1), Some(0));
+    }
+
+    #[test]
+    fn test_typed_marker_resolution_rejects_ambiguous_position_candidates() {
+        let chrom = ChromIdx::new(0);
+        let mut target_markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        target_markers.add_chrom("chr1");
+        target_markers.push(Marker::new(
+            chrom,
+            10,
+            Some("t0".into()),
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        target_markers.push(Marker::new(
+            chrom,
+            10,
+            Some("t1".into()),
+            Allele::Base(Nucleotide::A),
+            vec![Allele::Base(Nucleotide::C)],
+        ));
+        let target_gt = build_phased_matrix_from_columns(
+            target_markers,
+            1,
+            vec![vec![0, 1], vec![0, 1]],
+            &[2, 2],
+        );
+
+        let mut ref_markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        ref_markers.add_chrom("chr1");
+        ref_markers.push(Marker::new(
+            chrom,
+            10,
+            Some("r0".into()),
+            Allele::Base(Nucleotide::C),
+            vec![Allele::Base(Nucleotide::A)],
+        ));
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![None],
+            target_to_ref: vec![None; target_gt.n_markers()],
+            allele_mappings: vec![None; target_gt.n_markers()],
+        };
+
+        let resolved =
+            build_ref_typed_marker_resolutions(target_gt.markers(), &ref_markers, &alignment);
+        assert!(
+            resolved[0].is_none(),
+            "ambiguous positional candidates must not resolve"
+        );
+    }
+
+    #[test]
+    fn test_segment_build_target_probs_preserves_marker_error_rates() {
+        let offsets = vec![0usize, 2, 4];
+        let probs = vec![0.9f32, 0.1, 0.2, 0.8];
+        let observed = vec![true, true];
+        let mut input = TargetAlleleProbs::new(offsets, probs, observed, None, 0.0);
+        input.set_marker_error_rates(vec![0.01, 0.2]);
+
+        let extent = SegmentExtent::new(0, 1, 0, 1, 2);
+        let seg = extent.build_target_probs(&input);
+        assert!((seg.marker_error_rate(0).unwrap_or(0.0) - 0.01).abs() < 1e-6);
+        assert!((seg.marker_error_rate(1).unwrap_or(0.0) - 0.2).abs() < 1e-6);
     }
 }
