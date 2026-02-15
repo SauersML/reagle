@@ -1,5 +1,6 @@
 use reagle::Nucleotide;
 use reagle::config::Config;
+use reagle::io::streaming::GlobalMarkerIdx;
 use reagle::pipelines::imputation::ImputationPipeline;
 use reagle::pipelines::phasing::PhasingPipeline;
 
@@ -2524,6 +2525,7 @@ fn test_phasing_confidence() {
     // Run phasing in memory
     let result = pipeline.phase_in_memory_with_overlap(
         &target_gt, &gen_maps, None, // No overlap from previous window
+        GlobalMarkerIdx::new(0),
         None,
     );
 

@@ -267,8 +267,6 @@ const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
 const ORIENTATION_ETA_MAX: f64 = 0.05;
 const ORIENTATION_ETA_MIN: f64 = 1e-8;
 const ORIENTATION_ETA_EM_ITERS: usize = 2;
-const ORIENTATION_ETA_BETA_A: f64 = 0.002;
-const ORIENTATION_ETA_BETA_B: f64 = 9.998;
 const ORIENTATION_DECISION_MARGIN: f64 = 0.02;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
@@ -706,12 +704,7 @@ fn orientation_eta_from_expected_flips(expected_flips: f64, n_boundaries: usize)
     if n_boundaries == 0 {
         return ORIENTATION_ETA_MIN;
     }
-    let numer = ORIENTATION_ETA_BETA_A + expected_flips.max(0.0);
-    let denom = ORIENTATION_ETA_BETA_A + ORIENTATION_ETA_BETA_B + n_boundaries as f64;
-    if denom <= 0.0 {
-        return ORIENTATION_ETA_MIN;
-    }
-    (numer / denom).clamp(ORIENTATION_ETA_MIN, ORIENTATION_ETA_MAX)
+    (expected_flips.max(0.0) / n_boundaries as f64).clamp(ORIENTATION_ETA_MIN, ORIENTATION_ETA_MAX)
 }
 
 #[inline]
@@ -6134,6 +6127,11 @@ impl crate::pipelines::ImputationPipeline {
                         .unwrap_or(0.5);
                     let pri_keep = &priors_id[hap_idx];
                     let pri_swap = &priors_id[mate_idx];
+                    if (w_swap as f64 - 0.5).abs() < ORIENTATION_HANDOFF_MIN_MARGIN {
+                        // In non-identifiable orientation regions, avoid blending id/swap priors:
+                        // averaging branches collapses biological support and can induce boundary drift.
+                        return Some(std::borrow::Cow::Borrowed(pri_keep));
+                    }
                     if w_swap <= 1e-6 {
                         Some(std::borrow::Cow::Borrowed(pri_keep))
                     } else if w_swap >= 1.0 - 1e-6 {
