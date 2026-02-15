@@ -8256,7 +8256,7 @@ impl crate::pipelines::ImputationPipeline {
         };
         let mut smooth_sample_orientation = |result: &mut SampleImputationResult,
                                              capture_ref_idx: Option<usize>|
-         -> Option<(f32, f64, f64, f64, usize)> {
+         -> Option<(f32, f64, f64, f64, f64, usize)> {
             let n = output_end.saturating_sub(output_start);
             if n == 0 {
                 return None;
@@ -8497,15 +8497,28 @@ impl crate::pipelines::ImputationPipeline {
             } else {
                 0.0
             };
+            let entropy_mean = if n > 0 {
+                orientation_entropy_sum / n as f64
+            } else {
+                0.0
+            };
             let eta_min = if eta_min.is_finite() { eta_min } else { 0.0 };
             if (p1_handoff - 0.5).abs() < ORIENTATION_HANDOFF_MIN_MARGIN {
-                return Some((0.5, eta_mean, eta_min, eta_max, orientation_flip_events));
+                return Some((
+                    0.5,
+                    eta_mean,
+                    eta_min,
+                    eta_max,
+                    entropy_mean,
+                    orientation_flip_events,
+                ));
             }
             Some((
                 p1_handoff as f32,
                 eta_mean,
                 eta_min,
                 eta_max,
+                entropy_mean,
                 orientation_flip_events,
             ))
         };
@@ -8552,9 +8565,15 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
             let capture_ref_idx = item.last_info_idx.or(prior_marker_idx);
-            let (handoff_swap_prob, eta_mean, eta_min, eta_max, orientation_flip_events) =
-                smooth_sample_orientation(&mut item.result, capture_ref_idx)
-                    .unwrap_or((0.5, 0.0, 0.0, 0.0, 0));
+            let (
+                handoff_swap_prob,
+                eta_mean,
+                eta_min,
+                eta_max,
+                entropy_mean,
+                orientation_flip_events,
+            ) = smooth_sample_orientation(&mut item.result, capture_ref_idx)
+                .unwrap_or((0.5, 0.0, 0.0, 0.0, 0.0, 0));
             let (w_id, w_swap) =
                 update_orientation_boundary_weights(0.5, handoff_swap_prob.clamp(0.0, 1.0));
             orientation_eta_sum += eta_mean;
@@ -8562,9 +8581,7 @@ impl crate::pipelines::ImputationPipeline {
             orientation_eta_max = orientation_eta_max.max(eta_max);
             orientation_flip_events_total =
                 orientation_flip_events_total.saturating_add(orientation_flip_events);
-            let p0 = (w_id as f64).clamp(1e-12, 1.0);
-            let p1 = (w_swap as f64).clamp(1e-12, 1.0);
-            orientation_entropy_sum += -(p0 * p0.ln() + p1 * p1.ln());
+            orientation_entropy_sum += entropy_mean;
 
             if let Some(writer) = alt_prob_store_writer.as_ref() {
                 if let Some(values) = item.result.hap_alt_probs.0.as_ref() {
