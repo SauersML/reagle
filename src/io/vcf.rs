@@ -1397,18 +1397,7 @@ impl VcfWriter {
                     let a1 = column.get(hap1);
                     let a2 = column.get(hap2);
                     let sep = '|';
-                    write!(self.writer, "\t")?;
-                    if a1 == crate::data::storage::AlleleCode::MISSING.raw() {
-                        write!(self.writer, ".")?;
-                    } else {
-                        write!(self.writer, "{}", a1)?;
-                    }
-                    write!(self.writer, "{}", sep)?;
-                    if a2 == crate::data::storage::AlleleCode::MISSING.raw() {
-                        write!(self.writer, ".")?;
-                    } else {
-                        write!(self.writer, "{}", a2)?;
-                    }
+                    write!(self.writer, "\t{}{}{}", a1, sep, a2)?;
                 }
                 writeln!(self.writer)?;
             }
