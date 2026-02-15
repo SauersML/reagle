@@ -8754,9 +8754,17 @@ fn build_haploid_constrained_emit_profile(
             // at the uninformative equilibrium and never converges,
             // producing SER ~ 0.35 (coin-flip phasing).
             //
-            // With hard conditioning the ratio is p_no_err / p_err
-            // ~ 199 (for typical error rate 0.005), giving the FFBS
-            // the full signal it needs to resolve phase from iteration 1.
+            // With hard conditioning the raw ratio is p_no_err / p_err
+            // (~ 199 for typical error rate 0.005).  After blending:
+            //
+            //   emit_req / emit_opp
+            //     = [g * p_no_err + (1-g) * 0.5]
+            //     / [g * p_err    + (1-g) * 0.5]
+            //
+            // At g = 1 this is p_no_err / p_err ~ 199.  As g -> 0 it
+            // gracefully degrades to 1 (no genotype confidence, no
+            // signal).  MismatchProb clamps p_err >= 1e-6 so the
+            // denominator is never zero.
             //
             // Label-switching identifiability is handled separately by
             // the orientation HMM (decode_orientation_hmm), not here.
@@ -13024,6 +13032,45 @@ mod tests {
             emit_hom_mismatch < 0.1,
             "Expected low emission at hom when ref doesn't match, got {}",
             emit_hom_mismatch
+        );
+    }
+
+    #[test]
+    fn test_constrained_het_emission_has_signal_regardless_of_phase_conf() {
+        // Regression: the emission ratio at constrained hets must be
+        // strictly > 1 (required allele preferred over opposite).
+        // Before the hard-Gibbs fix, softening by phase_conf = 0.5
+        // collapsed the ratio to exactly 1:1, trapping the sampler.
+        let p_no_err = 0.995;
+        let p_err = 0.005;
+        let geno_conf = 1.0;
+
+        // Genotype {0, 1}, partner holds allele 0 => required = 1, opposite = 0.
+        let profile = build_haploid_constrained_emit_profile(
+            0, 1, 0, geno_conf, p_no_err, p_err,
+        );
+
+        let emit_required = profile.emit(1); // reference carries required allele
+        let emit_opposite = profile.emit(0); // reference carries opposite allele
+
+        // The ratio must be large (~199), certainly > 10.
+        let ratio = emit_required / emit_opposite;
+        assert!(
+            ratio > 10.0,
+            "Constrained het emission ratio should strongly prefer required allele, got {:.2}",
+            ratio,
+        );
+
+        // Also verify the absolute values are in the right ballpark.
+        assert!(
+            (emit_required - p_no_err).abs() < 0.01,
+            "emit_required should be ~p_no_err at geno_conf=1, got {}",
+            emit_required,
+        );
+        assert!(
+            (emit_opposite - p_err).abs() < 0.01,
+            "emit_opposite should be ~p_err at geno_conf=1, got {}",
+            emit_opposite,
         );
     }
 
