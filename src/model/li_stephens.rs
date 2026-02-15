@@ -83,3 +83,62 @@ pub fn on_off_transition_log_odds(recomb_rate: f32, donor_pool: f32) -> (f32, f3
     };
     (t11, t10, t01)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subset_linear_exact_k_preserves_probability_mass() {
+        let cases = [
+            (0.0f32, 1.0f32, 1usize),
+            (0.001, 3.0, 100),
+            (0.05, 16.0, 1000),
+            (0.25, 64.0, 5000),
+            (0.75, 32.0, 40),
+            (1.0, 10.0, 10),
+        ];
+        for (r, k, n) in cases {
+            let (stay, shift) = subset_linear_exact_k(r, k, n);
+            assert!(
+                stay.is_finite() && stay >= 0.0,
+                "stay invalid for r={r}, k={k}, n={n}"
+            );
+            assert!(
+                shift.is_finite() && shift >= 0.0,
+                "shift invalid for r={r}, k={k}, n={n}"
+            );
+            let mass = stay + k * shift;
+            assert!(
+                (mass - 1.0).abs() < 1e-6,
+                "mass not conserved: r={r}, k={k}, n={n}, mass={mass}"
+            );
+        }
+    }
+
+    #[test]
+    fn subset_linear_exact_k_matches_explicit_transition_update() {
+        let fwd = [0.05f32, 0.25, 0.15, 0.10, 0.45];
+        let sum: f32 = fwd.iter().sum();
+        let (stay, shift) = subset_linear_exact_k(0.07, fwd.len() as f32, 5000);
+
+        let mut direct = vec![0.0f32; fwd.len()];
+        for i in 0..fwd.len() {
+            let mut s = 0.0f32;
+            for (j, &p_j) in fwd.iter().enumerate() {
+                let t = if i == j { stay + shift } else { shift };
+                s += p_j * t;
+            }
+            direct[i] = s;
+        }
+
+        for i in 0..fwd.len() {
+            let affine = stay * fwd[i] + shift * sum;
+            assert!(
+                (affine - direct[i]).abs() < 1e-6,
+                "mismatch at i={i}: affine={affine}, direct={}",
+                direct[i]
+            );
+        }
+    }
+}
