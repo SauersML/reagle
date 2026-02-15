@@ -37,6 +37,8 @@ pub struct ModelParams {
 impl ModelParams {
     /// Default phase states
     pub const DEFAULT_PHASE_STATES: usize = 280;
+    /// Default imputation states
+    pub const DEFAULT_IMPUTE_STATES: usize = 1600;
 
     /// Default burnin iterations
     pub const DEFAULT_BURNIN: usize = 3;
@@ -104,7 +106,7 @@ impl ModelParams {
         Self {
             p_mismatch,
             recomb_intensity,
-            n_states: Self::DEFAULT_PHASE_STATES.min(n_ref_haps.saturating_sub(2)),
+            n_states: Self::DEFAULT_IMPUTE_STATES.min(n_ref_haps.saturating_sub(2)),
             burnin: Self::DEFAULT_BURNIN,
             iterations: Self::DEFAULT_ITERATIONS,
             lr_threshold: f32::INFINITY,
@@ -441,5 +443,14 @@ mod tests {
             "Expected 100.0, got {}",
             intensity
         );
+    }
+
+    #[test]
+    fn test_for_imputation_uses_imputation_state_default() {
+        let params = ModelParams::for_imputation(10_000, 100_000.0, None);
+        assert_eq!(params.n_states, ModelParams::DEFAULT_IMPUTE_STATES);
+
+        let small_panel = ModelParams::for_imputation(200, 100_000.0, None);
+        assert_eq!(small_panel.n_states, 198);
     }
 }

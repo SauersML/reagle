@@ -46,6 +46,17 @@ impl EmissionAffine {
 
 const MISSING_ALLELE: u8 = AlleleCode::MISSING.raw();
 
+#[inline]
+fn collect_stats_emission(targ_al: u8, ref_al: u8, p_no_err: f32, p_err: f32) -> f32 {
+    if targ_al == MISSING_ALLELE || ref_al == MISSING_ALLELE {
+        1.0
+    } else if ref_al == targ_al {
+        p_no_err
+    } else {
+        p_err
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefAllele {
     Missing,
@@ -740,7 +751,7 @@ impl HmmUpdater {
 // ============================================================================
 
 use crate::model::pl_emission::{
-    PlProvider, allele_probs_cond_from_pl, allele_probs_uncond_from_pl,
+    allele_probs_cond_from_pl, allele_probs_uncond_from_pl, PlProvider,
 };
 use crate::model::states::{MosaicCursor, StateSwitch, ThreadedHaps};
 use crate::model::types::{CombinedHapSpace, HapId};
@@ -1583,15 +1594,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let em = if targ_al == MISSING_ALLELE {
-                        1.0
-                    } else if ref_al == MISSING_ALLELE {
-                        p_no_err
-                    } else if ref_al == targ_al {
-                        p_no_err
-                    } else {
-                        p_err
-                    };
+                    let em = collect_stats_emission(targ_al, ref_al, p_no_err, p_err);
                     fwd[k] = em * (scale * fwd[k] + shift);
                     sum += fwd[k];
                 }
@@ -1602,15 +1605,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let em = if targ_al == MISSING_ALLELE {
-                        1.0
-                    } else if ref_al == MISSING_ALLELE {
-                        p_no_err
-                    } else if ref_al == targ_al {
-                        p_no_err
-                    } else {
-                        p_err
-                    };
+                    let em = collect_stats_emission(targ_al, ref_al, p_no_err, p_err);
                     fwd[k] = em * prior;
                     sum += fwd[k];
                 }
@@ -1663,15 +1658,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut sum = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = recomp_ref_row[k];
-                    let em = if recomp_targ_al == MISSING_ALLELE {
-                        1.0
-                    } else if ref_al == MISSING_ALLELE {
-                        p_no_err
-                    } else if ref_al == recomp_targ_al {
-                        p_no_err
-                    } else {
-                        p_err
-                    };
+                    let em = collect_stats_emission(recomp_targ_al, ref_al, p_no_err, p_err);
                     fwd_recomp[k] = transition.forward(fwd_recomp[k], em);
                     sum += fwd_recomp[k];
                 }
@@ -1700,15 +1687,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                     let mut sum = 0.0f32;
                     for k in 0..n_states {
                         let ref_al = recomp_ref_row[k];
-                        let em = if recomp_targ_al == MISSING_ALLELE {
-                            1.0
-                        } else if ref_al == MISSING_ALLELE {
-                            p_no_err
-                        } else if ref_al == recomp_targ_al {
-                            p_no_err
-                        } else {
-                            p_err
-                        };
+                        let em = collect_stats_emission(recomp_targ_al, ref_al, p_no_err, p_err);
                         fwd_prev[k] = transition.forward(fwd_prev[k], em);
                         sum += fwd_prev[k];
                     }
@@ -1730,17 +1709,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let ref_al = ref_row[k];
                 let observed = targ_al != MISSING_ALLELE && ref_al != MISSING_ALLELE;
                 let is_mismatch = observed && ref_al != targ_al;
-                let em = if !observed {
-                    if targ_al == MISSING_ALLELE {
-                        1.0
-                    } else {
-                        p_no_err
-                    }
-                } else if !is_mismatch {
-                    p_no_err
-                } else {
-                    p_err
-                };
+                let em = collect_stats_emission(targ_al, ref_al, p_no_err, p_err);
 
                 if m > 0 {
                     joint_state_sum += bwd[k] * em * fwd_prev[k].max(0.0) * same_state_scale;
@@ -1781,15 +1750,7 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
                 let mut constant_term = 0.0f32;
                 for k in 0..n_states {
                     let ref_al = ref_row[k];
-                    let em = if targ_al_next == MISSING_ALLELE {
-                        1.0
-                    } else if ref_al == MISSING_ALLELE {
-                        p_no_err
-                    } else if ref_al == targ_al_next {
-                        p_no_err
-                    } else {
-                        p_err
-                    };
+                    let em = collect_stats_emission(targ_al_next, ref_al, p_no_err, p_err);
                     emissions_tmp[k] = em;
                     constant_term += bwd[k] * em;
                 }
@@ -1809,10 +1770,10 @@ impl<'a, TargetSpace, RefSpace, HapSpace> MosaicHmm<'a, TargetSpace, RefSpace, H
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::ChromIdx;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::ChromIdx;
     use crate::model::types::RefHapSpace;
     use std::sync::Arc;
 
@@ -2346,5 +2307,21 @@ mod tests {
 
         let sum: f32 = bwd.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "Sum should be 1.0");
+    }
+
+    #[test]
+    fn test_collect_stats_missing_reference_is_neutral() {
+        let p_no_err = 0.999f32;
+        let p_err = 0.001f32;
+        let em = collect_stats_emission(0, MISSING_ALLELE, p_no_err, p_err);
+        assert_eq!(em, 1.0);
+    }
+
+    #[test]
+    fn test_collect_stats_observed_match_and_mismatch_emissions() {
+        let p_no_err = 0.99f32;
+        let p_err = 0.01f32;
+        assert_eq!(collect_stats_emission(1, 1, p_no_err, p_err), p_no_err);
+        assert_eq!(collect_stats_emission(1, 0, p_no_err, p_err), p_err);
     }
 }

@@ -1,13 +1,13 @@
 //! Beam search phaser for condensed targets.
 
-use crate::data::MarkerIdx;
 use crate::data::alignment::MarkerAlignment;
 use crate::data::condensed::{CallSite, CondensedTarget};
 use crate::data::marker::AnyMarkerSpace;
 use crate::data::ref_packed::PackedRefView;
-use crate::data::storage::GenotypeMatrix;
 use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
+use crate::data::storage::GenotypeMatrix;
+use crate::data::MarkerIdx;
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
 use crate::model::reference_pbwt::{DonorPick, PbwtStrictAllele, RankBeam, ReferencePbwt};
@@ -1518,8 +1518,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     fn orientation_flip_event_cost(&self, dist_morgans: f32) -> i32 {
         let d = dist_morgans.max(0.0) as f64;
         let rho = self.costs.recomb_intensity.max(1e-12);
-        let p_stay = (-rho * d).exp().clamp(1e-6, 1.0 - 1e-6);
-        ((p_stay / (1.0 - p_stay)).ln() * 1_000_000.0)
+        // Orientation parity follows a Poisson recombination count:
+        // P(keep) = P(even count) = 0.5 * (1 + exp(-2*rho*d))
+        // P(flip) = P(odd count)  = 0.5 * (1 - exp(-2*rho*d))
+        let decay = (-2.0 * rho * d).exp();
+        let p_keep = (0.5 * (1.0 + decay)).clamp(1e-12, 1.0 - 1e-12);
+        let p_flip = (0.5 * (1.0 - decay)).clamp(1e-12, 1.0 - 1e-12);
+        ((p_keep / p_flip).ln() * 1_000_000.0)
             .round()
             .clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
@@ -1932,7 +1937,11 @@ fn rank_donor_mass_dense(
         .iter()
         .filter_map(|&h| {
             let m = mass_by_hap.get(h).copied().unwrap_or(0.0);
-            if m > 0.0 { Some((h, m as f32)) } else { None }
+            if m > 0.0 {
+                Some((h, m as f32))
+            } else {
+                None
+            }
         })
         .collect();
     ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2122,13 +2131,13 @@ fn donor_posterior_mass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
     use crate::data::ref_packed::PackedRefView;
     use crate::data::storage::phase_state::{Phased, Unphased};
     use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
+    use crate::data::ChromIdx;
     use crate::model::parameters::ModelParams;
     use std::sync::Arc;
 
@@ -2300,5 +2309,24 @@ mod tests {
         assert!(ranked.iter().any(|(h, _)| *h == 1));
         assert!(ranked.iter().any(|(h, _)| *h == 2));
         assert!(!ranked.iter().any(|(h, _)| *h == 0));
+    }
+
+    #[test]
+    fn orientation_flip_cost_approaches_neutral_at_long_distance() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+
+        let near = phaser.orientation_flip_event_cost(1e-8);
+        let mid = phaser.orientation_flip_event_cost(0.5);
+        let far = phaser.orientation_flip_event_cost(20.0);
+
+        assert!(near > mid);
+        assert!(mid >= far);
+        assert!(far.abs() < 1_000);
     }
 }
