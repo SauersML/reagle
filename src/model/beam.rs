@@ -10,7 +10,9 @@ use crate::data::storage::phase_state::Phased;
 use crate::data::storage::sample_phase::SamplePhase;
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::parameters::ModelParams;
-use crate::model::reference_pbwt::{DonorPick, PbwtStrictAllele, RankBeam, ReferencePbwt};
+use crate::model::reference_pbwt::{
+    DonorPick, PbwtBiallelicQueryProb, PbwtQueryAllele, RankBeam, ReferencePbwt,
+};
 
 const BACKPTR_INDEX_BITS: usize = 15;
 const MAX_BACKPTR_PREV: u32 = (1u32 << BACKPTR_INDEX_BITS) - 1;
@@ -394,30 +396,52 @@ impl PbwtBeamIndex {
                 .allele_mappings
                 .get(orig_m)
                 .and_then(|v| v.clone());
-            let (qa0, qa1) = if let Some(map) = mapping {
+            let ((qa0, qp0), (qa1, qp1)) = if let Some(map) = mapping {
                 let m0 = map.targ_to_ref.get(0).copied().unwrap_or(-1);
                 let m1 = map.targ_to_ref.get(1).copied().unwrap_or(-1);
-                let qa0 = if m0 >= 0 && m0 <= 1 {
-                    PbwtStrictAllele::allele(m0 as u8).unwrap_or(PbwtStrictAllele::missing())
+                let q0 = if m0 >= 0 && m0 <= 1 {
+                    (
+                        PbwtQueryAllele::allele(m0 as u8).unwrap_or_else(PbwtQueryAllele::wildcard),
+                        PbwtBiallelicQueryProb::deterministic(m0 as u8),
+                    )
                 } else {
-                    PbwtStrictAllele::missing()
+                    (
+                        PbwtQueryAllele::wildcard(),
+                        PbwtBiallelicQueryProb::uniform(),
+                    )
                 };
-                let qa1 = if m1 >= 0 && m1 <= 1 {
-                    PbwtStrictAllele::allele(m1 as u8).unwrap_or(PbwtStrictAllele::missing())
+                let q1 = if m1 >= 0 && m1 <= 1 {
+                    (
+                        PbwtQueryAllele::allele(m1 as u8).unwrap_or_else(PbwtQueryAllele::wildcard),
+                        PbwtBiallelicQueryProb::deterministic(m1 as u8),
+                    )
                 } else {
-                    PbwtStrictAllele::missing()
+                    (
+                        PbwtQueryAllele::wildcard(),
+                        PbwtBiallelicQueryProb::uniform(),
+                    )
                 };
-                (qa0, qa1)
+                (q0, q1)
             } else {
-                (PbwtStrictAllele::missing(), PbwtStrictAllele::missing())
+                (
+                    (
+                        PbwtQueryAllele::wildcard(),
+                        PbwtBiallelicQueryProb::uniform(),
+                    ),
+                    (
+                        PbwtQueryAllele::wildcard(),
+                        PbwtBiallelicQueryProb::uniform(),
+                    ),
+                )
             };
 
             let mut beams = [RankBeam::full(n_ref as u32), RankBeam::full(n_ref as u32)];
-            pbwt.advance_with_beams_strict(
+            pbwt.advance_with_beams_query_probs(
                 &ref_alleles,
                 n_alleles,
                 hi_idx,
                 &[qa0, qa1],
+                Some(&[qp0, qp1]),
                 &mut beams,
             );
             let mut d0: Vec<DonorPick> = Vec::new();
@@ -928,6 +952,12 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
             phases.reverse();
             let p_swapped = compute_swap_posteriors(&logsum_swapped, &logsum_unswapped);
+            let phases = self.decode_swap_track(
+                &logsum_swapped,
+                &logsum_unswapped,
+                &condensed.call_sites,
+                &phases,
+            );
             let has_input_anchor = sample_phase.has_input_phase_anchor();
             for (i, phase_swapped) in phases.iter().enumerate() {
                 let call = &condensed.call_sites[i];
@@ -1033,14 +1063,23 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         let marker_idx = marker.as_usize();
         let mut match_a1: Vec<usize> = Vec::new();
         let mut match_a2: Vec<usize> = Vec::new();
+        let missing = crate::data::storage::AlleleCode::MISSING.raw();
 
         // Partition haplotypes by which allele they carry.
         for &h in list {
-            if self.ref_allele_matches(marker_idx, h, a1) {
-                match_a1.push(h);
-            }
-            if self.ref_allele_matches(marker_idx, h, a2) {
-                match_a2.push(h);
+            match self.packed_ref.ref_allele_targ(marker_idx, h) {
+                Some(ref_al) if ref_al == a1 => match_a1.push(h),
+                Some(ref_al) if ref_al == a2 => match_a2.push(h),
+                Some(ref_al) if ref_al == missing || ref_al > 1 => {
+                    // Keep unknown/out-of-domain reference alleles neutral at initialization.
+                    match_a1.push(h);
+                    match_a2.push(h);
+                }
+                None => {
+                    match_a1.push(h);
+                    match_a2.push(h);
+                }
+                _ => {}
             }
         }
 
@@ -1430,10 +1469,6 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         out.clear();
         cand.clear();
         let marker_idx = marker.as_usize();
-        let effective_match_cost = self.costs.match_emit_cost;
-        let effective_mismatch_cost = self.costs.mismatch_emit_cost;
-
-        let matches = self.ref_allele_matches(marker_idx, hap, targ_allele);
         // Build candidate support C first, then normalize exact transition probabilities on C.
         // Each candidate stores (hap, emission_cost, is_stay_candidate).
         #[inline]
@@ -1445,11 +1480,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         }
 
         // Always keep stay branch so truncation never forces a recombination.
-        let stay_emit = if matches {
-            effective_match_cost
-        } else {
-            effective_mismatch_cost
-        };
+        let stay_emit = self.emission_cost_for_hap(marker_idx, hap, targ_allele);
         push_unique(cand, hap, stay_emit, true);
 
         // Add recent switch candidates without hard allele gating. Under non-zero
@@ -1461,11 +1492,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
             let pool_idx = active_pool.list().len().saturating_sub(1) - idx;
             let pooled = pool_alleles[pool_idx];
-            let emit = if pooled == targ_allele {
-                effective_match_cost
-            } else {
-                effective_mismatch_cost
-            };
+            let emit = self.emission_cost_for_ref_allele(pooled, targ_allele);
             push_unique(cand, h, emit, false);
             if cand.len() >= cap.saturating_add(1) {
                 break;
@@ -1479,11 +1506,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
                 if h == hap {
                     continue;
                 }
-                let emit = if self.ref_allele_matches(marker_idx, h, targ_allele) {
-                    effective_match_cost
-                } else {
-                    effective_mismatch_cost
-                };
+                let emit = self.emission_cost_for_hap(marker_idx, h, targ_allele);
                 push_unique(cand, h, emit, false);
                 if cand.len() >= cap.saturating_add(1) {
                     break;
@@ -1542,11 +1565,28 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
     }
 
     #[inline]
-    fn ref_allele_matches(&self, marker: usize, hap: usize, targ_allele: u8) -> bool {
-        match self.packed_ref.ref_allele_targ(marker, hap) {
-            Some(a) => a == targ_allele,
-            None => false,
+    fn emission_cost_for_ref_allele(&self, ref_allele: u8, targ_allele: u8) -> i32 {
+        let missing = crate::data::storage::AlleleCode::MISSING.raw();
+        if targ_allele == missing || targ_allele > 1 {
+            return 0;
         }
+        if ref_allele == missing || ref_allele > 1 {
+            return 0;
+        }
+        if ref_allele == targ_allele {
+            self.costs.match_emit_cost
+        } else {
+            self.costs.mismatch_emit_cost
+        }
+    }
+
+    #[inline]
+    fn emission_cost_for_hap(&self, marker: usize, hap: usize, targ_allele: u8) -> i32 {
+        let ref_allele = self
+            .packed_ref
+            .ref_allele_targ(marker, hap)
+            .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw());
+        self.emission_cost_for_ref_allele(ref_allele, targ_allele)
     }
 
     #[inline]
@@ -1603,21 +1643,11 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return;
         }
 
-        // Collapse identical states (hap1, hap2, history fingerprint, last_swapped).
-        let cluster_key = |cluster: u16, hap: usize| -> u32 {
-            if cluster != u16::MAX {
-                cluster as u32
-            } else {
-                0x8000_0000u32 | (hap as u32 & 0x7FFF_FFFF)
-            }
-        };
+        // Collapse identical states by concrete hap ids (not PBWT cluster ids).
         beam.sort_unstable_by(|a, b| {
-            let a1 = cluster_key(a.cluster1, a.hap1);
-            let b1 = cluster_key(b.cluster1, b.hap1);
-            let a2 = cluster_key(a.cluster2, a.hap2);
-            let b2 = cluster_key(b.cluster2, b.hap2);
-            a1.cmp(&b1)
-                .then(a2.cmp(&b2))
+            a.hap1
+                .cmp(&b.hap1)
+                .then(a.hap2.cmp(&b.hap2))
                 .then(a.history_bits.cmp(&b.history_bits))
                 .then(a.history_len.cmp(&b.history_len))
                 .then(a.last_swapped.cmp(&b.last_swapped))
@@ -1627,9 +1657,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         for i in 1..beam.len() {
             let prev = &beam[write - 1];
             let curr = &beam[i];
-            let same = cluster_key(prev.cluster1, prev.hap1)
-                == cluster_key(curr.cluster1, curr.hap1)
-                && cluster_key(prev.cluster2, prev.hap2) == cluster_key(curr.cluster2, curr.hap2)
+            let same = prev.hap1 == curr.hap1
+                && prev.hap2 == curr.hap2
                 && prev.history_bits == curr.history_bits
                 && prev.history_len == curr.history_len
                 && prev.last_swapped == curr.last_swapped;
@@ -1685,23 +1714,13 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             return;
         }
 
-        // Collapse identical states (hap1, hap2, history fingerprint, last_swapped).
-        let cluster_key = |cluster: u16, hap: usize| -> u32 {
-            if cluster != u16::MAX {
-                cluster as u32
-            } else {
-                0x8000_0000u32 | (hap as u32 & 0x7FFF_FFFF)
-            }
-        };
+        // Collapse identical states by concrete hap ids (not PBWT cluster ids).
         let mut zipped: Vec<(BeamPath, u32)> =
             beam.iter().cloned().zip(ptrs.iter().copied()).collect();
         zipped.sort_unstable_by(|(a, _), (b, _)| {
-            let a1 = cluster_key(a.cluster1, a.hap1);
-            let b1 = cluster_key(b.cluster1, b.hap1);
-            let a2 = cluster_key(a.cluster2, a.hap2);
-            let b2 = cluster_key(b.cluster2, b.hap2);
-            a1.cmp(&b1)
-                .then(a2.cmp(&b2))
+            a.hap1
+                .cmp(&b.hap1)
+                .then(a.hap2.cmp(&b.hap2))
                 .then(a.history_bits.cmp(&b.history_bits))
                 .then(a.history_len.cmp(&b.history_len))
                 .then(a.last_swapped.cmp(&b.last_swapped))
@@ -1711,9 +1730,8 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         for i in 1..zipped.len() {
             let (ref prev, _) = zipped[write - 1];
             let (ref curr, _) = zipped[i];
-            let same = cluster_key(prev.cluster1, prev.hap1)
-                == cluster_key(curr.cluster1, curr.hap1)
-                && cluster_key(prev.cluster2, prev.hap2) == cluster_key(curr.cluster2, curr.hap2)
+            let same = prev.hap1 == curr.hap1
+                && prev.hap2 == curr.hap2
                 && prev.history_bits == curr.history_bits
                 && prev.history_len == curr.history_len
                 && prev.last_swapped == curr.last_swapped;
@@ -1757,6 +1775,77 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
             }
         }
         worst.saturating_sub(best) < self.config.collapse_gap
+    }
+
+    fn decode_swap_track(
+        &self,
+        logsum_swapped: &[f64],
+        logsum_unswapped: &[f64],
+        calls: &[CallSite],
+        fallback: &[bool],
+    ) -> Vec<bool> {
+        let n = calls
+            .len()
+            .min(logsum_swapped.len())
+            .min(logsum_unswapped.len());
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut dp_unswapped = vec![f64::NEG_INFINITY; n];
+        let mut dp_swapped = vec![f64::NEG_INFINITY; n];
+        let mut prev_unswapped = vec![false; n];
+        let mut prev_swapped = vec![false; n];
+
+        let (e0u, e0s) = swap_emission_pair(logsum_unswapped[0], logsum_swapped[0]);
+        dp_unswapped[0] = e0u;
+        dp_swapped[0] = e0s;
+
+        for i in 1..n {
+            let flip_cost = i64::from(self.orientation_flip_event_cost(calls[i].dist_morgans))
+                + i64::from(calls[i].flip_cost);
+            let flip_log_penalty = -(flip_cost as f64) / 1_000_000.0;
+            let (emit_unswapped, emit_swapped) =
+                swap_emission_pair(logsum_unswapped[i], logsum_swapped[i]);
+
+            let keep_unswapped = dp_unswapped[i - 1];
+            let flip_to_unswapped = dp_swapped[i - 1] + flip_log_penalty;
+            if keep_unswapped >= flip_to_unswapped {
+                dp_unswapped[i] = keep_unswapped + emit_unswapped;
+                prev_unswapped[i] = false;
+            } else {
+                dp_unswapped[i] = flip_to_unswapped + emit_unswapped;
+                prev_unswapped[i] = true;
+            }
+
+            let keep_swapped = dp_swapped[i - 1];
+            let flip_to_swapped = dp_unswapped[i - 1] + flip_log_penalty;
+            if keep_swapped >= flip_to_swapped {
+                dp_swapped[i] = keep_swapped + emit_swapped;
+                prev_swapped[i] = true;
+            } else {
+                dp_swapped[i] = flip_to_swapped + emit_swapped;
+                prev_swapped[i] = false;
+            }
+        }
+
+        let mut out = vec![false; n];
+        out[n - 1] = if dp_swapped[n - 1] > dp_unswapped[n - 1] {
+            true
+        } else if dp_swapped[n - 1] < dp_unswapped[n - 1] {
+            false
+        } else {
+            fallback.get(n - 1).copied().unwrap_or(false)
+        };
+
+        for i in (1..n).rev() {
+            out[i - 1] = if out[i] {
+                prev_swapped[i]
+            } else {
+                prev_unswapped[i]
+            };
+        }
+        out
     }
 }
 
@@ -1848,6 +1937,25 @@ fn logaddexp(a: f64, b: f64) -> f64 {
     }
     let m = if a > b { a } else { b };
     m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+#[inline]
+fn swap_emission_pair(log_unswapped: f64, log_swapped: f64) -> (f64, f64) {
+    if !log_unswapped.is_finite() && !log_swapped.is_finite() {
+        return (0.0, 0.0);
+    }
+    let m = if log_unswapped > log_swapped {
+        log_unswapped
+    } else {
+        log_swapped
+    };
+    let pu = (log_unswapped - m).exp();
+    let ps = (log_swapped - m).exp();
+    let z = pu + ps;
+    if z <= f64::MIN_POSITIVE {
+        return (0.0, 0.0);
+    }
+    ((pu / z).ln(), (ps / z).ln())
 }
 
 fn compute_swap_posteriors(logsum_swapped: &[f64], logsum_unswapped: &[f64]) -> Vec<f32> {
@@ -2300,5 +2408,108 @@ mod tests {
         assert!(ranked.iter().any(|(h, _)| *h == 1));
         assert!(ranked.iter().any(|(h, _)| *h == 2));
         assert!(!ranked.iter().any(|(h, _)| *h == 0));
+    }
+
+    #[test]
+    fn emission_cost_treats_missing_and_out_of_domain_as_neutral() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+        let missing = crate::data::storage::AlleleCode::MISSING.raw();
+
+        assert_eq!(phaser.emission_cost_for_ref_allele(missing, 0), 0);
+        assert_eq!(phaser.emission_cost_for_ref_allele(2, 0), 0);
+        assert_eq!(
+            phaser.emission_cost_for_ref_allele(0, 0),
+            phaser.costs.match_emit_cost
+        );
+        assert_eq!(
+            phaser.emission_cost_for_ref_allele(1, 0),
+            phaser.costs.mismatch_emit_cost
+        );
+    }
+
+    #[test]
+    fn prune_collapse_keeps_distinct_haps_even_if_cluster_matches() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+
+        let mut beam = vec![
+            BeamPath {
+                hap1: 0,
+                hap2: 1,
+                cluster1: 3,
+                cluster2: 5,
+                score: 10,
+                model_score: 10,
+                last_swapped: false,
+                history_bits: 0,
+                history_len: 0,
+                prev_idx: 0,
+                prev_swapped: false,
+            },
+            BeamPath {
+                hap1: 2,
+                hap2: 3,
+                cluster1: 3,
+                cluster2: 5,
+                score: 10,
+                model_score: 10,
+                last_swapped: false,
+                history_bits: 0,
+                history_len: 0,
+                prev_idx: 0,
+                prev_swapped: false,
+            },
+        ];
+        phaser.prune_and_collapse(&mut beam);
+        assert_eq!(beam.len(), 2);
+    }
+
+    #[test]
+    fn decode_swap_track_smooths_isolated_flip_spike() {
+        let target_gt = make_target_gt();
+        let ref_gt = make_ref_gt();
+        let alignment = MarkerAlignment::new(&target_gt, &ref_gt);
+        let packed_ref =
+            PackedRefView::build_sparse(&target_gt, &ref_gt, &alignment, &[0usize, 1usize])
+                .expect("packed ref build should succeed");
+        let phaser = BeamPhaser::new(&packed_ref, &ModelParams::default(), BeamConfig::default());
+
+        let calls: Vec<CallSite> = (0..5)
+            .map(|i| CallSite {
+                marker: MarkerIdx::new(i as u32),
+                hi_idx: i,
+                a1: 0,
+                a2: 1,
+                phase_conf: 0.5,
+                a1_freq: 0.5,
+                a2_freq: 0.5,
+                pbwt_len_morgans_a1: 0.0,
+                pbwt_len_morgans_a2: 0.0,
+                pbwt_density_a1: 0.0,
+                pbwt_density_a2: 0.0,
+                dist_morgans: 0.001,
+                flip_cost: 0,
+                fixed: false,
+            })
+            .collect();
+
+        let logsum_unswapped = vec![0.0, 0.0, -1.0, 0.0, 0.0];
+        let logsum_swapped = vec![-2.0, -2.0, 0.0, -2.0, -2.0];
+        let fallback = vec![false; calls.len()];
+        let decoded =
+            phaser.decode_swap_track(&logsum_swapped, &logsum_unswapped, &calls, &fallback);
+
+        assert_eq!(decoded, vec![false, false, false, false, false]);
     }
 }
