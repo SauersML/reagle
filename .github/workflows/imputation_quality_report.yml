@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check PR stability
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.head.ref, 'codex')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -35,6 +35,9 @@ jobs:
             echo "PR closed ($STATE). cancelling."
             exit 1
           fi
+      - name: Skip wait for codex branches
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.head.ref, 'codex')
+        run: echo "Branch contains 'codex'; skipping 5-minute wait."
       - name: Skip check
         if: github.event_name != 'pull_request'
         run: echo "Not a PR, proceeding immediately."
