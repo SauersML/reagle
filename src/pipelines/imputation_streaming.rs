@@ -263,13 +263,13 @@ const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
-const ORIENTATION_ALPHA_MIN: f64 = 0.60;
-const ORIENTATION_ALPHA_MAX: f64 = 1.00;
 const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
-const ORIENTATION_ETA_BASE: f64 = 2e-4;
-const ORIENTATION_ETA_UNCERTAIN_GAIN: f64 = 0.02;
-const ORIENTATION_ETA_ANCHORED_BOOST: f64 = 0.005;
 const ORIENTATION_ETA_MAX: f64 = 0.05;
+const ORIENTATION_ETA_MIN: f64 = 1e-8;
+const ORIENTATION_ETA_EM_ITERS: usize = 2;
+const ORIENTATION_ETA_BETA_A: f64 = 0.002;
+const ORIENTATION_ETA_BETA_B: f64 = 9.998;
+const ORIENTATION_DECISION_MARGIN: f64 = 0.02;
 // When memory detection fails, use a conservative fallback budget for prescan
 // batching/caching to avoid pathological re-reads of the target VCF.
 const PRESCAN_FALLBACK_AVAIL_BYTES: u64 = 256 * 1024 * 1024;
@@ -702,42 +702,40 @@ fn blend_haplotype_priors(
 }
 
 #[inline]
-fn compute_orientation_transition_eta(alpha_gap: f64, anchored_gap: bool) -> f64 {
-    let uncertainty = (1.0 - alpha_gap).clamp(0.0, 1.0);
-    let anchor_boost = if anchored_gap {
-        ORIENTATION_ETA_ANCHORED_BOOST
-    } else {
-        0.0
-    };
-    (ORIENTATION_ETA_BASE + ORIENTATION_ETA_UNCERTAIN_GAIN * uncertainty + anchor_boost)
-        .clamp(1e-8, ORIENTATION_ETA_MAX)
+fn orientation_eta_from_expected_flips(expected_flips: f64, n_boundaries: usize) -> f64 {
+    if n_boundaries == 0 {
+        return ORIENTATION_ETA_MIN;
+    }
+    let numer = ORIENTATION_ETA_BETA_A + expected_flips.max(0.0);
+    let denom = ORIENTATION_ETA_BETA_A + ORIENTATION_ETA_BETA_B + n_boundaries as f64;
+    if denom <= 0.0 {
+        return ORIENTATION_ETA_MIN;
+    }
+    (numer / denom).clamp(ORIENTATION_ETA_MIN, ORIENTATION_ETA_MAX)
 }
 
 #[inline]
-fn update_orientation_boundary_weights(prior_keep: f32, observed_swap: f32) -> (f32, f32) {
-    let w_keep = prior_keep.clamp(0.0, 1.0);
-    let w_swap = 1.0 - w_keep;
-    let p_swap_obs = observed_swap.clamp(0.0, 1.0);
-    let p_keep_obs = 1.0 - p_swap_obs;
-    let keep_post = w_keep * p_keep_obs;
-    let swap_post = w_swap * p_swap_obs;
-    let z = keep_post + swap_post;
-    if z <= 0.0 || !z.is_finite() {
-        return (0.5, 0.5);
-    }
-    (keep_post / z, swap_post / z)
+fn orientation_weights_from_posterior_swap(p_swap: f32) -> (f32, f32) {
+    let w_swap = p_swap.clamp(0.0, 1.0);
+    (1.0 - w_swap, w_swap)
 }
 
 #[inline]
 fn compose_boundary_message(
     priors_id: &HaplotypePriors,
     priors_swap: &HaplotypePriors,
-    weight_id: f32,
     weight_swap: f32,
 ) -> HaplotypePriors {
-    let sum = (weight_id + weight_swap).max(1e-8);
-    let w_swap = (weight_swap / sum).clamp(0.0, 1.0);
+    let w_swap = weight_swap.clamp(0.0, 1.0);
     blend_haplotype_priors(priors_id, priors_swap, w_swap)
+}
+
+#[inline]
+fn sample_idx_from_usize(sample_idx: usize) -> SampleIdx {
+    SampleIdx::new(
+        u32::try_from(sample_idx)
+            .expect("sample index conversion overflow: usize does not fit in u32"),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -3618,10 +3616,7 @@ impl SampleImputationResult {
 }
 
 struct ImputationHandoff {
-    priors: Vec<HaplotypePriors>,
     priors_id: Vec<HaplotypePriors>,
-    priors_swap: Vec<HaplotypePriors>,
-    orientation_weight_id: Vec<f32>,
     orientation_weight_swap: Vec<f32>,
     prior_global_idx: Option<usize>,
     prior_gen_pos: Option<f64>,
@@ -3703,7 +3698,7 @@ impl AltProbDiskStoreBuilder {
                 sample_idx, hap
             )));
         }
-        let sample = SampleIdx::from(sample_idx);
+        let sample = sample_idx_from_usize(sample_idx);
         let side = if hap == 0 { HapSide::H1 } else { HapSide::H2 };
         let offset_floats = sample
             .hap(side)
@@ -3771,7 +3766,7 @@ impl AltProbDiskStoreView {
         if sample_idx >= self.n_samples || hap > 1 || local_m >= self.output_markers {
             return None;
         }
-        let sample = SampleIdx::from(sample_idx);
+        let sample = sample_idx_from_usize(sample_idx);
         let side = if hap == 0 { HapSide::H1 } else { HapSide::H2 };
         let idx = sample
             .hap(side)
@@ -4453,15 +4448,11 @@ impl crate::pipelines::ImputationPipeline {
                         )
                     });
                     if let Some(handoff) = next_handoff {
-                        next_overlap.set_hap_priors(handoff.priors);
-                        next_overlap.set_orientation_hap_priors(
-                            handoff.priors_id,
-                            handoff.priors_swap,
-                        );
-                        next_overlap.set_orientation_weights(
-                            handoff.orientation_weight_id,
-                            handoff.orientation_weight_swap,
-                        );
+                        // Imputation handoff consumes orientation-conditioned hap priors.
+                        // Clear legacy state_probs to prevent mixed-frame overlap payloads.
+                        next_overlap.state_probs = None;
+                        next_overlap.set_orientation_hap_priors(handoff.priors_id);
+                        next_overlap.set_orientation_weights(handoff.orientation_weight_swap);
                         if let Some(idx) = handoff.prior_global_idx {
                             next_overlap.set_prior_stage1_global_marker(GlobalMarkerIdx::new(idx));
                         }
@@ -4768,15 +4759,11 @@ impl crate::pipelines::ImputationPipeline {
                         )
                     });
                     if let Some(handoff) = next_handoff {
-                        next_overlap.set_hap_priors(handoff.priors);
-                        next_overlap.set_orientation_hap_priors(
-                            handoff.priors_id,
-                            handoff.priors_swap,
-                        );
-                        next_overlap.set_orientation_weights(
-                            handoff.orientation_weight_id,
-                            handoff.orientation_weight_swap,
-                        );
+                        // Imputation handoff consumes orientation-conditioned hap priors.
+                        // Clear legacy state_probs to prevent mixed-frame overlap payloads.
+                        next_overlap.state_probs = None;
+                        next_overlap.set_orientation_hap_priors(handoff.priors_id);
+                        next_overlap.set_orientation_weights(handoff.orientation_weight_swap);
                         if let Some(idx) = handoff.prior_global_idx {
                             next_overlap.set_prior_stage1_global_marker(GlobalMarkerIdx::new(idx));
                         }
@@ -5087,35 +5074,16 @@ impl crate::pipelines::ImputationPipeline {
             }
         }
 
-        let overlap_hap_priors = if overlap_priors_usable {
-            imp_overlap.and_then(|o| o.hap_priors())
-        } else {
-            None
-        };
         let overlap_hap_priors_id = if overlap_priors_usable {
             imp_overlap.and_then(|o| o.hap_priors_id())
         } else {
             None
         };
-        let overlap_hap_priors_swap = if overlap_priors_usable {
-            imp_overlap.and_then(|o| o.hap_priors_swap())
+        let overlap_orientation_weight_swap = if overlap_priors_usable {
+            imp_overlap.and_then(|o| o.orientation_swap_weights())
         } else {
             None
         };
-        let (overlap_orientation_weight_id, overlap_orientation_weight_swap) =
-            if overlap_priors_usable {
-                if let Some(overlap) = imp_overlap {
-                    if let Some((w_id, w_swap)) = overlap.orientation_weights() {
-                        (Some(w_id), Some(w_swap))
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
 
         let normalize_probs = |probs: &mut [f32]| -> bool {
             let mut sum = 0.0f32;
@@ -5791,7 +5759,7 @@ impl crate::pipelines::ImputationPipeline {
                                 cached_sample_idx = sample_idx;
                                 cached_wildcard_weight = 0.0;
                                 cached_allele_weight = 0.0;
-                                let sample = SampleIdx::from(sample_idx);
+                                let sample = sample_idx_from_usize(sample_idx);
                                 let h1 = sample.hap(HapSide::H1);
                                 let h2 = sample.hap(HapSide::H2);
                                 let mut a1 = target_win.allele(target_marker, h1);
@@ -6144,30 +6112,42 @@ impl crate::pipelines::ImputationPipeline {
                 .for_each_with(result_tx, |tx, s| {
                     let prior_error_rate = sample_error_rates[s].clamp(1e-6, 0.5);
                     let item: Result<ImputeResult> = (|| {
-                let sample = SampleIdx::from(s);
+                let sample = sample_idx_from_usize(s);
                 let h1_idx = sample.hap(HapSide::H1);
                 let h2_idx = sample.hap(HapSide::H2);
-                let compose_overlap_prior = |sample_idx: usize, hap_idx: usize| -> Option<HaplotypePriors> {
-                    let priors_id = overlap_hap_priors_id?.get(hap_idx)?;
-                    let priors_swap = overlap_hap_priors_swap?.get(hap_idx)?;
-                    let w_id = overlap_orientation_weight_id
-                        .and_then(|w| w.get(sample_idx))
-                        .copied()
-                        .unwrap_or(0.5);
+                let compose_overlap_prior = |sample_idx: usize, hap_idx: usize| -> Option<std::borrow::Cow<'_, HaplotypePriors>> {
+                    let priors_id = overlap_hap_priors_id?;
+                    if hap_idx >= priors_id.len() {
+                        return None;
+                    }
+                    let mate_idx = if hap_idx % 2 == 0 {
+                        hap_idx.saturating_add(1)
+                    } else {
+                        hap_idx.saturating_sub(1)
+                    };
+                    if mate_idx >= priors_id.len() {
+                        return None;
+                    }
                     let w_swap = overlap_orientation_weight_swap
                         .and_then(|w| w.get(sample_idx))
                         .copied()
                         .unwrap_or(0.5);
-                    Some(compose_boundary_message(priors_id, priors_swap, w_id, w_swap))
+                    let pri_keep = &priors_id[hap_idx];
+                    let pri_swap = &priors_id[mate_idx];
+                    if w_swap <= 1e-6 {
+                        Some(std::borrow::Cow::Borrowed(pri_keep))
+                    } else if w_swap >= 1.0 - 1e-6 {
+                        Some(std::borrow::Cow::Borrowed(pri_swap))
+                    } else {
+                        Some(std::borrow::Cow::Owned(compose_boundary_message(
+                            pri_keep, pri_swap, w_swap,
+                        )))
+                    }
                 };
                 let prior_h1_composed = compose_overlap_prior(s, h1_idx.as_usize());
                 let prior_h2_composed = compose_overlap_prior(s, h2_idx.as_usize());
-                let priors_h1 = prior_h1_composed
-                    .as_ref()
-                    .or_else(|| overlap_hap_priors.and_then(|p| p.get(h1_idx.as_usize())));
-                let priors_h2 = prior_h2_composed
-                    .as_ref()
-                    .or_else(|| overlap_hap_priors.and_then(|p| p.get(h2_idx.as_usize())));
+                let priors_h1 = prior_h1_composed.as_deref();
+                let priors_h2 = prior_h2_composed.as_deref();
 
                     let (mut input_probs_h1, mut input_probs_h2, last_info_h1, last_info_h2) =
                         build_input_probs_pair(h1_idx, h2_idx, s);
@@ -7961,7 +7941,7 @@ impl crate::pipelines::ImputationPipeline {
                             if sample_idx != cached_sample_idx {
                                 cached_sample_idx = sample_idx;
                                 cached_wildcard_weight = 0.0;
-                                let sample = SampleIdx::from(sample_idx);
+                                let sample = sample_idx_from_usize(sample_idx);
                                 let h1 = sample.hap(HapSide::H1);
                                 let h2 = sample.hap(HapSide::H2);
                                 let mut a1 = target_win.allele(target_marker, h1);
@@ -8161,24 +8141,19 @@ impl crate::pipelines::ImputationPipeline {
         }
 
         let mut all_results = Vec::with_capacity(n_target_samples);
-        let mut next_priors_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
         let mut next_priors_id_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
-        let mut next_priors_swap_vec = vec![HaplotypePriors::empty(); n_target_samples * 2];
-        let mut next_orientation_weight_id = vec![0.5f32; n_target_samples];
         let mut next_orientation_weight_swap = vec![0.5f32; n_target_samples];
         let mut handoff_marker_idx: Option<usize> = None;
 
         let phase_mask = target_win.phase_mask();
         let mut scratch_emit0: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_emit1: Vec<f64> = vec![0.0; output_markers];
-        let mut scratch_orient_alpha: Vec<f64> = vec![ORIENTATION_ALPHA_MAX; output_markers];
         let mut scratch_log_stay: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_log_flip: Vec<f64> = vec![f64::NEG_INFINITY; output_markers];
         let mut scratch_fwd0: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_fwd1: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_bwd0: Vec<f64> = vec![0.0; output_markers];
         let mut scratch_bwd1: Vec<f64> = vec![0.0; output_markers];
-        let mut scratch_has_anchor: Vec<bool> = vec![false; output_markers];
         let mut scratch_swapped: Vec<bool> = vec![false; output_markers];
         let get_result_prob = |result: &SampleImputationResult,
                                hap: usize,
@@ -8195,7 +8170,7 @@ impl crate::pipelines::ImputationPipeline {
             if !input_phased {
                 return None;
             }
-            let sample = SampleIdx::from(sample_idx);
+            let sample = sample_idx_from_usize(sample_idx);
             let h1 = sample.hap(HapSide::H1);
             let h2 = sample.hap(HapSide::H2);
             if let Some(missing) = target_missing {
@@ -8255,7 +8230,8 @@ impl crate::pipelines::ImputationPipeline {
             Some((a1, a2, conf.clamp(0.5, 1.0)))
         };
         let mut smooth_sample_orientation = |result: &mut SampleImputationResult,
-                                             capture_ref_idx: Option<usize>|
+                                             capture_ref_idx: Option<usize>,
+                                             prior_swap_prob: f32|
          -> Option<(f32, f64, f64, f64, usize)> {
             let n = output_end.saturating_sub(output_start);
             if n == 0 {
@@ -8263,32 +8239,28 @@ impl crate::pipelines::ImputationPipeline {
             }
             let emit0 = &mut scratch_emit0;
             let emit1 = &mut scratch_emit1;
-            let orient_alpha = &mut scratch_orient_alpha;
             let log_stay = &mut scratch_log_stay;
             let log_flip = &mut scratch_log_flip;
             let fwd0 = &mut scratch_fwd0;
             let fwd1 = &mut scratch_fwd1;
             let bwd0 = &mut scratch_bwd0;
             let bwd1 = &mut scratch_bwd1;
-            let has_anchor = &mut scratch_has_anchor;
             let swapped = &mut scratch_swapped;
             emit0.resize(n, 0.0);
             emit1.resize(n, 0.0);
-            orient_alpha.resize(n, ORIENTATION_ALPHA_MAX);
             log_stay.resize(n, 0.0);
             log_flip.resize(n, f64::NEG_INFINITY);
             fwd0.resize(n, 0.0);
             fwd1.resize(n, 0.0);
             bwd0.resize(n, 0.0);
             bwd1.resize(n, 0.0);
-            has_anchor.resize(n, false);
             swapped.resize(n, false);
 
             let eps = 1e-30f64;
 
             for local_m in 0..n {
                 let ref_m = output_start + local_m;
-                let (e0, e1, alpha_local, anchored_here) = if let Some((a_left, a_right, phase_conf)) =
+                let (e0, e1) = if let Some((a_left, a_right, phase_conf)) =
                     get_anchor_obs(result.sample_idx, ref_m)
                 {
                     let p1_left = get_result_prob(result, 0, local_m, a_left).unwrap_or(0.5);
@@ -8313,75 +8285,14 @@ impl crate::pipelines::ImputationPipeline {
                     let swap_mix = (c * swapped_prob as f64 + (1.0 - c) * same as f64)
                         .max(eps)
                         .ln();
-                    (
-                        same_mix,
-                        swap_mix,
-                        c.clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX),
-                        true,
-                    )
+                    (same_mix, swap_mix)
                 } else {
-                    let mut alpha = ORIENTATION_ALPHA_MIN;
-                    if let (Some(p1), Some(p2)) = (
-                        result.hap_posterior(0, local_m),
-                        result.hap_posterior(1, local_m),
-                    ) {
-                        let n_alleles = ref_markers
-                            .marker(MarkerIdx::new(ref_m as u32))
-                            .n_alleles()
-                            .max(1);
-                        let mut h1 = 0.0f64;
-                        let mut h2 = 0.0f64;
-                        for a in 0..n_alleles {
-                            let q1 = p1.prob(a).clamp(0.0, 1.0);
-                            let q2 = p2.prob(a).clamp(0.0, 1.0);
-                            if q1 > 0.0 {
-                                h1 -= (q1 as f64) * (q1 as f64).ln();
-                            }
-                            if q2 > 0.0 {
-                                h2 -= (q2 as f64) * (q2 as f64).ln();
-                            }
-                        }
-                        let hmax = (n_alleles as f64).max(2.0).ln();
-                        if hmax > 0.0 {
-                            let conf1 = (1.0 - (h1 / hmax)).clamp(0.0, 1.0);
-                            let conf2 = (1.0 - (h2 / hmax)).clamp(0.0, 1.0);
-                            alpha = ((conf1 + conf2) * 0.5)
-                                .clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX);
-                        }
-                    } else if let (Some(p1_alt), Some(p2_alt)) = (
-                        result.hap_alt_prob(0, local_m),
-                        result.hap_alt_prob(1, local_m),
-                    ) {
-                        let q1 = (p1_alt as f64).clamp(0.0, 1.0);
-                        let q2 = (p2_alt as f64).clamp(0.0, 1.0);
-                        let h_bin = |q: f64| -> f64 {
-                            let p0 = (1.0 - q).clamp(0.0, 1.0);
-                            let p1 = q;
-                            let mut h = 0.0f64;
-                            if p0 > 0.0 {
-                                h -= p0 * p0.ln();
-                            }
-                            if p1 > 0.0 {
-                                h -= p1 * p1.ln();
-                            }
-                            h
-                        };
-                        let hmax = (2.0f64).ln();
-                        if hmax > 0.0 {
-                            let conf1 = (1.0 - (h_bin(q1) / hmax)).clamp(0.0, 1.0);
-                            let conf2 = (1.0 - (h_bin(q2) / hmax)).clamp(0.0, 1.0);
-                            alpha = ((conf1 + conf2) * 0.5)
-                                .clamp(ORIENTATION_ALPHA_MIN, ORIENTATION_ALPHA_MAX);
-                        }
-                    }
-                    // Unanchored marker-level orientation is unidentifiable from
-                    // independent haplotype posteriors alone; keep neutral emission.
-                    (0.0, 0.0, alpha, false)
+                    // Without anchors, id/swap orientation is not identifiable from
+                    // independent haplotype posteriors; keep emission neutral.
+                    (0.0, 0.0)
                 };
                 emit0[local_m] = e0;
                 emit1[local_m] = e1;
-                orient_alpha[local_m] = alpha_local;
-                has_anchor[local_m] = anchored_here;
             }
 
             let logsumexp2 = |a: f64, b: f64| -> f64 {
@@ -8391,56 +8302,70 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 m + ((a - m).exp() + (b - m).exp()).ln()
             };
-            log_stay[0] = 0.0;
-            log_flip[0] = f64::NEG_INFINITY;
-            let mut eta_sum = 0.0f64;
-            let mut eta_min = f64::INFINITY;
-            let mut eta_max = 0.0f64;
-            for local_m in 1..n {
-                // Orientation state transition eta_t is a separate process from
-                // Li-Stephens recombination. eta_t is monotone in orientation
-                // uncertainty and softly boosted around anchor-adjacent gaps.
-                let alpha_gap = (orient_alpha[local_m - 1] + orient_alpha[local_m]) * 0.5;
-                let anchored_gap = has_anchor[local_m - 1] || has_anchor[local_m];
-                let eta_t = compute_orientation_transition_eta(alpha_gap, anchored_gap);
-                eta_sum += eta_t;
-                eta_min = eta_min.min(eta_t);
-                eta_max = eta_max.max(eta_t);
-                log_stay[local_m] = (1.0 - eta_t).ln();
-                log_flip[local_m] = eta_t.ln();
-            }
+            let p_swap0 = (prior_swap_prob as f64).clamp(1e-6, 1.0 - 1e-6);
+            let p_keep0 = (1.0 - p_swap0).clamp(1e-6, 1.0 - 1e-6);
+            let mut run_orientation_fb = |eta: f64| -> Option<(f64, f64)> {
+                let eta_clamped = eta.clamp(ORIENTATION_ETA_MIN, ORIENTATION_ETA_MAX);
+                log_stay[0] = 0.0;
+                log_flip[0] = f64::NEG_INFINITY;
+                for local_m in 1..n {
+                    log_stay[local_m] = (1.0 - eta_clamped).ln();
+                    log_flip[local_m] = eta_clamped.ln();
+                }
+                fwd0[0] = p_keep0.ln() + emit0[0];
+                fwd1[0] = p_swap0.ln() + emit1[0];
+                for local_m in 1..n {
+                    let prev0 = fwd0[local_m - 1];
+                    let prev1 = fwd1[local_m - 1];
+                    fwd0[local_m] = emit0[local_m]
+                        + logsumexp2(prev0 + log_stay[local_m], prev1 + log_flip[local_m]);
+                    fwd1[local_m] = emit1[local_m]
+                        + logsumexp2(prev1 + log_stay[local_m], prev0 + log_flip[local_m]);
+                }
 
-            let log_half = (0.5f64).ln();
-            fwd0[0] = log_half + emit0[0];
-            fwd1[0] = log_half + emit1[0];
-            for local_m in 1..n {
-                let prev0 = fwd0[local_m - 1];
-                let prev1 = fwd1[local_m - 1];
-                fwd0[local_m] = emit0[local_m]
-                    + logsumexp2(prev0 + log_stay[local_m], prev1 + log_flip[local_m]);
-                fwd1[local_m] = emit1[local_m]
-                    + logsumexp2(prev1 + log_stay[local_m], prev0 + log_flip[local_m]);
-            }
+                bwd0[n - 1] = 0.0;
+                bwd1[n - 1] = 0.0;
+                for local_m in (0..n - 1).rev() {
+                    let next = local_m + 1;
+                    bwd0[local_m] = logsumexp2(
+                        log_stay[next] + emit0[next] + bwd0[next],
+                        log_flip[next] + emit1[next] + bwd1[next],
+                    );
+                    bwd1[local_m] = logsumexp2(
+                        log_flip[next] + emit0[next] + bwd0[next],
+                        log_stay[next] + emit1[next] + bwd1[next],
+                    );
+                }
 
-            bwd0[n - 1] = 0.0;
-            bwd1[n - 1] = 0.0;
-            for local_m in (0..n - 1).rev() {
-                let next = local_m + 1;
-                bwd0[local_m] = logsumexp2(
-                    log_stay[next] + emit0[next] + bwd0[next],
-                    log_flip[next] + emit1[next] + bwd1[next],
-                );
-                bwd1[local_m] = logsumexp2(
-                    log_flip[next] + emit0[next] + bwd0[next],
-                    log_stay[next] + emit1[next] + bwd1[next],
-                );
+                let log_z = logsumexp2(fwd0[n - 1], fwd1[n - 1]);
+                if !log_z.is_finite() {
+                    return None;
+                }
+                let mut expected_flips = 0.0f64;
+                for local_m in 1..n {
+                    let from0_to1 =
+                        fwd0[local_m - 1] + log_flip[local_m] + emit1[local_m] + bwd1[local_m];
+                    let from1_to0 =
+                        fwd1[local_m - 1] + log_flip[local_m] + emit0[local_m] + bwd0[local_m];
+                    let log_p_flip = logsumexp2(from0_to1, from1_to0) - log_z;
+                    let p_flip = if log_p_flip.is_finite() {
+                        log_p_flip.exp().clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    expected_flips += p_flip;
+                }
+                Some((log_z, expected_flips))
+            };
+            let mut eta = orientation_eta_from_expected_flips(0.0, n.saturating_sub(1));
+            for _ in 0..ORIENTATION_ETA_EM_ITERS {
+                let (_, expected_flips) = run_orientation_fb(eta)?;
+                eta = orientation_eta_from_expected_flips(expected_flips, n.saturating_sub(1));
             }
-
-            let log_z = logsumexp2(fwd0[n - 1], fwd1[n - 1]);
+            let (log_z, _) = run_orientation_fb(eta)?;
             if !log_z.is_finite() {
                 return Some((0.5, 0.0, 0.0, 0.0, 0));
             }
-            let mut orientation_entropy_sum = 0.0f64;
             for local_m in 0..n {
                 let log_p1 = fwd1[local_m] + bwd1[local_m] - log_z;
                 let p1 = if log_p1.is_finite() {
@@ -8448,10 +8373,17 @@ impl crate::pipelines::ImputationPipeline {
                 } else {
                     0.5
                 };
-                let p0 = (1.0 - p1).clamp(1e-12, 1.0);
-                let p1c = p1.clamp(1e-12, 1.0);
-                orientation_entropy_sum += -(p0 * p0.ln() + p1c * p1c.ln());
-                swapped[local_m] = p1 >= 0.5;
+                let upper = (0.5 + ORIENTATION_DECISION_MARGIN).clamp(0.5, 1.0);
+                let lower = (0.5 - ORIENTATION_DECISION_MARGIN).clamp(0.0, 0.5);
+                swapped[local_m] = if p1 > upper {
+                    true
+                } else if p1 < lower {
+                    false
+                } else if local_m > 0 {
+                    swapped[local_m - 1]
+                } else {
+                    prior_swap_prob > 0.5
+                };
             }
 
             let mut orientation_flip_events = 0usize;
@@ -8492,12 +8424,9 @@ impl crate::pipelines::ImputationPipeline {
             } else {
                 0.5
             };
-            let eta_mean = if n > 1 {
-                eta_sum / (n - 1) as f64
-            } else {
-                0.0
-            };
-            let eta_min = if eta_min.is_finite() { eta_min } else { 0.0 };
+            let eta_mean = eta;
+            let eta_min = eta;
+            let eta_max = eta;
             if (p1_handoff - 0.5).abs() < ORIENTATION_HANDOFF_MIN_MARGIN {
                 return Some((0.5, eta_mean, eta_min, eta_max, orientation_flip_events));
             }
@@ -8524,7 +8453,7 @@ impl crate::pipelines::ImputationPipeline {
                 ReagleError::vcf(format!("Failed to receive sample imputation result: {}", e))
             })??;
             let sample_idx = item.result.sample_idx;
-            let sample = SampleIdx::from(sample_idx);
+            let sample = sample_idx_from_usize(sample_idx);
             let h1 = sample.hap(HapSide::H1).as_usize();
             let h2 = sample.hap(HapSide::H2).as_usize();
             let need1 = sm_alt_probs_by_hap
@@ -8552,17 +8481,21 @@ impl crate::pipelines::ImputationPipeline {
                 }
             }
             let capture_ref_idx = item.last_info_idx.or(prior_marker_idx);
+            let prior_swap_prob = overlap_orientation_weight_swap
+                .and_then(|w| w.get(sample_idx))
+                .copied()
+                .unwrap_or(0.5);
             let (handoff_swap_prob, eta_mean, eta_min, eta_max, orientation_flip_events) =
-                smooth_sample_orientation(&mut item.result, capture_ref_idx)
+                smooth_sample_orientation(&mut item.result, capture_ref_idx, prior_swap_prob)
                     .unwrap_or((0.5, 0.0, 0.0, 0.0, 0));
-            let (w_id, w_swap) =
-                update_orientation_boundary_weights(0.5, handoff_swap_prob.clamp(0.0, 1.0));
+            let (_, w_swap) =
+                orientation_weights_from_posterior_swap(handoff_swap_prob.clamp(0.0, 1.0));
             orientation_eta_sum += eta_mean;
             orientation_eta_min = orientation_eta_min.min(eta_min);
             orientation_eta_max = orientation_eta_max.max(eta_max);
             orientation_flip_events_total =
                 orientation_flip_events_total.saturating_add(orientation_flip_events);
-            let p0 = (w_id as f64).clamp(1e-12, 1.0);
+            let p0 = (1.0f64 - w_swap as f64).clamp(1e-12, 1.0);
             let p1 = (w_swap as f64).clamp(1e-12, 1.0);
             orientation_entropy_sum += -(p0 * p0.ln() + p1 * p1.ln());
 
@@ -8635,20 +8568,11 @@ impl crate::pipelines::ImputationPipeline {
                 );
             }
             if let Some((p1, p2)) = item.priors {
-                let base = SampleIdx::from(sample_idx).hap(HapSide::H1).as_usize();
-                if base + 1 < next_priors_vec.len() {
+                let base = sample_idx_from_usize(sample_idx).hap(HapSide::H1).as_usize();
+                if base + 1 < next_priors_id_vec.len() {
                     next_priors_id_vec[base] = p1.clone();
                     next_priors_id_vec[base + 1] = p2.clone();
-                    next_priors_swap_vec[base] = p2.clone();
-                    next_priors_swap_vec[base + 1] = p1.clone();
-                    next_priors_vec[base] =
-                        compose_boundary_message(&p1, &p2, w_id, w_swap);
-                    next_priors_vec[base + 1] =
-                        compose_boundary_message(&p2, &p1, w_id, w_swap);
-                    if sample_idx < next_orientation_weight_id.len()
-                        && sample_idx < next_orientation_weight_swap.len()
-                    {
-                        next_orientation_weight_id[sample_idx] = w_id;
+                    if sample_idx < next_orientation_weight_swap.len() {
                         next_orientation_weight_swap[sample_idx] = w_swap;
                     }
                 }
@@ -8711,10 +8635,7 @@ impl crate::pipelines::ImputationPipeline {
             overlap_start_idx: overlap_start,
             alt_prob_store,
             handoff: Some(ImputationHandoff {
-                priors: next_priors_vec,
                 priors_id: next_priors_id_vec,
-                priors_swap: next_priors_swap_vec,
-                orientation_weight_id: next_orientation_weight_id,
                 orientation_weight_swap: next_orientation_weight_swap,
                 prior_global_idx: handoff_global_idx,
                 prior_gen_pos: handoff_gen_pos,
@@ -9005,7 +8926,7 @@ impl crate::pipelines::ImputationPipeline {
             };
 
         let get_genotyped_alleles = |marker_idx: usize, sample_idx: usize| -> Option<(u8, u8)> {
-            let sample = SampleIdx::from(sample_idx);
+            let sample = sample_idx_from_usize(sample_idx);
             let h1 = sample.hap(HapSide::H1);
             let h2 = sample.hap(HapSide::H2);
             if let Some(target_m) = alignment.target_marker(MarkerIdx::new(marker_idx as u32)) {
@@ -9094,7 +9015,7 @@ impl crate::pipelines::ImputationPipeline {
         };
 
         let get_target_raw_dosage = |marker_idx: usize, sample_idx: usize| -> Option<f32> {
-            let sample = SampleIdx::from(sample_idx);
+            let sample = sample_idx_from_usize(sample_idx);
             let h1 = sample.hap(HapSide::H1);
             let h2 = sample.hap(HapSide::H2);
             let ref_marker = ref_markers.marker(MarkerIdx::new(marker_idx as u32));
@@ -9865,7 +9786,7 @@ impl crate::pipelines::ImputationPipeline {
         let mut merged_quality = ImputationQuality::new(&n_alleles_per_marker);
         let target_samples = target_win.samples_arc();
         let get_target_alleles = |t_idx: usize, s: usize| -> Option<(u8, u8)> {
-            let sample = SampleIdx::from(s);
+            let sample = sample_idx_from_usize(s);
             let h1 = sample.hap(HapSide::H1);
             let h2 = sample.hap(HapSide::H2);
             let m = MarkerIdx::new(t_idx as u32);
@@ -10250,19 +10171,20 @@ mod tests {
     }
 
     #[test]
-    fn test_orientation_transition_eta_monotone_and_bounded() {
-        let low_uncertainty = compute_orientation_transition_eta(1.0, false);
-        let high_uncertainty = compute_orientation_transition_eta(ORIENTATION_ALPHA_MIN, false);
-        let anchored = compute_orientation_transition_eta(ORIENTATION_ALPHA_MIN, true);
-        assert!(low_uncertainty >= 1e-8);
-        assert!(anchored <= ORIENTATION_ETA_MAX);
-        assert!(high_uncertainty > low_uncertainty);
-        assert!(anchored > high_uncertainty);
+    fn test_orientation_eta_from_expected_flips_bounded_and_monotone() {
+        let n_boundaries = 1000usize;
+        let low = orientation_eta_from_expected_flips(0.0, n_boundaries);
+        let mid = orientation_eta_from_expected_flips(10.0, n_boundaries);
+        let high = orientation_eta_from_expected_flips(100.0, n_boundaries);
+        assert!(low >= ORIENTATION_ETA_MIN);
+        assert!(high <= ORIENTATION_ETA_MAX);
+        assert!(mid >= low);
+        assert!(high >= mid);
     }
 
     #[test]
-    fn test_update_orientation_boundary_weights_normalizes() {
-        let (w_id, w_swap) = update_orientation_boundary_weights(0.8, 0.3);
+    fn test_orientation_weights_from_posterior_swap_normalizes() {
+        let (w_id, w_swap) = orientation_weights_from_posterior_swap(0.3);
         let sum = w_id + w_swap;
         assert!(w_id.is_finite() && w_swap.is_finite());
         assert!((sum - 1.0).abs() < 1e-6);
@@ -10279,8 +10201,8 @@ mod tests {
             vec![GlobalHapId(2), GlobalHapId(3)],
             vec![0.60, 0.40],
         );
-        let m12 = compose_boundary_message(&p1, &p2, 0.7, 0.3);
-        let m21 = compose_boundary_message(&p2, &p1, 0.3, 0.7);
+        let m12 = compose_boundary_message(&p1, &p2, 0.3);
+        let m21 = compose_boundary_message(&p2, &p1, 0.7);
         assert_eq!(m12.ids(), m21.ids());
         assert_eq!(m12.probs().len(), m21.probs().len());
         for (a, b) in m12.probs().iter().zip(m21.probs().iter()) {

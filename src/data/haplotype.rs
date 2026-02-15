@@ -54,7 +54,9 @@ impl From<u32> for SampleIdx {
 
 impl From<usize> for SampleIdx {
     fn from(idx: usize) -> Self {
-        Self(idx as u32)
+        Self(
+            u32::try_from(idx).expect("SampleIdx conversion overflow: usize does not fit in u32"),
+        )
     }
 }
 
@@ -121,7 +123,7 @@ impl From<u32> for HapIdx {
 
 impl From<usize> for HapIdx {
     fn from(idx: usize) -> Self {
-        Self(idx as u32)
+        Self(u32::try_from(idx).expect("HapIdx conversion overflow: usize does not fit in u32"))
     }
 }
 

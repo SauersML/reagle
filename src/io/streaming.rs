@@ -17,6 +17,7 @@ use std::sync::Arc;
 use flate2::read::GzDecoder;
 use noodles::bgzf::io as bgzf_io;
 use noodles::vcf::Header;
+use serde::{Deserialize, Serialize};
 use tracing::info_span;
 
 use crate::data::ChromIdx;
@@ -50,7 +51,7 @@ impl Default for StreamingConfig {
 }
 
 /// Posterior state probabilities for soft-information handoff
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateProbs {
     /// State probabilities for each haplotype at each Stage 1 marker
     /// Layout: [hap][marker_idx][state]
@@ -64,11 +65,23 @@ pub struct StateProbs {
 impl StateProbs {}
 
 /// Global haplotype identifier (stable across windows).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct GlobalHapId(pub u32);
 
 /// Marker index relative to a window start (`0..window_len`).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+)]
 pub struct WindowLocalMarkerIdx(pub usize);
 
 impl WindowLocalMarkerIdx {
@@ -91,11 +104,17 @@ impl WindowLocalMarkerIdx {
     pub fn from_global(
         global: GlobalMarkerIdx,
         window_global_start: GlobalMarkerIdx,
+        window_len: usize,
     ) -> Option<Self> {
-        global
+        let local = global
             .as_usize()
             .checked_sub(window_global_start.as_usize())
-            .map(Self)
+            .map(Self)?;
+        if local.as_usize() < window_len {
+            Some(local)
+        } else {
+            None
+        }
     }
 }
 
@@ -103,7 +122,19 @@ impl WindowLocalMarkerIdx {
 ///
 /// This is distinct from window-local marker indices (`0..window_len`) and
 /// prevents accidental local/global index mixing across window boundaries.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+)]
 pub struct GlobalMarkerIdx(pub usize);
 
 impl GlobalMarkerIdx {
@@ -125,7 +156,7 @@ impl GlobalMarkerIdx {
 ///
 /// Design: Store (hap_id, prob) pairs sorted by hap_id for binary search.
 /// Only significant probabilities (>0.001) are stored to save memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HaplotypePriors {
     /// Sorted haplotype IDs (for binary search)
     hap_ids: Vec<GlobalHapId>,
@@ -232,7 +263,7 @@ impl Default for HaplotypePriors {
 /// This carries the phased alleles from the overlap region of the previous window
 /// to constrain the next window's phasing for phase continuity at window boundaries.
 /// Based on Java's FixedPhaseData and SplicedGT classes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhasedOverlap {
     /// Number of markers in the overlap
     pub n_markers: usize,
@@ -249,10 +280,6 @@ pub struct PhasedOverlap {
     pub hap_priors: Option<Vec<HaplotypePriors>>,
     /// Orientation-conditioned handoff priors under keep-label hypothesis.
     pub hap_priors_id: Option<Vec<HaplotypePriors>>,
-    /// Orientation-conditioned handoff priors under swapped-label hypothesis.
-    pub hap_priors_swap: Option<Vec<HaplotypePriors>>,
-    /// Per-sample orientation posterior mass for keep-label hypothesis.
-    pub orientation_weight_id: Option<Vec<f32>>,
     /// Per-sample orientation posterior mass for swap-label hypothesis.
     pub orientation_weight_swap: Option<Vec<f32>>,
 
@@ -284,8 +311,6 @@ impl PhasedOverlap {
             state_probs: None,
             hap_priors: None,
             hap_priors_id: None,
-            hap_priors_swap: None,
-            orientation_weight_id: None,
             orientation_weight_swap: None,
             prior_stage1_global_marker: None,
             prior_stage1_gen_pos: None,
@@ -312,12 +337,9 @@ impl PhasedOverlap {
     pub fn set_orientation_hap_priors(
         &mut self,
         priors_id: Vec<HaplotypePriors>,
-        priors_swap: Vec<HaplotypePriors>,
     ) {
         debug_assert_eq!(priors_id.len(), self.n_haps);
-        debug_assert_eq!(priors_swap.len(), self.n_haps);
         self.hap_priors_id = Some(priors_id);
-        self.hap_priors_swap = Some(priors_swap);
     }
 
     /// Get orientation-conditioned priors under keep-label hypothesis.
@@ -325,24 +347,15 @@ impl PhasedOverlap {
         self.hap_priors_id.as_deref()
     }
 
-    /// Get orientation-conditioned priors under swapped-label hypothesis.
-    pub fn hap_priors_swap(&self) -> Option<&[HaplotypePriors]> {
-        self.hap_priors_swap.as_deref()
-    }
-
-    /// Set per-sample orientation posterior weights.
-    pub fn set_orientation_weights(&mut self, weight_id: Vec<f32>, weight_swap: Vec<f32>) {
-        debug_assert_eq!(weight_id.len(), self.n_haps / 2);
+    /// Set per-sample orientation posterior swap weights.
+    pub fn set_orientation_weights(&mut self, weight_swap: Vec<f32>) {
         debug_assert_eq!(weight_swap.len(), self.n_haps / 2);
-        self.orientation_weight_id = Some(weight_id);
         self.orientation_weight_swap = Some(weight_swap);
     }
 
-    /// Get per-sample orientation posterior weights.
-    pub fn orientation_weights(&self) -> Option<(&[f32], &[f32])> {
-        let id = self.orientation_weight_id.as_deref()?;
-        let sw = self.orientation_weight_swap.as_deref()?;
-        Some((id, sw))
+    /// Get per-sample orientation posterior swap weights.
+    pub fn orientation_swap_weights(&self) -> Option<&[f32]> {
+        self.orientation_weight_swap.as_deref()
     }
 
     /// Set the global marker index at which haplotype priors were exported.
