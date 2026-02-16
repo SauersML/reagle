@@ -1412,7 +1412,7 @@ fn normalize_probs(probs: &mut [f32]) {
 fn adjusted_recomb_rate(recomb_rate: f32) -> f32 {
     // Ensure minimal background recombination to prevent infinite memory of
     // random states in zero-map-distance regions.
-    recomb_rate.max(1e-5).clamp(0.0, 1.0)
+    recomb_rate.max(1e-8).clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -1439,7 +1439,7 @@ pub(crate) fn compute_nearest_observed_lambda(
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
 ) {
-    const BASE_CLUSTER_CM: f32 = 0.02;
+    const BASE_CLUSTER_CM: f32 = 0.005;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);
@@ -3245,14 +3245,14 @@ trait ImputeKernel {
         active_states: usize,
         checkpoint_totals: Option<[f32; 3]>,
         use_boundary_fb_products: bool,
-        pattern_sum_key: &mut usize,
+        pattern_sum_key: &mut Option<usize>,
     ) -> Self::MarkerCtx {
         let _ = checkpoint_totals;
         let _ = use_boundary_fb_products;
         let prepared =
             self.prepare_marker(ws, m, state_haps, ref_columns, n_alleles, active_states);
         let key = Self::marker_key(&prepared);
-        if key != *pattern_sum_key {
+        if Some(key) != *pattern_sum_key {
             let n_groups = Self::marker_group_count(&prepared);
             ws.ensure_pattern_sums(n_groups);
             if use_boundary_fb_products {
@@ -3279,7 +3279,7 @@ trait ImputeKernel {
                     &mut ws.pattern_state_count[..n_groups],
                 );
             }
-            *pattern_sum_key = key;
+            *pattern_sum_key = Some(key);
         }
         prepared
     }
@@ -3639,7 +3639,7 @@ impl ImputeKernel for DenseKernel {
         active_states: usize,
         checkpoint_totals: Option<[f32; 3]>,
         use_boundary_fb_products: bool,
-        pattern_sum_key: &mut usize,
+        pattern_sum_key: &mut Option<usize>,
     ) -> Self::MarkerCtx {
         let n_groups = if n_alleles == 0 { 1 } else { n_alleles + 1 };
         if ws.dict_pattern_alleles.len() < n_groups {
@@ -3702,7 +3702,7 @@ impl ImputeKernel for DenseKernel {
                     }
                     self.pattern_signature_set(key, state_haps, active_states);
                 }
-                if key != *pattern_sum_key {
+                if Some(key) != *pattern_sum_key {
                     let n_patterns = col.seq_alleles().len();
                     ws.ensure_pattern_sums(n_patterns);
                     if use_boundary_fb_products {
@@ -3729,7 +3729,7 @@ impl ImputeKernel for DenseKernel {
                             &mut ws.pattern_state_count[..n_patterns],
                         );
                     }
-                    *pattern_sum_key = key;
+                    *pattern_sum_key = Some(key);
                 }
                 let n_patterns = col.seq_alleles().len();
                 return PreparedGroups {
@@ -3798,7 +3798,7 @@ impl ImputeKernel for DenseKernel {
                     }
                     self.dict_allele_signature_set(key, dict_offset, n_patterns);
                 }
-                if key != *pattern_sum_key {
+                if Some(key) != *pattern_sum_key {
                     ws.ensure_pattern_sums(n_patterns);
                     if use_boundary_fb_products {
                         fill_pattern_sums_with_products(
@@ -3824,7 +3824,7 @@ impl ImputeKernel for DenseKernel {
                             &mut ws.pattern_state_count[..n_patterns],
                         );
                     }
-                    *pattern_sum_key = key;
+                    *pattern_sum_key = Some(key);
                 }
                 return PreparedGroups {
                     key,
@@ -3840,7 +3840,7 @@ impl ImputeKernel for DenseKernel {
                     if self.sparse_identity_order {
                         let dense_key_u64 = Self::dense_identity_key(col, active_states, n_alleles);
                         let dense_key = dense_key_u64 as usize;
-                        if *pattern_sum_key == dense_key
+                        if *pattern_sum_key == Some(dense_key)
                             && self.dense_identity_match(col, active_states, dense_key_u64)
                         {
                             return PreparedGroups {
@@ -3945,7 +3945,7 @@ impl ImputeKernel for DenseKernel {
                         ws.pattern_sum_b[miss_pid] = miss_sum_b;
                         ws.pattern_sum_fb[miss_pid] = miss_sum_fb;
                         ws.pattern_state_count[miss_pid] = miss_count as f32;
-                        *pattern_sum_key = dense_key;
+                        *pattern_sum_key = Some(dense_key);
                         self.dense_identity_capture(col, active_states, dense_key_u64);
                     } else {
                         self.dense_identity_invalidate();
@@ -3994,14 +3994,14 @@ impl ImputeKernel for DenseKernel {
                             };
                             ws.pattern_state_count[pid] += 1.0;
                         }
-                        *pattern_sum_key = m.wrapping_add(1);
+                        *pattern_sum_key = Some(m.wrapping_add(1));
                     }
                 } else {
                     self.ensure_sparse_state_index(state_haps, active_states);
                     if self.sparse_identity_order {
                         let dense_key_u64 = Self::dense_identity_key(col, active_states, n_alleles);
                         let dense_key = dense_key_u64 as usize;
-                        if *pattern_sum_key == dense_key
+                        if *pattern_sum_key == Some(dense_key)
                             && self.dense_identity_match(col, active_states, dense_key_u64)
                         {
                             return PreparedGroups {
@@ -4125,7 +4125,7 @@ impl ImputeKernel for DenseKernel {
                         ws.pattern_sum_b[miss_pid] = miss_sum_b;
                         ws.pattern_sum_fb[miss_pid] = miss_sum_fb;
                         ws.pattern_state_count[miss_pid] = miss_count as f32;
-                        *pattern_sum_key = dense_key;
+                        *pattern_sum_key = Some(dense_key);
                         self.dense_identity_capture(col, active_states, dense_key_u64);
                     } else {
                         self.dense_identity_invalidate();
@@ -4172,11 +4172,11 @@ impl ImputeKernel for DenseKernel {
                             };
                             ws.pattern_state_count[pid] += 1.0;
                         }
-                        *pattern_sum_key = m.wrapping_add(1);
+                        *pattern_sum_key = Some(m.wrapping_add(1));
                     }
                 }
                 return PreparedGroups {
-                    key: *pattern_sum_key,
+                    key: pattern_sum_key.unwrap_or(m.wrapping_add(1)),
                     n_groups,
                     direct_alleles_ptr: std::ptr::null(),
                     direct_alleles_len: 0,
@@ -4356,12 +4356,12 @@ impl ImputeKernel for DenseKernel {
                         &mut ws.pattern_state_count[..n_groups],
                     );
                 }
-                *pattern_sum_key = prepared.key;
+                *pattern_sum_key = Some(prepared.key);
                 return prepared;
             }
         }
 
-        *pattern_sum_key = m.wrapping_add(1);
+        *pattern_sum_key = Some(m.wrapping_add(1));
         PreparedGroups {
             key: m.wrapping_add(1),
             n_groups,
@@ -4813,7 +4813,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         if active_markers > 0 {
             kernel.reset_backward();
             for cp_idx in checkpoint_grid.rev_indices() {
-                let mut pattern_sum_key: usize = usize::MAX;
+                let mut pattern_sum_key: Option<usize> = None;
                 let block = checkpoint_grid.block_view(cp_idx, active_markers);
                 let block_start = block.start_usize();
                 let block_end = block.end_usize();
@@ -5044,11 +5044,11 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        // Use state count (flat prior) for smoothing target, not posterior mass.
-                                        // In interior loop, this is the count of states in pattern group `pid`.
-                                        let count = ws.pattern_state_count[pid].max(0.0);
-                                        smoothing_prior_counts[idx] += count;
-                                        smoothing_prior_total += count;
+                                        // Use posterior mass for smoothing target to preserve local HMM signal.
+                                        // Using flat state counts (prior mass) here causes underfitting.
+                                        let mass = state_prob.max(0.0);
+                                        smoothing_prior_counts[idx] += mass;
+                                        smoothing_prior_total += mass;
                                     } else {
                                         // Out-of-domain allele mass uses prior-shrunk redistribution.
                                         missing_ood_mass += state_prob as f64;
@@ -5302,10 +5302,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        // Use state count (flat prior) for smoothing target, not posterior mass.
-                                        // In boundary loop, we visit each state explicitly, so add 1.0 per state.
-                                        smoothing_prior_counts[idx] += 1.0;
-                                        smoothing_prior_total += 1.0;
+                                        // Use posterior mass for smoothing target.
+                                        let mass = state_prob.max(0.0);
+                                        smoothing_prior_counts[idx] += mass;
+                                        smoothing_prior_total += mass;
                                     } else {
                                         missing_ood_mass += state_prob as f64;
                                     }
@@ -5328,9 +5328,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        // Use state count (1.0 per state) for smoothing target
-                                        smoothing_prior_counts[idx] += 1.0;
-                                        smoothing_prior_total += 1.0;
+                                        // Use posterior mass for smoothing target.
+                                        let mass = state_prob.max(0.0);
+                                        smoothing_prior_counts[idx] += mass;
+                                        smoothing_prior_total += mass;
                                     } else {
                                         // Keep mass accounting consistent with interior path:
                                         // out-of-domain mass is tracked separately.
