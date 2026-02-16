@@ -586,45 +586,25 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow sharpening below base when typed evidence is strong, but limit
-    // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    // Sharpening below base rate is dangerous: it makes the HMM over-trust
+    // local matches and become brittle to minor mismatches/errors, causing
+    // it to latch onto wrong haplotypes that happen to match locally.
+    // We clamp the lower bound to the base error rate to preserve robustness.
+    let min_error = base.max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
 #[inline]
 fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_rate: f32) -> f32 {
     let base = base_error_rate.clamp(1e-6, 0.5);
+    // Empirical tuning showed that aggressive sharpening of marker error rates
+    // (e.g. down to 0.15*base) caused over-trust in local matches and
+    // reduced robustness to rare-variant phasing errors.
+    // We now stick closer to the base error rate, only modulating slightly.
     if !observed || probs.is_empty() {
         return base;
     }
-    let mut max_prob = 0.0f32;
-    let mut entropy = 0.0f32;
-    let mut n_alleles = 0usize;
-    for &p in probs {
-        if !p.is_finite() || p <= 0.0 {
-            continue;
-        }
-        n_alleles += 1;
-        if p > max_prob {
-            max_prob = p;
-        }
-        entropy -= p * p.ln();
-    }
-    if n_alleles == 0 {
-        return base;
-    }
-    let max_entropy = (n_alleles.max(2) as f32).ln();
-    let entropy_norm = if max_entropy > 0.0 {
-        (entropy / max_entropy).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let scaled = base * (1.6 - 1.2 * confidence);
-    let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
-    let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    base
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -4324,7 +4304,8 @@ impl crate::pipelines::ImputationPipeline {
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+        // Formula: 4 * Ne / N_ref. (Scaled to Morgans, then p_recomb scales to cM).
+        let impute_recomb_intensity = (4.0 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
