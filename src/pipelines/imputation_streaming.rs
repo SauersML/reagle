@@ -141,6 +141,72 @@ fn fill_ref_alleles(col: &GenotypeColumn, out: &mut [u8]) {
     col.fill_all(out);
 }
 
+fn compute_window_panel_priors(
+    ref_window: &crate::io::bref3::RefWindow,
+) -> Option<Arc<Vec<AllelePosteriors>>> {
+    let n_haps = ref_window
+        .ref_columns
+        .first()
+        .map(|c| c.n_haplotypes())
+        .unwrap_or(0);
+    if n_haps == 0 {
+        return None;
+    }
+    let mut alleles = vec![0u8; n_haps];
+    let missing_raw = crate::data::storage::AlleleCode::MISSING.raw();
+    let mut priors = Vec::with_capacity(ref_window.markers.len());
+
+    for (m, col) in ref_window.ref_columns.iter().enumerate() {
+        fill_ref_alleles(col, &mut alleles);
+        let n_alleles = ref_window
+            .markers
+            .marker(MarkerIdx::new(m as u32))
+            .n_alleles();
+        if n_alleles <= 2 {
+            let mut alt_count = 0;
+            let mut total = 0;
+            for &a in &alleles {
+                if a != missing_raw {
+                    total += 1;
+                    if a == 1 {
+                        alt_count += 1;
+                    }
+                }
+            }
+            let p = if total > 0 {
+                alt_count as f32 / total as f32
+            } else {
+                0.0
+            };
+            priors.push(AllelePosteriors::Biallelic(p));
+        } else {
+            let mut counts = vec![0usize; n_alleles];
+            let mut total = 0usize;
+            for &a in &alleles {
+                if a != missing_raw {
+                    let idx = a as usize;
+                    if idx < n_alleles {
+                        counts[idx] += 1;
+                        total += 1;
+                    }
+                }
+            }
+            let mut probs = vec![0.0f32; n_alleles];
+            if total > 0 {
+                let inv = 1.0 / total as f32;
+                for i in 0..n_alleles {
+                    probs[i] = counts[i] as f32 * inv;
+                }
+            } else {
+                let inv = 1.0 / n_alleles.max(1) as f32;
+                probs.fill(inv);
+            }
+            priors.push(AllelePosteriors::Multiallelic(Arc::from(probs)));
+        }
+    }
+    Some(Arc::new(priors))
+}
+
 #[inline]
 fn is_represented_in_states(state_haps: &[RefHapId], col: &GenotypeColumn, allele: u8) -> bool {
     for &hap in state_haps {
@@ -4418,6 +4484,8 @@ impl crate::pipelines::ImputationPipeline {
                         &ref_window.markers,
                     );
 
+                    let panel_priors = compute_window_panel_priors(ref_window);
+
                     let phased_target = target_window.genotypes.clone().into_phased();
                     let phased_target_pl =
                         Some(target_window_source.genotypes.clone().into_phased());
@@ -4519,6 +4587,7 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.output_end,
                         true,
                         &mut sample_error_rates,
+                        panel_priors,
                     )?;
 
                     let mut next_handoff = None;
@@ -4712,6 +4781,8 @@ impl crate::pipelines::ImputationPipeline {
                         &ref_window.markers,
                     );
 
+                    let panel_priors = compute_window_panel_priors(&ref_window);
+
                     let phased_target = target_window.genotypes.clone().into_phased();
                     let phased_target_pl =
                         Some(target_window_source.genotypes.clone().into_phased());
@@ -4772,6 +4843,7 @@ impl crate::pipelines::ImputationPipeline {
                         ref_window.output_end,
                         true,
                         &mut sample_error_rates,
+                        panel_priors,
                     )?;
 
                     let mut next_handoff = None;
@@ -4928,6 +5000,7 @@ impl crate::pipelines::ImputationPipeline {
         output_end: usize,
         phase_conf_valid: bool,
         sample_error_rates: &mut [f32],
+        panel_priors: Option<Arc<Vec<AllelePosteriors>>>,
     ) -> Result<Option<ImputationWindowResults>> {
         let window_span = if self.config.profile {
             Some(
@@ -5728,11 +5801,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                panel_priors.clone(),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                panel_priors.clone(),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
