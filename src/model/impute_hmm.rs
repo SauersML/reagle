@@ -1702,7 +1702,6 @@ fn apply_marker_prior_smoothing(
     } else {
         fallback_missing_mass
     };
-    let floor_mix = min_prior_mix.clamp(0.0, 0.9);
     let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
     let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
@@ -1726,17 +1725,24 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
+
+    // Scale the static floor by combined error so dense/confident regions aren't
+    // artificially smoothed towards the panel mean.
+    // If combined_error is 0 (perfect density), floor_mix becomes 0,
+    // allowing HMM to reach 1.0 even if panel is split.
+    let floor_mix = (min_prior_mix * combined_error).clamp(0.0, 0.9);
+
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     //
     // Revised to blend even if missing_mass is zero (provided combined_error is high),
     // because sparse subsets can be biased even if fully contained.
     //
-    // We floor combined_error at 0.05 to ensure at least some blending capability
-    // (via disagreement boost) even when the HMM claims full confidence/coverage,
-    // protecting against Perfect LD traps.
+    // We remove the 0.05 floor to allow dense/complete-subset regions to fully trust the HMM,
+    // which is necessary for preserving private variants in dense panels.
+    // Traps in sparse/truncated regions are still handled via combined_error (dist + sparsity).
     let adaptive_panel_mix =
-        (0.25 * combined_error.max(0.05) * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.25);
+        (0.25 * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.25);
 
     let mut panel_probs_slice: Option<&[f32]> = None;
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -1766,7 +1772,6 @@ fn apply_marker_prior_smoothing(
                 panel_probs,
                 floor_mix,
                 adaptive_panel_mix,
-                dist_error,
             );
         }
     }
@@ -1804,7 +1809,6 @@ fn apply_adaptive_panel_blend(
     panel_probs: &[f32],
     floor_mix: f32,
     adaptive_panel_mix: f32,
-    dist_error: f32,
 ) {
     if allele_probs.len() != panel_probs.len() {
         return;
@@ -1827,47 +1831,65 @@ fn apply_adaptive_panel_blend(
     }
 
     if adaptive_panel_mix > 0.0 {
-        // Jensen-Shannon disagreement quantifies mismatch between local subset
-        // and panel prior. Larger mismatch increases blend strength, but blend
-        // remains bounded by adaptive_panel_mix cap.
-        let mut m_entropy = 0.0f32;
-        let mut p_entropy = 0.0f32;
-        let mut q_entropy = 0.0f32;
-        for (i, &p_raw) in allele_probs.iter().enumerate() {
-            let p = p_raw.clamp(0.0, 1.0);
-            let q = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let m = 0.5 * (p + q);
-            if p > 0.0 {
-                p_entropy -= p * p.ln();
-            }
-            if q > 0.0 {
-                q_entropy -= q * q.ln();
-            }
-            if m > 0.0 {
-                m_entropy -= m * m.ln();
+        // "Trap" detection:
+        // If the HMM is extremely confident (p ~ 1.0) but the chosen allele is rare in the panel,
+        // we suspect a "Perfect LD Trap" (subset collapse onto a rare haplotype).
+        // Conversely, if the HMM is confident and the allele is common (or supported), we trust it
+        // (Slam Dunk).
+        //
+        // We use a smooth rarity penalty e^(-20 * x) which decays rapidly as panel support x increases.
+        //   x=0.00 -> penalty=1.00
+        //   x=0.01 -> penalty=0.82
+        //   x=0.05 -> penalty=0.36
+        //   x=0.10 -> penalty=0.13
+        //   x=0.50 -> penalty~0.00
+        //
+        // Mixing weight w is enabled by either:
+        // 1. Uncertainty: HMM is not confident (1 - max_p).
+        // 2. Rarity: HMM is confident but panel says it's rare.
+        let mut max_hmm_p = 0.0f32;
+        let mut max_idx = 0;
+        for (i, &p) in allele_probs.iter().enumerate() {
+            if p > max_hmm_p {
+                max_hmm_p = p;
+                max_idx = i;
             }
         }
-        let js_div = (m_entropy - 0.5 * (p_entropy + q_entropy)).max(0.0);
-        let max_js = (2.0f32).ln();
-        let disagreement = (js_div / max_js).clamp(0.0, 1.0);
+        let panel_support = panel_probs.get(max_idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        // Stricter rarity decay (50.0) to target only extremely rare variants (traps),
+        // while preserving semi-rare (1-5%) variants.
+        // x=0.01 -> penalty=0.60
+        // x=0.05 -> penalty=0.08
+        let rarity_penalty = (-50.0 * panel_support).exp();
 
-        // Symmetric convex blend:
-        //   p <- (1-w) * p + w * panel
-        // applied after flooring to preserve calibration and normalization.
-        //
-        // Boost mixing significantly if local posterior disagrees with panel prior.
-        // This is critical for mitigating subset collapse (Perfect LD traps) where
-        // the HMM is confidently wrong relative to population frequency.
-        //
-        // Scale disagreement boost by dist_error so we trust the HMM more
-        // when we are close to a typed anchor (Slam Dunk).
-        let w = (adaptive_panel_mix + 0.15 * disagreement * dist_error).clamp(0.0, 0.15);
-        let one_minus_w = 1.0 - w;
-        for (i, prob) in allele_probs.iter_mut().enumerate() {
-            let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            *prob = one_minus_w * *prob + w * panel_p;
+        let uncertainty = (1.0 - max_hmm_p).max(0.0);
+        let mix_gate = (uncertainty + max_hmm_p * rarity_penalty).clamp(0.0, 1.0);
+
+        // Combine base sparsity/distance-driven intensity (adaptive_panel_mix) with the content gate.
+        let trap_mix = (adaptive_panel_mix * mix_gate).clamp(0.0, 0.15);
+
+        // Agreement sharpening: if HMM confidence is reasonably high (>0.9) AND
+        // the top HMM choice matches the panel consensus with very high confidence (>0.99),
+        // we can mix aggressively to sharpen the call (e.g. 0.93 -> 0.99).
+        // This is safe because HMM and Panel agree.
+        // It does NOT trigger for "Slam Dunk" (HMM=1.0 ALT, Panel=0.0 REF) because support=0.
+        // It does NOT trigger for "Trap" (HMM=1.0 ALT, Panel=0.0 REF) because support=0.
+        let agreement_mix = if max_hmm_p > 0.9 && panel_support > 0.99 {
+            0.5
+        } else {
+            0.0
+        };
+
+        let w = trap_mix.max(agreement_mix).clamp(0.0, 0.5);
+
+        if w > 1e-6 {
+            let one_minus_w = 1.0 - w;
+            for (i, prob) in allele_probs.iter_mut().enumerate() {
+                let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                *prob = one_minus_w * *prob + w * panel_p;
+            }
+            normalize_probs(allele_probs);
         }
-        normalize_probs(allele_probs);
     }
 }
 
