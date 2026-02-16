@@ -1410,7 +1410,9 @@ fn normalize_probs(probs: &mut [f32]) {
 
 #[inline]
 fn adjusted_recomb_rate(recomb_rate: f32) -> f32 {
-    recomb_rate.clamp(0.0, 1.0)
+    // Ensure minimal background recombination to prevent infinite memory of
+    // random states in zero-map-distance regions.
+    recomb_rate.max(1e-5).clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -1437,7 +1439,7 @@ pub(crate) fn compute_nearest_observed_lambda(
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
 ) {
-    const BASE_CLUSTER_CM: f32 = 0.005;
+    const BASE_CLUSTER_CM: f32 = 0.10;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);
@@ -1725,7 +1727,7 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        ((missing_mass + 0.5 * sparsity_boost) * combined_error).clamp(0.0, 0.75);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -5042,8 +5044,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
-                                        smoothing_prior_total += state_prob.max(0.0);
+                                        // Use state count (flat prior) for smoothing target, not posterior mass
+                                        let count = ws.pattern_state_count[pid].max(0.0);
+                                        smoothing_prior_counts[idx] += count;
+                                        smoothing_prior_total += count;
                                     } else {
                                         // Out-of-domain allele mass uses prior-shrunk redistribution.
                                         missing_ood_mass += state_prob as f64;
@@ -5297,8 +5301,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
-                                        smoothing_prior_total += state_prob.max(0.0);
+                                        // Use state count (flat prior) for smoothing target, not posterior mass
+                                        let count = ws.pattern_state_count[pid].max(0.0);
+                                        smoothing_prior_counts[idx] += count;
+                                        smoothing_prior_total += count;
                                     } else {
                                         missing_ood_mass += state_prob as f64;
                                     }
@@ -5321,8 +5327,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
-                                        smoothing_prior_total += state_prob.max(0.0);
+                                        // Use state count (1.0 per state) for smoothing target
+                                        smoothing_prior_counts[idx] += 1.0;
+                                        smoothing_prior_total += 1.0;
                                     } else {
                                         // Keep mass accounting consistent with interior path:
                                         // out-of-domain mass is tracked separately.
