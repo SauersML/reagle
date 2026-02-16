@@ -589,8 +589,9 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Sharpening below base rate is dangerous: it makes the HMM over-trust
     // local matches and become brittle to minor mismatches/errors, causing
     // it to latch onto wrong haplotypes that happen to match locally.
-    // We clamp the lower bound to the base error rate to preserve robustness.
-    let min_error = base.max(1e-6);
+    // We clamp the lower bound to 0.5 * base to preserve robustness while
+    // allowing some sharpening for clean data.
+    let min_error = (base * 0.5).max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -604,7 +605,15 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     if !observed || probs.is_empty() {
         return base;
     }
-    base
+    let mut max_p = 0.0f32;
+    for &p in probs {
+        if p > max_p {
+            max_p = p;
+        }
+    }
+    let error = (1.0 - max_p).clamp(0.0, 1.0);
+    // Allow sharpening down to 0.5 * base, but no further.
+    error.max(base * 0.5).max(1e-6).clamp(1e-6, 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
