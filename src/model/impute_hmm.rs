@@ -1729,12 +1729,15 @@ fn apply_marker_prior_smoothing(
     //
     // We mix based on:
     // 1. Coverage failure (missing_mass): HMM admits it doesn't cover the state space.
-    //    Scaled by combined_error (distance) because we trust local anchors more.
     // 2. Sparsity risk (sparsity_boost): HMM might be biased by small subset selection
-    //    (Perfect LD trap), even if missing_mass is low. We maintain this mix floor
-    //    even near anchors to correct false certainty.
+    //    (Perfect LD trap), even if missing_mass is low.
+    //
+    // Both terms are scaled by combined_error (distance/quality). If we are close
+    // to confident typed anchors, we trust the HMM subset transition structure
+    // (which captures local LD) over the global panel prior. Mixing the prior
+    // too strongly near anchors dilutes valid local signal.
     let coverage_mix = missing_mass * combined_error;
-    let sparsity_mix = sparsity_boost;
+    let sparsity_mix = sparsity_boost * combined_error;
     let base_mix = coverage_mix.max(sparsity_mix);
 
     // Allow stronger mixing (up to 95%) to fix AF collapse and calibration in sparse/uncertain regimes.
