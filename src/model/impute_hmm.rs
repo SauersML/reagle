@@ -1724,8 +1724,12 @@ fn apply_marker_prior_smoothing(
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
+    // Use maximum of missing_mass and truncation_error to drive the mix,
+    // ensuring we blend panel priors when the subset is small (high truncation)
+    // even if the HMM found full support within that subset.
+    let mix_driver = missing_mass.max(truncation_error * 0.5);
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.35 * mix_driver * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
