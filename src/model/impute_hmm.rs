@@ -5042,8 +5042,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
-                                        smoothing_prior_total += state_prob.max(0.0);
+                                        // Use state count (flat prior) for smoothing target, not posterior mass
+                                        let count = ws.pattern_state_count[pid].max(0.0);
+                                        smoothing_prior_counts[idx] += count;
+                                        smoothing_prior_total += count;
                                     } else {
                                         // Out-of-domain allele mass uses prior-shrunk redistribution.
                                         missing_ood_mass += state_prob as f64;
@@ -5297,8 +5299,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
-                                        smoothing_prior_total += state_prob.max(0.0);
+                                        // Use state count (flat prior) for smoothing target, not posterior mass
+                                        let count = ws.pattern_state_count[pid].max(0.0);
+                                        smoothing_prior_counts[idx] += count;
+                                        smoothing_prior_total += count;
                                     } else {
                                         missing_ood_mass += state_prob as f64;
                                     }
@@ -5321,8 +5325,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        smoothing_prior_counts[idx] += state_prob.max(0.0);
-                                        smoothing_prior_total += state_prob.max(0.0);
+                                        // Use state count (1.0 per state) for smoothing target
+                                        smoothing_prior_counts[idx] += 1.0;
+                                        smoothing_prior_total += 1.0;
                                     } else {
                                         // Keep mass accounting consistent with interior path:
                                         // out-of-domain mass is tracked separately.
