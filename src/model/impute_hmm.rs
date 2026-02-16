@@ -1736,7 +1736,7 @@ fn apply_marker_prior_smoothing(
     // (via disagreement boost) even when the HMM claims full confidence/coverage,
     // protecting against Perfect LD traps.
     let adaptive_panel_mix =
-        (0.5 * combined_error.max(0.2) * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.5);
+        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     let mut panel_probs_slice: Option<&[f32]> = None;
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -1761,7 +1761,13 @@ fn apply_marker_prior_smoothing(
 
     if let Some(panel_probs) = panel_probs_slice {
         if panel_probs.len() == allele_probs.len() {
-            apply_adaptive_panel_blend(allele_probs, panel_probs, floor_mix, adaptive_panel_mix);
+            apply_adaptive_panel_blend(
+                allele_probs,
+                panel_probs,
+                floor_mix,
+                adaptive_panel_mix,
+                sparsity_boost,
+            );
         }
     }
 
@@ -1798,6 +1804,7 @@ fn apply_adaptive_panel_blend(
     panel_probs: &[f32],
     floor_mix: f32,
     adaptive_panel_mix: f32,
+    sparsity_boost: f32,
 ) {
     if allele_probs.len() != panel_probs.len() {
         return;
@@ -1851,7 +1858,10 @@ fn apply_adaptive_panel_blend(
         // Boost mixing significantly if local posterior disagrees with panel prior.
         // This is critical for mitigating subset collapse (Perfect LD traps) where
         // the HMM is confidently wrong relative to population frequency.
-        let w = (adaptive_panel_mix + 0.75 * disagreement).clamp(0.0, 0.75);
+        //
+        // Scale disagreement boost by sparsity_boost so we trust the HMM more
+        // when coverage is good, even if it disagrees with the panel (rare variants).
+        let w = (adaptive_panel_mix + 0.25 * disagreement * sparsity_boost).clamp(0.0, 0.45);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
