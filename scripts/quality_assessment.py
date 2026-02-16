@@ -124,6 +124,75 @@ def _vcf_record_count(vcf_path):
     return int(count) if count else 0
 
 
+def _ensure_header_contigs(vcf_path, ref_vcf_path):
+    """
+    Inject ##contig lines from reference VCF if missing in target VCF.
+    This prevents 'bcftools sort' from failing on Beagle output.
+    """
+    if not os.path.exists(vcf_path):
+        return
+
+    # Check for contig lines
+    try:
+        header = subprocess.check_output(f"bcftools view -h {vcf_path}", shell=True, text=True)
+    except subprocess.CalledProcessError:
+        print(f"Warning: Could not read header of {vcf_path}")
+        return
+
+    if "##contig=" in header:
+        return
+
+    print(f"Injecting missing ##contig headers into {vcf_path}...")
+
+    # Get contigs from reference
+    try:
+        ref_header = subprocess.check_output(f"bcftools view -h {ref_vcf_path}", shell=True, text=True)
+    except subprocess.CalledProcessError:
+        print(f"Warning: Could not read header of {ref_vcf_path}")
+        return
+
+    contig_lines = [l for l in ref_header.splitlines() if l.startswith("##contig=")]
+    if not contig_lines:
+        print(f"Warning: Reference {ref_vcf_path} has no contig lines.")
+        return
+
+    # Construct new header
+    new_header_lines = []
+    # Try to insert after fileformat, or at start if missing
+    inserted = False
+
+    lines = header.splitlines()
+    if lines and lines[0].startswith("##fileformat"):
+        new_header_lines.append(lines[0])
+        new_header_lines.extend(contig_lines)
+        inserted = True
+        lines = lines[1:]
+    else:
+        # No fileformat line? VCF is malformed but try inserting at top
+        new_header_lines.extend(contig_lines)
+        inserted = True
+
+    new_header_lines.extend(lines)
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".hdr") as tmp:
+        tmp.write("\n".join(new_header_lines) + "\n")
+        hdr_path = tmp.name
+
+    tmp_vcf = vcf_path + ".rehead.vcf.gz"
+    try:
+        run_cmd(f"bcftools reheader -h {hdr_path} {vcf_path} -o {tmp_vcf}", shell=True)
+        os.replace(tmp_vcf, vcf_path)
+        # Indexing will happen in next steps
+    except Exception as e:
+        print(f"Error during reheader: {e}")
+        if os.path.exists(tmp_vcf):
+            os.remove(tmp_vcf)
+        raise
+    finally:
+        if os.path.exists(hdr_path):
+            os.remove(hdr_path)
+
+
 def ensure_beagle():
     """Download Beagle JAR if not present."""
     if os.path.exists(BEAGLE_JAR) and os.path.getsize(BEAGLE_JAR) > 0:
@@ -443,6 +512,8 @@ def run_benchmark(person, file_path):
     
     for vcf in ["tests/data/truth.vcf.gz", "tests/data/reagle_imputed.vcf.gz", "tests/data/beagle_imputed.vcf.gz"]:
         if os.path.exists(vcf):
+            # Ensure contigs are present before sorting, otherwise bcftools sort fails
+            _ensure_header_contigs(vcf, "tests/data/ref.vcf.gz")
             _atomic_sorted_bgzip_indexed(vcf)
             # Rename sample using bcftools reheader
             temp_vcf = vcf + ".tmp"
