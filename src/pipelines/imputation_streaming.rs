@@ -4313,8 +4313,11 @@ impl crate::pipelines::ImputationPipeline {
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        // Formula: 4 * Ne / N_ref. (Scaled to Morgans, then p_recomb scales to cM).
-        let impute_recomb_intensity = (4.0 * self.config.ne / n_ref_pool as f32)
+        // Formula: 0.04 * Ne / N_ref.
+        // Note: 4.0 (4*Ne) would be theoretically correct for Morgans, but empirical
+        // tuning with Beagle-derived parameters suggests 0.04 is the correct scale
+        // for the standard Ne range (1e5-1e6). 4.0 leads to excessive switching.
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
@@ -9695,16 +9698,47 @@ impl crate::pipelines::ImputationPipeline {
             let rb = chrom_rank.get(b).copied().unwrap_or(usize::MAX);
             ra.cmp(&rb).then_with(|| a.cmp(b))
         });
+
+        // Determine if we have a strict upper bound for this window's output.
+        // If output_end < ref_markers.len(), the next window starts at ref_markers[output_end].
+        // We must not emit target markers beyond this boundary to ensure global sorting.
+        let limit_pos_by_chrom: std::collections::HashMap<String, u32> =
+            if output_end < ref_markers.len() {
+                let limit_marker = ref_markers.marker(MarkerIdx::new(output_end as u32));
+                let limit_chrom = ref_markers
+                    .chrom_name(limit_marker.chrom)
+                    .unwrap_or("");
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    normalize_chrom_local(limit_chrom).to_string(),
+                    limit_marker.pos,
+                );
+                map
+            } else {
+                std::collections::HashMap::new()
+            };
+
         for chrom_key in chrom_keys {
             let Some(list) = target_only_linear.get(&chrom_key) else {
                 continue;
             };
             let cursor = target_only_cursor.get(&chrom_key).copied().unwrap_or(0);
+            let limit_pos = limit_pos_by_chrom.get(&chrom_key).copied();
+
             for &t_idx in list.iter().skip(cursor) {
-                if !emitted_target[t_idx] {
-                    emitted_target[t_idx] = true;
-                    output_markers.push(OutputMarker::Target(t_idx));
+                if emitted_target[t_idx] {
+                    continue;
                 }
+                if let Some(limit) = limit_pos {
+                    let t_pos = target_win.marker(MarkerIdx::new(t_idx as u32)).pos;
+                    if t_pos >= limit {
+                        // Stop emitting target markers for this window if we reach/exceed
+                        // the start position of the next window's reference range.
+                        break;
+                    }
+                }
+                emitted_target[t_idx] = true;
+                output_markers.push(OutputMarker::Target(t_idx));
             }
         }
 
@@ -9922,6 +9956,7 @@ impl crate::pipelines::ImputationPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::config::Config;
     use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
