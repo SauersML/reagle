@@ -1802,6 +1802,7 @@ impl<'a, RefSpace> BeamPhaser<'a, RefSpace> {
         worst.saturating_sub(best) < self.config.collapse_gap
     }
 
+    #[cfg(test)]
     fn decode_swap_track(
         &self,
         logsum_swapped: &[f64],
@@ -1952,6 +1953,7 @@ fn hap_constraints_penalty<RefSpace>(
     (penalty, penalty == 0)
 }
 
+#[cfg(test)]
 #[inline]
 fn swap_emission_pair(log_unswapped: f64, log_swapped: f64) -> (f64, f64) {
     if !log_unswapped.is_finite() && !log_swapped.is_finite() {
