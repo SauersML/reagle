@@ -82,6 +82,26 @@ def _atomic_indexed_copy(src_vcf, out_vcf):
                 os.remove(p)
 
 
+def _atomic_sorted_bgzip_indexed(vcf_path):
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=".",
+        prefix=f".{os.path.basename(vcf_path)}.",
+        suffix=".sorted.tmp.vcf.gz",
+    ) as tmp:
+        tmp_vcf = tmp.name
+    try:
+        run_cmd(["bcftools", "sort", "-Oz", "-o", tmp_vcf, vcf_path])
+        run_cmd(["bcftools", "index", "-f", tmp_vcf])
+        _replace_vcf_and_index(tmp_vcf, vcf_path)
+    finally:
+        for suffix in ("", ".csi", ".tbi"):
+            p = tmp_vcf + suffix
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def _vcf_record_count(vcf_path):
     if vcf_path.endswith(".vcf") and not vcf_path.endswith(".vcf.gz"):
         result = subprocess.run(
@@ -423,6 +443,7 @@ def run_benchmark(person, file_path):
     
     for vcf in ["tests/data/truth.vcf.gz", "tests/data/reagle_imputed.vcf.gz", "tests/data/beagle_imputed.vcf.gz"]:
         if os.path.exists(vcf):
+            _atomic_sorted_bgzip_indexed(vcf)
             # Rename sample using bcftools reheader
             temp_vcf = vcf + ".tmp"
             run_cmd(f"bcftools reheader -s sample_name.txt {vcf} -o {temp_vcf}", shell=True)
