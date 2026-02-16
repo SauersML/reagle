@@ -1689,15 +1689,18 @@ fn apply_marker_prior_smoothing(
     };
     let fallback_missing_mass = if panel_haps > 0 && active_states < panel_haps {
         let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        raw_ratio.powi(3)
+        // Use quadratic decay instead of cubic to be less conservative about
+        // truncation impact. If we drop 50% of the panel, we should acknowledge
+        // significant missing info.
+        raw_ratio.powi(2)
     } else {
         0.0
     };
-    let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
-    } else {
-        fallback_missing_mass
-    };
+    // Use the maximum of observed missing mass (from states with missing alleles)
+    // and fallback missing mass (from state truncation).
+    // This ensures we regularize heavily truncated subsets even if the selected
+    // states have no missing data, preventing overconfidence in a biased subset.
+    let missing_mass = observed_missing_mass.max(fallback_missing_mass);
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
     let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
     let dist_error = 1.0 - dist_retain;
@@ -1722,10 +1725,11 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
-    // Conservative adaptive blend: panel priors should stabilize pathological
-    // cases, not dominate local HMM evidence.
+    // Adaptive blend: allow up to 80% panel mix when truncation/missingness
+    // is high. This stabilizes "perfect LD traps" where the selected subset
+    // is heavily biased (e.g. 100% ALT) vs the full panel.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.80 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.80);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -2127,21 +2131,32 @@ fn normalize_allele_posterior_structural_missing(
     }
 
     let inv_total = 1.0 / total;
-    if missing_ood > 0.0 {
+    // Treat missing reference alleles and out-of-domain alleles similarly:
+    // both represent mass where the HMM state does not specify a concrete
+    // allele in the target domain. We distribute this mass using a Dirichlet
+    // posterior predictive centered at the local target prior (pi), rather
+    // than assuming it strictly follows the represented subset (q).
+    //
+    // This robustifies imputation against "perfect LD traps" where the only
+    // surviving active states carry a mismatching allele, but a "missing"
+    // state (neutral emission) carries significant mass.
+    //
+    // Model: rho_missing = (q + alpha*pi) / (Q + alpha)
+    let missing_total = missing_ref + missing_ood;
+    if missing_total > 0.0 {
         // Structural Dirichlet concentration alpha is derived from prior
         // concentration (effective allele count), not hand-tuned thresholds.
-        // rho_ood = (q + alpha*pi)/(Q + alpha).
         let prior = normalized_allele_prior(prior_scratch, target_probs);
-        let ood_dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
-        let inv_subset = 1.0 / subset;
-        let inv_rho = 1.0 / (subset + ood_dirichlet_alpha);
-        let q_coeff = (1.0 + missing_ref * inv_subset + missing_ood * inv_rho) * inv_total;
-        let pi_coeff = (missing_ood * ood_dirichlet_alpha * inv_rho) * inv_total;
+        let dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
+        let inv_rho = 1.0 / (subset + dirichlet_alpha);
+        let q_coeff = (1.0 + missing_total * inv_rho) * inv_total;
+        let pi_coeff = (missing_total * dirichlet_alpha * inv_rho) * inv_total;
         affine_blend_with_prior_in_place(allele_probs, prior.as_slice(), q_coeff, pi_coeff);
     } else {
-        // No OOD mass: exact MAR redistribution for reference-missing states.
-        let q_coeff = (1.0 + missing_ref / subset) * inv_total;
-        scale_slice_in_place(allele_probs, q_coeff);
+        // No missing mass, just normalize subset.
+        // q_coeff = 1/Q * (1 + 0) = 1/Q. But we use inv_total (1/Total)
+        // since Total = Subset here.
+        scale_slice_in_place(allele_probs, inv_total);
     }
 }
 

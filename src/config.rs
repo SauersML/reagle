@@ -126,6 +126,10 @@ pub struct Config {
     /// chr21 sweeps (10 target / 1000 ref) showed a quality sweet spot around
     /// 25-30 for phase/IQS/Hellinger, while dosage R² peaked closer to ~50.
     /// Defaulting to 50 prioritizes dosage-first workflows.
+    ///
+    /// Update: Increased default to 200 to avoid "perfect LD traps" on small/medium
+    /// panels where 50 states might exclude all carriers of a rare/minor allele,
+    /// leading to catastrophic over-imputation of the major allele.
     pub window_top_k: usize,
 
     /// Base fraction of state budget from carried priors.
@@ -273,11 +277,11 @@ impl Default for Config {
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
-            cluster: 0.005,
+            cluster: 0.0005,
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
-            window_top_k: 50,
+            window_top_k: 200,
             state_mix_prior_frac: 0.20,
             state_mix_window_frac: 0.35,
             state_mix_donor_frac: 0.25,
@@ -291,8 +295,8 @@ impl Default for Config {
             state_mix_weak_window_frac: 0.10,
             state_mix_weak_donor_frac: 0.30,
             state_mix_weak_core_frac: 0.50,
-            ne: 200000.0,
-            err: None,
+            ne: 1000000.0,
+            err: Some(0.001),
             em: true,
             window: 40.0,
             window_markers: 100000,
