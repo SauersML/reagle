@@ -1732,11 +1732,11 @@ fn apply_marker_prior_smoothing(
     // Revised to blend even if missing_mass is zero (provided combined_error is high),
     // because sparse subsets can be biased even if fully contained.
     //
-    // We floor combined_error at 0.1 to ensure at least some blending capability
+    // We floor combined_error at 0.05 to ensure at least some blending capability
     // (via disagreement boost) even when the HMM claims full confidence/coverage,
     // protecting against Perfect LD traps.
     let adaptive_panel_mix =
-        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.25 * combined_error.max(0.05) * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.25);
 
     let mut panel_probs_slice: Option<&[f32]> = None;
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -1766,7 +1766,7 @@ fn apply_marker_prior_smoothing(
                 panel_probs,
                 floor_mix,
                 adaptive_panel_mix,
-                sparsity_boost,
+                dist_error,
             );
         }
     }
@@ -1804,7 +1804,7 @@ fn apply_adaptive_panel_blend(
     panel_probs: &[f32],
     floor_mix: f32,
     adaptive_panel_mix: f32,
-    sparsity_boost: f32,
+    dist_error: f32,
 ) {
     if allele_probs.len() != panel_probs.len() {
         return;
@@ -1859,9 +1859,9 @@ fn apply_adaptive_panel_blend(
         // This is critical for mitigating subset collapse (Perfect LD traps) where
         // the HMM is confidently wrong relative to population frequency.
         //
-        // Scale disagreement boost by sparsity_boost so we trust the HMM more
-        // when coverage is good, even if it disagrees with the panel (rare variants).
-        let w = (adaptive_panel_mix + 0.25 * disagreement * sparsity_boost).clamp(0.0, 0.45);
+        // Scale disagreement boost by dist_error so we trust the HMM more
+        // when we are close to a typed anchor (Slam Dunk).
+        let w = (adaptive_panel_mix + 0.15 * disagreement * dist_error).clamp(0.0, 0.15);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
