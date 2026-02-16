@@ -1439,7 +1439,7 @@ pub(crate) fn compute_nearest_observed_lambda(
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
 ) {
-    const BASE_CLUSTER_CM: f32 = 0.10;
+    const BASE_CLUSTER_CM: f32 = 0.02;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);
@@ -5044,7 +5044,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        // Use state count (flat prior) for smoothing target, not posterior mass
+                                        // Use state count (flat prior) for smoothing target, not posterior mass.
+                                        // In interior loop, this is the count of states in pattern group `pid`.
                                         let count = ws.pattern_state_count[pid].max(0.0);
                                         smoothing_prior_counts[idx] += count;
                                         smoothing_prior_total += count;
@@ -5301,10 +5302,10 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                     if idx < allele_len {
                                         ws.allele_probs[idx] += state_prob;
                                         subset_total += state_prob as f64;
-                                        // Use state count (flat prior) for smoothing target, not posterior mass
-                                        let count = ws.pattern_state_count[pid].max(0.0);
-                                        smoothing_prior_counts[idx] += count;
-                                        smoothing_prior_total += count;
+                                        // Use state count (flat prior) for smoothing target, not posterior mass.
+                                        // In boundary loop, we visit each state explicitly, so add 1.0 per state.
+                                        smoothing_prior_counts[idx] += 1.0;
+                                        smoothing_prior_total += 1.0;
                                     } else {
                                         missing_ood_mass += state_prob as f64;
                                     }
