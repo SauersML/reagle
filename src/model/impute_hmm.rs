@@ -628,6 +628,7 @@ pub struct ImputeWorkspace {
     state_posterior_scratch: Vec<f32>,
     boundary_fb_products: Vec<f32>,
     allele_prior_scratch: Vec<f32>,
+    panel_freq_scratch: Vec<f32>,
     dict_pattern_alleles: Vec<u8>,
     emission_by_allele: Vec<f32>,
     pattern_id_cache: Vec<PatternIdCacheEntry>,
@@ -775,6 +776,7 @@ impl ImputeWorkspace {
             state_posterior_scratch: Vec::new(),
             boundary_fb_products: Vec::new(),
             allele_prior_scratch: Vec::new(),
+            panel_freq_scratch: Vec::new(),
             dict_pattern_alleles: Vec::new(),
             emission_by_allele: Vec::new(),
             pattern_id_cache: Vec::new(),
@@ -1645,6 +1647,8 @@ fn apply_marker_prior_smoothing(
     smoothing_prior_counts: &mut [f32],
     smoothing_prior_total: f32,
     allele_prior_scratch: &mut Vec<f32>,
+    panel_freq_scratch: &mut Vec<f32>,
+    ref_col: Option<&GenotypeColumn>,
     probs: &[f32],
     nearest_obs_retain: f32,
     untyped_uniform_marker: bool,
@@ -1724,29 +1728,46 @@ fn apply_marker_prior_smoothing(
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
+    //
+    // Revised to blend even if missing_mass is zero (provided combined_error is high),
+    // because sparse subsets can be biased even if fully contained.
+    //
+    // We floor combined_error at 0.1 to ensure at least some blending capability
+    // (via disagreement boost) even when the HMM claims full confidence/coverage,
+    // protecting against Perfect LD traps.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.5 * combined_error.max(0.2) * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.5);
 
+    let mut panel_probs_slice: Option<&[f32]> = None;
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
-            AllelePosteriors::Biallelic(p_alt) if allele_probs.len() == 2 => {
+            AllelePosteriors::Biallelic(p_alt) => {
+                if panel_freq_scratch.len() < 2 {
+                    panel_freq_scratch.resize(2, 0.0);
+                }
                 let p_alt = p_alt.clamp(0.0, 1.0);
-                let panel_probs = [1.0 - p_alt, p_alt];
-                apply_adaptive_panel_blend(
-                    allele_probs,
-                    &panel_probs,
-                    floor_mix,
-                    adaptive_panel_mix,
-                );
+                panel_freq_scratch[0] = 1.0 - p_alt;
+                panel_freq_scratch[1] = p_alt;
+                panel_probs_slice = Some(&panel_freq_scratch[..2]);
             }
-            AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
-                apply_adaptive_panel_blend(allele_probs, p, floor_mix, adaptive_panel_mix);
+            AllelePosteriors::Multiallelic(p) => {
+                panel_probs_slice = Some(p);
             }
-            _ => {}
+        }
+    } else if let Some(col) = ref_col {
+        compute_panel_freqs(col, allele_probs.len(), panel_freq_scratch);
+        panel_probs_slice = Some(panel_freq_scratch);
+    }
+
+    if let Some(panel_probs) = panel_probs_slice {
+        if panel_probs.len() == allele_probs.len() {
+            apply_adaptive_panel_blend(allele_probs, panel_probs, floor_mix, adaptive_panel_mix);
         }
     }
 
-    let prior_probs = if smoothing_prior_total > 0.0 {
+    let prior_probs = if let Some(panel) = panel_probs_slice {
+        AlleleProbsView::from_trusted(panel)
+    } else if smoothing_prior_total > 0.0 {
         let inv = 1.0 / smoothing_prior_total;
         for v in smoothing_prior_counts.iter_mut() {
             *v *= inv;
@@ -1826,7 +1847,11 @@ fn apply_adaptive_panel_blend(
         // Symmetric convex blend:
         //   p <- (1-w) * p + w * panel
         // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.45);
+        //
+        // Boost mixing significantly if local posterior disagrees with panel prior.
+        // This is critical for mitigating subset collapse (Perfect LD traps) where
+        // the HMM is confidently wrong relative to population frequency.
+        let w = (adaptive_panel_mix + 0.75 * disagreement).clamp(0.0, 0.75);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -1834,6 +1859,112 @@ fn apply_adaptive_panel_blend(
         }
         normalize_probs(allele_probs);
     }
+}
+
+fn compute_panel_freqs(col: &GenotypeColumn, n_alleles: usize, out: &mut Vec<f32>) {
+    if out.len() != n_alleles {
+        out.resize(n_alleles, 0.0);
+    }
+    out.fill(0.0);
+    let n_haps = col.n_haplotypes();
+    if n_haps == 0 {
+        return;
+    }
+    let inv_n = 1.0 / n_haps as f32;
+
+    match col {
+        GenotypeColumn::Dense(c) => {
+            if c.bits_per_allele() == 1 {
+                let bits = c.bits_raw();
+                let missing = c.missing_raw();
+                let mut alt_count = 0usize;
+                let mut missing_count = 0usize;
+                let n_words = bits.len();
+                for i in 0..n_words {
+                    let m = missing.get(i).copied().unwrap_or(0);
+                    let b = bits.get(i).copied().unwrap_or(0);
+                    alt_count += (b & !m).count_ones() as usize;
+                    missing_count += m.count_ones() as usize;
+                }
+                // Mask out padding bits in the last word if necessary
+                let rem = n_haps % 64;
+                if rem != 0 && n_words > 0 {
+                    let last_mask = (1u64 << rem) - 1;
+                    let last_idx = n_words - 1;
+                    let m = missing.get(last_idx).copied().unwrap_or(0);
+                    let b = bits.get(last_idx).copied().unwrap_or(0);
+                    let extra_mask = !last_mask;
+                    // Subtract counts from padding bits if they were set (unlikely but safe)
+                    alt_count -= ((b & !m) & extra_mask).count_ones() as usize;
+                    missing_count -= (m & extra_mask).count_ones() as usize;
+                }
+
+                let ref_count = n_haps.saturating_sub(alt_count + missing_count);
+                if n_alleles > 0 {
+                    out[0] = ref_count as f32 * inv_n;
+                }
+                if n_alleles > 1 {
+                    out[1] = alt_count as f32 * inv_n;
+                }
+            } else {
+                for i in 0..n_haps {
+                    let a = c.get(HapIdx::new(i as u32));
+                    let code = AlleleCode::from_raw(a);
+                    if !code.is_missing() {
+                        let idx = a as usize;
+                        if idx < n_alleles {
+                            out[idx] += inv_n;
+                        }
+                    }
+                }
+            }
+        }
+        GenotypeColumn::Sparse(c) => {
+            let carriers = c.carriers();
+            let n_carriers = carriers.len();
+            let is_inverted = c.is_inverted();
+            let (alt_count, ref_count) = if is_inverted {
+                (n_haps.saturating_sub(n_carriers), n_carriers)
+            } else {
+                (n_carriers, n_haps.saturating_sub(n_carriers))
+            };
+
+            if n_alleles > 0 {
+                out[0] = ref_count as f32 * inv_n;
+            }
+            if n_alleles > 1 {
+                out[1] = alt_count as f32 * inv_n;
+            }
+        }
+        GenotypeColumn::SeqCoded(c) => {
+            let hap_to_seq = c.hap_to_seq();
+            let seq_alleles = c.seq_alleles();
+            for &seq_idx in hap_to_seq {
+                let a = seq_alleles[seq_idx as usize];
+                let code = AlleleCode::from_raw(a);
+                if !code.is_missing() {
+                    let idx = a as usize;
+                    if idx < n_alleles {
+                        out[idx] += inv_n;
+                    }
+                }
+            }
+        }
+        GenotypeColumn::Dictionary(c, offset) => {
+            for i in 0..n_haps {
+                let p = c.hap_pattern_idx(RefHapId::new(i as u32));
+                let a = c.pattern_allele(*offset, p);
+                let code = AlleleCode::from_raw(a);
+                if !code.is_missing() {
+                    let idx = a as usize;
+                    if idx < n_alleles {
+                        out[idx] += inv_n;
+                    }
+                }
+            }
+        }
+    }
+    normalize_probs(out);
 }
 
 #[inline]
@@ -5108,6 +5239,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             smoothing_prior_counts,
                                             smoothing_prior_total,
                                             &mut ws.allele_prior_scratch,
+                                            &mut ws.panel_freq_scratch,
+                                            Some(&ref_columns[m]),
                                             probs.as_slice(),
                                             ws.nearest_obs_retain.get(m).copied().unwrap_or(0.0),
                                             target_probs.is_untyped_uniform_marker(m),
@@ -5376,6 +5509,8 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         smoothing_prior_counts,
                                         smoothing_prior_total,
                                         &mut ws.allele_prior_scratch,
+                                        &mut ws.panel_freq_scratch,
+                                        Some(&ref_columns[m_rev]),
                                         probs.as_slice(),
                                         ws.nearest_obs_retain.get(m_rev).copied().unwrap_or(0.0),
                                         target_probs.is_untyped_uniform_marker(m_rev),
