@@ -1689,10 +1689,10 @@ fn apply_marker_prior_smoothing(
     };
     let fallback_missing_mass = if panel_haps > 0 && active_states < panel_haps {
         let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        // Use quadratic decay instead of cubic to be less conservative about
-        // truncation impact. If we drop 50% of the panel, we should acknowledge
-        // significant missing info.
-        raw_ratio.powi(2)
+        // Use cubic decay to be conservative about truncation impact:
+        // if we drop 50% of the panel (ratio=0.5), missing_mass=(0.5)^3=0.125.
+        // This avoids aggressive fallback when the subset is still reasonably large.
+        raw_ratio.powi(3)
     } else {
         0.0
     };
@@ -1725,11 +1725,10 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
-    // Adaptive blend: allow up to 80% panel mix when truncation/missingness
-    // is high. This stabilizes "perfect LD traps" where the selected subset
-    // is heavily biased (e.g. 100% ALT) vs the full panel.
+    // Adaptive blend: allow up to 35% panel mix when truncation/missingness
+    // is high. Higher mixes can degrade accuracy by washing out local linkage.
     let adaptive_panel_mix =
-        (0.80 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.80);
+        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
