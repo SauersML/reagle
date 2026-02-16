@@ -590,6 +590,70 @@ def prepare_truth(source, output_vcf, panel_path):
     print(f"Truth prepared: {output_vcf}")
 
 
+def _ensure_contig_header(vcf_path, ref_path):
+    """Checks for ##contig lines in VCF header and injects them from reference if missing."""
+    try:
+        # Get existing header
+        header = subprocess.check_output(["bcftools", "view", "-h", vcf_path], text=True)
+    except Exception as e:
+        print(f"Warning: Could not read header from {vcf_path}: {e}")
+        return
+
+    if "##contig=<ID=" in header:
+        return
+
+    print(f"Injecting missing contig header into {vcf_path}...")
+
+    # Extract contig definitions from reference
+    try:
+        ref_header = subprocess.check_output(
+            ["bcftools", "view", "-h", ref_path],
+            text=True
+        )
+        ref_contigs = "\n".join(
+            line for line in ref_header.splitlines()
+            if line.startswith("##contig")
+        )
+    except Exception:
+        ref_contigs = ""
+
+    if not ref_contigs:
+        # Fallback if reference doesn't have it either (unlikely for indexed VCFs)
+        ref_contigs = "##contig=<ID=chr22>"
+
+    # Insert contigs after fileformat
+    new_header_lines = []
+    inserted = False
+    for line in header.splitlines():
+        new_header_lines.append(line)
+        if line.startswith("##fileformat") and not inserted:
+            new_header_lines.append(ref_contigs)
+            inserted = True
+
+    if not inserted:
+        # If no fileformat line found (weird), prepend
+        new_header_lines.insert(0, ref_contigs)
+
+    header_txt = "temp_header.txt"
+    with open(header_txt, "w") as f:
+        f.write("\n".join(new_header_lines) + "\n")
+
+    # Apply reheader
+    tmp_out = vcf_path + ".reheader.vcf.gz"
+    try:
+        subprocess.check_call(["bcftools", "reheader", "-h", header_txt, "-o", tmp_out, vcf_path])
+        subprocess.check_call(["bcftools", "index", "-f", tmp_out])
+        _replace_vcf_and_index(tmp_out, vcf_path)
+    finally:
+        if os.path.exists(header_txt):
+            os.remove(header_txt)
+        # Cleanup tmp_out if it exists (e.g. failure)
+        for suffix in ("", ".csi", ".tbi"):
+            p = tmp_out + suffix
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def run_conversion(input_path, output_vcf, panel_path):
     """
     Runs convert_genome on a microarray/raw consumer file and produces:
@@ -663,6 +727,10 @@ def run_conversion(input_path, output_vcf, panel_path):
     # the converted target focused on valid sites.
     print("Filtering invalid records (missing ALT but non-ref GT)...")
     _atomic_bgzip_view(temp_hg38_vcf, output_vcf, extra_args=["-e", 'ALT="." && GT[*]="alt"'])
+
+    # Fix potential header issues (missing contig) which breaks downstream tools like Beagle/bcftools
+    _ensure_contig_header(output_vcf, panel_path)
+
     print("Conversion complete.")
 
     if "extracted" in raw_file:
