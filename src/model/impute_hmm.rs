@@ -2127,21 +2127,32 @@ fn normalize_allele_posterior_structural_missing(
     }
 
     let inv_total = 1.0 / total;
-    if missing_ood > 0.0 {
+    // Treat missing reference alleles and out-of-domain alleles similarly:
+    // both represent mass where the HMM state does not specify a concrete
+    // allele in the target domain. We distribute this mass using a Dirichlet
+    // posterior predictive centered at the local target prior (pi), rather
+    // than assuming it strictly follows the represented subset (q).
+    //
+    // This robustifies imputation against "perfect LD traps" where the only
+    // surviving active states carry a mismatching allele, but a "missing"
+    // state (neutral emission) carries significant mass.
+    //
+    // Model: rho_missing = (q + alpha*pi) / (Q + alpha)
+    let missing_total = missing_ref + missing_ood;
+    if missing_total > 0.0 {
         // Structural Dirichlet concentration alpha is derived from prior
         // concentration (effective allele count), not hand-tuned thresholds.
-        // rho_ood = (q + alpha*pi)/(Q + alpha).
         let prior = normalized_allele_prior(prior_scratch, target_probs);
-        let ood_dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
-        let inv_subset = 1.0 / subset;
-        let inv_rho = 1.0 / (subset + ood_dirichlet_alpha);
-        let q_coeff = (1.0 + missing_ref * inv_subset + missing_ood * inv_rho) * inv_total;
-        let pi_coeff = (missing_ood * ood_dirichlet_alpha * inv_rho) * inv_total;
+        let dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
+        let inv_rho = 1.0 / (subset + dirichlet_alpha);
+        let q_coeff = (1.0 + missing_total * inv_rho) * inv_total;
+        let pi_coeff = (missing_total * dirichlet_alpha * inv_rho) * inv_total;
         affine_blend_with_prior_in_place(allele_probs, prior.as_slice(), q_coeff, pi_coeff);
     } else {
-        // No OOD mass: exact MAR redistribution for reference-missing states.
-        let q_coeff = (1.0 + missing_ref / subset) * inv_total;
-        scale_slice_in_place(allele_probs, q_coeff);
+        // No missing mass, just normalize subset.
+        // q_coeff = 1/Q * (1 + 0) = 1/Q. But we use inv_total (1/Total)
+        // since Total = Subset here.
+        scale_slice_in_place(allele_probs, inv_total);
     }
 }
 
