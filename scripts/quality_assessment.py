@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import urllib.request
 from urllib.error import URLError, HTTPError
+import gzip
 
 BEAGLE_JAR = "beagle.jar"
 BEAGLE_URL = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar"
@@ -92,7 +93,13 @@ def _atomic_sorted_bgzip_indexed(vcf_path):
     ) as tmp:
         tmp_vcf = tmp.name
     try:
-        run_cmd(["bcftools", "sort", "-Oz", "-o", tmp_vcf, vcf_path])
+        try:
+            run_cmd(["bcftools", "sort", "-Oz", "-o", tmp_vcf, vcf_path])
+        except subprocess.CalledProcessError:
+            repaired = _repair_missing_contigs_in_place(vcf_path)
+            if not repaired:
+                raise
+            run_cmd(["bcftools", "sort", "-Oz", "-o", tmp_vcf, vcf_path])
         run_cmd(["bcftools", "index", "-f", tmp_vcf])
         _replace_vcf_and_index(tmp_vcf, vcf_path)
     finally:
@@ -100,6 +107,104 @@ def _atomic_sorted_bgzip_indexed(vcf_path):
             p = tmp_vcf + suffix
             if os.path.exists(p):
                 os.remove(p)
+
+
+def _scan_vcf_contigs_from_records(vcf_path):
+    opener = gzip.open if vcf_path.endswith(".gz") else open
+    contigs = set()
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as vcf_in:
+        for line in vcf_in:
+            if not line or line[0] == "#":
+                continue
+            fields = line.split("\t", 1)
+            if fields and fields[0]:
+                contigs.add(fields[0])
+    return contigs
+
+
+def _contigs_from_header_text(header_text):
+    contigs = set()
+    for line in header_text.splitlines():
+        if not line.startswith("##contig=<ID="):
+            continue
+        after = line[len("##contig=<ID="):]
+        contig = after.split(",", 1)[0].split(">", 1)[0]
+        if contig:
+            contigs.add(contig)
+    return contigs
+
+
+def _repair_missing_contigs_in_place(vcf_path):
+    header = subprocess.run(
+        ["bcftools", "view", "-h", vcf_path],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    header_contigs = _contigs_from_header_text(header)
+    record_contigs = _scan_vcf_contigs_from_records(vcf_path)
+    missing = sorted(record_contigs - header_contigs)
+    if not missing:
+        return False
+
+    print(
+        f"Repairing VCF header for {vcf_path}: adding missing contigs "
+        + ", ".join(missing)
+    )
+
+    lines = header.splitlines()
+    chrom_idx = next((i for i, line in enumerate(lines) if line.startswith("#CHROM")), -1)
+    if chrom_idx < 0:
+        raise RuntimeError(f"Malformed VCF header in {vcf_path}: missing #CHROM line")
+
+    new_lines = lines[:chrom_idx]
+    for contig in missing:
+        new_lines.append(f"##contig=<ID={contig}>")
+    new_lines.extend(lines[chrom_idx:])
+    fixed_header = "\n".join(new_lines) + "\n"
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        delete=False,
+        dir=".",
+        prefix=f".{os.path.basename(vcf_path)}.",
+        suffix=".fixed-header.tmp.txt",
+    ) as header_tmp:
+        header_tmp.write(fixed_header)
+        header_path = header_tmp.name
+
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=".",
+        prefix=f".{os.path.basename(vcf_path)}.",
+        suffix=".reheadered.tmp.vcf.gz",
+    ) as vcf_tmp:
+        reheadered_path = vcf_tmp.name
+
+    try:
+        run_cmd(
+            [
+                "bcftools",
+                "reheader",
+                "-h",
+                header_path,
+                vcf_path,
+                "-o",
+                reheadered_path,
+            ]
+        )
+        os.replace(reheadered_path, vcf_path)
+        for suffix in (".csi", ".tbi"):
+            idx = vcf_path + suffix
+            if os.path.exists(idx):
+                os.remove(idx)
+        return True
+    finally:
+        if os.path.exists(header_path):
+            os.remove(header_path)
+        if os.path.exists(reheadered_path):
+            os.remove(reheadered_path)
 
 
 def _vcf_record_count(vcf_path):
