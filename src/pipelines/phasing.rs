@@ -1193,7 +1193,14 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let query_allele = query_alleles[i].as_allele();
                 let allele_certainty = match query_allele {
                     Some(a) if a > 1 => 1.0,
-                    _ => (p0 - p1).abs(),
+                    _ => {
+                        let diff = (p0 - p1).abs();
+                        if diff <= f32::EPSILON {
+                            0.01
+                        } else {
+                            diff
+                        }
+                    }
                 };
                 if allele_certainty <= f32::EPSILON {
                     continue;
@@ -1470,7 +1477,14 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let query_allele = query_alleles[i].as_allele();
                 let allele_certainty = match query_allele {
                     Some(a) if a > 1 => 1.0,
-                    _ => (p0 - p1).abs(),
+                    _ => {
+                        let diff = (p0 - p1).abs();
+                        if diff <= f32::EPSILON {
+                            0.01
+                        } else {
+                            diff
+                        }
+                    }
                 };
                 if allele_certainty <= f32::EPSILON {
                     continue;

@@ -589,10 +589,9 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     //
-    // Update: allow very strict error rates (down to 1e-5) to force the HMM
-    // to switch when mismatches occur, preventing "sticky" overconfidence.
-    // Combined with higher Ne, this reduces DR2 inflation.
-    let min_error = 1e-5f32;
+    // Allow sharpening below base when typed evidence is strong, but limit
+    // maximum sharpening to avoid sparse-array collapse.
+    let min_error = 1e-4f32;
     posterior.clamp(min_error, 0.5)
 }
 
