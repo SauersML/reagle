@@ -1643,7 +1643,6 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     let mut ref_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_ref_haps];
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
     let mut query_rows_by_allele: Vec<Vec<usize>> = Vec::new();
-    let mut pending_updates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); batch_haps.len()];
 
     for m in 0..n_markers {
         let Some(resolution) = resolutions.get(m).copied().flatten() else {
@@ -1701,16 +1700,8 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             continue;
         }
 
-        // Exact grouped update with deferred sparse accumulation:
-        // Original per-row score for row i, hap h at marker m:
-        //   S_i[h] += w_{m,a_i} * 1{a_h == a_i}
-        // where a_i is target allele for row i and
-        // w_{m,a} = prescan_match_weight(freq_{m,a}, min_freq).
-        //
-        // Grouping rows by a_i is algebraically identical:
-        // for each allele a, all rows in group G_a share the same w_{m,a},
-        // and all h in bin B_a satisfy 1{a_h == a}. Applying the same delta
-        // to every (i in G_a, h in B_a) yields exactly the same sum.
+        // Direct update without buffering: avoids massive memory overhead and sorting.
+        // Writes are to small per-row score vectors which fit in L1/L2 cache.
         for targ_idx in 0..n_alleles {
             let rows = &query_rows_by_allele[targ_idx];
             if rows.is_empty() {
@@ -1730,42 +1721,20 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             let bins = ref_bins.get(targ_idx);
             let Some(bins) = bins else { continue };
             for &i in rows {
-                let row_pending = &mut pending_updates[i];
-                row_pending.reserve(bins.len());
+                let row_global = &mut global_scores[i];
+                let row_window = &mut window_scores[i];
                 for &rh in bins {
-                    row_pending.push((rh, weight));
+                    let idx = rh as usize;
+                    row_global[idx] += weight;
+                    let w = &mut row_window[idx];
+                    if w.is_finite() {
+                        *w += weight;
+                    } else {
+                        *w = weight;
+                    }
                 }
             }
         }
-    }
-
-    // Flush sparse updates into dense score rows once. This preserves exact
-    // scoring formula while reducing repeated random writes in the marker loop.
-    for i in 0..batch_haps.len() {
-        let row_pending = &mut pending_updates[i];
-        if row_pending.is_empty() {
-            continue;
-        }
-        row_pending.sort_unstable_by_key(|(idx, _)| *idx);
-        let row_global = &mut global_scores[i];
-        let row_window = &mut window_scores[i];
-        let mut j = 0usize;
-        while j < row_pending.len() {
-            let idx = row_pending[j].0 as usize;
-            let mut delta = 0.0f32;
-            while j < row_pending.len() && row_pending[j].0 as usize == idx {
-                delta += row_pending[j].1;
-                j += 1;
-            }
-            row_global[idx] += delta;
-            let w = &mut row_window[idx];
-            if w.is_finite() {
-                *w += delta;
-            } else {
-                *w = delta;
-            }
-        }
-        row_pending.clear();
     }
 }
 
