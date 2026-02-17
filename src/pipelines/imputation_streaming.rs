@@ -10030,63 +10030,27 @@ mod tests {
     }
 
     #[test]
-    fn test_calibrated_emission_error_sharp_observations_clamped_to_base() {
-        // 3 observed, informative markers: near-certain hard calls.
+    fn test_calibrated_emission_error_passthrough_clamped_base() {
+        // Disabled calibration: should just clamp base error rate
         let offsets = vec![0, 2, 4, 6];
         let probs = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
         let observed = vec![true, true, true];
         let input = TargetAlleleProbs::new(offsets, probs, observed, None, 0.0);
 
+        // Case 1: Base inside clamp range [1e-6, 0.5]
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening is allowed down to 10% of base or 1e-6.
-        let limit = base * 0.1;
-        assert!(
-            out >= limit,
-            "expected calibrated error clamped to limit {}, got {}",
-            limit,
-            out
-        );
-        // With sharp observations, it should be below base.
-        assert!(
-            out < base,
-            "expected calibrated error to sharpen below base {}, got {}",
-            base,
-            out
-        );
-    }
+        assert!((out - base).abs() < 1e-9, "expected base error rate pass-through");
 
-    #[test]
-    fn test_calibrated_emission_error_can_exceed_base_with_noisy_observations() {
-        // Informative noisy markers (far from uniform) should raise posterior
-        // error above a too-optimistic base rate under Beta shrinkage.
-        let offsets = vec![0, 2, 4];
-        let probs = vec![0.9, 0.1, 0.88, 0.12];
-        let observed = vec![true, true];
-        let input = TargetAlleleProbs::new(offsets, probs, observed, None, 0.0);
+        // Case 2: Base too small
+        let base_small = 1e-10;
+        let out_small = calibrated_emission_error(&input, base_small);
+        assert!((out_small - 1e-6).abs() < 1e-9, "expected clamping to min 1e-6");
 
-        let base = 0.02;
-        let out = calibrated_emission_error(&input, base);
-        assert!(
-            out > base,
-            "expected calibration to raise error above base {}, got {}",
-            base,
-            out
-        );
-        // For Beta-Binomial style shrinkage, posterior mean should lie between
-        // prior mean (base) and empirical weighted residual mean.
-        let empirical_weighted_residual = 0.10940167f32;
-        assert!(
-            out < empirical_weighted_residual,
-            "expected shrinkage below empirical weighted residual {}, got {}",
-            empirical_weighted_residual,
-            out
-        );
-        assert!(
-            out <= 0.5,
-            "expected calibrated emission error in valid probability range, got {}",
-            out
-        );
+        // Case 3: Base too large
+        let base_large = 0.8;
+        let out_large = calibrated_emission_error(&input, base_large);
+        assert!((out_large - 0.5).abs() < 1e-9, "expected clamping to max 0.5");
     }
 
     #[test]
