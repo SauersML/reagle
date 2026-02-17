@@ -2746,7 +2746,8 @@ fn build_imputation_plan(
 
     // Keep LMS allocation path; full-panel mode can degrade calibration
     // when donor-guided and overlap handoff logic are active.
-    let can_full_panel = false;
+    // However, for small panels, subsetting is unnecessary and can drop rare variants.
+    let can_full_panel = n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS;
     if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
@@ -2767,6 +2768,11 @@ fn build_imputation_plan(
         plan.per_window_cap = n_ref_haps.max(1);
         plan.per_window_caps = per_window_caps.to_vec();
         plan.full_panel = true;
+        // Ensure abyss_mask is sized correctly (all zeros) so downstream logic
+        // (which assumes valid masks) does not panic on OOB access.
+        for mask in &mut plan.abyss_mask {
+            mask.resize(n_ref_haps, false);
+        }
         for _ in 0..n_target_haps {
             plan.stats.update(n_ref_haps, 0, 0);
         }
@@ -7117,12 +7123,12 @@ impl crate::pipelines::ImputationPipeline {
                     };
                 let compute_transition_lambda =
                     |state_haps: &[RefHapId], donors: &[(RefHapId, f32)]| -> f32 {
-                        // Relax stickiness cap to prevent AF collapse on rare variants in sparse
-                        // regions. 0.94 suppressed recombination by ~16x, causing the HMM to
-                        // lock onto wrong haplotypes across large gaps.
-                        // Restored to 0.94 to maintain accuracy in sparse regions (prevents HMM
-                        // from losing phase). AF recovery is now handled by strong panel prior mixing.
-                        const LAMBDA_MAX: f32 = 0.94;
+                        // Stickiness cap for the HMM transition model.
+                        // - 0.94 (original): High stickiness, good for dense R2, bad for sparse AF collapse.
+                        // - 0.1 (previous fix): Low stickiness, good for sparse AF, regressions in dense R2/concordance.
+                        // - 0.5 (compromise): Moderate stickiness. We rely on improved adaptive panel blending
+                        //   (quartic ramp) to handle rare variant AF collapse in sparse regions.
+                        const LAMBDA_MAX: f32 = 0.5;
                         if state_haps.is_empty() {
                             return 0.0;
                         }

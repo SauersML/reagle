@@ -1804,7 +1804,10 @@ fn apply_adaptive_panel_blend(
         // Scale the floor by rare_boost to prevent hallucination on common variants.
         // - Common: floor_mix * 0.05 (tiny floor).
         // - Rare:   floor_mix * 1.00 (full floor).
-        let scaled_floor = (floor_mix * (0.05 + 0.95 * rare_boost)).clamp(0.0, 0.15);
+        //
+        // Increased clamp from 0.15 to 0.80 to allow sufficient rescue of
+        // rare variants in very sparse regions (where floor_mix is high).
+        let scaled_floor = (floor_mix * (0.05 + 0.95 * rare_boost)).clamp(0.0, 0.80);
         if scaled_floor > 0.0 {
             for (i, prob) in allele_probs.iter_mut().enumerate() {
                 let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -1817,7 +1820,11 @@ fn apply_adaptive_panel_blend(
         }
     }
 
-    if adaptive_panel_mix > 0.0 {
+    // Combine local adaptive mix (from HMM diagnostics) and global floor mix
+    // (from window sparsity) to determine blending weight.
+    let combined_mix = adaptive_panel_mix.max(floor_mix * 0.5);
+
+    if combined_mix > 0.0 {
         // MAF-based blending:
         // Trust HMM more when panel prior is ambiguous/common (entropy high, max prob low).
         // Trust Prior more when panel prior is sharp/rare (entropy low, max prob high).
@@ -1830,10 +1837,10 @@ fn apply_adaptive_panel_blend(
         //
         // Base weight from sparsity.
         // If sparse (mix=0.25), and Rare (boost=1.0) -> w = 0.25. (Fixes AF collapse).
-        // If sparse (mix=0.25), and Common (boost=0.0) -> w = 0.0. (Fixes Hallucination).
+        // If sparse (mix=0.25), and Common (boost=0.0) -> w = 0.0125. (Fixes Hallucination).
         //
         // We add a small base to allow *some* mixing always (for stability).
-        let w = (adaptive_panel_mix * (0.02 + 0.98 * rare_boost)).clamp(0.0, 0.80);
+        let w = (combined_mix * (0.05 + 0.95 * rare_boost)).clamp(0.0, 0.95);
 
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
