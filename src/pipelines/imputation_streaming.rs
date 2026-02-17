@@ -588,7 +588,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Safety floor adjusted from 0.1 to 0.5 to prevent extreme over-confidence
+    // in rare-variant imputation when the reference match is perfect.
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -624,7 +627,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    blended.clamp((base * 0.5).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -7704,9 +7707,7 @@ impl crate::pipelines::ImputationPipeline {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
                         }
                         let ws = ws_opt.as_mut().unwrap();
-                        // Disable calibration to prevent over-confidence; use base error rate directly.
-                        // let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
-                        let effective_error_rate = error_rate.clamp(1e-6, 0.5);
+                        let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
                         run_impute_hmm(
                             &state_haps,
                             ref_columns,
