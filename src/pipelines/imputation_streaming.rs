@@ -664,8 +664,11 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    // Boosted floor to better match Java Beagle's robustness in sparse regions.
+    // The previous 0.08 scaling was too conservative, causing AF collapse on
+    // rare variants when typed markers were distant (>10kb).
+    let floor = 0.02 + 0.25 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.40)
 }
 
 #[inline]
@@ -5070,6 +5073,56 @@ impl crate::pipelines::ImputationPipeline {
         }
         let handoff_recomb_rate = p_recomb.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
+        let panel_priors_arc = {
+            let mut vec = Vec::with_capacity(n_ref_markers);
+            let mut alleles_buf = Vec::new();
+            for m in 0..n_ref_markers {
+                let col = &ref_columns[m];
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(m as u32))
+                    .n_alleles()
+                    .max(1);
+
+                let n_haps = col.n_haplotypes();
+                if alleles_buf.len() < n_haps {
+                    alleles_buf.resize(n_haps, 0u8);
+                }
+                col.fill_all(&mut alleles_buf);
+
+                let mut counts = vec![0usize; n_alleles];
+                let mut total = 0usize;
+                for &a in &alleles_buf[..n_haps] {
+                    if a != crate::data::storage::AlleleCode::MISSING.raw() {
+                        let idx = a as usize;
+                        if idx < n_alleles {
+                            counts[idx] += 1;
+                            total += 1;
+                        }
+                    }
+                }
+
+                if total > 0 {
+                    let inv = 1.0 / total as f32;
+                    if n_alleles == 2 {
+                        vec.push(AllelePosteriors::Biallelic(
+                            counts.get(1).copied().unwrap_or(0) as f32 * inv,
+                        ));
+                    } else {
+                        let probs: Vec<f32> = counts.iter().map(|&c| c as f32 * inv).collect();
+                        vec.push(AllelePosteriors::Multiallelic(std::sync::Arc::from(probs)));
+                    }
+                } else if n_alleles == 2 {
+                    vec.push(AllelePosteriors::Biallelic(0.0));
+                } else {
+                    vec.push(AllelePosteriors::Multiallelic(std::sync::Arc::from(vec![
+                        0.0;
+                        n_alleles
+                    ])));
+                }
+            }
+            std::sync::Arc::new(vec)
+        };
+
         // Only consume overlap priors when their anchor marker is physically
         // compatible with the current window. This prevents seam drift from
         // stale/misaligned priors being projected into the wrong window.
@@ -5728,11 +5781,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                Some(panel_priors_arc.clone()),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                Some(panel_priors_arc.clone()),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
@@ -7053,7 +7116,10 @@ impl crate::pipelines::ImputationPipeline {
                     };
                 let compute_transition_lambda =
                     |state_haps: &[RefHapId], donors: &[(RefHapId, f32)]| -> f32 {
-                        const LAMBDA_MAX: f32 = 0.94;
+                        // Relax stickiness cap to prevent AF collapse on rare variants in sparse
+                        // regions. 0.94 suppressed recombination by ~16x, causing the HMM to
+                        // lock onto wrong haplotypes across large gaps.
+                        const LAMBDA_MAX: f32 = 0.0;
                         if state_haps.is_empty() {
                             return 0.0;
                         }
