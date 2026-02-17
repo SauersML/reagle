@@ -291,7 +291,7 @@ impl Default for Config {
             state_mix_weak_window_frac: 0.10,
             state_mix_weak_donor_frac: 0.30,
             state_mix_weak_core_frac: 0.50,
-            ne: 200000.0,
+            ne: 5_000_000.0,
             err: None,
             em: true,
             window: 40.0,
