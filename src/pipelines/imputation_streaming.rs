@@ -1628,8 +1628,9 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     ref_columns: &[PackedRefColumn],
     n_ref_haps: usize,
     alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+    marker_bins: &[(usize, usize)],
     global_scores: &mut [Vec<f32>],
-    window_scores: &mut [Vec<f32>],
+    bin_scores: &mut [Vec<Vec<f32>>],
 ) {
     let n_markers = ref_columns.len().min(ref_markers.len());
     if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
@@ -1643,9 +1644,22 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     let mut ref_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_ref_haps];
     let mut ref_bins: Vec<Vec<u32>> = Vec::new();
     let mut query_rows_by_allele: Vec<Vec<usize>> = Vec::new();
-    let mut pending_updates: Vec<Vec<(u32, f32)>> = vec![Vec::new(); batch_haps.len()];
+    // pending_updates[hap_row][bin_idx] -> list of (ref_hap_idx, weight)
+    let mut pending_updates: Vec<Vec<Vec<(u32, f32)>>> =
+        vec![vec![Vec::new(); marker_bins.len()]; batch_haps.len()];
 
+    let mut bin_idx = 0usize;
     for m in 0..n_markers {
+        while bin_idx < marker_bins.len() && m >= marker_bins[bin_idx].1 {
+            bin_idx += 1;
+        }
+        if bin_idx >= marker_bins.len() {
+            break;
+        }
+        if m < marker_bins[bin_idx].0 {
+            continue;
+        }
+
         let Some(resolution) = resolutions.get(m).copied().flatten() else {
             continue;
         };
@@ -1701,16 +1715,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             continue;
         }
 
-        // Exact grouped update with deferred sparse accumulation:
-        // Original per-row score for row i, hap h at marker m:
-        //   S_i[h] += w_{m,a_i} * 1{a_h == a_i}
-        // where a_i is target allele for row i and
-        // w_{m,a} = prescan_match_weight(freq_{m,a}, min_freq).
-        //
-        // Grouping rows by a_i is algebraically identical:
-        // for each allele a, all rows in group G_a share the same w_{m,a},
-        // and all h in bin B_a satisfy 1{a_h == a}. Applying the same delta
-        // to every (i in G_a, h in B_a) yields exactly the same sum.
+        // Exact grouped update with deferred sparse accumulation
         for targ_idx in 0..n_alleles {
             let rows = &query_rows_by_allele[targ_idx];
             if rows.is_empty() {
@@ -1730,7 +1735,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             let bins = ref_bins.get(targ_idx);
             let Some(bins) = bins else { continue };
             for &i in rows {
-                let row_pending = &mut pending_updates[i];
+                let row_pending = &mut pending_updates[i][bin_idx];
                 row_pending.reserve(bins.len());
                 for &rh in bins {
                     row_pending.push((rh, weight));
@@ -1739,33 +1744,40 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
         }
     }
 
-    // Flush sparse updates into dense score rows once. This preserves exact
-    // scoring formula while reducing repeated random writes in the marker loop.
+    // Flush sparse updates into dense score rows once.
     for i in 0..batch_haps.len() {
-        let row_pending = &mut pending_updates[i];
-        if row_pending.is_empty() {
-            continue;
-        }
-        row_pending.sort_unstable_by_key(|(idx, _)| *idx);
         let row_global = &mut global_scores[i];
-        let row_window = &mut window_scores[i];
-        let mut j = 0usize;
-        while j < row_pending.len() {
-            let idx = row_pending[j].0 as usize;
-            let mut delta = 0.0f32;
-            while j < row_pending.len() && row_pending[j].0 as usize == idx {
-                delta += row_pending[j].1;
-                j += 1;
+        let row_bins = &mut bin_scores[i];
+
+        for (b_idx, bin_pending) in pending_updates[i].iter_mut().enumerate() {
+            if bin_pending.is_empty() {
+                continue;
             }
-            row_global[idx] += delta;
-            let w = &mut row_window[idx];
-            if w.is_finite() {
-                *w += delta;
-            } else {
-                *w = delta;
+            bin_pending.sort_unstable_by_key(|(idx, _)| *idx);
+            let row_bin = &mut row_bins[b_idx];
+
+            let mut j = 0usize;
+            while j < bin_pending.len() {
+                let idx = bin_pending[j].0 as usize;
+                let mut delta = 0.0f32;
+                while j < bin_pending.len() && bin_pending[j].0 as usize == idx {
+                    delta += bin_pending[j].1;
+                    j += 1;
+                }
+                if idx < row_global.len() {
+                    row_global[idx] += delta;
+                }
+                if idx < row_bin.len() {
+                    let w = &mut row_bin[idx];
+                    if w.is_finite() {
+                        *w += delta;
+                    } else {
+                        *w = delta;
+                    }
+                }
             }
+            bin_pending.clear();
         }
-        row_pending.clear();
     }
 }
 
