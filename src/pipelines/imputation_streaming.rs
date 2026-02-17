@@ -667,8 +667,12 @@ fn adaptive_untyped_prior_mix(
     // Boosted floor to better match Java Beagle's robustness in sparse regions.
     // The previous 0.08 scaling was too conservative, causing AF collapse on
     // rare variants when typed markers were distant (>10kb).
-    let floor = 0.02 + 0.25 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.40)
+    //
+    // Reduced scaling further to prevent hallucination in dense regions
+    // (dosage spikes in test_ultra_dense_markers).
+    // The main fix for AF collapse is passing panel_priors correctly, not this floor.
+    let floor = 0.001 + 0.05 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.10)
 }
 
 #[inline]
