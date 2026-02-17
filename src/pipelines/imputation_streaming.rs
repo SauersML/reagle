@@ -636,7 +636,6 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
 #[inline]
 fn adaptive_untyped_prior_mix(
     observed_ratio: f32,
-    cluster_cm: f32,
     p_mismatch: f32,
     phase_confidence_unavailable: bool,
 ) -> f32 {
@@ -647,13 +646,7 @@ fn adaptive_untyped_prior_mix(
     let typed = observed_ratio.clamp(0.0, 1.0);
     let missing = 1.0 - typed;
 
-    // Cubic ramp keeps the floor almost zero until missingness becomes
-    // meaningful, then increases sharply in sparse windows.
-    let missing_ramp = missing.powi(3);
-
-    // Slightly stronger floor when cluster distance is wide (weaker local
-    // linkage signal) or the model error rate is elevated.
-    let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
+    // Slightly stronger floor when the model error rate is elevated.
     let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 1.6);
 
     // Unphased-target imputation has additional uncertainty from phase
@@ -668,11 +661,17 @@ fn adaptive_untyped_prior_mix(
     // The previous 0.08 scaling was too conservative, causing AF collapse on
     // rare variants when typed markers were distant (>10kb).
     //
-    // Reduced scaling further to prevent hallucination in dense regions
-    // (dosage spikes in test_ultra_dense_markers).
-    // The main fix for AF collapse is passing panel_priors correctly, not this floor.
-    let floor = 0.001 + 0.05 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.10)
+    // Using a steeper ramp (powi 10) to discriminate between:
+    // - Sparse/Chip (missing ~0.99): ramp ~0.90.
+    // - Dense (missing ~0.9): ramp ~0.34.
+    //
+    // We allow a very high floor (up to 0.5) for sparse regions, but rely on
+    // HMM-side logic (rare_boost) to suppress it for common variants.
+    let missing_ramp = missing.powi(10);
+    let floor = 0.001 + 0.50 * missing_ramp;
+
+    // Note: cluster_factor removed; ref density should not suppress target prior needs.
+    (floor * err_factor * phase_factor).clamp(0.001, 0.80)
 }
 
 #[inline]
@@ -5764,13 +5763,11 @@ impl crate::pipelines::ImputationPipeline {
             };
             let min_untyped_prior_mix1 = adaptive_untyped_prior_mix(
                 observed_ratio1,
-                smoothing_cluster_cm,
                 self.params.p_mismatch,
                 !phase_conf_valid,
             );
             let min_untyped_prior_mix2 = adaptive_untyped_prior_mix(
                 observed_ratio2,
-                smoothing_cluster_cm,
                 self.params.p_mismatch,
                 !phase_conf_valid,
             );
@@ -7123,7 +7120,9 @@ impl crate::pipelines::ImputationPipeline {
                         // Relax stickiness cap to prevent AF collapse on rare variants in sparse
                         // regions. 0.94 suppressed recombination by ~16x, causing the HMM to
                         // lock onto wrong haplotypes across large gaps.
-                        const LAMBDA_MAX: f32 = 0.0;
+                        // Restored to 0.94 to maintain accuracy in sparse regions (prevents HMM
+                        // from losing phase). AF recovery is now handled by strong panel prior mixing.
+                        const LAMBDA_MAX: f32 = 0.94;
                         if state_haps.is_empty() {
                             return 0.0;
                         }

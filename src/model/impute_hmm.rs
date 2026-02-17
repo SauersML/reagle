@@ -1782,10 +1782,29 @@ fn apply_adaptive_panel_blend(
         return;
     }
 
+    // Calculate MAF/Rareness profile first to guide both floor and mix.
+    //
+    // Panel Max Prob:
+    // - Common (0.5/0.5) -> Max ~ 0.5.
+    // - Rare (0.99/0.01) -> Max ~ 0.99.
+    //
+    // rare_boost = ((panel_max - 0.5) * 2.0)^4. (Range 0.0 to 1.0).
+    // If Rare (0.99), boost ~ 1.0.
+    // If Common (0.5), boost ~ 0.0.
+    let mut panel_max = 0.0f32;
+    for &p in panel_probs {
+        if p > panel_max {
+            panel_max = p;
+        }
+    }
+    let rare_boost = ((panel_max - 0.5).max(0.0) * 2.0).powi(4); // Quartic to stay low for mid-range.
+
     if floor_mix > 0.0 {
-        // Floor step: enforce a small allele floor from panel probabilities so
-        // extremely sparse subsets cannot assign hard zeros too early.
-        let scaled_floor = floor_mix.clamp(0.0, 0.15);
+        // Floor step: enforce a small allele floor from panel probabilities.
+        // Scale the floor by rare_boost to prevent hallucination on common variants.
+        // - Common: floor_mix * 0.05 (tiny floor).
+        // - Rare:   floor_mix * 1.00 (full floor).
+        let scaled_floor = (floor_mix * (0.05 + 0.95 * rare_boost)).clamp(0.0, 0.15);
         if scaled_floor > 0.0 {
             for (i, prob) in allele_probs.iter_mut().enumerate() {
                 let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -1799,34 +1818,23 @@ fn apply_adaptive_panel_blend(
     }
 
     if adaptive_panel_mix > 0.0 {
-        // Jensen-Shannon disagreement quantifies mismatch between local subset
-        // and panel prior. Larger mismatch increases blend strength, but blend
-        // remains bounded by adaptive_panel_mix cap.
-        let mut m_entropy = 0.0f32;
-        let mut p_entropy = 0.0f32;
-        let mut q_entropy = 0.0f32;
-        for (i, &p_raw) in allele_probs.iter().enumerate() {
-            let p = p_raw.clamp(0.0, 1.0);
-            let q = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let m = 0.5 * (p + q);
-            if p > 0.0 {
-                p_entropy -= p * p.ln();
-            }
-            if q > 0.0 {
-                q_entropy -= q * q.ln();
-            }
-            if m > 0.0 {
-                m_entropy -= m * m.ln();
-            }
-        }
-        let js_div = (m_entropy - 0.5 * (p_entropy + q_entropy)).max(0.0);
-        let max_js = (2.0f32).ln();
-        let disagreement = (js_div / max_js).clamp(0.0, 1.0);
+        // MAF-based blending:
+        // Trust HMM more when panel prior is ambiguous/common (entropy high, max prob low).
+        // Trust Prior more when panel prior is sharp/rare (entropy low, max prob high).
+        //
+        // Rare variant logic: if Panel Prior says "99% Ref, 1% Alt", and HMM says "100% Ref",
+        // and we are in a sparse region (adaptive_panel_mix high), we want to pull towards 1% Alt.
+        //
+        // Common variant logic: if Panel Prior says "50% Ref, 50% Alt", and HMM says "100% Ref",
+        // we want to trust HMM (strong LD).
+        //
+        // Base weight from sparsity.
+        // If sparse (mix=0.25), and Rare (boost=1.0) -> w = 0.25. (Fixes AF collapse).
+        // If sparse (mix=0.25), and Common (boost=0.0) -> w = 0.0. (Fixes Hallucination).
+        //
+        // We add a small base to allow *some* mixing always (for stability).
+        let w = (adaptive_panel_mix * (0.02 + 0.98 * rare_boost)).clamp(0.0, 0.80);
 
-        // Symmetric convex blend:
-        //   p <- (1-w) * p + w * panel
-        // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.45);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
