@@ -527,72 +527,10 @@ fn estimate_hmm_job_bytes(n_states: usize, window_markers: usize, typed_markers:
 
 #[inline]
 fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f32) -> f32 {
-    // Empirical-Bayes calibration:
-    // Treat residual r = 1 - max_a p(a) at informative typed markers as a
-    // noisy observation of per-marker emission error epsilon.
-    // Posterior mean under Beta(alpha, beta) prior:
-    //   eps_post = (alpha + sum(w*r)) / (alpha + beta + sum(w))
-    // with prior mean anchored to base_error_rate and prior strength m0.
-    // We weight each marker by normalized information content:
-    //   w = 1 - H(p)/log(K), K = number of alleles
-    // so near-uniform markers contribute little evidence.
-    const PRIOR_STRENGTH_MARKERS: f32 = 16.0;
-    let mut weighted_residual_sum = 0.0f32;
-    let mut weight_sum = 0.0f32;
-    for m in 0..input_probs.n_markers() {
-        if !input_probs.is_observed_marker(m) || input_probs.is_uniform_marker(m) {
-            continue;
-        }
-        let probs = input_probs.probs_for_marker(m);
-        if probs.is_empty() {
-            continue;
-        }
-        let mut max_prob = 0.0f32;
-        let mut any_finite = false;
-        let mut entropy = 0.0f32;
-        let mut n_alleles = 0usize;
-        for &p in probs {
-            if p.is_finite() {
-                any_finite = true;
-                if p > 0.0 {
-                    entropy -= p * p.ln();
-                }
-                n_alleles += 1;
-                if p > max_prob {
-                    max_prob = p;
-                }
-            }
-        }
-        if !any_finite {
-            continue;
-        }
-        let max_entropy = (n_alleles.max(2) as f32).ln();
-        let info_weight = if max_entropy > 0.0 {
-            (1.0 - (entropy / max_entropy)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        if info_weight <= 0.0 {
-            continue;
-        }
-        let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
-        weighted_residual_sum += info_weight * residual;
-        weight_sum += info_weight;
-    }
-    if weight_sum <= 0.0 {
-        return base_error_rate.clamp(1e-6, 0.5);
-    }
-    let base = base_error_rate.clamp(1e-6, 0.5);
-    let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
-    let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
-    let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow sharpening below base when typed evidence is strong, but limit
-    // maximum sharpening to avoid sparse-array collapse.
-    //
-    // Safety floor adjusted from 0.1 to 0.5 to prevent extreme over-confidence
-    // in rare-variant imputation when the reference match is perfect.
-    let min_error = (base * 0.5).max(1e-6).min(base);
-    posterior.clamp(min_error, 0.5)
+    let _ = input_probs;
+    // Disabled sharpening to avoid over-confidence on sparse arrays.
+    // Returning base_error_rate ensures we respect the provided or calculated error model.
+    base_error_rate.clamp(1e-6, 0.5)
 }
 
 #[inline]
