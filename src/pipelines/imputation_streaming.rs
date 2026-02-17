@@ -688,7 +688,11 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    // Use self-information (log-prob) to ensure non-zero weight for all matches.
+    // Previous ((1-p)/p).ln().max(0.0) zeroed out common-allele matches, causing
+    // state starvation (empty donors) in regions lacking rare variants.
+    // -ln(p) scales from ~0.001 (p=0.999) to ~6.9 (p=0.001).
+    -p.ln()
 }
 
 #[inline]
