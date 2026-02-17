@@ -7053,7 +7053,10 @@ impl crate::pipelines::ImputationPipeline {
                     };
                 let compute_transition_lambda =
                     |state_haps: &[RefHapId], donors: &[(RefHapId, f32)]| -> f32 {
-                        const LAMBDA_MAX: f32 = 0.94;
+                        // Relax stickiness cap to prevent AF collapse on rare variants in sparse
+                        // regions. 0.94 suppressed recombination by ~16x, causing the HMM to
+                        // lock onto wrong haplotypes across large gaps.
+                        const LAMBDA_MAX: f32 = 0.5;
                         if state_haps.is_empty() {
                             return 0.0;
                         }
