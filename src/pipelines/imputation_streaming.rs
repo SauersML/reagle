@@ -588,7 +588,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Update: relaxed lower bound to 0.5*base (was 0.1*base). Aggressive
+    // sharpening (down to 1e-5) causes overconfidence and DR2 inflation
+    // (Rust 0.75 vs Java 0.03) when the HMM overfits to typed anchors.
+    let min_error = (base * 0.5).max(1e-5).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -624,7 +628,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    blended.clamp((base * 0.5).max(1e-5), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
