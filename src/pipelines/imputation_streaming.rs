@@ -4324,7 +4324,7 @@ impl crate::pipelines::ImputationPipeline {
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        let impute_recomb_intensity = (4.0 * self.config.ne / n_ref_pool as f32)
+        let impute_recomb_intensity = (2.0 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;

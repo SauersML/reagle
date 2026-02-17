@@ -50,10 +50,7 @@ impl ModelParams {
     /// Maximum recombination intensity
     ///
     /// Safety cap to prevent numerical issues with extreme Ne/n_haps ratios.
-    /// The Li-Stephens formula 4.0*Ne/n_haps can exceed 4000 with small panels
-    /// (e.g. Ne=200K, 200 haps → 4000.0). A low cap makes the HMM
-    /// too "sticky", causing AF collapse and poor dosage calibration.
-    pub const MAX_RECOMB_INTENSITY: f32 = 20000.0;
+    pub const MAX_RECOMB_INTENSITY: f32 = 10000.0;
 
     /// Minimum recombination probability to prevent Perfect LD traps
     pub const MIN_RECOMB_PROB: f32 = 1e-9;
@@ -78,9 +75,8 @@ impl ModelParams {
     /// * `ne` - Effective population size (from CLI or default)
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
-        // Formula from Li & Stephens (2003): rho = 4 * Ne / n
-        // Previous 0.04 factor was likely a unit conversion error (cM vs Morgan).
-        let recomb_intensity = (4.0 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
+        // Formula from Java PhaseData constructor
+        let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -100,7 +96,7 @@ impl ModelParams {
     /// Uses Li-Stephens recombination intensity based on the reference
     /// haplotype count only (copying states), not target+reference.
     pub fn for_imputation(n_ref_haps: usize, ne: f32, err: Option<f32>) -> Self {
-        let recomb_intensity = (4.0 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
+        let recomb_intensity = (0.04 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps));
         Self {
             p_mismatch,
@@ -371,8 +367,8 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 4.0 * 100_000 / 1000 = 400.0
-        let expected = 4.0 * 100_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
 
