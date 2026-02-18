@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -4324,7 +4324,7 @@ impl crate::pipelines::ImputationPipeline {
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+        let impute_recomb_intensity = (1.0 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
