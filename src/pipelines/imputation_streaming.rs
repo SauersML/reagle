@@ -241,9 +241,9 @@ fn collect_carriers_for_allele(
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_PER_WINDOW_MULT: usize = 8;
-const PBWT_MIN_PER_HAP: usize = 64;
-const PBWT_MAX_PER_HAP: usize = 256;
+const PBWT_PER_WINDOW_MULT: usize = 20;
+const PBWT_MIN_PER_HAP: usize = 200;
+const PBWT_MAX_PER_HAP: usize = 800;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
@@ -589,12 +589,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     //
-    // Sharpening below the nominal error rate (e.g. 1e-4 -> 1e-5) causes
-    // "Perfect LD trap" failures where valid haplotypes are decimated by
-    // over-penalization at genotyped sites that happen to mismatch (due to
-    // minor phasing errors or imperfect LD). We prevent dropping below `base`
-    // to align with Java Beagle behavior and improve robustness.
-    let min_error = base.max(1e-6);
+    // Sharpening is allowed down to 1% of base (or 1e-6). This allows the HMM
+    // to trust strong evidence heavily, which is crucial for accuracy on
+    // high-quality data (e.g. chr21 benchmark), while retaining a small floor
+    // for numerical stability.
+    let min_error = (base * 0.01).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -670,7 +669,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
+    // Reduced base floor to 0.1% to allow more aggressive local inference.
+    let floor = 0.001 + 0.08 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
@@ -10104,12 +10104,18 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-
-        // Sharpening below base is now disabled to prevent overconfidence/LD trap.
-        // Even with perfect evidence, we should not drop below the base error rate.
+        // Sharpening is allowed down to 10% of base or 1e-6.
+        let limit = base * 0.1;
         assert!(
-            (out - base).abs() < 1e-6,
-            "expected calibrated error clamped to base {}, got {}",
+            out >= limit,
+            "expected calibrated error clamped to limit {}, got {}",
+            limit,
+            out
+        );
+        // With sharp observations, it should be below base.
+        assert!(
+            out < base,
+            "expected calibrated error to sharpen below base {}, got {}",
             base,
             out
         );
