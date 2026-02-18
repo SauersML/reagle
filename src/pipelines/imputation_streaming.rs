@@ -664,8 +664,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.005 + 0.10 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.15)
+    let floor = 0.002 + 0.10 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.002, 0.12)
 }
 
 #[inline]
@@ -5231,6 +5231,62 @@ impl crate::pipelines::ImputationPipeline {
                 );
             }
         }
+        let panel_priors: std::sync::Arc<Vec<AllelePosteriors>> = {
+            let priors: Vec<AllelePosteriors> = ref_columns
+                .par_iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let marker = ref_markers.marker(MarkerIdx::new(i as u32));
+                    let n_alleles = marker.n_alleles();
+                    let n_haps = col.n_haplotypes();
+                    if n_haps == 0 {
+                        return AllelePosteriors::Biallelic(0.0);
+                    }
+                    if let GenotypeColumn::Sparse(s) = col {
+                        if n_alleles <= 2 {
+                            let carriers = s.carriers().len();
+                            let freq = carriers as f32 / n_haps as f32;
+                            let p_alt = if s.is_inverted() { 1.0 - freq } else { freq };
+                            return AllelePosteriors::Biallelic(p_alt);
+                        }
+                    }
+                    let mut alleles = vec![0u8; n_haps];
+                    col.fill_all(&mut alleles);
+                    let mut valid = 0u32;
+                    let mut counts = vec![0u32; n_alleles];
+                    for &a in &alleles {
+                        if a != crate::data::storage::AlleleCode::MISSING.raw() {
+                            if (a as usize) < n_alleles {
+                                counts[a as usize] += 1;
+                            }
+                            valid += 1;
+                        }
+                    }
+                    if valid == 0 {
+                        if n_alleles == 2 {
+                            AllelePosteriors::Biallelic(0.0)
+                        } else {
+                            AllelePosteriors::Multiallelic(std::sync::Arc::from(vec![
+                                0.0;
+                                n_alleles
+                            ]))
+                        }
+                    } else if n_alleles == 2 {
+                        let p_alt = counts[1] as f32 / valid as f32;
+                        AllelePosteriors::Biallelic(p_alt)
+                    } else {
+                        let inv = 1.0 / valid as f32;
+                        let mut probs = vec![0.0; n_alleles];
+                        for i in 0..n_alleles {
+                            probs[i] = counts[i] as f32 * inv;
+                        }
+                        AllelePosteriors::Multiallelic(std::sync::Arc::from(probs))
+                    }
+                })
+                .collect();
+            std::sync::Arc::new(priors)
+        };
+
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -5728,11 +5784,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                Some(panel_priors.clone()),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                Some(panel_priors.clone()),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };

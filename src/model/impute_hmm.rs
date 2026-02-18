@@ -1722,10 +1722,35 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
+
+    let mut rarity_mix = 0.0f32;
+    if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+        let maf = match panel {
+            AllelePosteriors::Biallelic(p) => p.min(1.0 - p),
+            AllelePosteriors::Multiallelic(probs) => {
+                let max_p = probs.iter().fold(0.0f32, |a, &b| a.max(b));
+                1.0 - max_p
+            }
+        };
+        // Stronger smoothing for rare variants to prevent LD-trap false positives.
+        if maf < 0.002 {
+            rarity_mix = 0.60;
+        } else if maf < 0.02 {
+            rarity_mix = 0.45;
+        } else if maf < 0.05 {
+            rarity_mix = 0.20;
+        } else if maf < 0.10 {
+            rarity_mix = 0.05;
+        }
+    }
+
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
-    let adaptive_panel_mix =
-        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+    let adaptive_panel_mix = if missing_mass > 0.0 || combined_error > 0.1 || rarity_mix > 0.0 {
+        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost) + rarity_mix).clamp(0.0, 0.65)
+    } else {
+        0.0
+    };
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
