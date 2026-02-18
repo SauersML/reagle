@@ -1698,7 +1698,36 @@ fn apply_marker_prior_smoothing(
     } else {
         fallback_missing_mass
     };
-    let floor_mix = min_prior_mix.clamp(0.0, 0.9);
+    // Don't apply heavy floors to common variants where the HMM should be trusted.
+    // The aggressive adaptive floor (up to 0.12) causes bias (dosage ~0.11) in
+    // sparse-but-structured regions (e.g. test_simulated_chip_density).
+    let mut rarity_mix = 0.0f32;
+    if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+        let maf = match panel {
+            AllelePosteriors::Biallelic(p) => p.min(1.0 - p),
+            AllelePosteriors::Multiallelic(probs) => {
+                let max_p = probs.iter().fold(0.0f32, |a, &b| a.max(b));
+                1.0 - max_p
+            }
+        };
+        // Stronger smoothing for rare variants to prevent LD-trap false positives.
+        if maf < 0.002 {
+            rarity_mix = 0.60;
+        } else if maf < 0.02 {
+            rarity_mix = 0.45;
+        } else if maf < 0.05 {
+            rarity_mix = 0.20;
+        }
+    }
+
+    // Don't apply heavy floors to common variants where the HMM should be trusted.
+    // The aggressive adaptive floor (up to 0.12) causes bias (dosage ~0.11) in
+    // sparse-but-structured regions (e.g. test_simulated_chip_density).
+    let floor_mix = if rarity_mix > 0.0 {
+        min_prior_mix.clamp(0.0, 0.9)
+    } else {
+        min_prior_mix.clamp(0.0, 0.01)
+    };
     let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
     let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
@@ -1723,35 +1752,19 @@ fn apply_marker_prior_smoothing(
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
 
-    let mut rarity_mix = 0.0f32;
-    if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
-        let maf = match panel {
-            AllelePosteriors::Biallelic(p) => p.min(1.0 - p),
-            AllelePosteriors::Multiallelic(probs) => {
-                let max_p = probs.iter().fold(0.0f32, |a, &b| a.max(b));
-                1.0 - max_p
-            }
-        };
-        // Stronger smoothing for rare variants to prevent LD-trap false positives.
-        if maf < 0.002 {
-            rarity_mix = 0.60;
-        } else if maf < 0.02 {
-            rarity_mix = 0.45;
-        } else if maf < 0.05 {
-            rarity_mix = 0.20;
-        } else if maf < 0.10 {
-            rarity_mix = 0.05;
-        }
-    }
-
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
-    let adaptive_panel_mix = if missing_mass > 0.0 || combined_error > 0.1 || rarity_mix > 0.0 {
-        // Use max() instead of addition to avoid compounding penalties.
-        // Rare variants take the rarity floor; sparse/distant sites take the distance penalty.
+    let adaptive_panel_mix = if rarity_mix > 0.0 {
+        // Strong mixing for rare variants prevents "perfect LD trap" false positives.
+        // We allow distance/error penalties to increase this mix, but the primary
+        // driver is rarity.
         (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost))
             .max(rarity_mix)
             .clamp(0.0, 0.65)
+    } else if missing_mass > 0.5 {
+        // Common variants: only mix if significant mass is missing from the subset.
+        // Otherwise, trust the local subset prior even at distance.
+        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.25)
     } else {
         0.0
     };
