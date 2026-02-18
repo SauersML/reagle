@@ -588,7 +588,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    // WARNING: Sharpening below base rate (e.g. to 1e-5) can cause extreme
+    // posterior concentration on single haplotypes, exacerbating false positives
+    // for rare variants in small panels. Clamp to base for robustness.
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -4907,6 +4910,51 @@ impl crate::pipelines::ImputationPipeline {
         eprintln!("Streaming imputation complete: {} markers", total_markers);
         Ok(())
     }
+    fn compute_panel_priors<RefMarkerSpace: Sync>(
+        ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
+        ref_columns: &[GenotypeColumn],
+    ) -> Arc<Vec<AllelePosteriors>> {
+        let priors: Vec<AllelePosteriors> = ref_columns
+            .par_iter()
+            .enumerate()
+            .map(|(m, col)| {
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(m as u32))
+                    .n_alleles()
+                    .max(1);
+                let n_haps = col.n_haplotypes();
+                if n_haps == 0 {
+                    return AllelePosteriors::Biallelic(0.0);
+                }
+                let mut counts = vec![0usize; n_alleles];
+                let mut total = 0usize;
+                for h in 0..n_haps {
+                    let a = col.get(HapIdx::new(h as u32));
+                    if a != crate::data::storage::AlleleCode::MISSING.raw() {
+                        let idx = a as usize;
+                        if idx < n_alleles {
+                            counts[idx] += 1;
+                            total += 1;
+                        }
+                    }
+                }
+
+                if total == 0 {
+                    return AllelePosteriors::Biallelic(0.0);
+                }
+
+                let inv = 1.0 / total as f32;
+                if n_alleles == 2 {
+                    AllelePosteriors::Biallelic(counts[1] as f32 * inv)
+                } else {
+                    let probs: Vec<f32> = counts.iter().map(|&c| c as f32 * inv).collect();
+                    AllelePosteriors::Multiallelic(Arc::from(probs))
+                }
+            })
+            .collect();
+        Arc::new(priors)
+    }
+
     fn run_imputation_window_streaming<
         TargetSpace: Sync,
         RefMarkerSpace: Sync,
@@ -4959,6 +5007,10 @@ impl crate::pipelines::ImputationPipeline {
         if output_start >= output_end || n_ref_markers == 0 {
             return Ok(None);
         }
+
+        // Compute reference panel priors for adaptive regularization
+        let panel_priors = Self::compute_panel_priors(ref_markers, ref_columns);
+
         if let Some(bb) = &self.telemetry {
             bb.set_stage(crate::utils::telemetry::Stage::Imputation);
             bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
@@ -5728,11 +5780,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                Some(panel_priors.clone()),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                Some(panel_priors.clone()),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };

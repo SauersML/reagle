@@ -1706,8 +1706,13 @@ fn apply_marker_prior_smoothing(
     } else {
         1.0
     };
-    let sparsity_boost = (1.0 - active_ratio).powi(2);
-    let truncation_error = (1.0 - active_ratio).clamp(0.0, 1.0);
+    // Account for finite reference panel sampling variance.
+    // Small panels (N < 2000) are inherently sparse approximations of the population.
+    let finite_panel_error = (1.0 - (panel_haps as f32 / 2000.0)).clamp(0.0, 1.0);
+
+    let sparsity_boost = (1.0 - active_ratio).powi(2) + finite_panel_error.powi(2);
+    let truncation_error = (1.0 - active_ratio).max(finite_panel_error).clamp(0.0, 1.0);
+
     // Approximation error combines structural-missingness and truncation:
     //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
     // This term captures model/subset limitations, not map distance.
@@ -1725,7 +1730,7 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.5 * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.5);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1826,7 +1831,7 @@ fn apply_adaptive_panel_blend(
         // Symmetric convex blend:
         //   p <- (1-w) * p + w * panel
         // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.45);
+    let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.75);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
