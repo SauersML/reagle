@@ -1747,7 +1747,11 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix = if missing_mass > 0.0 || combined_error > 0.1 || rarity_mix > 0.0 {
-        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost) + rarity_mix).clamp(0.0, 0.65)
+        // Use max() instead of addition to avoid compounding penalties.
+        // Rare variants take the rarity floor; sparse/distant sites take the distance penalty.
+        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost))
+            .max(rarity_mix)
+            .clamp(0.0, 0.65)
     } else {
         0.0
     };
