@@ -142,7 +142,10 @@ impl MarkerImputationStats {
         // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
         // Return 1.0 because they trivially impute correctly.
         if sum <= 1e-4 || (sum - n).abs() <= 1e-4 {
-            return 1.0;
+            // If the marker is imputed, zero variance means we cannot estimate
+            // correlation (undefined), so we return 0.0 to match Beagle behavior.
+            // If it is genotyped, we know the truth, so consistency implies correctness.
+            return if self.is_imputed { 0.0 } else { 1.0 };
         }
 
         let sum_sq = self.sum_p_sq[allele];
