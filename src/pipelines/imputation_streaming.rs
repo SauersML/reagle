@@ -242,9 +242,9 @@ fn collect_carriers_for_allele(
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 16;
-const PBWT_MIN_PER_HAP: usize = 256;
-const PBWT_MAX_PER_HAP: usize = 800;
-const PBWT_MIN_MARKER_STEP: usize = 25;
+const PBWT_MIN_PER_HAP: usize = 128;
+const PBWT_MAX_PER_HAP: usize = 512;
+const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
 const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
@@ -592,10 +592,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     //
-    // Sharpening is allowed down to 15% of base (or 1e-6). This avoids the
-    // "Perfect LD trap" where the HMM becomes overconfident in a wrong path
-    // (poor calibration), while still rewarding high-quality data.
-    let min_error = (base * 0.15).max(1e-6).min(base);
+    // Sharpening is allowed down to 10% of base (or 1e-6). This allows the HMM
+    // to trust strong evidence heavily, which is crucial for accuracy on
+    // high-quality data (e.g. chr21 benchmark), while retaining a small floor
+    // for numerical stability.
+    let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -671,9 +672,9 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    // Base floor at 0.5% provides a safety net against hallucination in
+    // Base floor at 0.2% provides a safety net against hallucination in
     // sparse regions while allowing local inference to dominate.
-    let floor = 0.005 + 0.08 * missing_ramp;
+    let floor = 0.002 + 0.08 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
