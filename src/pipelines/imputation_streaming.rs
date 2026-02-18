@@ -4327,8 +4327,7 @@ impl crate::pipelines::ImputationPipeline {
         //
         // Boost effective population size for imputation to allow more plasticity.
         // Phasing uses config.ne directly (e.g. 1e6), but imputation needs higher recombination
-        // to match Beagle's behavior on HGDP (MAE test).
-        let effective_ne = self.config.ne * 5.0;
+        let effective_ne = self.config.ne;
         let impute_recomb_intensity = (0.04 * effective_ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
