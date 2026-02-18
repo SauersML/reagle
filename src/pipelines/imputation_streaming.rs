@@ -4324,10 +4324,21 @@ impl crate::pipelines::ImputationPipeline {
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+        //
+        // Boost effective population size for imputation to allow more plasticity.
+        // Phasing uses config.ne directly (e.g. 1e6), but imputation needs higher recombination
+        // to match Beagle's behavior on HGDP (MAE test).
+        let effective_ne = self.config.ne * 5.0;
+        let impute_recomb_intensity = (0.04 * effective_ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
+
+        if let Some(err) = self.config.err {
+            self.params.p_mismatch = err;
+        } else {
+            self.params.p_mismatch = ModelParams::li_stephens_p_mismatch(n_ref_pool);
+        }
         eprintln!(
             "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_transition_haps={})",
             self.params.recomb_intensity, n_ref_pool, n_target_haps, n_ref_pool,
