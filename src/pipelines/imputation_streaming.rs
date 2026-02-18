@@ -478,14 +478,21 @@ fn overlap_start_from_hazard(output_start: usize, output_end: usize, p_recomb: &
 }
 
 #[inline]
-fn compute_abyss_rank_cutoff(n_ref_haps: usize, window_top_k: usize) -> usize {
+fn compute_abyss_rank_cutoff(
+    n_ref_haps: usize,
+    window_top_k: usize,
+    per_window_cap: usize,
+) -> usize {
     if n_ref_haps == 0 {
         return 1;
     }
-    // Keep this as a direct knob (clamped to panel size). We intentionally do
-    // not reintroduce a hidden min-per-window floor here; that previously made
-    // wide top-k sweeps look "flat" by collapsing many settings to one cutoff.
-    window_top_k.max(1).min(n_ref_haps)
+    // Respect the memory budget (per_window_cap) if it allows more states than
+    // the configured top-k floor. This ensures we use available resources to
+    // maximize accuracy.
+    window_top_k
+        .max(per_window_cap)
+        .max(1)
+        .min(n_ref_haps)
 }
 
 fn estimate_state_budget(
@@ -3188,8 +3195,16 @@ fn build_imputation_plan(
                         }
                     }
 
-                    let abyss_rank_cutoff =
-                        compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
+                    let abyss_rank_cutoff = compute_abyss_rank_cutoff(
+                        n_ref_haps,
+                        window_top_k.max(1),
+                        per_window_cap_window,
+                    );
+                    let abyss_rank_cutoff = compute_abyss_rank_cutoff(
+                        n_ref_haps,
+                        window_top_k.max(1),
+                        per_window_cap_window,
+                    );
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
