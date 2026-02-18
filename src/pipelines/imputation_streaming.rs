@@ -687,8 +687,19 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
+    // Score matches by negative log probability:
+    // - Rare matches (p near 0) get high scores (e.g. -ln(0.01) ~= 4.6).
+    // - Common matches (p near 1) get low but positive scores (e.g. -ln(0.99) ~= 0.01).
+    //
+    // This allows the pre-scan to distinguish between "matches common background"
+    // (score > 0) and "mismatches everything" (score 0), ensuring we select
+    // relevant background haplotypes even in regions without rare variants.
+    //
+    // Previous logic `ln((1-p)/p)` clamped common matches (p > 0.5) to zero,
+    // causing random selection of background haplotypes and poor accuracy
+    // when the active set missed the correct common haplotype.
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    -p.ln()
 }
 
 #[inline]
