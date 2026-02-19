@@ -652,9 +652,15 @@ fn adaptive_untyped_prior_mix(
     let missing_ramp = missing.powi(3);
 
     // Slightly stronger floor when cluster distance is wide (weaker local
-    // linkage signal) or the model error rate is elevated.
+    // linkage signal).
+    //
+    // Note: Previously we scaled the floor by model error rate (p_mismatch),
+    // but this was counterproductive. High error rates (e.g. 1e-2) indicate
+    // significant haplotype divergence, where the HMM should be allowed to
+    // flexibly select rare alleles even with mismatches. Scaling the floor up
+    // suppressed these rare signals, causing AF collapse. We now let the HMM
+    // govern ambiguity without enforcing a higher prior floor.
     let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
-    let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 1.6);
 
     // Unphased-target imputation has additional uncertainty from phase
     // transfer, so apply a mild boost.
@@ -665,7 +671,7 @@ fn adaptive_untyped_prior_mix(
     };
 
     let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    (floor * cluster_factor * phase_factor).clamp(0.001, 0.12)
 }
 
 #[inline]
