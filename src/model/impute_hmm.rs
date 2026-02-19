@@ -1624,7 +1624,7 @@ fn smooth_allele_posteriors_subset(
     // Deviation form (p = pi + delta):
     //   delta' = delta / (1 + alpha)
     // so this step is explicit shrinkage of deviation from pi.
-    let base_mass = (effective_alleles * (1.0 - retain) / retain).max(1.50);
+    let base_mass = (15.0 * effective_alleles * (1.0 - retain) / retain).max(0.05);
     // Keep entropy boost modest; large multipliers over-shrink rare ALT signal
     // when subset support is sparse.
     let prior_mass = base_mass * (1.0 + 0.5 * confidence_boost);
@@ -1727,7 +1727,7 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.10 + 0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.02 + 0.30 * combined_error + 0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
