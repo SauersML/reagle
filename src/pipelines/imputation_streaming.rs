@@ -587,13 +587,15 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
 
-    // Disable aggressive sharpening: always respect the base error rate floor.
-    // The "min_error" logic (allowing drop to 0.1*base) causes overfitting
-    // to perfect-match haplotypes, which degrades accuracy on large panels
-    // where imperfect matches are common (e.g. de novo mutation).
+    // Allow sharpening below base when typed evidence is strong, but limit
+    // maximum sharpening to avoid sparse-array collapse.
     //
-    // Force posterior to be at least base_error_rate.
-    posterior.clamp(base, 0.5)
+    // Relaxed floor to 0.5 * base (was 0.1 * base). Aggressive sharpening
+    // assumes the reference panel is perfect (contains exact matches), which
+    // causes "stiff" HMM behavior and confidence in wrong alleles when the
+    // best-matching haplotype happens to carry a mismatch at an untyped site.
+    let min_error = (base * 0.5).max(1e-6).min(base);
+    posterior.clamp(min_error, 0.5)
 }
 
 #[inline]
