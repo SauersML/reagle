@@ -100,7 +100,10 @@ impl ModelParams {
     /// haplotype count only (copying states), not target+reference.
     pub fn for_imputation(n_ref_haps: usize, ne: f32, err: Option<f32>) -> Self {
         let recomb_intensity = (0.04 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps));
+        // Default p_mismatch from Li-Stephens (mutation-only) is often too low (~4e-4)
+        // for imputation which must account for genotyping errors in the target.
+        // Enforce a minimum floor (1e-3) to prevent overconfidence/rigidity.
+        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps).max(1e-3));
         Self {
             p_mismatch,
             recomb_intensity,

@@ -428,19 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_emission_prob_tracks_target_concentration() {
-        let match_prob = 0.99f32;
-        let mismatch_prob = 0.01f32;
-
+    fn test_missing_emission_prob_is_neutral() {
+        // Whether target is concentrated or diffuse, the missing-reference
+        // emission should be neutral (1/K) to avoid hallucinating matches.
+        // For biallelic, 1/K = 0.5.
         let concentrated = AlleleProbsView::from_trusted(&[1.0, 0.0]);
         let diffuse = AlleleProbsView::from_trusted(&[0.5, 0.5]);
 
-        let c = missing_emission_prob(concentrated, match_prob, mismatch_prob);
-        let d = missing_emission_prob(diffuse, match_prob, mismatch_prob);
+        let c = missing_emission_prob(concentrated);
+        let d = missing_emission_prob(diffuse);
 
-        assert!((c - match_prob).abs() < 1e-6);
-        assert!(d < c);
-        assert!(d > mismatch_prob);
+        assert!((c - 0.5).abs() < 1e-6);
+        assert!((d - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -484,7 +483,7 @@ mod tests {
                     error_rate
                 };
                 let match_prob = 1.0 - error_rate;
-                let miss = missing_emission_prob(target_probs, match_prob, mismatch_prob);
+                let miss = missing_emission_prob(target_probs);
                 let mut best_called = mismatch_prob;
                 for &p in probs {
                     let called = mismatch_prob + (match_prob - mismatch_prob) * p;
@@ -495,6 +494,45 @@ mod tests {
                 assert!(miss <= best_called + 1e-6);
             }
         }
+    }
+
+    #[test]
+    fn test_missing_ref_penalty_vs_mismatch() {
+        // Target is confident '0' (prob 1.0 for allele 0)
+        let target_probs_slice = &[1.0f32, 0.0];
+        let target_probs = AlleleProbsView::from_trusted(target_probs_slice);
+
+        let error_rate = 0.01f32;
+        let match_prob = 1.0 - error_rate;
+        let mismatch_prob = error_rate; // for biallelic
+
+        // Calculate emissions for Ref=0 (Match), Ref=1 (Mismatch), Ref=. (Missing)
+
+        // Match (Ref=0)
+        // fill_emissions does: emission_by_allele[0] = mismatch + (match-mismatch)*1.0 = match
+        let emit_match = match_prob;
+
+        // Mismatch (Ref=1)
+        // emission_by_allele[1] = mismatch + (match-mismatch)*0.0 = mismatch
+        let emit_mismatch = mismatch_prob;
+
+        // Missing (Ref=.)
+        let emit_missing = missing_emission_prob(target_probs);
+
+        println!("Match: {:.4}", emit_match);
+        println!("Mismatch: {:.4}", emit_mismatch);
+        println!("Missing: {:.4}", emit_missing);
+
+        // We expect: Match > Missing > Mismatch
+        // Missing should be neutral (0.5 for biallelic), not equal to Match.
+        assert!(
+            emit_match > emit_missing + 0.1,
+            "Missing ref should be penalized relative to perfect match"
+        );
+        assert!(
+            emit_missing > emit_mismatch,
+            "Missing ref should be better than mismatch"
+        );
     }
 }
 
@@ -1294,7 +1332,7 @@ fn fill_emissions(
         error_rate
     };
     let match_prob = 1.0 - error_rate;
-    let missing_prob = missing_emission_prob(target_probs, match_prob, mismatch_prob);
+    let missing_prob = missing_emission_prob(target_probs);
 
     if emission_by_allele.len() < n_alleles {
         emission_by_allele.resize(n_alleles, 1.0);
@@ -1340,7 +1378,7 @@ fn fill_pattern_emissions(
         error_rate
     };
     let match_prob = 1.0 - error_rate;
-    let missing_prob = missing_emission_prob(target_probs, match_prob, mismatch_prob);
+    let missing_prob = missing_emission_prob(target_probs);
     if emission_by_allele.len() < n_alleles {
         emission_by_allele.resize(n_alleles, 1.0);
     }
@@ -1368,28 +1406,20 @@ fn fill_pattern_emissions(
 }
 
 #[inline]
-fn missing_emission_prob(
-    target_probs: AlleleProbsView<'_>,
-    match_prob: f32,
-    mismatch_prob: f32,
-) -> f32 {
+fn missing_emission_prob(target_probs: AlleleProbsView<'_>) -> f32 {
     let n = target_probs.len();
     if n == 0 {
         return 1.0;
     }
-    let mut sum = 0.0f32;
-    let mut sum_sq = 0.0f32;
-    for i in 0..n {
-        let p = target_probs.get(i).unwrap_or(0.0).max(0.0);
-        sum += p;
-        sum_sq += p * p;
-    }
-    let concentration = if sum > 0.0 {
-        (sum_sq / (sum * sum)).clamp(0.0, 1.0)
-    } else {
-        1.0 / n as f32
-    };
-    mismatch_prob + (match_prob - mismatch_prob) * concentration
+    // Treat missing reference alleles as uninformative (neutral).
+    // Assuming uniform prior over K reference alleles, the likelihood P(O|H=.)
+    // is simply 1/K, regardless of the observed target probability mass O.
+    //
+    // Previous logic attempted to boost match probability if target was concentrated,
+    // effectively treating Ref=. as "likely matching the dominant target allele".
+    // This created an accuracy bias where missing-data haplotypes were preferred
+    // over slightly-mismatched true haplotypes, damaging precision.
+    1.0 / n as f32
 }
 
 #[inline]
@@ -1724,8 +1754,15 @@ fn apply_marker_prior_smoothing(
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
+    //
+    // Use max(missing_mass, combined_error) to trigger blending either when
+    // state-space is structurally deficient OR when distance/truncation
+    // uncertainty is high. Previously, dependence on missing_mass*combined_error
+    // disabled blending in fully-populated (missing_mass=0) but distant subsets,
+    // leading to overconfident collapse on the wrong haplotype.
+    let error_signal = missing_mass.max(combined_error * 0.5);
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.35 * error_signal * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {

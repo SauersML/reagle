@@ -588,7 +588,12 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Disabling sharpening (min_error = base) prevents DR2 overestimation.
+    // When min_error goes down to 1e-5, the HMM becomes extremely stiff and
+    // overconfident, producing GP ~ 1.0 even for ambiguous imputation.
+    // Clamping to `base` ensures we respect the configured/prior error rate.
+    let min_error = base.max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -10098,18 +10103,11 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening is allowed down to 10% of base or 1e-6.
-        let limit = base * 0.1;
+        // Sharpening is disabled to prevent overconfidence; error rate should
+        // not drop below the configured base rate.
         assert!(
-            out >= limit,
-            "expected calibrated error clamped to limit {}, got {}",
-            limit,
-            out
-        );
-        // With sharp observations, it should be below base.
-        assert!(
-            out < base,
-            "expected calibrated error to sharpen below base {}, got {}",
+            out >= base,
+            "expected calibrated error clamped to base {}, got {}",
             base,
             out
         );
