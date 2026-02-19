@@ -2979,10 +2979,11 @@ fn forward_update_impl<C: RefColumnLike>(
     let recomb_rate = marker_recomb_rate(p_recomb, m);
     let marker_error = target_probs.marker_error_rate(m).unwrap_or(base_error_rate);
 
+    let current_fwd_sum: f32 = ws.fwd[..active_states].iter().sum();
     let mut next_sum = if uniform {
         transition_only_forward_update(
             &mut ws.fwd[..active_states],
-            1.0,
+            current_fwd_sum,
             recomb_rate,
             transition_haps,
             transition_lambda,
@@ -3005,7 +3006,7 @@ fn forward_update_impl<C: RefColumnLike>(
             let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
             WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
-                1.0,
+                current_fwd_sum,
                 recomb_rate_eff,
                 transition_haps,
                 active_states as f32,
@@ -3053,10 +3054,11 @@ fn forward_update_seqcoded(
     let col = seqcoded_col(&ref_columns[m]);
     let seq_patterns = refresh_seq_patterns(col, last_hap_ptr, state_haps, &mut ws.state_patterns);
 
+    let current_fwd_sum: f32 = ws.fwd[..active_states].iter().sum();
     let mut next_sum = if uniform {
         transition_only_forward_update(
             &mut ws.fwd[..active_states],
-            1.0,
+            current_fwd_sum,
             recomb_rate,
             transition_haps,
             transition_lambda,
@@ -3077,7 +3079,7 @@ fn forward_update_seqcoded(
             let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
             WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
-                1.0,
+                current_fwd_sum,
                 recomb_rate_eff,
                 transition_haps,
                 active_states as f32,
@@ -3122,10 +3124,11 @@ fn forward_update_dict(
     let recomb_rate = marker_recomb_rate(p_recomb, m);
     let marker_error = target_probs.marker_error_rate(m).unwrap_or(base_error_rate);
 
+    let current_fwd_sum: f32 = ws.fwd[..active_states].iter().sum();
     let mut next_sum = if uniform {
         transition_only_forward_update(
             &mut ws.fwd[..active_states],
-            1.0,
+            current_fwd_sum,
             recomb_rate,
             transition_haps,
             transition_lambda,
@@ -3154,7 +3157,7 @@ fn forward_update_dict(
             let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
             WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
-                1.0,
+                current_fwd_sum,
                 recomb_rate_eff,
                 transition_haps,
                 active_states as f32,
