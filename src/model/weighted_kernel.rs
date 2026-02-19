@@ -311,6 +311,182 @@ impl WeightedHmmUpdater {
         }
         new_sum
     }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn fwd_update_uniform_avx512(
+        fwd: &mut [f32],
+        scale: f32,
+        base_shift: f32,
+        emissions: &[f32],
+        n_patterns: usize,
+    ) -> f32 {
+        unsafe {
+            let base_shift_vec = _mm512_set1_ps(base_shift);
+            let scale_vec = _mm512_set1_ps(scale);
+            let mut sum_vec = _mm512_setzero_ps();
+
+            let mut k = 0;
+            let fwd_ptr = fwd.as_mut_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_patterns {
+                let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+
+                // res = E[i] * (scale * F[i] + shift)
+                let scaled = _mm512_add_ps(_mm512_mul_ps(scale_vec, fwd_chunk), base_shift_vec);
+                let res = _mm512_mul_ps(emit_vec, scaled);
+
+                _mm512_storeu_ps(fwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
+
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut new_sum: f32 = sum_arr.iter().sum();
+
+            for i in k..n_patterns {
+                let f = *fwd_ptr.add(i);
+                let e = *emit_ptr.add(i);
+                let t = scale.mul_add(f, base_shift);
+                let v = e * t;
+                *fwd_ptr.add(i) = v;
+                new_sum += v;
+            }
+            new_sum
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx512f,fma")]
+    unsafe fn fwd_update_uniform_avx512_fma(
+        fwd: &mut [f32],
+        scale: f32,
+        base_shift: f32,
+        emissions: &[f32],
+        n_patterns: usize,
+    ) -> f32 {
+        unsafe {
+            let base_shift_vec = _mm512_set1_ps(base_shift);
+            let scale_vec = _mm512_set1_ps(scale);
+            let mut sum_vec = _mm512_setzero_ps();
+
+            let mut k = 0;
+            let fwd_ptr = fwd.as_mut_ptr();
+            let emit_ptr = emissions.as_ptr();
+            while k + 16 <= n_patterns {
+                let fwd_chunk = _mm512_loadu_ps(fwd_ptr.add(k));
+                let emit_vec = _mm512_loadu_ps(emit_ptr.add(k));
+
+                // res = E[i] * (scale * F[i] + shift)
+                let scaled = _mm512_fmadd_ps(scale_vec, fwd_chunk, base_shift_vec);
+                let res = _mm512_mul_ps(emit_vec, scaled);
+
+                _mm512_storeu_ps(fwd_ptr.add(k), res);
+                sum_vec = _mm512_add_ps(sum_vec, res);
+                k += 16;
+            }
+
+            let mut sum_arr = [0.0f32; 16];
+            _mm512_storeu_ps(sum_arr.as_mut_ptr(), sum_vec);
+            let mut new_sum: f32 = sum_arr.iter().sum();
+
+            for i in k..n_patterns {
+                let f = *fwd_ptr.add(i);
+                let e = *emit_ptr.add(i);
+                let t = scale.mul_add(f, base_shift);
+                let v = e * t;
+                *fwd_ptr.add(i) = v;
+                new_sum += v;
+            }
+            new_sum
+        }
+    }
+
+    /// Forward update with uniform transitions (weight=1.0 for all states)
+    ///
+    /// F_new[i] = (scale * F_old[i] + base_shift) * E[i]
+    #[inline]
+    pub fn fwd_update_uniform(
+        fwd: &mut [f32],
+        fwd_sum: f32,
+        recomb_rate: f32,
+        n_ref_haps: usize,
+        active_haps: f32,
+        emissions: EmissionProbs<'_>,
+        n_patterns: usize,
+    ) -> f32 {
+        let emissions = emissions.as_slice();
+        let (scale, base_shift) =
+            Self::conditioned_transition_params(recomb_rate, n_ref_haps, active_haps, fwd_sum);
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if n_patterns >= 16 && is_x86_feature_detected!("avx512f") {
+                if is_x86_feature_detected!("fma") {
+                    unsafe {
+                        return Self::fwd_update_uniform_avx512_fma(
+                            fwd,
+                            scale,
+                            base_shift,
+                            emissions,
+                            n_patterns,
+                        );
+                    }
+                }
+                unsafe {
+                    return Self::fwd_update_uniform_avx512(
+                        fwd,
+                        scale,
+                        base_shift,
+                        emissions,
+                        n_patterns,
+                    );
+                }
+            }
+        }
+
+        let base_shift_vec = f32x8::splat(base_shift);
+        let scale_vec = f32x8::splat(scale);
+        let mut sum_vec = f32x8::splat(0.0);
+
+        let mut k = 0;
+        while k + 8 <= n_patterns {
+            let mut fwd_arr = [0.0f32; 8];
+            let mut emit_arr = [0.0f32; 8];
+            unsafe {
+                std::ptr::copy_nonoverlapping(fwd.as_ptr().add(k), fwd_arr.as_mut_ptr(), 8);
+                std::ptr::copy_nonoverlapping(emissions.as_ptr().add(k), emit_arr.as_mut_ptr(), 8);
+            }
+            let fwd_chunk = f32x8::from(fwd_arr);
+            let emit_vec = f32x8::from(emit_arr);
+
+            // res = E[i] * (scale * F[i] + shift)
+            let res = emit_vec * (scale_vec * fwd_chunk + base_shift_vec);
+
+            let res_arr: [f32; 8] = res.into();
+            unsafe {
+                std::ptr::copy_nonoverlapping(res_arr.as_ptr(), fwd.as_mut_ptr().add(k), 8);
+            }
+
+            sum_vec += res;
+            k += 8;
+        }
+
+        let mut new_sum = sum_vec.reduce_add();
+        for i in k..n_patterns {
+            unsafe {
+                let f = *fwd.get_unchecked(i);
+                let e = *emissions.get_unchecked(i);
+                let t = scale.mul_add(f, base_shift);
+                let v = e * t;
+                *fwd.get_unchecked_mut(i) = v;
+                new_sum += v;
+            }
+        }
+        new_sum
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +561,43 @@ mod tests {
                 "Value mismatch at index {}",
                 i
             );
+        }
+    }
+
+    #[test]
+    fn test_uniform_matches_weighted_with_unit_weights() {
+        let n_patterns = 12;
+        let mut fwd_weighted = vec![0.1f32; n_patterns];
+        let mut fwd_uniform = vec![0.1f32; n_patterns];
+        let fwd_sum = 1.2;
+        let recomb_rate = 0.05;
+        let n_ref_haps = 100;
+        let unit_weights = vec![1.0f32; n_patterns];
+        let emissions: Vec<f32> = (0..n_patterns).map(|i| 0.5 + (i as f32) * 0.04).collect();
+
+        let sum_weighted = WeightedHmmUpdater::fwd_update_weighted(
+            &mut fwd_weighted,
+            fwd_sum,
+            recomb_rate,
+            n_ref_haps,
+            PatternCounts::new(&unit_weights),
+            EmissionProbs::new(&emissions),
+            n_patterns,
+        );
+
+        let sum_uniform = WeightedHmmUpdater::fwd_update_uniform(
+            &mut fwd_uniform,
+            fwd_sum,
+            recomb_rate,
+            n_ref_haps,
+            n_patterns as f32,
+            EmissionProbs::new(&emissions),
+            n_patterns,
+        );
+
+        assert!((sum_weighted - sum_uniform).abs() < 1e-6);
+        for i in 0..n_patterns {
+            assert!((fwd_weighted[i] - fwd_uniform[i]).abs() < 1e-6);
         }
     }
 
