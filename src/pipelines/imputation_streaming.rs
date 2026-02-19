@@ -586,10 +586,14 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow sharpening below base when typed evidence is strong, but limit
-    // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
-    posterior.clamp(min_error, 0.5)
+
+    // Disable aggressive sharpening: always respect the base error rate floor.
+    // The "min_error" logic (allowing drop to 0.1*base) causes overfitting
+    // to perfect-match haplotypes, which degrades accuracy on large panels
+    // where imperfect matches are common (e.g. de novo mutation).
+    //
+    // Force posterior to be at least base_error_rate.
+    posterior.clamp(base, 0.5)
 }
 
 #[inline]
@@ -624,7 +628,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    blended.clamp((base * 0.5).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
