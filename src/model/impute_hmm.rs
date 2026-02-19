@@ -1576,7 +1576,9 @@ fn smooth_allele_posteriors_subset(
         return;
     }
     let max_effective = allele_probs.len().max(1) as f32;
-    let effective_alleles = (1.0 / prior_sq_sum).clamp(1.0, max_effective);
+    // Use full allele count for effective support to ensure robust smoothing
+    // even when the prior is concentrated (e.g. rare variants).
+    let effective_alleles = max_effective;
     // Retain decomposition:
     //   dist_retain   = map-distance retain from typed anchors
     //   approx_retain = 1 - approximation_error
@@ -1622,7 +1624,7 @@ fn smooth_allele_posteriors_subset(
     // Deviation form (p = pi + delta):
     //   delta' = delta / (1 + alpha)
     // so this step is explicit shrinkage of deviation from pi.
-    let base_mass = (effective_alleles * (1.0 - retain) / retain).max(0.0);
+    let base_mass = (effective_alleles * (1.0 - retain) / retain).max(1.50);
     // Keep entropy boost modest; large multipliers over-shrink rare ALT signal
     // when subset support is sparse.
     let prior_mass = base_mass * (1.0 + 0.5 * confidence_boost);
@@ -1694,7 +1696,7 @@ fn apply_marker_prior_smoothing(
         0.0
     };
     let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
+        observed_missing_mass.max(fallback_missing_mass)
     } else {
         fallback_missing_mass
     };
@@ -1725,7 +1727,7 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.10 + 0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1746,7 +1748,33 @@ fn apply_marker_prior_smoothing(
         }
     }
 
-    let prior_probs = if smoothing_prior_total > 0.0 {
+    let prior_probs = if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+        match panel {
+            AllelePosteriors::Biallelic(p_alt) if allele_probs.len() == 2 => {
+                allele_prior_scratch.clear();
+                allele_prior_scratch.push(1.0 - p_alt);
+                allele_prior_scratch.push(*p_alt);
+                AlleleProbsView::from_trusted(allele_prior_scratch)
+            }
+            AllelePosteriors::Multiallelic(probs) if probs.len() == allele_probs.len() => {
+                AlleleProbsView::from_trusted(probs)
+            }
+            _ => {
+                if smoothing_prior_total > 0.0 {
+                    let inv = 1.0 / smoothing_prior_total;
+                    for v in smoothing_prior_counts.iter_mut() {
+                        *v *= inv;
+                    }
+                    AlleleProbsView::from_trusted(smoothing_prior_counts)
+                } else {
+                    normalized_allele_prior(
+                        allele_prior_scratch,
+                        AlleleProbsView::from_trusted(probs),
+                    )
+                }
+            }
+        }
+    } else if smoothing_prior_total > 0.0 {
         let inv = 1.0 / smoothing_prior_total;
         for v in smoothing_prior_counts.iter_mut() {
             *v *= inv;
