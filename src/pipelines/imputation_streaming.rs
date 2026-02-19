@@ -586,10 +586,9 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Do not sharpen below base (user-specified error floor). This prevents
-    // the HMM from becoming overconfident and rejecting correct haplotypes
-    // due to isolated genotyping errors in the input scaffold (Perfect LD trap).
-    let min_error = base;
+    // Allow sharpening below base when typed evidence is strong, but limit
+    // maximum sharpening to avoid sparse-array collapse.
+    let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -600,6 +599,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         return base;
     }
     let mut max_prob = 0.0f32;
+    let mut entropy = 0.0f32;
     let mut n_alleles = 0usize;
     for &p in probs {
         if !p.is_finite() || p <= 0.0 {
@@ -609,21 +609,22 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         if p > max_prob {
             max_prob = p;
         }
+        entropy -= p * p.ln();
     }
     if n_alleles == 0 {
         return base;
     }
-    // Do not sharpen below base for confident calls, as this creates a "perfect LD trap"
-    // where correct rare variants are rejected because of an erroneous (but confident)
-    // 0/0 genotype at a flanking marker.
-    //
-    // Use base as the center point for confident calls (scaled = base).
-    // For low-confidence calls, we allow expansion (scaled > base) if needed,
-    // but we remove the (1.6 - 1.2*confidence) logic that pushed it to 0.4*base.
-    let scaled = base;
+    let max_entropy = (n_alleles.max(2) as f32).ln();
+    let entropy_norm = if max_entropy > 0.0 {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp(base, 0.5)
+    blended.clamp((base * 0.15).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -10097,11 +10098,18 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening below base is now disabled to avoid the Perfect LD trap.
-        // Even if the posterior suggests lower error, we clamp to the user-specified base.
+        // Sharpening is allowed down to 10% of base or 1e-6.
+        let limit = base * 0.1;
         assert!(
-            (out - base).abs() < 1e-6,
-            "expected calibrated error clamped to base {}, got {}",
+            out >= limit,
+            "expected calibrated error clamped to limit {}, got {}",
+            limit,
+            out
+        );
+        // With sharp observations, it should be below base.
+        assert!(
+            out < base,
+            "expected calibrated error to sharpen below base {}, got {}",
             base,
             out
         );
