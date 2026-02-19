@@ -588,7 +588,8 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    // RELAXED: Don't sharpen too aggressively to avoid killing rare variant paths.
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -664,7 +665,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
+    let floor = 0.0001 + 0.01 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
