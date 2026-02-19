@@ -536,7 +536,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // We weight each marker by normalized information content:
     //   w = 1 - H(p)/log(K), K = number of alleles
     // so near-uniform markers contribute little evidence.
-    const PRIOR_STRENGTH_MARKERS: f32 = 16.0;
+    const PRIOR_STRENGTH_MARKERS: f32 = 2.0;
     let mut weighted_residual_sum = 0.0f32;
     let mut weight_sum = 0.0f32;
     for m in 0..input_probs.n_markers() {
@@ -652,9 +652,14 @@ fn adaptive_untyped_prior_mix(
     let missing_ramp = missing.powi(3);
 
     // Slightly stronger floor when cluster distance is wide (weaker local
-    // linkage signal) or the model error rate is elevated.
+    // linkage signal).
     let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
-    let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 1.6);
+
+    // Scale floor by model error rate, but cap at 1.0.
+    // Low error rate (sharp model) allows lower floor (trust HMM more).
+    // High error rate (diffuse model) should NOT raise the floor, as that
+    // suppresses rare variant signals (AF collapse).
+    let err_factor = (p_mismatch / 4e-4f32).clamp(0.5, 1.0);
 
     // Unphased-target imputation has additional uncertainty from phase
     // transfer, so apply a mild boost.
