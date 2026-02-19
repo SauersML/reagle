@@ -5231,6 +5231,55 @@ impl crate::pipelines::ImputationPipeline {
                 );
             }
         }
+        let panel_priors: Option<Arc<Vec<AllelePosteriors>>> = {
+            let mut priors = Vec::with_capacity(n_ref_markers);
+            for col in ref_columns {
+                let n = col.n_haplotypes();
+                if n == 0 {
+                    priors.push(AllelePosteriors::Biallelic(0.0));
+                    continue;
+                }
+                match col {
+                    GenotypeColumn::Dense(c) if c.bits_per_allele() == 1 => {
+                        let p_alt = c.alt_count() as f32 / n as f32;
+                        priors.push(AllelePosteriors::Biallelic(p_alt));
+                    }
+                    GenotypeColumn::Sparse(c) => {
+                        let p_alt = c.n_carriers() as f32 / n as f32;
+                        priors.push(AllelePosteriors::Biallelic(p_alt));
+                    }
+                    _ => {
+                        let mut counts = Vec::new();
+                        for h in 0..n {
+                            let a = col.get(HapIdx::new(h as u32));
+                            if crate::data::storage::AlleleCode::from_raw(a).is_missing() {
+                                continue;
+                            }
+                            let idx = a as usize;
+                            if idx >= counts.len() {
+                                counts.resize(idx + 1, 0u32);
+                            }
+                            counts[idx] += 1;
+                        }
+                        let total: u32 = counts.iter().sum();
+                        if total == 0 {
+                            priors.push(AllelePosteriors::Biallelic(0.0));
+                        } else if counts.len() <= 2 {
+                            let p_alt = counts.get(1).copied().unwrap_or(0) as f32 / total as f32;
+                            priors.push(AllelePosteriors::Biallelic(p_alt));
+                        } else {
+                            let probs: Vec<f32> = counts
+                                .iter()
+                                .map(|&c| c as f32 / total as f32)
+                                .collect();
+                            priors.push(AllelePosteriors::Multiallelic(Arc::from(probs)));
+                        }
+                    }
+                }
+            }
+            Some(Arc::new(priors))
+        };
+
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -5728,11 +5777,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                panel_priors.clone(),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                panel_priors.clone(),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
