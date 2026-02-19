@@ -1548,7 +1548,6 @@ fn smooth_allele_posteriors_subset(
     approximation_error: f32,
     untyped_uniform_marker: bool,
 ) {
-    const MIN_RETAIN: f32 = 1e-4;
     if allele_probs.is_empty() {
         return;
     }
@@ -1575,24 +1574,34 @@ fn smooth_allele_posteriors_subset(
     if prior_sq_sum <= 0.0 {
         return;
     }
-    let max_effective = allele_probs.len().max(1) as f32;
-    // Use full allele count for effective support to ensure robust smoothing
-    // even when the prior is concentrated (e.g. rare variants).
-    let effective_alleles = max_effective;
     // Retain decomposition:
     //   dist_retain   = map-distance retain from typed anchors
     //   approx_retain = 1 - approximation_error
-    //   retain        = dist_retain * approx_retain
     //
     // Multiplication encodes "both conditions must hold to trust p strongly":
     // even if distance retain is high, truncation/missing can still reduce trust.
     // even if approximation diagnostics look good, deep map distance still reduces trust.
-    let dist_retain = nearest_obs_retain.clamp(MIN_RETAIN, 1.0);
-    let approx_retain = (1.0 - approximation_error.clamp(0.0, 0.9999)).clamp(MIN_RETAIN, 1.0);
-    let retain = (dist_retain * approx_retain).clamp(MIN_RETAIN, 1.0);
-    // Entropy-aware confidence gating: when posterior entropy is much lower
-    // than the local-prior entropy, the state subset is likely overconfident.
-    // Increase smoothing in that regime to reduce sparse-subset collapse.
+
+    // Dirichlet-style pseudocount update:
+    //   p'_a = (p_a + alpha * pi_a) / (1 + alpha)
+    // where pi is the local donor-conditional prior.
+    //
+    // If alpha=(1-retain)/retain, posterior mass weight would be exactly retain:
+    //   posterior coefficient = 1/(1+alpha) = retain.
+    //
+    // Here alpha is further scaled by:
+    // - effective_alleles (pi diffuseness proxy),
+    // - entropy-derived confidence_boost,
+    // to prevent brittle overconfidence under sparse subset support.
+    //
+    // Deviation form (p = pi + delta):
+    //   delta' = delta / (1 + alpha)
+    // so this step is explicit shrinkage of deviation from pi.
+    let effective_alleles = allele_probs.len().max(1) as f32;
+    let dist_retain = nearest_obs_retain.clamp(1e-4, 1.0);
+    let approx_retain = (1.0 - approximation_error.clamp(0.0, 0.9999)).clamp(1e-4, 1.0);
+    let retain = (dist_retain * approx_retain).clamp(1e-4, 1.0);
+
     let mut post_entropy = 0.0f32;
     let mut prior_entropy = 0.0f32;
     for (&post, &prior) in allele_probs.iter().zip(subset_prior_probs.iter()) {
@@ -1611,20 +1620,8 @@ fn smooth_allele_posteriors_subset(
 
     // Dirichlet-style pseudocount update:
     //   p'_a = (p_a + alpha * pi_a) / (1 + alpha)
-    // where pi is the local donor-conditional prior.
-    //
-    // If alpha=(1-retain)/retain, posterior mass weight would be exactly retain:
-    //   posterior coefficient = 1/(1+alpha) = retain.
-    //
-    // Here alpha is further scaled by:
-    // - effective_alleles (pi diffuseness proxy),
-    // - entropy-derived confidence_boost,
-    // to prevent brittle overconfidence under sparse subset support.
-    //
-    // Deviation form (p = pi + delta):
-    //   delta' = delta / (1 + alpha)
     // so this step is explicit shrinkage of deviation from pi.
-    let base_mass = (15.0 * effective_alleles * (1.0 - retain) / retain).max(0.05);
+    let base_mass = (1.5 * effective_alleles * (1.0 - retain) / retain).max(0.05);
     // Keep entropy boost modest; large multipliers over-shrink rare ALT signal
     // when subset support is sparse.
     let prior_mass = base_mass * (1.0 + 0.5 * confidence_boost);
@@ -1701,14 +1698,11 @@ fn apply_marker_prior_smoothing(
         fallback_missing_mass
     };
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
-    let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
-    let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
         (active_states as f32 / panel_haps as f32).clamp(0.0, 1.0)
     } else {
         1.0
     };
-    let sparsity_boost = (1.0 - active_ratio).powi(2);
     let truncation_error = (1.0 - active_ratio).clamp(0.0, 1.0);
     // Approximation error combines structural-missingness and truncation:
     //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
@@ -1722,12 +1716,14 @@ fn apply_marker_prior_smoothing(
     // This keeps the decomposition explicit:
     // - distance governs physical information decay
     // - diagnostics govern approximation-risk inflation
+    let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
+    let dist_error = 1.0 - dist_retain;
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.02 + 0.30 * combined_error + 0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.01 + 0.05 * combined_error).clamp(0.0, 0.05);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
