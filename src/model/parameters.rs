@@ -81,7 +81,11 @@ impl ModelParams {
         // Formula from Java PhaseData constructor
         let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
-        let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
+        // Ensure error rate is not lower than the theoretical Li-Stephens lower bound
+        // for the given panel size. This prevents over-confident collapsing (high ECE)
+        // when users specify extremely low manual error rates for small panels.
+        let ls_default = Self::li_stephens_p_mismatch(n_haps);
+        let p_mismatch = err.unwrap_or(ls_default).max(ls_default);
 
         Self {
             p_mismatch,

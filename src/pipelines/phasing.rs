@@ -11036,7 +11036,7 @@ fn sample_dynamic_mcmc(
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
     }
-    let swap_probs_conf = if !swap_probs.is_empty() {
+    let mut swap_probs_conf = if !swap_probs.is_empty() {
         let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
         let (decoded_bits, posterior_probs, _) =
             decode_orientation_hmm(&swap_probs, &transition_logs);
@@ -11045,6 +11045,14 @@ fn sample_dynamic_mcmc(
     } else {
         swap_probs.clone()
     };
+
+    // If there are no anchors, the global phase orientation is unidentifiable (symmetric).
+    // The HMM will pick one mode (e.g. 0|1) and be confident about it, but the
+    // symmetric mode (1|0) is equally valid. True confidence regarding absolute
+    // phase (Allele 1 vs Allele 2) should be 0.5.
+    if !has_anchor {
+        swap_probs_conf.fill(0.5);
+    }
     {
         let mut path1_switches = 0usize;
         let mut path2_switches = 0usize;
