@@ -11,7 +11,7 @@ use crate::data::storage::{
 use crate::error::{ReagleError, Result};
 use crate::model::li_stephens::subset_linear_exact_k;
 use crate::model::types::RefHapId;
-use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpdater};
+use crate::model::weighted_kernel::{EmissionProbs, WeightedHmmUpdater};
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
@@ -619,7 +619,6 @@ pub struct ImputeWorkspace {
     pub emissions: Vec<f32>,
     pub fwd_checkpoints: Vec<f32>,
     pub fwd_scales: Vec<f32>,
-    pub weights: Vec<f32>,
     pub state_alleles: Vec<u8>,
     pub state_patterns: Vec<u16>,
     pub pattern_emissions: Vec<f32>,
@@ -766,7 +765,6 @@ impl ImputeWorkspace {
             emissions: vec![1.0; n_states],
             fwd_checkpoints: Vec::new(),
             fwd_scales: vec![1.0; n_markers],
-            weights: vec![1.0; n_states],
             state_alleles: vec![AlleleCode::MISSING.raw(); n_states],
             state_patterns: vec![0u16; n_states],
             pattern_emissions: Vec::new(),
@@ -797,10 +795,6 @@ impl ImputeWorkspace {
             self.fwd.resize(n_states, 0.0);
             self.bwd.resize(n_states, 1.0);
             self.emissions.resize(n_states, 1.0);
-            self.weights.resize(n_states, 1.0);
-        }
-        if self.weights.len() < n_states {
-            self.weights.resize(n_states, 1.0);
         }
         if self.state_alleles.len() < n_states {
             self.state_alleles
@@ -3009,12 +3003,12 @@ fn forward_update_impl<C: RefColumnLike>(
         );
         if recomb_rate > 0.0 {
             let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
-            WeightedHmmUpdater::fwd_update_weighted(
+            WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
                 1.0,
                 recomb_rate_eff,
                 transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
+                active_states as f32,
                 EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
@@ -3081,12 +3075,12 @@ fn forward_update_seqcoded(
         }
         if recomb_rate > 0.0 {
             let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
-            WeightedHmmUpdater::fwd_update_weighted(
+            WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
                 1.0,
                 recomb_rate_eff,
                 transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
+                active_states as f32,
                 EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
@@ -3158,12 +3152,12 @@ fn forward_update_dict(
         }
         if recomb_rate > 0.0 {
             let recomb_rate_eff = effective_recomb_rate(recomb_rate, transition_lambda);
-            WeightedHmmUpdater::fwd_update_weighted(
+            WeightedHmmUpdater::fwd_update_uniform(
                 &mut ws.fwd,
                 1.0,
                 recomb_rate_eff,
                 transition_haps,
-                PatternCounts::new(&ws.weights[..active_states]),
+                active_states as f32,
                 EmissionProbs::new(&ws.emissions[..active_states]),
                 active_states,
             )
@@ -4681,9 +4675,6 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
     let active_states = ws.active_states();
     assert!(active_states <= state_haps.len());
     let active_markers = ws.active_markers();
-    if active_states > 0 {
-        ws.weights[..active_states].fill(1.0);
-    }
 
     let n_ref_haps = ref_allele_freqs.n_ref_haps().max(1);
     assert!(
