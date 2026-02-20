@@ -129,8 +129,9 @@ impl ModelParams {
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
         // Beagle often estimates ~5e-4 for imputation.
-        // A floor of 1e-4 prevents over-strict matching on sparse arrays.
-        val.max(1e-4)
+        // A floor of 5e-4 prevents over-strict matching on sparse arrays,
+        // reducing overconfidence and improving calibration.
+        val.max(5e-4)
     }
 
     /// Calculate LR threshold for a given iteration
