@@ -1562,6 +1562,14 @@ fn smooth_allele_posteriors_subset(
     if !untyped_uniform_marker {
         return;
     }
+
+    // Disable smoothing toward local prior: rely on HMM information decay (fwd/bwd mixing).
+    // The HMM naturally decays to stationary distribution over map distance.
+    // Explicit smoothing here double-counts uncertainty and over-regularizes rare variants.
+    if true {
+        return;
+    }
+
     // Bayesian shrinkage toward a local prior pi on untyped/uniform markers.
     //
     // We estimate effective support from pi (not from current posterior p),
