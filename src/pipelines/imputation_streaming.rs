@@ -1321,7 +1321,13 @@ fn select_top_k_adaptive_with_support(
         if !score.is_finite() || score <= 0.0 {
             continue;
         }
-        support = support.saturating_add(1);
+        // Only count scores significantly above the epsilon background (1e-5) as "support".
+        // A threshold of 1e-4 allows weak signals to be collected but prevents the
+        // massive number of epsilon-weighted common variants from inflating the
+        // support metric and triggering aggressive top-m reduction.
+        if score > 1e-4 {
+            support = support.saturating_add(1);
+        }
         let candidate = RankedScore { idx, score };
         if heap.len() < upper_k {
             heap.push(Reverse(candidate));
