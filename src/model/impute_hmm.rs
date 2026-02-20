@@ -1698,7 +1698,6 @@ fn apply_marker_prior_smoothing(
     } else {
         fallback_missing_mass
     };
-    let floor_mix = min_prior_mix.clamp(0.0, 0.9);
     let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
     let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
@@ -1752,35 +1751,25 @@ fn apply_marker_prior_smoothing(
         }
     }
 
-    let base_mix = if active_ratio > 0.9 {
-        0.0
-    } else if site_maf < 0.01 {
-        0.20
-    } else if site_maf < 0.05 {
-        // Linear decay 0.20 -> 0.01
-        0.20 - ((site_maf - 0.01) / 0.04) * 0.19
+    // Disable panel mixing (both floor and adaptive) for:
+    // 1. Full panel runs (active_ratio > 0.9): HMM has all info, mixing adds noise/bias.
+    // 2. Common variants (MAF > 10%): HMM is robust, panel prior is diffuse/noisy.
+    let (floor_mix, base_mix, mix_driver_scale) = if active_ratio > 0.9 || site_maf > 0.10 {
+        (0.0, 0.0, 0.0)
     } else {
-        0.0
+        // Rare variants in subset runs: use mixing to prevent collapse.
+        let scale = 1.0;
+        let base = if site_maf < 0.01 {
+            0.20
+        } else if site_maf < 0.05 {
+            // Linear decay 0.20 -> 0.01
+            0.20 - ((site_maf - 0.01) / 0.04) * 0.19
+        } else {
+            0.0
+        };
+        (min_prior_mix.clamp(0.0, 0.9), base, scale)
     };
 
-    // Remove combined_error multiplier to ensure distance-based decay is linear,
-    // not quadratic (since combined_error is proportional to dist_error).
-    //
-    // Also scale distance-based mixing by MAF:
-    // - Common variants (MAF > 10%) are robust; trust HMM even at distance.
-    // - Rare variants are fragile; allow full distance-based fallback.
-    // Use 0.0 scale for common variants to ensure we don't wash out clear HMM
-    // calls (e.g. 0.0) with diffuse priors (0.5) even at large map distances.
-    //
-    // Also disable this fallback if we are running with the full reference panel
-    // (active_ratio ~ 1.0), as subset selection bias is eliminated.
-    let mix_driver_scale = if active_ratio > 0.9 {
-        0.0
-    } else if site_maf > 0.10 {
-        0.01
-    } else {
-        1.0
-    };
     let adaptive_panel_mix = (base_mix
         + mix_driver_scale * mix_driver * (1.0 + 0.75 * sparsity_boost))
         .clamp(0.0, 0.50);
