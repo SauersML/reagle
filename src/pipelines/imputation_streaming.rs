@@ -664,8 +664,11 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.02 + 0.04 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.01, 0.25)
+    // Revert to conservative floor (0.005) to avoid over-smoothing posteriors.
+    // High floors (>0.01) degrade calibration (DR2 bias) and accuracy (R2)
+    // by pulling rare-variant posteriors too strongly toward panel frequency.
+    let floor = 0.005 + 0.02 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.002, 0.15)
 }
 
 #[inline]
@@ -2390,8 +2393,14 @@ fn compute_per_window_cap(
 
             // If full panel fits in RAM, we normally prefer it.
             // However, for speed, we should still respect window_top_k if it is significantly smaller.
+            // If we have 20k haps and 20k fit in RAM, but window_top_k is 50,
+            // using 20k is extremely slow (O(K*M)).
+            // So we clamp the "memory-allowed capacity" to a reasonable multiple of window_top_k.
+            //
+            // We use a generous multiplier (16x) to allow high accuracy on medium panels (e.g. 2k haps)
+            // while still preventing pathological O(N^2) scaling on massive panels (20k+) when top-k is small.
             let speed_limit = window_top_k
-                .saturating_mul(3)
+                .saturating_mul(16)
                 .max(SMALL_PANEL_FULL_CAP_HAPS);
 
             if can_fit_full_panel {
