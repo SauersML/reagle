@@ -1734,14 +1734,45 @@ fn apply_marker_prior_smoothing(
     let mix_driver = missing_mass.max(dist_error);
 
     // Base floor to prevent total collapse on rare variants.
-    // Increased to 0.20 to match Java Beagle's behavior of reverting to prior
-    // when HMM signal is weak or potentially biased by subset selection (Perfect LD trap).
-    let base_mix = 0.20;
+    // Dynamic adjustment:
+    // - Rare variants (MAF < 1%): Trust prior more (subset selection may miss them).
+    //   Set base_mix high (0.20) to ensure we output non-zero probability.
+    // - Common variants (MAF > 5%): Trust HMM more (subset should capture them).
+    //   Set base_mix low (0.01) to avoid polluting clear calls with prior noise.
+    let mut site_maf = 0.5; // Default to common (trust HMM) if priors missing
+    if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+        match panel {
+            AllelePosteriors::Biallelic(p_alt) => {
+                site_maf = p_alt.min(1.0 - p_alt);
+            }
+            AllelePosteriors::Multiallelic(probs) => {
+                let max_p = probs.iter().fold(0.0f32, |a, &b| a.max(b));
+                site_maf = 1.0 - max_p;
+            }
+        }
+    }
+
+    let base_mix = if site_maf < 0.01 {
+        0.20
+    } else if site_maf < 0.05 {
+        // Linear decay 0.20 -> 0.01
+        0.20 - ((site_maf - 0.01) / 0.04) * 0.19
+    } else {
+        0.0
+    };
 
     // Remove combined_error multiplier to ensure distance-based decay is linear,
     // not quadratic (since combined_error is proportional to dist_error).
-    let adaptive_panel_mix =
-        (base_mix + 1.0 * mix_driver * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.50);
+    //
+    // Also scale distance-based mixing by MAF:
+    // - Common variants (MAF > 10%) are robust; trust HMM even at distance.
+    // - Rare variants are fragile; allow full distance-based fallback.
+    // Use 0.0 scale for common variants to ensure we don't wash out clear HMM
+    // calls (e.g. 0.0) with diffuse priors (0.5) even at large map distances.
+    let mix_driver_scale = if site_maf > 0.10 { 0.0 } else { 1.0 };
+    let adaptive_panel_mix = (base_mix
+        + mix_driver_scale * mix_driver * (1.0 + 0.75 * sparsity_boost))
+        .clamp(0.0, 0.50);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
