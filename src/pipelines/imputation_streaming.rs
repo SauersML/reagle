@@ -1462,12 +1462,14 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
 ) -> Vec<Option<TypedMarkerResolution>> {
     let target_pos_index = build_target_marker_position_index(target_markers);
     let mut out = vec![None; ref_markers.len()];
+    let mut resolved_count = 0;
     for (ref_m, slot) in out.iter_mut().enumerate() {
         if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
             *slot = Some(TypedMarkerResolution {
                 target_idx: target_m.as_usize(),
                 map_kind: TypedMarkerMapKind::Alignment,
             });
+            resolved_count += 1;
             continue;
         }
 
@@ -1515,6 +1517,39 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
             });
         }
         *slot = candidate;
+        if let Some(res) = slot {
+            resolved_count += 1;
+            if resolved_count <= 5 {
+                let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
+                eprintln!(
+                    "Resolved marker {}: target_idx={}, map_kind={:?}, ref={:?}:{}",
+                    resolved_count, res.target_idx, res.map_kind, ref_marker.chrom, ref_marker.pos
+                );
+            }
+        }
+    }
+    if resolved_count == 0 && target_markers.len() > 0 {
+        eprintln!(
+            "WARNING: No markers resolved in window! Ref markers: {}, Target markers: {}",
+            ref_markers.len(),
+            target_markers.len()
+        );
+        if let Some(first_ref) = ref_markers.get(MarkerIdx::new(0)) {
+             let ref_chrom = ref_markers.chrom_name(first_ref.chrom).unwrap_or("");
+             eprintln!("First ref marker: {}:{}", ref_chrom, first_ref.pos);
+             eprintln!("Normalized ref chrom: '{}'", normalize_chrom_local(ref_chrom));
+             if let Some(target_map) = target_pos_index.get(normalize_chrom_local(ref_chrom)) {
+                 eprintln!("Target markers on this chrom: {}", target_map.len());
+                 if let Some(first_target_pos) = target_map.keys().next() {
+                     eprintln!("Example target pos: {}", first_target_pos);
+                 }
+             } else {
+                 eprintln!("No target markers found on chrom '{}'", normalize_chrom_local(ref_chrom));
+                 if let Some(k) = target_pos_index.keys().next() {
+                     eprintln!("Available target chroms: {}", k);
+                 }
+             }
+        }
     }
     out
 }

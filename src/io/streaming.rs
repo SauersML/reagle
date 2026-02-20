@@ -1005,6 +1005,11 @@ impl StreamingVcfReader {
             phased_overlap: None,
         };
 
+        if n_markers > 0 {
+            let first = window.genotypes.marker(crate::data::MarkerIdx::new(0));
+            eprintln!("StreamWindow loaded: {} markers, first={}:{}", n_markers, self.markers_meta.chrom_name(first.chrom).unwrap_or("?"), first.pos);
+        }
+
         while let Some(front) = self.buffer.front() {
             let front_chrom = self
                 .markers_meta
