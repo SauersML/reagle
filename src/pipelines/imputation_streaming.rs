@@ -5231,6 +5231,53 @@ impl crate::pipelines::ImputationPipeline {
                 );
             }
         }
+
+        let mut panel_posteriors: Vec<AllelePosteriors> = Vec::with_capacity(n_ref_markers);
+        {
+            let mut ref_alleles = vec![0u8; plan.n_ref_haps];
+            let mut counts = Vec::new();
+            for m in 0..n_ref_markers {
+                let col = &ref_columns[m];
+                fill_ref_alleles(col, &mut ref_alleles);
+                let n_alleles = ref_markers.marker(MarkerIdx::new(m as u32)).n_alleles();
+                counts.resize(n_alleles, 0.0);
+                counts.fill(0.0);
+                let mut sum = 0.0f32;
+                for &a in &ref_alleles {
+                    if a != crate::data::storage::AlleleCode::MISSING.raw() {
+                        let idx = a as usize;
+                        if idx < n_alleles {
+                            counts[idx] += 1.0;
+                            sum += 1.0;
+                        }
+                    }
+                }
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
+                    for c in &mut counts {
+                        *c *= inv;
+                    }
+                    if n_alleles == 2 {
+                        panel_posteriors.push(AllelePosteriors::Biallelic(counts[1]));
+                    } else {
+                        panel_posteriors.push(AllelePosteriors::Multiallelic(
+                            std::sync::Arc::from(counts.as_slice()),
+                        ));
+                    }
+                } else {
+                    if n_alleles == 2 {
+                        panel_posteriors.push(AllelePosteriors::Biallelic(0.0));
+                    } else {
+                        let zeros = vec![0.0; n_alleles];
+                        panel_posteriors.push(AllelePosteriors::Multiallelic(
+                            std::sync::Arc::from(zeros.as_slice()),
+                        ));
+                    }
+                }
+            }
+        }
+        let panel_posteriors_arc = std::sync::Arc::new(panel_posteriors);
+
         let build_input_probs_pair = |hap1: HapIdx,
                                       hap2: HapIdx,
                                       sample_idx: usize|
@@ -5728,11 +5775,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                Some(panel_posteriors_arc.clone()),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                Some(panel_posteriors_arc.clone()),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };

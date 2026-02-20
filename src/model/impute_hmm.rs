@@ -1720,12 +1720,28 @@ fn apply_marker_prior_smoothing(
     // This keeps the decomposition explicit:
     // - distance governs physical information decay
     // - diagnostics govern approximation-risk inflation
-    let combined_error =
-        (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
+    //
+    // We allow distance-based decay (dist_error) to drive panel mixing even
+    // if the HMM is confident (low missing_mass), because the active subset
+    // may not contain rare variants present in the full panel ("Perfect LD trap").
+    //
+    // dist_error (1.0 - nearest_obs_retain) proxies the probability that physical
+    // linkage has broken down. Even if the HMM found a path (missing_mass small),
+    // if linkage is broken, that path is just a guess from the subset. We should
+    // revert to the panel prior proportional to the broken linkage.
+    let mix_driver = missing_mass.max(dist_error);
+
+    // Base floor to prevent total collapse on rare variants.
+    // Increased to 0.20 to match Java Beagle's behavior of reverting to prior
+    // when HMM signal is weak or potentially biased by subset selection (Perfect LD trap).
+    let base_mix = 0.20;
+
+    // Remove combined_error multiplier to ensure distance-based decay is linear,
+    // not quadratic (since combined_error is proportional to dist_error).
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (base_mix + 1.0 * mix_driver * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.50);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
