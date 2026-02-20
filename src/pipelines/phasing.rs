@@ -385,11 +385,11 @@ fn fit_cohort_calibration(
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
-const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
+const STAGE1_BLOCK_TARGET_MARKERS: usize = 100;
 const STAGE1_BLOCK_TARGET_MARKERS_FAST_MAX: usize = 800;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_MIN_MARKER_STEP: usize = 50;
+const PBWT_MIN_MARKER_STEP: usize = 10;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
