@@ -242,7 +242,7 @@ fn collect_carriers_for_allele(
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
-const PBWT_MIN_PER_HAP: usize = 64;
+const PBWT_MIN_PER_HAP: usize = 128;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
@@ -256,7 +256,7 @@ const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
-const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
+const SMALL_PANEL_FULL_CAP_HAPS: usize = 64;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
@@ -664,8 +664,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    let floor = 0.02 + 0.04 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.01, 0.25)
 }
 
 #[inline]
@@ -2359,10 +2359,22 @@ fn compute_per_window_cap(
     n_threads: usize,
     safe_bytes_per_thread: u64,
     force_full_panel: bool,
+    window_top_k: usize,
 ) -> usize {
-    if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS {
+    // If the panel is very small, we default to using all haplotypes ("full panel")
+    // to maximize accuracy, provided it doesn't grossly exceed the user's
+    // requested top-k (e.g. if user asks for 50 and we have 200, we might use 200).
+    //
+    // Heuristic: If panel is small AND fits within 2x the requested top-k
+    // use full panel. Otherwise, respect the memory/performance tradeoff.
+    let small_panel_limit = window_top_k
+        .saturating_mul(2)
+        .max(SMALL_PANEL_FULL_CAP_HAPS);
+
+    if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS && n_ref_haps <= small_panel_limit {
         return n_ref_haps.max(1);
     }
+
     let mut per_window_cap_window = if force_full_panel {
         n_ref_haps.max(1)
     } else {
@@ -2375,10 +2387,22 @@ fn compute_per_window_cap(
                 .saturating_mul(n_threads.max(1));
             let can_fit_full_panel = available_bytes > 0
                 && full_panel_bytes as f64 <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
+
+            // If full panel fits in RAM, we normally prefer it.
+            // However, for speed, we should still respect window_top_k if it is significantly smaller.
+            let speed_limit = window_top_k
+                .saturating_mul(3)
+                .max(SMALL_PANEL_FULL_CAP_HAPS);
+
             if can_fit_full_panel {
-                n_ref_haps
+                if n_ref_haps <= speed_limit {
+                    n_ref_haps
+                } else {
+                    speed_limit
+                }
             } else {
-                (safe_bytes_per_thread as usize) / per_state_bytes
+                let ram_limit = (safe_bytes_per_thread as usize) / per_state_bytes;
+                ram_limit.min(speed_limit)
             }
         };
         if cap == 0 {
@@ -2419,6 +2443,7 @@ fn prepare_reference_data(
     n_threads: usize,
     safe_bytes_per_thread: u64,
     force_full_panel: bool,
+    window_top_k: usize,
 ) -> Result<ReferenceData> {
     let memory_budget = if available_bytes == 0 {
         0u64
@@ -2507,6 +2532,7 @@ fn prepare_reference_data(
                 n_threads,
                 safe_bytes_per_thread,
                 force_full_panel,
+                window_top_k,
             );
             per_window_caps.push(per_window_cap_window);
 
@@ -4226,6 +4252,7 @@ impl crate::pipelines::ImputationPipeline {
             n_threads,
             safe_bytes_per_thread,
             prescan_force_full_panel,
+            self.config.window_top_k,
         )?;
 
         match &ref_data {
