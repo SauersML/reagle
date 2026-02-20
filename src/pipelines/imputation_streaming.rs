@@ -7089,7 +7089,9 @@ impl crate::pipelines::ImputationPipeline {
                             return 0.0;
                         }
                         if k_ess <= 1 {
-                            return LAMBDA_MAX;
+                            // If only 1 state has donor support, do not force stickiness.
+                            // Allow mixing with other states (core/prior) via standard transition.
+                            return 0.0;
                         }
                         // Effective sample size over donor weights on the FINAL selected state set:
                         //   Neff = (sum w)^2 / sum(w^2), with Neff in [1, K_ess].
