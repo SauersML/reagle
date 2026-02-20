@@ -1322,10 +1322,12 @@ fn select_top_k_adaptive_with_support(
             continue;
         }
         // Only count scores significantly above the epsilon background (1e-5) as "support".
-        // A threshold of 1e-4 allows weak signals to be collected but prevents the
-        // massive number of epsilon-weighted common variants from inflating the
-        // support metric and triggering aggressive top-m reduction.
-        if score > 1e-4 {
+        // A threshold of 0.01 (1e-2) ensures we filter out the accumulated epsilon noise
+        // even for large windows (e.g. 500 markers * 1e-5 = 0.005), while still capturing
+        // even very weak true signals (e.g. single match at freq 0.49 => score ~0.04).
+        // This prevents the "strong support" logic from being triggered by pure background,
+        // allowing the adaptive logic to boost state count (backfill) as intended.
+        if score > 0.01 {
             support = support.saturating_add(1);
         }
         let candidate = RankedScore { idx, score };
