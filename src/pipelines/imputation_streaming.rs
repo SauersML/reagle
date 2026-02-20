@@ -244,7 +244,7 @@ const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
-const PBWT_MIN_MARKER_STEP: usize = 50;
+const PBWT_MIN_MARKER_STEP: usize = 10;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
 const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
@@ -253,7 +253,7 @@ const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
-const SM_MATCH_DONORS: usize = 16;
+const SM_MATCH_DONORS: usize = 64;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
@@ -664,8 +664,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.04 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    let floor = 0.005 + 0.10 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.15)
 }
 
 #[inline]
