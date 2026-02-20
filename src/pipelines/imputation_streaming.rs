@@ -1331,6 +1331,25 @@ fn select_top_k_adaptive_with_support(
             heap.push(Reverse(candidate));
         }
     }
+
+    // Backfill with zero-score/background haplotypes if we have spare capacity.
+    // This prevents "perfect LD traps" where the only selected haplotypes are those
+    // matching rare target alleles, while haplotypes matching common background
+    // alleles (score=0) are excluded, forcing false-positive imputation of linked
+    // rare variants.
+    if heap.len() < upper_k {
+        for (idx, &score) in scores.iter().enumerate() {
+            if heap.len() >= upper_k {
+                break;
+            }
+            if score.is_finite() && score <= 0.0 {
+                // Add with actual score (0.0 or negative). They will be sorted
+                // correctly relative to positive scores.
+                heap.push(Reverse(RankedScore { idx, score }));
+            }
+        }
+    }
+
     let top_m =
         adaptive_top_m_window_from_support(support, base_top_m, per_window_cap_window, n_ref_haps);
     let mut ranked: Vec<(usize, f32)> = heap
