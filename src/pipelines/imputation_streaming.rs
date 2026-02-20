@@ -253,7 +253,7 @@ const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
-const SM_MATCH_DONORS: usize = 16;
+const SM_MATCH_DONORS: usize = 64;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
@@ -664,7 +664,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
+    let floor = 0.002 + 0.04 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 

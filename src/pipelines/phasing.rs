@@ -385,11 +385,10 @@ fn fit_cohort_calibration(
 
 const STAGE1_BLOCK_MIN_CM: f64 = 0.01;
 const STAGE1_BLOCK_MAX_CM: f64 = 20.0;
-const STAGE1_BLOCK_TARGET_MARKERS: usize = 200;
-const STAGE1_BLOCK_TARGET_MARKERS_FAST_MAX: usize = 800;
+const STAGE1_BLOCK_TARGET_MARKERS: usize = 100;
 const STAGE1_BLOCK_MIN_MARKERS: usize = 10;
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_MIN_MARKER_STEP: usize = 50;
+const PBWT_MIN_MARKER_STEP: usize = 10;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
@@ -523,12 +522,10 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
     }
 
     let mut sum_dist = 0.0f64;
-    let mut sum_sq_dist = 0.0f64;
     let mut n_dist = 0usize;
     for w in gen_positions.windows(2) {
         let d = (w[1] - w[0]).abs().max(f64::EPSILON);
         sum_dist += d;
-        sum_sq_dist += d * d;
         n_dist += 1;
     }
     if n_dist == 0 {
@@ -536,33 +533,12 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
     }
 
     let avg = sum_dist / n_dist as f64;
-    let variance = (sum_sq_dist / n_dist as f64 - avg * avg).max(0.0);
-    let std_dev = variance.sqrt();
-    let cv = std_dev / avg.max(f64::EPSILON);
 
-    // Fast, accuracy-safe adaptive block sizing:
-    // - In stable marker-density regions (low CV), use larger blocks to cut Stage 1 transitions.
-    // - On very large windows, increase block marker targets further to reduce MCMC overhead.
-    // - In volatile/sparse regions (high CV), stay close to legacy behavior.
-    let density_stability_boost = if cv < 0.65 {
-        1.0 + ((0.65 - cv) / 0.65) * 1.4
-    } else {
-        1.0
-    };
-    let window_scale_boost = match gen_positions.len() {
-        0..=4_999 => 1.0,
-        5_000..=11_999 => 1.2,
-        12_000..=24_999 => 1.5,
-        _ => 1.8,
-    };
-    let target_markers = ((STAGE1_BLOCK_TARGET_MARKERS as f64
-        * density_stability_boost
-        * window_scale_boost)
-        .round() as usize)
-        .clamp(
-            STAGE1_BLOCK_TARGET_MARKERS,
-            STAGE1_BLOCK_TARGET_MARKERS_FAST_MAX,
-        );
+    // Simplified block sizing for maximum accuracy:
+    // Use the base target marker count directly to ensure consistent, fine-grained
+    // phasing resolution regardless of density stability or window size.
+    // This removes the aggressive boosting that was previously applied for speed.
+    let target_markers = STAGE1_BLOCK_TARGET_MARKERS;
 
     let block = avg * target_markers as f64;
     block.clamp(STAGE1_BLOCK_MIN_CM, STAGE1_BLOCK_MAX_CM)
