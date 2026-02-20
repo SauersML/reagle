@@ -1752,7 +1752,9 @@ fn apply_marker_prior_smoothing(
         }
     }
 
-    let base_mix = if site_maf < 0.01 {
+    let base_mix = if active_ratio > 0.9 {
+        0.0
+    } else if site_maf < 0.01 {
         0.20
     } else if site_maf < 0.05 {
         // Linear decay 0.20 -> 0.01
@@ -1769,7 +1771,16 @@ fn apply_marker_prior_smoothing(
     // - Rare variants are fragile; allow full distance-based fallback.
     // Use 0.0 scale for common variants to ensure we don't wash out clear HMM
     // calls (e.g. 0.0) with diffuse priors (0.5) even at large map distances.
-    let mix_driver_scale = if site_maf > 0.10 { 0.0 } else { 1.0 };
+    //
+    // Also disable this fallback if we are running with the full reference panel
+    // (active_ratio ~ 1.0), as subset selection bias is eliminated.
+    let mix_driver_scale = if active_ratio > 0.9 {
+        0.0
+    } else if site_maf > 0.10 {
+        0.01
+    } else {
+        1.0
+    };
     let adaptive_panel_mix = (base_mix
         + mix_driver_scale * mix_driver * (1.0 + 0.75 * sparsity_boost))
         .clamp(0.0, 0.50);
