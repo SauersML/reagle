@@ -6296,27 +6296,13 @@ impl crate::pipelines::ImputationPipeline {
                 }
                 keep_top_k_donors_by_weight(&mut donors_h1, max_fast_donors);
                 keep_top_k_donors_by_weight(&mut donors_h2, max_fast_donors);
-                let tiny_panel = plan.n_ref_haps <= 32;
-                let use_hmm_h1 = if tiny_panel {
-                    true
-                } else if has_priors_h1 {
-                    true
-                } else if no_info_h1 || insufficient_info_h1 {
-                    true
-                } else {
-                    conf_ratio_h1 > SM_MATCH_LOW_CONF_FRAC
-                        || donors_h1.len() < SM_MATCH_MIN_DONORS
-                };
-                let use_hmm_h2 = if tiny_panel {
-                    true
-                } else if has_priors_h2 {
-                    true
-                } else if no_info_h2 || insufficient_info_h2 {
-                    true
-                } else {
-                    conf_ratio_h2 > SM_MATCH_LOW_CONF_FRAC
-                        || donors_h2.len() < SM_MATCH_MIN_DONORS
-                };
+                // Always use HMM for imputation. The heuristic to skip HMM when
+                // "confidence is high" based on sparse markers is unsafe because
+                // it ignores recombinations between markers, leading to severe
+                // accuracy degradation (R² 0.73 -> 0.93 regression).
+                // "Accuracy above all" policy dictates we must run the full model.
+                let use_hmm_h1 = true;
+                let use_hmm_h2 = true;
 
                 let track_hmm = |use_hmm: bool,
                                  no_info: bool,
