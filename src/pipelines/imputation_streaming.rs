@@ -2155,7 +2155,7 @@ fn open_ref_reader(path: &Path) -> Result<RefPanelReader> {
     }
 }
 
-const BREF3_CONVERT_MIN_BYTES: u64 = 500 * 1024 * 1024;
+const BREF3_CONVERT_MIN_BYTES: u64 = 1024;
 const IMPUTE_WINDOW_LOG_INTERVAL: usize = 250;
 
 #[inline]
