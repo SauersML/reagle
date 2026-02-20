@@ -242,7 +242,7 @@ fn collect_carriers_for_allele(
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
-const PBWT_MIN_PER_HAP: usize = 128;
+const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
@@ -664,11 +664,12 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    // Revert to conservative floor (0.005) to avoid over-smoothing posteriors.
-    // High floors (>0.01) degrade calibration (DR2 bias) and accuracy (R2)
-    // by pulling rare-variant posteriors too strongly toward panel frequency.
-    let floor = 0.005 + 0.02 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.002, 0.15)
+    // A floor of 0.01 provides reasonable regularization for calibration without
+    // excessively diluting the HMM signal (which degrades R2).
+    // Combined with the increased state budget (16x top-k), this should balance
+    // accuracy and honesty.
+    let floor = 0.01 + 0.02 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.005, 0.20)
 }
 
 #[inline]
