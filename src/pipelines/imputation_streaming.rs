@@ -688,12 +688,7 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    // Use a small epsilon floor to ensure common-allele matches (which carry
-    // modest local LD information) get a non-zero weight. This allows PBWT
-    // donor selection to pick the "best" background haplotypes (closest in
-    // PBWT order) rather than falling back to index-based selection when
-    // rare variants are absent or don't match.
-    ((1.0 - p) / p).ln().max(1e-5)
+    ((1.0 - p) / p).ln().max(0.0)
 }
 
 #[inline]
@@ -1317,19 +1312,13 @@ fn select_top_k_adaptive_with_support(
     let mut heap: BinaryHeap<Reverse<RankedScore>> =
         BinaryHeap::with_capacity(upper_k.saturating_add(1));
     let mut support = 0usize;
+
+    // Pass 1: Collect positive scores (informative haplotypes)
     for (idx, &score) in scores.iter().enumerate() {
         if !score.is_finite() || score <= 0.0 {
             continue;
         }
-        // Only count scores significantly above the epsilon background (1e-5) as "support".
-        // A threshold of 0.01 (1e-2) ensures we filter out the accumulated epsilon noise
-        // even for large windows (e.g. 500 markers * 1e-5 = 0.005), while still capturing
-        // even very weak true signals (e.g. single match at freq 0.49 => score ~0.04).
-        // This prevents the "strong support" logic from being triggered by pure background,
-        // allowing the adaptive logic to boost state count (backfill) as intended.
-        if score > 0.01 {
-            support = support.saturating_add(1);
-        }
+        support = support.saturating_add(1);
         let candidate = RankedScore { idx, score };
         if heap.len() < upper_k {
             heap.push(Reverse(candidate));
@@ -1345,19 +1334,16 @@ fn select_top_k_adaptive_with_support(
         }
     }
 
-    // Backfill with zero-score/background haplotypes if we have spare capacity.
+    // Pass 2: Backfill with zero-score/background haplotypes if we have spare capacity.
     // This prevents "perfect LD traps" where the only selected haplotypes are those
     // matching rare target alleles, while haplotypes matching common background
-    // alleles (score=0 or uninitialized NEG_INFINITY) are excluded, forcing
-    // false-positive imputation of linked rare variants.
+    // alleles (score=0 or uninitialized NEG_INFINITY) are excluded.
+    // We use a small epsilon score (1e-6) to ensure they pass downstream positive-score checks.
     if heap.len() < upper_k {
         for (idx, &score) in scores.iter().enumerate() {
             if heap.len() >= upper_k {
                 break;
             }
-            // Include both explicit zero/negative scores AND uninitialized
-            // (NEG_INFINITY) scores. Use a small epsilon to ensure they pass
-            // downstream `score > 0.0` filters (e.g. in distribute_scores).
             if !score.is_finite() || score <= 0.0 {
                 heap.push(Reverse(RankedScore { idx, score: 1e-6 }));
             }
@@ -1368,12 +1354,6 @@ fn select_top_k_adaptive_with_support(
         adaptive_top_m_window_from_support(support, base_top_m, per_window_cap_window, n_ref_haps);
 
     // If we backfilled, ensure we retain the backfilled diversity.
-    // The top_m calculation based on support might be too aggressive if support
-    // was low/zero (leading to backfill) but the formula didn't boost enough,
-    // or if we simply want to guarantee the backfilled items are kept.
-    // Since upper_k is the target for backfill, and we only backfill if
-    // heap.len() < upper_k, effectively we want to clamp top_m to the heap size
-    // if backfilling occurred.
     if heap.len() > support {
         top_m = top_m.max(heap.len());
     }
