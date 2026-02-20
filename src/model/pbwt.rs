@@ -622,6 +622,19 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
         self.counts[1] = binary_counts[1] as usize;
         self.counts[2] = binary_counts[2] as usize;
 
+        // Recompute per-word counts from the provided bits, as they are not
+        // preserved in the updater between prepare and finalize steps.
+        // This is critical for compute_biallelic_word_bases to generate
+        // correct scatter offsets.
+        for (w, &bits) in permuted_bits.iter().enumerate().take(n_words) {
+            self.word_count1[w] = bits.count_ones() as u8;
+        }
+        if binary_counts[1] > 0 {
+            for (w, &miss) in permuted_missing_bits.iter().enumerate().take(n_words) {
+                self.word_count_miss[w] = miss.count_ones() as u8;
+            }
+        }
+
         let mut running = 0usize;
         for i in 0..n_bins {
             self.offsets[i] = running;
