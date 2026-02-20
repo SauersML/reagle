@@ -252,4 +252,5 @@ mod tests {
             crate::data::storage::AlleleCode::MISSING.raw()
         );
     }
+
 }
