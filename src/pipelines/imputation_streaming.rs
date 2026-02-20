@@ -243,7 +243,7 @@ fn collect_carriers_for_allele(
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
-const PBWT_MAX_PER_HAP: usize = 256;
+const PBWT_MAX_PER_HAP: usize = 4096;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
@@ -688,7 +688,7 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    (-p.ln()).max(1e-5)
 }
 
 #[inline]
@@ -1723,7 +1723,11 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             if freq <= 0.0 {
                 continue;
             }
-            let weight = prescan_match_weight(freq, min_freq);
+            let mut weight = prescan_match_weight(freq, min_freq);
+            if freq > 0.5 {
+                if m % 100 != 0 { continue; }
+                weight *= 100.0;
+            }
             if weight <= 0.0 {
                 continue;
             }
@@ -1939,7 +1943,11 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let mut weight = prescan_match_weight(freq, min_freq);
+                if freq > 0.5 {
+                    if m % 100 != 0 { continue; }
+                    weight *= 100.0;
+                }
                 if weight <= 0.0 {
                     continue;
                 }
@@ -2041,7 +2049,11 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let mut weight = prescan_match_weight(freq, min_freq);
+                if freq > 0.5 {
+                    if m % 100 != 0 { continue; }
+                    weight *= 100.0;
+                }
                 if weight <= 0.0 {
                     continue;
                 }
@@ -2387,7 +2399,8 @@ fn compute_per_window_cap(
         cap
     };
     let cap = n_ref_haps.max(1);
-    per_window_cap_window = per_window_cap_window.min(cap).max(1);
+    // Limit to 500 states for performance while ensuring we pick the best ones
+    per_window_cap_window = per_window_cap_window.min(cap).min(500).max(1);
     per_window_cap_window
 }
 
@@ -3030,45 +3043,377 @@ fn build_imputation_plan(
                 packed_columns,
                 ..
             } => {
-                for (idx, (ref_window, ref_columns)) in
-                    windows.iter().zip(packed_columns.iter()).enumerate()
-                {
-                    let n_ref_markers = ref_window.markers.len();
-                    if n_ref_markers == 0 {
-                        continue;
+                if target_cache.is_some() {
+                    struct Acc {
+                        global_scores: Vec<Vec<f32>>,
+                        window_scores: Vec<Vec<f32>>,
+                        best_window_scores: Vec<Vec<f32>>,
+                        window_rank_hits: Vec<Vec<u32>>,
+                        scores_by_window: Vec<Vec<Vec<(usize, f32)>>>,
+                        diag: PbwtPrescanWindowDiag,
+                        pbwt_sampled_min: usize,
+                        pbwt_sampled_max: usize,
+                        exact_total: usize,
+                        pbwt_total: usize,
+                        pbwt_flat: usize,
+                        pbwt_low: usize,
+                        pbwt_non_finite: usize,
+                        atm_calls: usize,
+                        atm_sum: usize,
+                        atm_min: usize,
+                        atm_max: usize,
+                        atm_boosted: usize,
+                        atm_reduced: usize,
+                        window_span_cm: Option<f64>,
+                        window_span_bp: Option<u64>,
+                        processed: usize,
                     }
-                    if window_span_cm.is_none() || window_span_bp.is_none() {
-                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                        let end_pos = ref_window
-                            .markers
-                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                            .pos;
-                        let span_bp = end_pos.saturating_sub(start_pos);
-                        let span_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
-                            .unwrap_or("");
-                        let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
-                        let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
-                        window_span_bp = Some(span_bp.into());
-                        window_span_cm = Some((end_cm - start_cm).abs());
-                    }
-                    // Derive per-window cap from the observed marker count to match
-                    // the real workspace footprint (fwd/bwd/history scale with markers).
-                    let per_window_cap_window = per_window_caps
-                        .get(window_idx)
-                        .copied()
-                        .unwrap_or(per_window_cap.max(1));
 
-                    let (alignment_cow, phased_target_cow) = if let Some(cache) =
-                        target_cache.as_ref()
+                    let acc = windows.par_iter().zip(packed_columns.par_iter()).enumerate().fold(
+                        || {
+                            let mut gs = vec![Vec::new(); batch_len];
+                            let mut ws = vec![Vec::new(); batch_len];
+                            let mut bws = vec![Vec::new(); batch_len];
+                            let mut wrh = vec![Vec::new(); batch_len];
+                            let mut sbw = vec![Vec::new(); batch_len];
+                            for i in 0..batch_len {
+                                gs[i] = vec![0.0f32; n_ref_haps];
+                                ws[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                                bws[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                                wrh[i] = vec![0u32; n_ref_haps];
+                                sbw[i] = vec![Vec::new(); planning_num_windows];
+                            }
+                            Acc {
+                                global_scores: gs,
+                                window_scores: ws,
+                                best_window_scores: bws,
+                                window_rank_hits: wrh,
+                                scores_by_window: sbw,
+                                diag: PbwtPrescanWindowDiag::default(),
+                                pbwt_sampled_min: usize::MAX,
+                                pbwt_sampled_max: 0,
+                                exact_total: 0,
+                                pbwt_total: 0,
+                                pbwt_flat: 0,
+                                pbwt_low: 0,
+                                pbwt_non_finite: 0,
+                                atm_calls: 0,
+                                atm_sum: 0,
+                                atm_min: usize::MAX,
+                                atm_max: 0,
+                                atm_boosted: 0,
+                                atm_reduced: 0,
+                                window_span_cm: None,
+                                window_span_bp: None,
+                                processed: 0,
+                            }
+                        },
+                        |mut acc, (idx, (ref_window, ref_columns))| {
+                            let n_ref_markers = ref_window.markers.len();
+                            if n_ref_markers == 0 {
+                                return acc;
+                            }
+                            if acc.window_span_cm.is_none() || acc.window_span_bp.is_none() {
+                                let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                                let end_pos = ref_window
+                                    .markers
+                                    .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                    .pos;
+                                let span_bp = end_pos.saturating_sub(start_pos);
+                                let span_chrom = ref_window
+                                    .markers
+                                    .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
+                                    .unwrap_or("");
+                                let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
+                                let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
+                                acc.window_span_bp = Some(span_bp.into());
+                                acc.window_span_cm = Some((end_cm - start_cm).abs());
+                            }
+
+                            let window_idx = idx;
+                            let per_window_cap_window = per_window_caps
+                                .get(window_idx)
+                                .copied()
+                                .unwrap_or(per_window_cap.max(1));
+
+                            // Safety: target_cache is guaranteed Some(_) by outer check, and
+                            // cache entries correspond 1:1 with windows.
+                            let entry = target_cache
+                                .as_ref()
+                                .and_then(|c| c.get(window_idx))
+                                .and_then(|e| e.as_ref());
+
+                            let (alignment, phased_target) = if let Some(entry) = entry {
+                                (&entry.alignment, &entry.phased_target)
+                            } else {
+                                // Fallback for gaps in target cache (e.g. empty windows) is to skip
+                                return acc;
+                            };
+
+                            for w in acc.window_scores.iter_mut() {
+                                w.fill(f32::NEG_INFINITY);
+                            }
+
+                            let k_per_hap = per_window_cap_window
+                                .saturating_mul(PBWT_PER_WINDOW_MULT)
+                                .max(PBWT_MIN_PER_HAP)
+                                .min(PBWT_MAX_PER_HAP)
+                                .max(1);
+
+                            let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
+                            let use_exact = should_use_exact_prescan(
+                                n_ref_haps,
+                                batch_haps.len(),
+                                phased_target.n_markers(),
+                            );
+
+                            if use_exact {
+                                acc.exact_total = acc.exact_total.saturating_add(1);
+                                score_window_batch_exact_packed(
+                                    &batch_haps,
+                                    phased_target,
+                                    &ref_window.markers,
+                                    ref_columns,
+                                    n_ref_haps,
+                                    alignment,
+                                    &mut acc.global_scores,
+                                    &mut acc.window_scores,
+                                );
+                            } else {
+                                acc.pbwt_total = acc.pbwt_total.saturating_add(1);
+                                let diag = score_window_batch_pbwt_packed(
+                                    &batch_haps,
+                                    phased_target,
+                                    &ref_window.markers,
+                                    ref_columns,
+                                    n_ref_haps,
+                                    alignment,
+                                    gen_maps,
+                                    k_per_hap,
+                                    step_cm,
+                                    &mut acc.global_scores,
+                                    &mut acc.window_scores,
+                                );
+                                acc.diag.sampled_markers = acc.diag.sampled_markers.saturating_add(diag.sampled_markers);
+                                acc.diag.total_markers = acc.diag.total_markers.saturating_add(diag.total_markers);
+                                acc.pbwt_sampled_min = acc.pbwt_sampled_min.min(diag.sampled_markers);
+                                acc.pbwt_sampled_max = acc.pbwt_sampled_max.max(diag.sampled_markers);
+                                acc.diag.distinct_gen_pos = acc.diag.distinct_gen_pos.max(diag.distinct_gen_pos); // Approx
+                                if acc.diag.min_gen_pos == 0.0 && acc.diag.max_gen_pos == 0.0 {
+                                    acc.diag.min_gen_pos = diag.min_gen_pos;
+                                    acc.diag.max_gen_pos = diag.max_gen_pos;
+                                }
+                                if diag.distinct_gen_pos <= 1
+                                    || (diag.max_gen_pos - diag.min_gen_pos).abs() <= 1e-12
+                                {
+                                    acc.pbwt_flat = acc.pbwt_flat.saturating_add(1);
+                                }
+                                if diag.sampled_markers <= 2 {
+                                    acc.pbwt_low = acc.pbwt_low.saturating_add(1);
+                                }
+                                if diag.non_finite_gen_pos > 0 {
+                                    acc.pbwt_non_finite = acc.pbwt_non_finite.saturating_add(1);
+                                }
+                            }
+
+                            let abyss_rank_cutoff =
+                                compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
+                            for (i, _) in batch_haps.iter().enumerate() {
+                                for (h, score) in acc.window_scores[i].iter().copied().enumerate() {
+                                    if score > acc.best_window_scores[i][h] {
+                                        acc.best_window_scores[i][h] = score;
+                                    }
+                                }
+
+                                let abyss_top = select_top_k(&acc.window_scores[i], abyss_rank_cutoff);
+                                for (ref_idx, _) in abyss_top {
+                                    if ref_idx < acc.window_rank_hits[i].len() {
+                                        acc.window_rank_hits[i][ref_idx] =
+                                            acc.window_rank_hits[i][ref_idx].saturating_add(1);
+                                    }
+                                }
+                            }
+
+                            let (plan_start, plan_end) = plan
+                                .io_to_planning_ranges
+                                .get(window_idx)
+                                .copied()
+                                .unwrap_or((0, planning_num_windows.min(1)));
+                            let (io_s, io_e) = window_handoff
+                                .get(window_idx)
+                                .copied()
+                                .unwrap_or((f64::NAN, f64::NAN));
+
+                            for i in 0..batch_len {
+                                let base_top_m = per_window_cap_window
+                                    .saturating_mul(PBWT_PER_WINDOW_MULT)
+                                    .max(per_window_cap_window)
+                                    .min(n_ref_haps.max(1));
+                                let (top_m, top) = select_top_k_adaptive_with_support(
+                                    &acc.window_scores[i],
+                                    base_top_m,
+                                    per_window_cap_window,
+                                    n_ref_haps,
+                                );
+                                acc.atm_calls = acc.atm_calls.saturating_add(1);
+                                acc.atm_sum = acc.atm_sum.saturating_add(top_m);
+                                acc.atm_min = acc.atm_min.min(top_m);
+                                acc.atm_max = acc.atm_max.max(top_m);
+                                if top_m > base_top_m {
+                                    acc.atm_boosted = acc.atm_boosted.saturating_add(1);
+                                } else if top_m < base_top_m {
+                                    acc.atm_reduced = acc.atm_reduced.saturating_add(1);
+                                }
+                                distribute_scores_to_planning_bins(
+                                    &top,
+                                    io_s,
+                                    io_e,
+                                    plan_start,
+                                    plan_end,
+                                    &planning_handoff,
+                                    &mut acc.scores_by_window[i],
+                                );
+                            }
+
+                            acc.processed += 1;
+                            acc
+                        },
+                    ).reduce(
+                        || Acc {
+                            global_scores: vec![vec![0.0f32; n_ref_haps]; batch_len],
+                            window_scores: Vec::new(), // Not used in reduce
+                            best_window_scores: vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_len],
+                            window_rank_hits: vec![vec![0u32; n_ref_haps]; batch_len],
+                            scores_by_window: vec![vec![Vec::new(); planning_num_windows]; batch_len],
+                            diag: PbwtPrescanWindowDiag::default(),
+                            pbwt_sampled_min: usize::MAX,
+                            pbwt_sampled_max: 0,
+                            exact_total: 0,
+                            pbwt_total: 0,
+                            pbwt_flat: 0,
+                            pbwt_low: 0,
+                            pbwt_non_finite: 0,
+                            atm_calls: 0,
+                            atm_sum: 0,
+                            atm_min: usize::MAX,
+                            atm_max: 0,
+                            atm_boosted: 0,
+                            atm_reduced: 0,
+                            window_span_cm: None,
+                            window_span_bp: None,
+                            processed: 0,
+                        },
+                        |mut a, b| {
+                            for (ra, rb) in a.global_scores.iter_mut().zip(b.global_scores.iter()) {
+                                for (va, vb) in ra.iter_mut().zip(rb.iter()) {
+                                    *va += *vb;
+                                }
+                            }
+                            for (ra, rb) in a.best_window_scores.iter_mut().zip(b.best_window_scores.iter()) {
+                                for (va, vb) in ra.iter_mut().zip(rb.iter()) {
+                                    *va = va.max(*vb);
+                                }
+                            }
+                            for (ra, rb) in a.window_rank_hits.iter_mut().zip(b.window_rank_hits.iter()) {
+                                for (va, vb) in ra.iter_mut().zip(rb.iter()) {
+                                    *va = va.saturating_add(*vb);
+                                }
+                            }
+                            for (ra, rb) in a.scores_by_window.iter_mut().zip(b.scores_by_window.iter()) {
+                                for (wa, wb) in ra.iter_mut().zip(rb.iter()) {
+                                    wa.extend_from_slice(wb);
+                                }
+                            }
+                            a.diag.sampled_markers += b.diag.sampled_markers;
+                            a.diag.total_markers += b.diag.total_markers;
+                            a.pbwt_sampled_min = a.pbwt_sampled_min.min(b.pbwt_sampled_min);
+                            a.pbwt_sampled_max = a.pbwt_sampled_max.max(b.pbwt_sampled_max);
+                            a.diag.distinct_gen_pos = a.diag.distinct_gen_pos.max(b.diag.distinct_gen_pos);
+                            a.exact_total += b.exact_total;
+                            a.pbwt_total += b.pbwt_total;
+                            a.pbwt_flat += b.pbwt_flat;
+                            a.pbwt_low += b.pbwt_low;
+                            a.pbwt_non_finite += b.pbwt_non_finite;
+                            a.atm_calls += b.atm_calls;
+                            a.atm_sum += b.atm_sum;
+                            a.atm_min = a.atm_min.min(b.atm_min);
+                            a.atm_max = a.atm_max.max(b.atm_max);
+                            a.atm_boosted += b.atm_boosted;
+                            a.atm_reduced += b.atm_reduced;
+                            if a.window_span_cm.is_none() { a.window_span_cm = b.window_span_cm; }
+                            if a.window_span_bp.is_none() { a.window_span_bp = b.window_span_bp; }
+                            a.processed += b.processed;
+                            a
+                        },
+                    );
+
+                    // Unpack accumulator back to variables
+                    global_scores = acc.global_scores;
+                    window_scores = acc.window_scores; // Reused buffer, content irrelevant
+                    best_window_scores = acc.best_window_scores;
+                    window_rank_hits = acc.window_rank_hits;
+                    scores_by_window = acc.scores_by_window;
+
+                    pbwt_sampled_sum += acc.diag.sampled_markers;
+                    pbwt_markers_sum += acc.diag.total_markers;
+                    pbwt_sampled_min = pbwt_sampled_min.min(acc.pbwt_sampled_min);
+                    pbwt_sampled_max = pbwt_sampled_max.max(acc.pbwt_sampled_max);
+
+                    exact_windows_total += acc.exact_total;
+                    pbwt_windows_total += acc.pbwt_total;
+                    pbwt_flat_windows += acc.pbwt_flat;
+                    pbwt_low_sample_windows += acc.pbwt_low;
+                    pbwt_non_finite_windows += acc.pbwt_non_finite;
+                    adaptive_top_m_calls += acc.atm_calls;
+                    adaptive_top_m_sum += acc.atm_sum;
+                    adaptive_top_m_min = adaptive_top_m_min.min(acc.atm_min);
+                    adaptive_top_m_max = adaptive_top_m_max.max(acc.atm_max);
+                    adaptive_top_m_boosted += acc.atm_boosted;
+                    adaptive_top_m_reduced += acc.atm_reduced;
+                    if window_span_cm.is_none() { window_span_cm = acc.window_span_cm; }
+                    if window_span_bp.is_none() { window_span_bp = acc.window_span_bp; }
+                    window_idx += acc.processed;
+
+                    if let Some(bb) = telemetry {
+                        bb.set_current_window(window_idx as u64);
+                        bb.add_markers(acc.processed as u64);
+                    }
+
+                } else {
+                    for (ref_window, ref_columns) in
+                        windows.iter().zip(packed_columns.iter())
                     {
-                        if let Some(Some(entry)) = cache.get(idx) {
-                            (
-                                Cow::Borrowed(&entry.alignment),
-                                Cow::Borrowed(&entry.phased_target),
-                            )
-                        } else {
+                        let n_ref_markers = ref_window.markers.len();
+                        if n_ref_markers == 0 {
+                            continue;
+                        }
+                        if window_span_cm.is_none() || window_span_bp.is_none() {
+                            let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                            let end_pos = ref_window
+                                .markers
+                                .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                .pos;
+                            let span_bp = end_pos.saturating_sub(start_pos);
+                            let span_chrom = ref_window
+                                .markers
+                                .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
+                                .unwrap_or("");
+                            let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
+                            let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
+                            window_span_bp = Some(span_bp.into());
+                            window_span_cm = Some((end_cm - start_cm).abs());
+                        }
+                        // Derive per-window cap from the observed marker count to match
+                        // the real workspace footprint (fwd/bwd/history scale with markers).
+                        let per_window_cap_window = per_window_caps
+                            .get(window_idx)
+                            .copied()
+                            .unwrap_or(per_window_cap.max(1));
+
+                        let (alignment_cow, phased_target_cow): (
+                            Cow<MarkerAlignment<AnyMarkerSpace, RefWindowSpace>>,
+                            Cow<GenotypeMatrix<Phased, AnyMarkerSpace>>
+                        ) = {
                             let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                             let ref_chrom = ref_window
                                 .markers
@@ -3083,11 +3428,8 @@ fn build_imputation_plan(
                             let reader = target_reader.as_mut().ok_or_else(|| {
                                 ReagleError::vcf("Target reader missing in prescan".to_string())
                             })?;
-                            let target_window = reader.load_window_for_region(
-                                &chrom_candidates,
-                                start_pos,
-                                end_pos,
-                            )?;
+                            let target_window =
+                                reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?;
                             let Some(target_window) = target_window else {
                                 continue;
                             };
@@ -3097,34 +3439,7 @@ fn build_imputation_plan(
                             );
                             let phased_target = target_window.genotypes.into_phased();
                             (Cow::Owned(alignment), Cow::Owned(phased_target))
-                        }
-                    } else {
-                        let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-                        let ref_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_chrom_idx)
-                            .unwrap_or("UNKNOWN");
-                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                        let end_pos = ref_window
-                            .markers
-                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                            .pos;
-                        let chrom_candidates = chrom_variants(ref_chrom);
-                        let reader = target_reader.as_mut().ok_or_else(|| {
-                            ReagleError::vcf("Target reader missing in prescan".to_string())
-                        })?;
-                        let target_window =
-                            reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?;
-                        let Some(target_window) = target_window else {
-                            continue;
                         };
-                        let alignment = MarkerAlignment::new_with_ref_markers(
-                            &target_window.genotypes,
-                            &ref_window.markers,
-                        );
-                        let phased_target = target_window.genotypes.into_phased();
-                        (Cow::Owned(alignment), Cow::Owned(phased_target))
-                    };
                     let alignment = alignment_cow.as_ref();
                     let phased_target = phased_target_cow.as_ref();
 
@@ -3252,6 +3567,7 @@ fn build_imputation_plan(
                         bb.set_current_window(window_idx as u64);
                         bb.add_markers(1);
                     }
+                }
                 }
             }
             ReferenceData::OnDisk { .. } => {
