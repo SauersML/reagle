@@ -2387,8 +2387,8 @@ fn compute_per_window_cap(
         cap
     };
     let cap = n_ref_haps.max(1);
-    // Limit to 1024 states for performance while ensuring we pick the best ones
-    per_window_cap_window = per_window_cap_window.min(cap).min(1024).max(1);
+    // Limit to 8192 states for performance while ensuring we pick the best ones
+    per_window_cap_window = per_window_cap_window.min(cap).min(8192).max(1);
     per_window_cap_window
 }
 
@@ -3236,15 +3236,18 @@ fn build_imputation_plan(
                     ));
                 };
                 ref_reader.rewind()?;
+                let mut processed_count = 0;
                 loop {
                     let ref_window = ref_reader.next_window()?;
                     let Some(ref_window) = ref_window else { break };
 
-                    let idx = window_idx;
+                    let current_window_idx = window_idx + processed_count;
                     let n_ref_markers = ref_window.markers.len();
                     if n_ref_markers == 0 {
+                        processed_count += 1;
                         continue;
                     }
+
                     if window_span_cm.is_none() || window_span_bp.is_none() {
                         let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
                         let end_pos = ref_window
@@ -3261,22 +3264,22 @@ fn build_imputation_plan(
                         window_span_bp = Some(span_bp.into());
                         window_span_cm = Some((end_cm - start_cm).abs());
                     }
-                    // Derive per-window cap from the observed marker count to match
-                    // the real workspace footprint (fwd/bwd/history scale with markers).
+
                     let per_window_cap_window = per_window_caps
-                        .get(window_idx)
+                        .get(current_window_idx)
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
 
                     let (alignment_cow, phased_target_cow) = if let Some(cache) =
                         target_cache.as_ref()
                     {
-                        if let Some(Some(entry)) = cache.get(idx) {
+                        if let Some(Some(entry)) = cache.get(processed_count) {
                             (
                                 Cow::Borrowed(&entry.alignment),
                                 Cow::Borrowed(&entry.phased_target),
                             )
                         } else {
+                            // Cache miss or None entry, fallback to reading
                             let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                             let ref_chrom = ref_window
                                 .markers
@@ -3298,6 +3301,7 @@ fn build_imputation_plan(
                                 end_pos,
                             )?;
                             let Some(target_window) = target_window else {
+                                processed_count += 1;
                                 continue;
                             };
 
@@ -3327,6 +3331,7 @@ fn build_imputation_plan(
                         let target_window =
                             reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?;
                         let Some(target_window) = target_window else {
+                            processed_count += 1;
                             continue;
                         };
 
@@ -3344,6 +3349,9 @@ fn build_imputation_plan(
                         w.fill(f32::NEG_INFINITY);
                     }
 
+                    // OnDisk windows are already packed in cache
+                    let ref_columns = &ref_window.columns;
+
                     let k_per_hap = per_window_cap_window
                         .saturating_mul(PBWT_PER_WINDOW_MULT)
                         .max(PBWT_MIN_PER_HAP)
@@ -3360,11 +3368,11 @@ fn build_imputation_plan(
                         exact_windows_total = exact_windows_total.saturating_add(1);
                         score_window_batch_exact_packed(
                             &batch_haps,
-                            &phased_target,
+                            phased_target,
                             &ref_window.markers,
-                            &ref_window.columns,
+                            &ref_columns,
                             n_ref_haps,
-                            &alignment,
+                            alignment,
                             &mut global_scores,
                             &mut window_scores,
                         );
@@ -3372,11 +3380,11 @@ fn build_imputation_plan(
                         pbwt_windows_total = pbwt_windows_total.saturating_add(1);
                         let diag = score_window_batch_pbwt_packed(
                             &batch_haps,
-                            &phased_target,
+                            phased_target,
                             &ref_window.markers,
-                            &ref_window.columns,
+                            &ref_columns,
                             n_ref_haps,
-                            &alignment,
+                            alignment,
                             gen_maps,
                             k_per_hap,
                             step_cm,
@@ -3421,11 +3429,11 @@ fn build_imputation_plan(
                     // Persist per-window sparse scores for LMS allocator (top-M per window).
                     let (plan_start, plan_end) = plan
                         .io_to_planning_ranges
-                        .get(window_idx)
+                        .get(current_window_idx)
                         .copied()
                         .unwrap_or((0, planning_num_windows.min(1)));
                     let (io_s, io_e) = window_handoff
-                        .get(window_idx)
+                        .get(current_window_idx)
                         .copied()
                         .unwrap_or((f64::NAN, f64::NAN));
                     for i in 0..batch_len {
@@ -3459,12 +3467,14 @@ fn build_imputation_plan(
                         );
                     }
 
-                    window_idx += 1;
                     if let Some(bb) = telemetry {
-                        bb.set_current_window(window_idx as u64);
+                        bb.set_current_window(current_window_idx as u64);
                         bb.add_markers(1);
                     }
+
+                    processed_count += 1;
                 }
+                window_idx += processed_count;
             }
         }
 
