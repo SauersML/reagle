@@ -1694,7 +1694,7 @@ fn apply_marker_prior_smoothing(
         0.0
     };
     let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
+        observed_missing_mass.max(fallback_missing_mass)
     } else {
         fallback_missing_mass
     };
