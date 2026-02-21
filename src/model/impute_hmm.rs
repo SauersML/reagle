@@ -1737,8 +1737,8 @@ fn apply_marker_prior_smoothing(
     // - If we explain data poorly (missing_mass high), we mix.
     // - If we are close to anchors AND explain data perfectly, we trust HMM (mix=0).
     let adaptive_panel_mix =
-        (0.6 * combined_error * (1.0 + 0.75 * sparsity_boost))
-            .clamp(0.0, 0.6);
+        (0.35 * combined_error * (1.0 + 0.75 * sparsity_boost))
+            .clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
