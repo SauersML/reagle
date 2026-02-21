@@ -518,7 +518,6 @@ def prepare_truth(source, output_vcf, panel_path):
         "convert_genome",
         source_vcf,
         truth_raw_vcf,
-        "--ref", ref_hg38_fasta,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
@@ -637,7 +636,6 @@ def run_conversion(input_path, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         raw_file,
-        "--ref", ref_hg38_fasta,
         "--output-dir", temp_output_dir,
         "--assembly", "GRCh38",
         "--format", "vcf",

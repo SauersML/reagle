@@ -1884,49 +1884,30 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
         let col = &ref_columns[m];
-        let mut n_alleles = 2;
+        col.fill_alleles(&mut ref_alleles);
 
-        if let PackedRefColumn::Bits {
-            bits: 1,
-            n_haps: col_n_haps,
-            words,
-            missing,
-        } = col
-        {
-            pbwt_fwd.advance_with_beams_strict_packed(
-                words,
-                missing,
-                *col_n_haps,
-                m,
-                &query_alleles,
-                &mut beams_fwd,
-            );
-        } else {
-            col.fill_alleles(&mut ref_alleles);
-
-            let mut max_allele = 1u8;
-            for &a in ref_alleles.iter() {
-                if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
+        let mut max_allele = 1u8;
+        for &a in ref_alleles.iter() {
+            if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
+                max_allele = a;
+            }
+        }
+        for &q in &query_alleles {
+            if let Some(a) = q.as_allele() {
+                if a > max_allele {
                     max_allele = a;
                 }
             }
-            for &q in &query_alleles {
-                if let Some(a) = q.as_allele() {
-                    if a > max_allele {
-                        max_allele = a;
-                    }
-                }
-            }
-            n_alleles = (max_allele as usize).saturating_add(1).max(2);
-
-            pbwt_fwd.advance_with_beams_strict(
-                &ref_alleles,
-                n_alleles,
-                m,
-                &query_alleles,
-                &mut beams_fwd,
-            );
         }
+        let n_alleles = (max_allele as usize).saturating_add(1).max(2);
+
+        pbwt_fwd.advance_with_beams_strict(
+            &ref_alleles,
+            n_alleles,
+            m,
+            &query_alleles,
+            &mut beams_fwd,
+        );
 
         allele_counts.clear();
         allele_counts.resize(n_alleles, 0);
@@ -2005,49 +1986,30 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
         let col = &ref_columns[m];
-        let mut n_alleles = 2;
+        col.fill_alleles(&mut ref_alleles);
 
-        if let PackedRefColumn::Bits {
-            bits: 1,
-            n_haps: col_n_haps,
-            words,
-            missing,
-        } = col
-        {
-            pbwt_bwd.advance_with_beams_strict_packed(
-                words,
-                missing,
-                *col_n_haps,
-                rev_step,
-                &query_alleles,
-                &mut beams_bwd,
-            );
-        } else {
-            col.fill_alleles(&mut ref_alleles);
-
-            let mut max_allele = 1u8;
-            for &a in ref_alleles.iter() {
-                if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
+        let mut max_allele = 1u8;
+        for &a in ref_alleles.iter() {
+            if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
+                max_allele = a;
+            }
+        }
+        for &q in &query_alleles {
+            if let Some(a) = q.as_allele() {
+                if a > max_allele {
                     max_allele = a;
                 }
             }
-            for &q in &query_alleles {
-                if let Some(a) = q.as_allele() {
-                    if a > max_allele {
-                        max_allele = a;
-                    }
-                }
-            }
-            n_alleles = (max_allele as usize).saturating_add(1).max(2);
-
-            pbwt_bwd.advance_with_beams_strict(
-                &ref_alleles,
-                n_alleles,
-                rev_step,
-                &query_alleles,
-                &mut beams_bwd,
-            );
         }
+        let n_alleles = (max_allele as usize).saturating_add(1).max(2);
+
+        pbwt_bwd.advance_with_beams_strict(
+            &ref_alleles,
+            n_alleles,
+            rev_step,
+            &query_alleles,
+            &mut beams_bwd,
+        );
 
         allele_counts.clear();
         allele_counts.resize(n_alleles, 0);
