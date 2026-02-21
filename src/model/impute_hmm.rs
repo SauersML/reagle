@@ -1654,6 +1654,7 @@ fn apply_marker_prior_smoothing(
     active_states: usize,
     panel_haps: usize,
     min_prior_mix: f32,
+    p_mismatch: f32,
     warned_af_fallback: &mut bool,
     context: ImputeHmmContext,
 ) {
@@ -1689,7 +1690,7 @@ fn apply_marker_prior_smoothing(
     };
     let fallback_missing_mass = if panel_haps > 0 && active_states < panel_haps {
         let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        raw_ratio
+        p_mismatch * 2.0 * raw_ratio
     } else {
         0.0
     };
@@ -5117,6 +5118,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             active_states,
                                             transition_haps,
                                             target_probs.min_untyped_prior_mix(),
+                                            error_rate,
                                             &mut warned_af_fallback,
                                             context,
                                         );
@@ -5385,6 +5387,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         active_states,
                                         transition_haps,
                                         target_probs.min_untyped_prior_mix(),
+                                        error_rate,
                                         &mut warned_af_fallback,
                                         context,
                                     );
