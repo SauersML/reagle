@@ -1698,7 +1698,6 @@ fn apply_marker_prior_smoothing(
     } else {
         fallback_missing_mass
     };
-    let floor_mix = min_prior_mix.clamp(0.0, 0.9);
     let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
     let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
@@ -1722,12 +1721,18 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
+    // Scale the floor mix by the combined error (distance + approximation).
+    // Allow a small baseline floor (10%) to prevent absolute zeros even in
+    // confident regions, which helps stability against genotyping errors.
+    let floor_mix = (min_prior_mix * (0.1 + 0.9 * combined_error)).clamp(0.0, 0.9);
+
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     //
     // Use approximation_error (union of missing_mass and truncation_error)
-    // rather than raw missing_mass to ensure that subset truncation alone
-    // triggers regularization, even if the selected subset has no missing data.
+    // to trigger panel mixing when the subset is either uninformative OR
+    // incomplete. This helps regularize "confident but wrong" HMM predictions
+    // when the true haplotype was pruned during state selection.
     let adaptive_panel_mix =
         (0.6 * approximation_error * combined_error * (1.0 + 0.75 * sparsity_boost))
             .clamp(0.0, 0.6);

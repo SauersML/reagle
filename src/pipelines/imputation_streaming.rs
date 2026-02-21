@@ -2742,7 +2742,11 @@ fn build_imputation_plan(
     // when donor-guided and overlap handoff logic are active.
     // However, if the panel is small enough to fit entirely in the window cap,
     // explicitly using full panel is safer than relying on LMS to select 100%.
-    let can_full_panel = per_window_caps.iter().all(|&c| c >= n_ref_haps);
+    //
+    // Update: Empirically, forcing full panel degrades accuracy on some
+    // benchmarks (e.g. HGDP+1KG comparison) because it bypasses the "denoising"
+    // effect of PBWT selection. Only use full panel if forced (e.g. no memory info).
+    let can_full_panel = available_bytes == 0 && per_window_caps.iter().all(|&c| c >= n_ref_haps);
     if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
