@@ -162,9 +162,14 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        // Intensity is scaled for cM (0.04 * Ne / n), not Morgans (4 * Ne / n).
-        // No division by 100 needed.
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // Scaling factor:
+        // Li-Stephens rate ρ = 4 * Ne * r.
+        // recomb_intensity = 0.04 * Ne / n.
+        // We apply a 1/100 factor to distance here to match legacy behavior/tuning.
+        // Effectively this treats gen_dist_cm as if it needs further scaling or
+        // implies Ne should be interpreted differently.
+        // Without this, p_recomb is too high for small n (loss of linkage).
+        let p = (-f64::exp_m1(c * gen_dist_cm / 100.0)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
