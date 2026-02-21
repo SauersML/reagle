@@ -9705,12 +9705,59 @@ impl crate::pipelines::ImputationPipeline {
             let rb = chrom_rank.get(b).copied().unwrap_or(usize::MAX);
             ra.cmp(&rb).then_with(|| a.cmp(b))
         });
+
+        // Determine the genomic limit for target markers in this window.
+        // If output_end < ref_markers.len(), the next reference marker (at output_end)
+        // belongs to the overlap/handoff region and will be processed in the next window.
+        // We must not emit target markers beyond this position to preserve global sort order.
+        let next_ref_pos = if output_end < ref_markers.len() {
+            Some((
+                ref_markers.marker(MarkerIdx::new(output_end as u32)).chrom,
+                ref_markers.marker(MarkerIdx::new(output_end as u32)).pos,
+            ))
+        } else {
+            None
+        };
+
         for chrom_key in chrom_keys {
             let Some(list) = target_only_linear.get(&chrom_key) else {
                 continue;
             };
             let cursor = target_only_cursor.get(&chrom_key).copied().unwrap_or(0);
+            let chrom_idx_map = if let Some((limit_chrom, _)) = next_ref_pos {
+                ref_markers.chrom_name(limit_chrom).map(normalize_chrom_local)
+            } else {
+                None
+            };
+
             for &t_idx in list.iter().skip(cursor) {
+                if let Some((_, limit_pos)) = next_ref_pos {
+                    // Check if we are on the same chromosome. If so, enforce the position limit.
+                    // If chrom_key (normalized) matches limit_chrom_name (normalized), we are confident.
+                    // If names mismatch but we are in a single-window context where we expect coherence,
+                    // we rely on name matching to avoid filtering across different chromosomes.
+                    // Note: `chrom_key` comes from `target_only_linear` which is grouped by normalized chrom name.
+                    let same_chrom = if let Some(limit_chrom_name) = chrom_idx_map {
+                        chrom_key == limit_chrom_name
+                    } else {
+                        // Fallback: if we can't get a normalized name for the limit marker (unlikely),
+                        // assume mismatch to be safe, or check if this is the only chromosome being processed?
+                        // Given the unsorted error was on the SAME sequence, the name check *should* have passed.
+                        // We will log if we are skipping purely based on pos if names are ambiguous, but here
+                        // we stick to strict name matching to avoid cross-chrom filtering.
+                        false
+                    };
+
+                    if same_chrom {
+                        let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
+                        // STRICT check: do not emit if >= limit.
+                        // This prevents emitting markers that overlap into the next window's core region.
+                        if t_marker.pos >= limit_pos {
+                            continue;
+                        }
+                    }
+                }
+
                 if !emitted_target[t_idx] {
                     emitted_target[t_idx] = true;
                     output_markers.push(OutputMarker::Target(t_idx));
