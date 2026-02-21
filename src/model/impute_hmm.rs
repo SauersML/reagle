@@ -1729,7 +1729,7 @@ fn apply_marker_prior_smoothing(
     // structural missing mass. If we are far from typed markers, we must blend
     // with panel priors even if we have full state coverage, to prevent HMM
     // stickiness/hallucination in sparse regions.
-    let dist_mix = 0.5 * dist_error;
+    let dist_mix = 0.1 * dist_error;
     let structural_mix = 0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost);
     let adaptive_panel_mix = structural_mix.max(dist_mix).clamp(0.0, 0.50);
 

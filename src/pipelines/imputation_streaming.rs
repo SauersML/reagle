@@ -589,9 +589,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     //
-    // Enforce a hard floor of 0.01 to prevent Winner-Takes-All behavior
+    // Enforce a hard floor of 1e-6 to prevent Winner-Takes-All behavior
     // on sparse arrays, which causes stickiness and hallucinations (High DR2 / Low Accuracy).
-    let min_error = (base * 0.1).max(0.01).min(base.max(0.01));
+    // Relaxed to 1e-6 to allow Beagle-like sharpening (99.9%+ confidence).
+    let min_error = (base * 0.1).max(1e-6).min(base.max(1e-6));
     posterior.clamp(min_error, 0.5)
 }
 

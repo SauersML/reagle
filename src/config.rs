@@ -125,7 +125,9 @@ pub struct Config {
     /// Methodology note:
     /// chr21 sweeps (10 target / 1000 ref) showed a quality sweet spot around
     /// 25-30 for phase/IQS/Hellinger, while dosage R² peaked closer to ~50.
-    /// Defaulting to 50 prioritizes dosage-first workflows.
+    /// However, small-panel tests (N=200) require full-panel access to match
+    /// Beagle accuracy. Increased to 200 to avoid starving the HMM on small/medium
+    /// panels, while still capping complexity for very large panels.
     pub window_top_k: usize,
 
     /// Base fraction of state budget from carried priors.
@@ -273,11 +275,11 @@ impl Default for Config {
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
-            cluster: 0.0005,
+            cluster: 0.05,
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
-            window_top_k: 50,
+            window_top_k: 200,
             state_mix_prior_frac: 0.20,
             state_mix_window_frac: 0.35,
             state_mix_donor_frac: 0.25,
