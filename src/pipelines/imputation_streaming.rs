@@ -588,7 +588,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Enforce a hard floor of 0.01 to prevent Winner-Takes-All behavior
+    // on sparse arrays, which causes stickiness and hallucinations (High DR2 / Low Accuracy).
+    let min_error = (base * 0.1).max(0.01).min(base.max(0.01));
     posterior.clamp(min_error, 0.5)
 }
 
@@ -664,8 +667,12 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    // Boost background mixing to prevent hallucinations in sparse regions.
+    // If we have no data, we should default to population frequencies (prior).
+    // Previous floor of 0.12 was too low, allowing sticky HMM tracks to
+    // dominate even when they were just random noise.
+    let floor = 0.01 + 0.20 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.50)
 }
 
 #[inline]
@@ -1462,14 +1469,12 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
 ) -> Vec<Option<TypedMarkerResolution>> {
     let target_pos_index = build_target_marker_position_index(target_markers);
     let mut out = vec![None; ref_markers.len()];
-    let mut resolved_count = 0;
     for (ref_m, slot) in out.iter_mut().enumerate() {
         if let Some(target_m) = alignment.ref_to_target.get(ref_m).and_then(|v| *v) {
             *slot = Some(TypedMarkerResolution {
                 target_idx: target_m.as_usize(),
                 map_kind: TypedMarkerMapKind::Alignment,
             });
-            resolved_count += 1;
             continue;
         }
 
@@ -1517,39 +1522,6 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
             });
         }
         *slot = candidate;
-        if let Some(res) = slot {
-            resolved_count += 1;
-            if resolved_count <= 5 {
-                let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
-                eprintln!(
-                    "Resolved marker {}: target_idx={}, map_kind={:?}, ref={:?}:{}",
-                    resolved_count, res.target_idx, res.map_kind, ref_marker.chrom, ref_marker.pos
-                );
-            }
-        }
-    }
-    if resolved_count == 0 && target_markers.len() > 0 {
-        eprintln!(
-            "WARNING: No markers resolved in window! Ref markers: {}, Target markers: {}",
-            ref_markers.len(),
-            target_markers.len()
-        );
-        if let Some(first_ref) = ref_markers.get(MarkerIdx::new(0)) {
-             let ref_chrom = ref_markers.chrom_name(first_ref.chrom).unwrap_or("");
-             eprintln!("First ref marker: {}:{}", ref_chrom, first_ref.pos);
-             eprintln!("Normalized ref chrom: '{}'", normalize_chrom_local(ref_chrom));
-             if let Some(target_map) = target_pos_index.get(normalize_chrom_local(ref_chrom)) {
-                 eprintln!("Target markers on this chrom: {}", target_map.len());
-                 if let Some(first_target_pos) = target_map.keys().next() {
-                     eprintln!("Example target pos: {}", first_target_pos);
-                 }
-             } else {
-                 eprintln!("No target markers found on chrom '{}'", normalize_chrom_local(ref_chrom));
-                 if let Some(k) = target_pos_index.keys().next() {
-                     eprintln!("Available target chroms: {}", k);
-                 }
-             }
-        }
     }
     out
 }
@@ -7848,14 +7820,20 @@ impl crate::pipelines::ImputationPipeline {
                     p1_out = priors;
                     dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let total: f32 = donors_h1
+                    let smoothing = 1.0;
+                    let total_raw: f32 = donors_h1
                         .iter()
                         .map(|(_, c)| if c.is_finite() && *c > 0.0 { *c } else { 0.0 })
                         .sum();
+                    let n_donors = donors_h1.len() as f32;
+                    let total = total_raw + n_donors * smoothing;
                     if total > 0.0 {
                         let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h1
                             .iter()
-                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c / total))
+                            .map(|(h, c)| {
+                                let val = if c.is_finite() && *c > 0.0 { *c } else { 0.0 };
+                                (GlobalHapId(h.as_u32()), (val + smoothing) / total)
+                            })
                             .unzip();
                         p1_out = HaplotypePriors::new(ids, probs);
                         hap1_posts = Some(posts_from_donors(&donors_h1, &mut posts_probs_buf)?);
@@ -7912,14 +7890,20 @@ impl crate::pipelines::ImputationPipeline {
                     p2_out = priors;
                     dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let total: f32 = donors_h2
+                    let smoothing = 1.0;
+                    let total_raw: f32 = donors_h2
                         .iter()
                         .map(|(_, c)| if c.is_finite() && *c > 0.0 { *c } else { 0.0 })
                         .sum();
+                    let n_donors = donors_h2.len() as f32;
+                    let total = total_raw + n_donors * smoothing;
                     if total > 0.0 {
                         let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h2
                             .iter()
-                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c / total))
+                            .map(|(h, c)| {
+                                let val = if c.is_finite() && *c > 0.0 { *c } else { 0.0 };
+                                (GlobalHapId(h.as_u32()), (val + smoothing) / total)
+                            })
                             .unzip();
                         p2_out = HaplotypePriors::new(ids, probs);
                         hap2_posts = Some(posts_from_donors(&donors_h2, &mut posts_probs_buf)?);

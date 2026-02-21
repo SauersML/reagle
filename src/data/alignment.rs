@@ -83,12 +83,6 @@ impl<TargetSpace, RefSpace> MarkerAlignment<TargetSpace, RefSpace> {
         let mut dropped_ambiguous_flips = 0usize;
 
         for (key, ref_candidates) in &ref_pos_map {
-            if key.pos == 14011858 {
-                eprintln!("Alignment: Checking ref pos 14011858. Key: {:?}. Target candidates: {:?}", key, target_pos_map.get(key).map(|v| v.len()));
-                if let Some(target_candidates) = target_pos_map.get(key) {
-                     eprintln!("  Ref candidates: {}, Target candidates: {}", ref_candidates.len(), target_candidates.len());
-                }
-            }
             let Some(target_candidates) = target_pos_map.get(key) else {
                 continue;
             };
@@ -440,9 +434,6 @@ fn build_target_pos_map<S: PhaseState, Space>(
     for m in 0..target_gt.n_markers() {
         let marker = target_gt.marker(MarkerIdx::new(m as u32));
         let chrom_name = target_gt.markers().chrom_name(marker.chrom).unwrap_or("");
-        if m == 0 {
-             eprintln!("Alignment: Target first marker: {}:{}", chrom_name, marker.pos);
-        }
         target_pos_map
             .entry(PosKey::new(chrom_name, marker.pos))
             .or_default()
@@ -456,9 +447,6 @@ fn build_ref_pos_map<Space>(ref_markers: &Markers<Space>) -> HashMap<PosKey, Vec
     for m in 0..ref_markers.len() {
         let marker = ref_markers.marker(MarkerIdx::new(m as u32));
         let chrom_name = ref_markers.chrom_name(marker.chrom).unwrap_or("");
-        if marker.pos == 14011858 {
-             eprintln!("Alignment: Ref marker at 14011858 found. Chrom: '{}'", chrom_name);
-        }
         ref_pos_map
             .entry(PosKey::new(chrom_name, marker.pos))
             .or_default()
