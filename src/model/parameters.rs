@@ -162,14 +162,9 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        // Scaling factor:
-        // Li-Stephens rate ρ = 4 * Ne * r.
-        // recomb_intensity = 0.04 * Ne / n.
-        // We apply a 1/100 factor to distance here to match legacy behavior/tuning.
-        // Effectively this treats gen_dist_cm as if it needs further scaling or
-        // implies Ne should be interpreted differently.
-        // Without this, p_recomb is too high for small n (loss of linkage).
-        let p = (-f64::exp_m1(c * gen_dist_cm / 100.0)) as f32;
+        // Intensity is scaled for cM (0.04 * Ne / n), not Morgans (4 * Ne / n).
+        // No division by 100 needed.
+        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -272,8 +267,8 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        // Convert cM^-1 to Morgan^-1 by multiplying by 100.0
-        Some((self.sum_expected_switches / self.sum_gen_dist * 100.0) as f32)
+        // Return intensity per cM (no *100.0 scaling needed, matches p_recomb input)
+        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
     }
 
     /// Estimate mismatch probability
@@ -438,13 +433,13 @@ mod tests {
     fn test_param_estimates_recomb_intensity_scaling() {
         let mut e = ParamEstimates::new();
         // 1 switch over 1.0 cM genetic distance
-        // Intensity should be 1 switch / 0.01 Morgans = 100 switches / Morgan
+        // Intensity should be 1 switch / 1.0 cM = 1.0
         e.add_switch(1.0, 1.0);
 
         let intensity = e.recomb_intensity().unwrap();
         assert!(
-            (intensity - 100.0).abs() < 0.001,
-            "Expected 100.0, got {}",
+            (intensity - 1.0).abs() < 0.001,
+            "Expected 1.0, got {}",
             intensity
         );
     }
