@@ -742,6 +742,108 @@ impl<I: PbwtIndex> ReferencePbwtImpl<I> {
         self.finalize_step(ref_alleles, n_alleles, marker);
     }
 
+    pub fn advance_with_beams_strict_packed(
+        &mut self,
+        words: &[u64],
+        missing: &[u64],
+        n_haps: usize,
+        marker: usize,
+        query_alleles: &[PbwtStrictAllele],
+        beams: &mut [RankBeam],
+    ) {
+        let mut scratch = std::mem::take(&mut self.step_scratch);
+        self.advance_with_beams_strict_packed_scratch(
+            words,
+            missing,
+            n_haps,
+            marker,
+            query_alleles,
+            beams,
+            &mut scratch,
+        );
+        self.step_scratch = scratch;
+    }
+
+    pub fn advance_with_beams_strict_packed_scratch(
+        &mut self,
+        words: &[u64],
+        missing: &[u64],
+        n_haps: usize,
+        marker: usize,
+        query_alleles: &[PbwtStrictAllele],
+        beams: &mut [RankBeam],
+        scratch: &mut Vec<(u32, u32, u64)>,
+    ) {
+        self.prepare_step_from_packed(words, missing, n_haps);
+        // Biallelic implies n_alleles=2
+        self.update_beams_with_scratch_strict(beams, query_alleles, 2, scratch);
+        self.finalize_step(&[], 2, marker);
+    }
+
+    pub fn prepare_step_from_packed(&mut self, words: &[u64], missing: &[u64], n_haps: usize) {
+        self.ensure_bit_buffers();
+        let n_ref = self.ppa.len().min(n_haps);
+        let n_words = (n_ref + 63) / 64;
+        let mut count1 = 0u32;
+        let mut count_miss = 0u32;
+        let mut idx = 0usize;
+
+        for w in 0..n_words {
+            let mut bits = 0u64;
+            let mut miss = 0u64;
+            let block_end = (idx + 64).min(n_ref);
+            let mut bit = 0u64;
+            while idx < block_end {
+                let ppa_idx = self.ppa[idx].to_usize();
+                let word_idx = ppa_idx / 64;
+                let bit_idx = ppa_idx % 64;
+
+                let mut m_val = 0u64;
+                if word_idx < missing.len() {
+                    m_val = (missing[word_idx] >> bit_idx) & 1;
+                }
+
+                if m_val == 1 {
+                    miss |= 1u64 << bit;
+                } else {
+                    let mut val = 0u64;
+                    if word_idx < words.len() {
+                        val = (words[word_idx] >> bit_idx) & 1;
+                    }
+                    if val == 1 {
+                        bits |= 1u64 << bit;
+                    }
+                }
+                idx += 1;
+                bit += 1;
+            }
+            self.permuted_bits[w] = bits;
+            self.permuted_missing_bits[w] = miss;
+            count1 += bits.count_ones();
+            count_miss += miss.count_ones();
+        }
+
+        let count0 = n_ref as u32 - count1 - count_miss;
+        self.binary_counts[0] = count0;
+        self.binary_counts[1] = count_miss;
+        self.binary_counts[2] = count1;
+
+        let mut running = 0u32;
+        for b in 0..3 {
+            self.binary_offsets[b] = running;
+            running += self.binary_counts[b];
+        }
+
+        self.prefix_ones_words[0] = 0;
+        self.prefix_missing_words[0] = 0;
+        for w in 0..n_words {
+            self.prefix_ones_words[w + 1] =
+                self.prefix_ones_words[w] + self.permuted_bits[w].count_ones();
+            self.prefix_missing_words[w + 1] =
+                self.prefix_missing_words[w] + self.permuted_missing_bits[w].count_ones();
+        }
+    }
+
     pub fn prepare_step(&mut self, ref_alleles: &[u8], n_alleles: usize) {
         let alphabet = PbwtAlphabet::new(n_alleles)
             .expect("invalid PBWT alphabet: n_alleles must be in 2..=u8::MAX");
@@ -1152,6 +1254,13 @@ impl ReferencePbwt {
         }
     }
 
+    pub fn prepare_step_from_packed(&mut self, words: &[u64], missing: &[u64], n_haps: usize) {
+        match self {
+            Self::U16(inner) => inner.prepare_step_from_packed(words, missing, n_haps),
+            Self::U32(inner) => inner.prepare_step_from_packed(words, missing, n_haps),
+        }
+    }
+
     pub fn update_beams_with_scratch_query(
         &mut self,
         beams: &mut [RankBeam],
@@ -1204,6 +1313,35 @@ impl ReferencePbwt {
             Self::U32(inner) => inner.advance_with_beams_strict(
                 ref_alleles,
                 n_alleles,
+                marker,
+                query_alleles,
+                beams,
+            ),
+        }
+    }
+
+    pub fn advance_with_beams_strict_packed(
+        &mut self,
+        words: &[u64],
+        missing: &[u64],
+        n_haps: usize,
+        marker: usize,
+        query_alleles: &[PbwtStrictAllele],
+        beams: &mut [RankBeam],
+    ) {
+        match self {
+            Self::U16(inner) => inner.advance_with_beams_strict_packed(
+                words,
+                missing,
+                n_haps,
+                marker,
+                query_alleles,
+                beams,
+            ),
+            Self::U32(inner) => inner.advance_with_beams_strict_packed(
+                words,
+                missing,
+                n_haps,
                 marker,
                 query_alleles,
                 beams,
