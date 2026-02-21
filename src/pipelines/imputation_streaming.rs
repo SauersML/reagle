@@ -6262,7 +6262,7 @@ impl crate::pipelines::ImputationPipeline {
                         // switch if the donor is contradicted by data.
                         // If max_weight is 0 (or empty), default to 1.0.
                         let prior_weight = if max_weight > 0.0 {
-                            max_weight * 0.25
+                            max_weight * 0.01
                         } else {
                             1.0
                         };
