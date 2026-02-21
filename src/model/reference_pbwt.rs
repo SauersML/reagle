@@ -217,6 +217,70 @@ impl PbwtBiallelicQueryProb {
         }
     }
 
+    pub fn prepare_step_from_packed(&mut self, words: &[u64], missing: &[u64], n_haps: usize) {
+        self.ensure_bit_buffers();
+        let n_ref = self.ppa.len().min(n_haps);
+        let n_words = (n_ref + 63) / 64;
+        let mut count1 = 0u32;
+        let mut count_miss = 0u32;
+        let mut idx = 0usize;
+
+        for w in 0..n_words {
+            let mut bits = 0u64;
+            let mut miss = 0u64;
+            let block_end = (idx + 64).min(n_ref);
+            let mut bit = 0u64;
+            while idx < block_end {
+                let ppa_idx = self.ppa[idx].to_usize();
+                let word_idx = ppa_idx / 64;
+                let bit_idx = ppa_idx % 64;
+
+                let mut m_val = 0u64;
+                if word_idx < missing.len() {
+                    m_val = (missing[word_idx] >> bit_idx) & 1;
+                }
+
+                if m_val == 1 {
+                    miss |= 1u64 << bit;
+                } else {
+                    let mut val = 0u64;
+                    if word_idx < words.len() {
+                        val = (words[word_idx] >> bit_idx) & 1;
+                    }
+                    if val == 1 {
+                        bits |= 1u64 << bit;
+                    }
+                }
+                idx += 1;
+                bit += 1;
+            }
+            self.permuted_bits[w] = bits;
+            self.permuted_missing_bits[w] = miss;
+            count1 += bits.count_ones();
+            count_miss += miss.count_ones();
+        }
+
+        let count0 = n_ref as u32 - count1 - count_miss;
+        self.binary_counts[0] = count0;
+        self.binary_counts[1] = count_miss;
+        self.binary_counts[2] = count1;
+
+        let mut running = 0u32;
+        for b in 0..3 {
+            self.binary_offsets[b] = running;
+            running += self.binary_counts[b];
+        }
+
+        self.prefix_ones_words[0] = 0;
+        self.prefix_missing_words[0] = 0;
+        for w in 0..n_words {
+            self.prefix_ones_words[w + 1] =
+                self.prefix_ones_words[w] + self.permuted_bits[w].count_ones();
+            self.prefix_missing_words[w + 1] =
+                self.prefix_missing_words[w] + self.permuted_missing_bits[w].count_ones();
+        }
+    }
+
     #[inline]
     pub fn uniform() -> Self {
         Self { p0: 0.5, p1: 0.5 }
@@ -1149,6 +1213,13 @@ impl ReferencePbwt {
         match self {
             Self::U16(inner) => inner.prepare_step(ref_alleles, n_alleles),
             Self::U32(inner) => inner.prepare_step(ref_alleles, n_alleles),
+        }
+    }
+
+    pub fn prepare_step_from_packed(&mut self, words: &[u64], missing: &[u64], n_haps: usize) {
+        match self {
+            Self::U16(inner) => inner.prepare_step_from_packed(words, missing, n_haps),
+            Self::U32(inner) => inner.prepare_step_from_packed(words, missing, n_haps),
         }
     }
 
