@@ -1689,12 +1689,12 @@ fn apply_marker_prior_smoothing(
     };
     let fallback_missing_mass = if panel_haps > 0 && active_states < panel_haps {
         let raw_ratio = ((panel_haps - active_states) as f32 / panel_haps as f32).clamp(0.0, 1.0);
-        raw_ratio.powi(3)
+        raw_ratio
     } else {
         0.0
     };
     let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
+        observed_missing_mass.max(fallback_missing_mass)
     } else {
         fallback_missing_mass
     };
