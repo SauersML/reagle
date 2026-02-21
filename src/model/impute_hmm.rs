@@ -1437,7 +1437,7 @@ pub(crate) fn compute_nearest_observed_lambda(
     p_recomb: &[f32],
     smoothing_cluster_cm: f32,
 ) {
-    const BASE_CLUSTER_CM: f32 = 0.005;
+    const BASE_CLUSTER_CM: f32 = 0.5;
     let n = target_probs.n_markers();
     if ws.nearest_obs_fwd.len() < n {
         ws.nearest_obs_fwd.resize(n, f32::INFINITY);
@@ -1706,10 +1706,13 @@ fn apply_marker_prior_smoothing(
         1.0
     };
     let sparsity_boost = (1.0 - active_ratio).powi(2);
-    let truncation_error = (1.0 - active_ratio).clamp(0.0, 1.0);
-    // Approximation error combines structural-missingness and truncation:
-    //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
-    // This term captures model/subset limitations, not map distance.
+    // Truncation error: penalize only if we selected a very small slice of the panel (< 40%).
+    // If we kept >= 40% of haplotypes, we assume the subset is representative enough.
+    // This protects ultra-dense cases (where we select ~50% perfectly) from penalty,
+    // while regularizing sparse imputation where we select a thin slice (e.g. <10%).
+    let truncation_error = (1.0 - active_ratio / 0.4).clamp(0.0, 1.0);
+
+    // Approximation error combines structural-missingness and truncation.
     let approximation_error =
         (1.0 - (1.0 - missing_mass) * (1.0 - truncation_error)).clamp(0.0, 0.9999);
     // Combine map and approximation uncertainty via independent-failure union:
@@ -1729,12 +1732,12 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     //
-    // Use approximation_error (union of missing_mass and truncation_error)
-    // to trigger panel mixing when the subset is either uninformative OR
-    // incomplete. This helps regularize "confident but wrong" HMM predictions
-    // when the true haplotype was pruned during state selection.
+    // Use combined_error (union of map-distance error and missing mass) to drive mixing.
+    // - If we are far from anchors (dist_error high), we mix.
+    // - If we explain data poorly (missing_mass high), we mix.
+    // - If we are close to anchors AND explain data perfectly, we trust HMM (mix=0).
     let adaptive_panel_mix =
-        (0.6 * approximation_error * combined_error * (1.0 + 0.75 * sparsity_boost))
+        (0.6 * combined_error * (1.0 + 0.75 * sparsity_boost))
             .clamp(0.0, 0.6);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
@@ -1809,34 +1812,14 @@ fn apply_adaptive_panel_blend(
     }
 
     if adaptive_panel_mix > 0.0 {
-        // Jensen-Shannon disagreement quantifies mismatch between local subset
-        // and panel prior. Larger mismatch increases blend strength, but blend
-        // remains bounded by adaptive_panel_mix cap.
-        let mut m_entropy = 0.0f32;
-        let mut p_entropy = 0.0f32;
-        let mut q_entropy = 0.0f32;
-        for (i, &p_raw) in allele_probs.iter().enumerate() {
-            let p = p_raw.clamp(0.0, 1.0);
-            let q = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let m = 0.5 * (p + q);
-            if p > 0.0 {
-                p_entropy -= p * p.ln();
-            }
-            if q > 0.0 {
-                q_entropy -= q * q.ln();
-            }
-            if m > 0.0 {
-                m_entropy -= m * m.ln();
-            }
-        }
-        let js_div = (m_entropy - 0.5 * (p_entropy + q_entropy)).max(0.0);
-        let max_js = (2.0f32).ln();
-        let disagreement = (js_div / max_js).clamp(0.0, 1.0);
-
         // Symmetric convex blend:
         //   p <- (1-w) * p + w * panel
         // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.8);
+        //
+        // Do NOT boost mixing based on disagreement (Jensen-Shannon). Boosting
+        // when HMM disagrees with panel suppresses real rare variants found by
+        // the HMM but absent/rare in the panel average.
+        let w = adaptive_panel_mix.clamp(0.0, 0.8);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
