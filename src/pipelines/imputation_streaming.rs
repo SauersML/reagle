@@ -6257,12 +6257,12 @@ impl crate::pipelines::ImputationPipeline {
                             .fold(0.0f32, |a, b| a.max(b));
                         // If we have strong existing matches, make sure priors are
                         // competitive but not dominant.
-                        // Lower weight (e.g. 5%) preserves the PBWT donor's lead when it
+                        // Lower weight (e.g. 1%) preserves the PBWT donor's lead when it
                         // is correct, while still providing a valid path for the HMM to
                         // switch if the donor is contradicted by data.
                         // If max_weight is 0 (or empty), default to 1.0.
                         let prior_weight = if max_weight > 0.0 {
-                            max_weight * 0.05
+                            max_weight * 0.25
                         } else {
                             1.0
                         };
