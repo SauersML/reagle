@@ -60,6 +60,47 @@ use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
 
+fn compute_panel_priors(columns: &[GenotypeColumn], n_ref_haps: usize) -> Arc<Vec<AllelePosteriors>> {
+    let n_cols = columns.len();
+    let mut priors = Vec::with_capacity(n_cols);
+    let mut buffer = vec![0u8; n_ref_haps];
+    let missing_raw = crate::data::storage::AlleleCode::MISSING.raw();
+
+    for col in columns {
+        col.fill_all(&mut buffer);
+        let mut counts = Vec::new();
+        let mut total = 0.0f32;
+
+        for &a in &buffer {
+            if a == missing_raw {
+                continue;
+            }
+            let idx = a as usize;
+            if idx >= counts.len() {
+                counts.resize(idx + 1, 0.0f32);
+            }
+            counts[idx] += 1.0;
+            total += 1.0;
+        }
+
+        if total > 0.0 {
+            let inv = 1.0 / total;
+            for c in counts.iter_mut() {
+                *c *= inv;
+            }
+            if counts.len() <= 2 {
+                let p_alt = counts.get(1).copied().unwrap_or(0.0);
+                priors.push(AllelePosteriors::Biallelic(p_alt));
+            } else {
+                priors.push(AllelePosteriors::Multiallelic(Arc::from(counts)));
+            }
+        } else {
+            priors.push(AllelePosteriors::Biallelic(0.0));
+        }
+    }
+    Arc::new(priors)
+}
+
 /// Retain only the `k` highest-weight donors, discarding the rest.
 ///
 /// Uses `select_nth_unstable_by` for O(n) partitioning followed by a
@@ -2741,6 +2782,7 @@ fn build_imputation_plan(
     // Keep LMS allocation path; full-panel mode can degrade calibration
     // when donor-guided and overlap handoff logic are active.
     let can_full_panel = false;
+
     if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
@@ -4503,12 +4545,15 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
+                    let panel_priors = Some(compute_panel_priors(&ref_window.ref_columns, n_ref_pool));
+
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
                         phased_target_pl.as_ref(),
                         target_missing,
                         &ref_window.markers,
                         &ref_window.ref_columns,
+                        panel_priors,
                         &alignment,
                         &gen_maps,
                         imp_overlap.as_ref(),
@@ -4756,12 +4801,15 @@ impl crate::pipelines::ImputationPipeline {
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
+                    let panel_priors = Some(compute_panel_priors(&ref_window.ref_columns, n_ref_pool));
+
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
                         phased_target_pl.as_ref(),
                         target_missing,
                         &ref_window.markers,
                         &ref_window.ref_columns,
+                        panel_priors,
                         &alignment,
                         &gen_maps,
                         imp_overlap.as_ref(),
@@ -4918,6 +4966,7 @@ impl crate::pipelines::ImputationPipeline {
         target_missing: Option<&GenotypeMatrix<TargetMissingState, TargetSpace>>,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
         ref_columns: &[GenotypeColumn],
+        panel_priors: Option<Arc<Vec<AllelePosteriors>>>,
         alignment: &MarkerAlignment<TargetSpace, RefMarkerSpace>,
         gen_maps: &GeneticMaps,
         imp_overlap: Option<&PhasedOverlap>,
@@ -5728,11 +5777,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                panel_priors.clone(),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                panel_priors.clone(),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
