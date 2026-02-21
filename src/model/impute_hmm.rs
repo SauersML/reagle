@@ -1724,8 +1724,13 @@ fn apply_marker_prior_smoothing(
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
+    //
+    // Use approximation_error (union of missing_mass and truncation_error)
+    // rather than raw missing_mass to ensure that subset truncation alone
+    // triggers regularization, even if the selected subset has no missing data.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.6 * approximation_error * combined_error * (1.0 + 0.75 * sparsity_boost))
+            .clamp(0.0, 0.6);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1826,7 +1831,7 @@ fn apply_adaptive_panel_blend(
         // Symmetric convex blend:
         //   p <- (1-w) * p + w * panel
         // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.45);
+        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.8);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);

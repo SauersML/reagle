@@ -2740,7 +2740,9 @@ fn build_imputation_plan(
 
     // Keep LMS allocation path; full-panel mode can degrade calibration
     // when donor-guided and overlap handoff logic are active.
-    let can_full_panel = false;
+    // However, if the panel is small enough to fit entirely in the window cap,
+    // explicitly using full panel is safer than relying on LMS to select 100%.
+    let can_full_panel = per_window_caps.iter().all(|&c| c >= n_ref_haps);
     if can_full_panel {
         let num_windows = per_window_caps.len();
         if num_windows == 0 {
@@ -2761,7 +2763,8 @@ fn build_imputation_plan(
         plan.per_window_cap = n_ref_haps.max(1);
         plan.per_window_caps = per_window_caps.to_vec();
         plan.full_panel = true;
-        for _ in 0..n_target_haps {
+        for i in 0..n_target_haps {
+            plan.abyss_mask[i] = BitVec::repeat(false, n_ref_haps);
             plan.stats.update(n_ref_haps, 0, 0);
         }
         eprintln!(
@@ -4959,6 +4962,8 @@ impl crate::pipelines::ImputationPipeline {
         if output_start >= output_end || n_ref_markers == 0 {
             return Ok(None);
         }
+
+        let panel_priors = compute_panel_priors(ref_markers, ref_columns);
         if let Some(bb) = &self.telemetry {
             bb.set_stage(crate::utils::telemetry::Stage::Imputation);
             bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
@@ -5728,11 +5733,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                Some(panel_priors.clone()),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                Some(panel_priors.clone()),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
@@ -10579,4 +10594,55 @@ mod tests {
         assert!((seg.marker_error_rate(0).unwrap_or(0.0) - 0.01).abs() < 1e-6);
         assert!((seg.marker_error_rate(1).unwrap_or(0.0) - 0.2).abs() < 1e-6);
     }
+}
+
+
+fn compute_panel_priors<Space>(
+    markers: &crate::data::marker::Markers<Space>,
+    columns: &[GenotypeColumn],
+) -> Arc<Vec<AllelePosteriors>> {
+    let mut priors = Vec::with_capacity(columns.len());
+    let mut allele_counts = Vec::new();
+    let mut allele_buf = Vec::new();
+
+    for (m, col) in columns.iter().enumerate() {
+        let n_alleles = markers.marker(MarkerIdx::new(m as u32)).n_alleles();
+        let n_haps = col.n_haplotypes();
+        if allele_buf.len() < n_haps {
+            allele_buf.resize(n_haps, 0u8);
+        }
+        col.fill_all(&mut allele_buf);
+
+        allele_counts.clear();
+        allele_counts.resize(n_alleles, 0usize);
+        let mut total = 0usize;
+
+        for &a in &allele_buf[..n_haps] {
+            if a != crate::data::storage::AlleleCode::MISSING.raw() {
+                let idx = a as usize;
+                if idx < n_alleles {
+                    allele_counts[idx] += 1;
+                    total += 1;
+                }
+            }
+        }
+
+        if total > 0 {
+            if n_alleles == 2 {
+                let p_alt = allele_counts[1] as f32 / total as f32;
+                priors.push(AllelePosteriors::Biallelic(p_alt));
+            } else {
+                let mut probs = Vec::with_capacity(n_alleles);
+                let inv = 1.0 / total as f32;
+                for &c in &allele_counts {
+                    probs.push(c as f32 * inv);
+                }
+                priors.push(AllelePosteriors::Multiallelic(Arc::from(probs)));
+            }
+        } else {
+            let zeros = vec![0.0; n_alleles];
+            priors.push(AllelePosteriors::Multiallelic(Arc::from(zeros)));
+        }
+    }
+    Arc::new(priors)
 }
