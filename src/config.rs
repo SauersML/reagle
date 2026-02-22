@@ -125,7 +125,7 @@ pub struct Config {
     /// Methodology note:
     /// chr21 sweeps (10 target / 1000 ref) showed a quality sweet spot around
     /// 25-30 for phase/IQS/Hellinger, while dosage R² peaked closer to ~50.
-    /// Defaulting to 200 ensures rare variants are not pruned from small panels.
+    /// Defaulting to 60 optimizes for dosage R².
     pub window_top_k: usize,
 
     /// Base fraction of state budget from carried priors.
@@ -277,7 +277,7 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
-            window_top_k: 200,
+            window_top_k: 60,
             state_mix_prior_frac: 0.20,
             state_mix_window_frac: 0.35,
             state_mix_donor_frac: 0.25,
