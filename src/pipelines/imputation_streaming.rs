@@ -589,10 +589,8 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     //
-    // Floor is set to 10% of base rate (e.g. 0.1% for 1% base), allowing
-    // the HMM to trust high-quality genotypes significantly more than the
-    // background error rate.
-    let min_error = base * 0.1;
+    // Sharpening is no longer allowed below base to prevent over-confidence.
+    let min_error = base;
     posterior.clamp(min_error, 0.5)
 }
 
@@ -10102,18 +10100,18 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening is allowed down to 10% of base or 1e-6.
-        let limit = base * 0.1;
+        // Sharpening is no longer allowed below base to prevent over-confidence.
+        let limit = base;
         assert!(
             out >= limit,
             "expected calibrated error clamped to limit {}, got {}",
             limit,
             out
         );
-        // With sharp observations, it should be below base.
+        // It should be exactly base if the calibrated value would have been lower.
         assert!(
-            out < base,
-            "expected calibrated error to sharpen below base {}, got {}",
+            (out - base).abs() < 1e-6,
+            "expected calibrated error to be clamped to base {}, got {}",
             base,
             out
         );
