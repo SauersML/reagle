@@ -588,10 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    //
-    // Adjusted to prevent over-sharpening which causes AF collapse
-    // (perfect LD trap) and poor calibration (overconfidence).
-    let min_error = base.max(1e-6);
+    let min_error = (base * 0.1).max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -627,8 +624,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    // Adjusted clamp floor to base to prevent over-sharpening.
-    blended.clamp(base.max(1e-6), 0.5)
+    blended.clamp((base * 0.1).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -657,8 +653,8 @@ fn adaptive_untyped_prior_mix(
 
     // Slightly stronger floor when cluster distance is wide (weaker local
     // linkage signal) or the model error rate is elevated.
-    let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 5.0);
-    let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 5.0);
+    let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
+    let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 1.6);
 
     // Unphased-target imputation has additional uncertainty from phase
     // transfer, so apply a mild boost.
@@ -669,7 +665,7 @@ fn adaptive_untyped_prior_mix(
     };
 
     let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.25)
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
 #[inline]
