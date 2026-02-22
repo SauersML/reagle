@@ -688,7 +688,7 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    ((1.0 - p) / p).ln().max(0.0)
+    (-p.ln()).max(0.0)
 }
 
 #[inline]
@@ -1724,6 +1724,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
                 continue;
             }
             let weight = prescan_match_weight(freq, min_freq);
+            if m < 5 && targ_idx == 0 { eprintln!("DEBUG: m={} freq={:.4} min={:.4} weight={:.4} targ={}", m, freq, min_freq, weight, targ_idx); }
             if weight <= 0.0 {
                 continue;
             }
@@ -2334,13 +2335,10 @@ struct PrescanTargetEntry {
 }
 
 fn trim_alignment_for_prescan_cache(
-    mut alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
+    alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
 ) -> MarkerAlignment<AnyMarkerSpace, RefWindowSpace> {
-    // Prescan scoring only uses target_to_ref + reverse_map_allele (allele_mappings).
-    // Dropping ref_to_target avoids storing a second large mapping that is unused
-    // during prescan and materially increases cache memory.
-    alignment.ref_to_target.clear();
-    alignment.ref_to_target.shrink_to_fit();
+    // We NEED ref_to_target for build_ref_typed_marker_resolutions in prescan scoring.
+    // Clearing it causes expensive (and potentially buggy) positional re-resolution per batch.
     alignment
 }
 
@@ -10578,5 +10576,15 @@ mod tests {
         let seg = extent.build_target_probs(&input);
         assert!((seg.marker_error_rate(0).unwrap_or(0.0) - 0.01).abs() < 1e-6);
         assert!((seg.marker_error_rate(1).unwrap_or(0.0) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_prescan_match_weight_positive() {
+        let min_freq = 0.005;
+        let w1 = prescan_match_weight(1.0, min_freq);
+        assert!(w1 > 0.0, "Weight for p=1.0 should be positive, got {}", w1);
+
+        let w_mid = prescan_match_weight(0.5, min_freq);
+        assert!(w_mid > 0.0, "Weight for p=0.5 should be positive, got {}", w_mid);
     }
 }
