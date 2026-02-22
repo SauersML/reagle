@@ -588,7 +588,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Relaxed floor (base) to prevent over-sharpening on sparse targets.
+    // Extremely low error rates (< 1e-5) cause the HMM to discard too many
+    // "near-match" haplotypes, reducing robustness at imputed sites.
+    let min_error = base;
     posterior.clamp(min_error, 0.5)
 }
 

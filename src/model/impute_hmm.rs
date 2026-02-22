@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_emission_prob_tracks_target_concentration() {
+    fn test_missing_emission_prob_is_neutral() {
         let match_prob = 0.99f32;
         let mismatch_prob = 0.01f32;
 
@@ -438,9 +438,13 @@ mod tests {
         let c = missing_emission_prob(concentrated, match_prob, mismatch_prob);
         let d = missing_emission_prob(diffuse, match_prob, mismatch_prob);
 
-        assert!((c - match_prob).abs() < 1e-6);
-        assert!(d < c);
-        assert!(d > mismatch_prob);
+        // Missing emission should be neutral (0.5 for biallelic) regardless of
+        // target concentration. It must be less than match_prob (to prefer
+        // actual matches) but greater than mismatch_prob.
+        assert!((c - 0.5).abs() < 1e-6);
+        assert!((d - 0.5).abs() < 1e-6);
+        assert!(c < match_prob);
+        assert!(c > mismatch_prob);
     }
 
     #[test]
@@ -1377,18 +1381,15 @@ fn missing_emission_prob(
     if n == 0 {
         return 1.0;
     }
-    let mut sum = 0.0f32;
-    let mut sum_sq = 0.0f32;
-    for i in 0..n {
-        let p = target_probs.get(i).unwrap_or(0.0).max(0.0);
-        sum += p;
-        sum_sq += p * p;
-    }
-    let concentration = if sum > 0.0 {
-        (sum_sq / (sum * sum)).clamp(0.0, 1.0)
-    } else {
-        1.0 / n as f32
-    };
+    // Neutral emission for missing reference: assume uniform prior on the
+    // underlying reference allele. This ensures that a definite match (p=match_prob)
+    // is preferred over a missing reference (p=1/n), while a missing reference
+    // is preferred over a definite mismatch (p=mismatch_prob).
+    //
+    // Previous behavior used target concentration, which allowed missing reference
+    // to score as high as a perfect match when the target was confident. This
+    // caused the HMM to lose information by selecting non-informative haplotypes.
+    let concentration = 1.0 / n as f32;
     mismatch_prob + (match_prob - mismatch_prob) * concentration
 }
 
