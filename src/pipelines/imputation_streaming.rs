@@ -60,6 +60,58 @@ use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PrescanStats {
+    exact_windows_total: usize,
+    pbwt_windows_total: usize,
+    pbwt_sampled_sum: usize,
+    pbwt_markers_sum: usize,
+    pbwt_sampled_min: usize,
+    pbwt_sampled_max: usize,
+    pbwt_flat_windows: usize,
+    pbwt_low_sample_windows: usize,
+    pbwt_non_finite_windows: usize,
+    adaptive_top_m_calls: usize,
+    adaptive_top_m_sum: usize,
+    adaptive_top_m_min: usize,
+    adaptive_top_m_max: usize,
+    adaptive_top_m_boosted: usize,
+    adaptive_top_m_reduced: usize,
+}
+
+impl PrescanStats {
+    fn new() -> Self {
+        Self {
+            pbwt_sampled_min: usize::MAX,
+            adaptive_top_m_min: usize::MAX,
+            ..Default::default()
+        }
+    }
+}
+
+impl std::ops::Add for PrescanStats {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            exact_windows_total: self.exact_windows_total + rhs.exact_windows_total,
+            pbwt_windows_total: self.pbwt_windows_total + rhs.pbwt_windows_total,
+            pbwt_sampled_sum: self.pbwt_sampled_sum + rhs.pbwt_sampled_sum,
+            pbwt_markers_sum: self.pbwt_markers_sum + rhs.pbwt_markers_sum,
+            pbwt_sampled_min: self.pbwt_sampled_min.min(rhs.pbwt_sampled_min),
+            pbwt_sampled_max: self.pbwt_sampled_max.max(rhs.pbwt_sampled_max),
+            pbwt_flat_windows: self.pbwt_flat_windows + rhs.pbwt_flat_windows,
+            pbwt_low_sample_windows: self.pbwt_low_sample_windows + rhs.pbwt_low_sample_windows,
+            pbwt_non_finite_windows: self.pbwt_non_finite_windows + rhs.pbwt_non_finite_windows,
+            adaptive_top_m_calls: self.adaptive_top_m_calls + rhs.adaptive_top_m_calls,
+            adaptive_top_m_sum: self.adaptive_top_m_sum + rhs.adaptive_top_m_sum,
+            adaptive_top_m_min: self.adaptive_top_m_min.min(rhs.adaptive_top_m_min),
+            adaptive_top_m_max: self.adaptive_top_m_max.max(rhs.adaptive_top_m_max),
+            adaptive_top_m_boosted: self.adaptive_top_m_boosted + rhs.adaptive_top_m_boosted,
+            adaptive_top_m_reduced: self.adaptive_top_m_reduced + rhs.adaptive_top_m_reduced,
+        }
+    }
+}
+
 /// Retain only the `k` highest-weight donors, discarding the rest.
 ///
 /// Uses `select_nth_unstable_by` for O(n) partitioning followed by a
@@ -3030,228 +3082,362 @@ fn build_imputation_plan(
                 packed_columns,
                 ..
             } => {
-                for (idx, (ref_window, ref_columns)) in
-                    windows.iter().zip(packed_columns.iter()).enumerate()
-                {
-                    let n_ref_markers = ref_window.markers.len();
-                    if n_ref_markers == 0 {
-                        continue;
-                    }
-                    if window_span_cm.is_none() || window_span_bp.is_none() {
-                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                        let end_pos = ref_window
-                            .markers
-                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                            .pos;
-                        let span_bp = end_pos.saturating_sub(start_pos);
-                        let span_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
-                            .unwrap_or("");
-                        let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
-                        let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
-                        window_span_bp = Some(span_bp.into());
-                        window_span_cm = Some((end_cm - start_cm).abs());
-                    }
-                    // Derive per-window cap from the observed marker count to match
-                    // the real workspace footprint (fwd/bwd/history scale with markers).
-                    let per_window_cap_window = per_window_caps
-                        .get(window_idx)
-                        .copied()
-                        .unwrap_or(per_window_cap.max(1));
+                let init_accum = || {
+                    (
+                        vec![vec![0.0f32; n_ref_haps]; batch_len], // global_scores
+                        vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_len], // best_window_scores
+                        vec![vec![0u32; n_ref_haps]; batch_len], // window_rank_hits
+                        Vec::new(), // sparse_updates: (batch_idx, planning_window, scores)
+                        PrescanStats::new(),
+                        None::<(f64, u64)>, // window_span
+                        0usize,             // processed_count
+                    )
+                };
 
-                    let (alignment_cow, phased_target_cow) = if let Some(cache) =
-                        target_cache.as_ref()
-                    {
-                        if let Some(Some(entry)) = cache.get(idx) {
-                            (
-                                Cow::Borrowed(&entry.alignment),
-                                Cow::Borrowed(&entry.phased_target),
-                            )
-                        } else {
-                            let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-                            let ref_chrom = ref_window
-                                .markers
-                                .chrom_name(ref_chrom_idx)
-                                .unwrap_or("UNKNOWN");
-                            let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                            let end_pos = ref_window
-                                .markers
-                                .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                                .pos;
-                            let chrom_candidates = chrom_variants(ref_chrom);
-                            let reader = target_reader.as_mut().ok_or_else(|| {
-                                ReagleError::vcf("Target reader missing in prescan".to_string())
-                            })?;
-                            let target_window = reader.load_window_for_region(
-                                &chrom_candidates,
-                                start_pos,
-                                end_pos,
-                            )?;
-                            let Some(target_window) = target_window else {
-                                continue;
-                            };
-                            let alignment = MarkerAlignment::new_with_ref_markers(
-                                &target_window.genotypes,
-                                &ref_window.markers,
-                            );
-                            let phased_target = target_window.genotypes.into_phased();
-                            (Cow::Owned(alignment), Cow::Owned(phased_target))
-                        }
-                    } else {
-                        let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
-                        let ref_chrom = ref_window
-                            .markers
-                            .chrom_name(ref_chrom_idx)
-                            .unwrap_or("UNKNOWN");
-                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
-                        let end_pos = ref_window
-                            .markers
-                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
-                            .pos;
-                        let chrom_candidates = chrom_variants(ref_chrom);
-                        let reader = target_reader.as_mut().ok_or_else(|| {
-                            ReagleError::vcf("Target reader missing in prescan".to_string())
-                        })?;
-                        let target_window =
-                            reader.load_window_for_region(&chrom_candidates, start_pos, end_pos)?;
-                        let Some(target_window) = target_window else {
-                            continue;
-                        };
-                        let alignment = MarkerAlignment::new_with_ref_markers(
-                            &target_window.genotypes,
-                            &ref_window.markers,
+                let (global_acc, best_acc, hits_acc, sparse_acc, stats_acc, span_acc, processed_acc) =
+                    windows
+                        .par_iter()
+                        .zip(packed_columns.par_iter())
+                        .enumerate()
+                        .fold(
+                            init_accum,
+                            |mut acc, (idx, (ref_window, ref_columns))| {
+                                let (
+                                    global,
+                                    best,
+                                    hits,
+                                    sparse,
+                                    stats,
+                                    span_opt,
+                                    processed,
+                                ) = &mut acc;
+
+                                let n_ref_markers = ref_window.markers.len();
+                                if n_ref_markers == 0 {
+                                    return acc;
+                                }
+
+                                if span_opt.is_none() {
+                                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                                    let end_pos = ref_window
+                                        .markers
+                                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                        .pos;
+                                    let span_bp = end_pos.saturating_sub(start_pos);
+                                    let span_chrom = ref_window
+                                        .markers
+                                        .chrom_name(ref_window.markers.marker(MarkerIdx::new(0)).chrom)
+                                        .unwrap_or("");
+                                    let start_cm = gen_maps.gen_pos_by_name(span_chrom, start_pos);
+                                    let end_cm = gen_maps.gen_pos_by_name(span_chrom, end_pos);
+                                    *span_opt = Some(((end_cm - start_cm).abs(), span_bp.into()));
+                                }
+
+                                let window_idx = idx;
+                                let per_window_cap_window = per_window_caps
+                                    .get(window_idx)
+                                    .copied()
+                                    .unwrap_or(per_window_cap.max(1));
+
+                                let (alignment_cow, phased_target_cow) = if let Some(cache) =
+                                    target_cache.as_ref()
+                                {
+                                    if let Some(Some(entry)) = cache.get(idx) {
+                                        (
+                                            Cow::Borrowed(&entry.alignment),
+                                            Cow::Borrowed(&entry.phased_target),
+                                        )
+                                    } else {
+                                        // Cache miss/failure in read-only path: need reader.
+                                        let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                                        let ref_chrom = ref_window
+                                            .markers
+                                            .chrom_name(ref_chrom_idx)
+                                            .unwrap_or("UNKNOWN");
+                                        let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                                        let end_pos = ref_window
+                                            .markers
+                                            .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                            .pos;
+                                        let chrom_candidates = chrom_variants(ref_chrom);
+                                        // On-demand reader open
+                                        let mut reader = StreamingVcfReader::open(
+                                            target_path,
+                                            gen_maps.clone(),
+                                            streaming_config.clone(),
+                                        ).ok(); // Parallel fallback: ignore errors or return partial?
+                                        let target_window = reader.as_mut().and_then(|r| r.load_window_for_region(
+                                            &chrom_candidates,
+                                            start_pos,
+                                            end_pos,
+                                        ).ok().flatten());
+
+                                        if let Some(target_window) = target_window {
+                                            let alignment = MarkerAlignment::new_with_ref_markers(
+                                                &target_window.genotypes,
+                                                &ref_window.markers,
+                                            );
+                                            let phased_target = target_window.genotypes.into_phased();
+                                            (Cow::Owned(alignment), Cow::Owned(phased_target))
+                                        } else {
+                                            return acc;
+                                        }
+                                    }
+                                } else {
+                                    // No cache: open fresh reader per window (costly but correct for parallel fallback)
+                                    // Ideally we rely on cache.
+                                    let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
+                                    let ref_chrom = ref_window
+                                        .markers
+                                        .chrom_name(ref_chrom_idx)
+                                        .unwrap_or("UNKNOWN");
+                                    let start_pos = ref_window.markers.marker(MarkerIdx::new(0)).pos;
+                                    let end_pos = ref_window
+                                        .markers
+                                        .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
+                                        .pos;
+                                    let chrom_candidates = chrom_variants(ref_chrom);
+                                    let mut reader = StreamingVcfReader::open(
+                                        target_path,
+                                        gen_maps.clone(),
+                                        streaming_config.clone(),
+                                    ).expect("Parallel target reader open failed");
+                                    let target_window = reader.load_window_for_region(
+                                        &chrom_candidates,
+                                        start_pos,
+                                        end_pos,
+                                    ).expect("Parallel target window load failed");
+
+                                    if let Some(target_window) = target_window {
+                                        let alignment = MarkerAlignment::new_with_ref_markers(
+                                            &target_window.genotypes,
+                                            &ref_window.markers,
+                                        );
+                                        let phased_target = target_window.genotypes.into_phased();
+                                        (Cow::Owned(alignment), Cow::Owned(phased_target))
+                                    } else {
+                                        return acc;
+                                    }
+                                };
+                                let alignment = alignment_cow.as_ref();
+                                let phased_target = phased_target_cow.as_ref();
+
+                                // Local window scores buffer
+                                let mut local_window_scores = vec![vec![f32::NEG_INFINITY; n_ref_haps]; batch_len];
+
+                                let k_per_hap = per_window_cap_window
+                                    .saturating_mul(PBWT_PER_WINDOW_MULT)
+                                    .max(PBWT_MIN_PER_HAP)
+                                    .min(PBWT_MAX_PER_HAP)
+                                    .max(1);
+
+                                let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
+                                let use_exact = should_use_exact_prescan(
+                                    n_ref_haps,
+                                    batch_haps.len(),
+                                    phased_target.n_markers(),
+                                );
+                                if use_exact {
+                                    stats.exact_windows_total += 1;
+                                    score_window_batch_exact_packed(
+                                        &batch_haps,
+                                        &phased_target,
+                                        &ref_window.markers,
+                                        ref_columns,
+                                        n_ref_haps,
+                                        &alignment,
+                                        global, // Updates global sum directly in accumulator
+                                        &mut local_window_scores,
+                                    );
+                                } else {
+                                    stats.pbwt_windows_total += 1;
+                                    let diag = score_window_batch_pbwt_packed(
+                                        &batch_haps,
+                                        &phased_target,
+                                        &ref_window.markers,
+                                        ref_columns,
+                                        n_ref_haps,
+                                        &alignment,
+                                        gen_maps,
+                                        k_per_hap,
+                                        step_cm,
+                                        global, // Updates global sum directly in accumulator
+                                        &mut local_window_scores,
+                                    );
+                                    stats.pbwt_sampled_sum += diag.sampled_markers;
+                                    stats.pbwt_markers_sum += diag.total_markers;
+                                    stats.pbwt_sampled_min = stats.pbwt_sampled_min.min(diag.sampled_markers);
+                                    stats.pbwt_sampled_max = stats.pbwt_sampled_max.max(diag.sampled_markers);
+                                    if diag.distinct_gen_pos <= 1
+                                        || (diag.max_gen_pos - diag.min_gen_pos).abs() <= 1e-12
+                                    {
+                                        stats.pbwt_flat_windows += 1;
+                                    }
+                                    if diag.sampled_markers <= 2 {
+                                        stats.pbwt_low_sample_windows += 1;
+                                    }
+                                    if diag.non_finite_gen_pos > 0 {
+                                        stats.pbwt_non_finite_windows += 1;
+                                    }
+                                }
+
+                                let abyss_rank_cutoff =
+                                    compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
+                                for (i, _) in batch_haps.iter().enumerate() {
+                                    for (h, &score) in local_window_scores[i].iter().enumerate() {
+                                        if score > best[i][h] {
+                                            best[i][h] = score;
+                                        }
+                                    }
+
+                                    let abyss_top = select_top_k(&local_window_scores[i], abyss_rank_cutoff);
+                                    for (ref_idx, _) in abyss_top {
+                                        if ref_idx < hits[i].len() {
+                                            hits[i][ref_idx] = hits[i][ref_idx].saturating_add(1);
+                                        }
+                                    }
+                                }
+
+                                let (plan_start, plan_end) = plan
+                                    .io_to_planning_ranges
+                                    .get(window_idx)
+                                    .copied()
+                                    .unwrap_or((0, planning_num_windows.min(1)));
+                                let (io_s, io_e) = window_handoff
+                                    .get(window_idx)
+                                    .copied()
+                                    .unwrap_or((f64::NAN, f64::NAN));
+
+                                // Temporary buffer for distributing scores
+                                let mut temp_planning_scores = vec![Vec::new(); planning_num_windows];
+
+                                for i in 0..batch_len {
+                                    let base_top_m = per_window_cap_window
+                                        .saturating_mul(PBWT_PER_WINDOW_MULT)
+                                        .max(per_window_cap_window)
+                                        .min(n_ref_haps.max(1));
+                                    let (top_m, top) = select_top_k_adaptive_with_support(
+                                        &local_window_scores[i],
+                                        base_top_m,
+                                        per_window_cap_window,
+                                        n_ref_haps,
+                                    );
+                                    stats.adaptive_top_m_calls += 1;
+                                    stats.adaptive_top_m_sum += top_m;
+                                    stats.adaptive_top_m_min = stats.adaptive_top_m_min.min(top_m);
+                                    stats.adaptive_top_m_max = stats.adaptive_top_m_max.max(top_m);
+                                    if top_m > base_top_m {
+                                        stats.adaptive_top_m_boosted += 1;
+                                    } else if top_m < base_top_m {
+                                        stats.adaptive_top_m_reduced += 1;
+                                    }
+
+                                    // Distribute to temp buffer
+                                    distribute_scores_to_planning_bins(
+                                        &top,
+                                        io_s,
+                                        io_e,
+                                        plan_start,
+                                        plan_end,
+                                        &planning_handoff,
+                                        &mut temp_planning_scores,
+                                    );
+
+                                    // Move to sparse accumulator
+                                    for (p, scores) in temp_planning_scores.iter_mut().enumerate() {
+                                        if !scores.is_empty() {
+                                            sparse.push((i, p, std::mem::take(scores)));
+                                        }
+                                    }
+                                }
+
+                                *processed += 1;
+                                acc
+                            },
+                        )
+                        .reduce(
+                            init_accum,
+                            |mut a, mut b| {
+                                // Merge b into a
+                                for (ga, gb) in a.0.iter_mut().zip(b.0.iter()) {
+                                    for (va, vb) in ga.iter_mut().zip(gb.iter()) {
+                                        *va += vb;
+                                    }
+                                }
+                                for (ba, bb) in a.1.iter_mut().zip(b.1.iter()) {
+                                    for (va, vb) in ba.iter_mut().zip(bb.iter()) {
+                                        if *vb > *va {
+                                            *va = *vb;
+                                        }
+                                    }
+                                }
+                                for (ha, hb) in a.2.iter_mut().zip(b.2.iter()) {
+                                    for (va, vb) in ha.iter_mut().zip(hb.iter()) {
+                                        *va += vb;
+                                    }
+                                }
+                                a.3.append(&mut b.3);
+                                a.4 = a.4 + b.4;
+                                if a.5.is_none() {
+                                    a.5 = b.5;
+                                }
+                                a.6 += b.6;
+                                a
+                            },
                         );
-                        let phased_target = target_window.genotypes.into_phased();
-                        (Cow::Owned(alignment), Cow::Owned(phased_target))
-                    };
-                    let alignment = alignment_cow.as_ref();
-                    let phased_target = phased_target_cow.as_ref();
 
-                    for w in window_scores.iter_mut() {
-                        w.fill(f32::NEG_INFINITY);
+                // Apply accumulated results
+                for (i, row) in global_acc.into_iter().enumerate() {
+                    for (h, val) in row.into_iter().enumerate() {
+                        global_scores[i][h] += val;
                     }
-
-                    let k_per_hap = per_window_cap_window
-                        .saturating_mul(PBWT_PER_WINDOW_MULT)
-                        .max(PBWT_MIN_PER_HAP)
-                        .min(PBWT_MAX_PER_HAP)
-                        .max(1);
-
-                    let step_cm = PBWT_SELECT_BLOCK_CM.max(imp_step_cm);
-                    let use_exact = should_use_exact_prescan(
-                        n_ref_haps,
-                        batch_haps.len(),
-                        phased_target.n_markers(),
-                    );
-                    if use_exact {
-                        exact_windows_total = exact_windows_total.saturating_add(1);
-                        score_window_batch_exact_packed(
-                            &batch_haps,
-                            &phased_target,
-                            &ref_window.markers,
-                            ref_columns,
-                            n_ref_haps,
-                            &alignment,
-                            &mut global_scores,
-                            &mut window_scores,
-                        );
-                    } else {
-                        pbwt_windows_total = pbwt_windows_total.saturating_add(1);
-                        let diag = score_window_batch_pbwt_packed(
-                            &batch_haps,
-                            &phased_target,
-                            &ref_window.markers,
-                            ref_columns,
-                            n_ref_haps,
-                            &alignment,
-                            gen_maps,
-                            k_per_hap,
-                            step_cm,
-                            &mut global_scores,
-                            &mut window_scores,
-                        );
-                        pbwt_sampled_sum = pbwt_sampled_sum.saturating_add(diag.sampled_markers);
-                        pbwt_markers_sum = pbwt_markers_sum.saturating_add(diag.total_markers);
-                        pbwt_sampled_min = pbwt_sampled_min.min(diag.sampled_markers);
-                        pbwt_sampled_max = pbwt_sampled_max.max(diag.sampled_markers);
-                        if diag.distinct_gen_pos <= 1
-                            || (diag.max_gen_pos - diag.min_gen_pos).abs() <= 1e-12
-                        {
-                            pbwt_flat_windows = pbwt_flat_windows.saturating_add(1);
-                        }
-                        if diag.sampled_markers <= 2 {
-                            pbwt_low_sample_windows = pbwt_low_sample_windows.saturating_add(1);
-                        }
-                        if diag.non_finite_gen_pos > 0 {
-                            pbwt_non_finite_windows = pbwt_non_finite_windows.saturating_add(1);
+                }
+                for (i, row) in best_acc.into_iter().enumerate() {
+                    for (h, val) in row.into_iter().enumerate() {
+                        if val > best_window_scores[i][h] {
+                            best_window_scores[i][h] = val;
                         }
                     }
-
-                    let abyss_rank_cutoff =
-                        compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
-                    for (i, _) in batch_haps.iter().enumerate() {
-                        for (h, score) in window_scores[i].iter().copied().enumerate() {
-                            if score > best_window_scores[i][h] {
-                                best_window_scores[i][h] = score;
-                            }
-                        }
-
-                        let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
-                        for (ref_idx, _) in abyss_top {
-                            if ref_idx < window_rank_hits[i].len() {
-                                window_rank_hits[i][ref_idx] =
-                                    window_rank_hits[i][ref_idx].saturating_add(1);
-                            }
-                        }
+                }
+                for (i, row) in hits_acc.into_iter().enumerate() {
+                    for (h, val) in row.into_iter().enumerate() {
+                        window_rank_hits[i][h] += val;
                     }
-
-                    // Persist per-window sparse scores for LMS allocator (top-M per window).
-                    let (plan_start, plan_end) = plan
-                        .io_to_planning_ranges
-                        .get(window_idx)
-                        .copied()
-                        .unwrap_or((0, planning_num_windows.min(1)));
-                    let (io_s, io_e) = window_handoff
-                        .get(window_idx)
-                        .copied()
-                        .unwrap_or((f64::NAN, f64::NAN));
-                    for i in 0..batch_len {
-                        let base_top_m = per_window_cap_window
-                            .saturating_mul(PBWT_PER_WINDOW_MULT)
-                            .max(per_window_cap_window)
-                            .min(n_ref_haps.max(1));
-                        let (top_m, top) = select_top_k_adaptive_with_support(
-                            &window_scores[i],
-                            base_top_m,
-                            per_window_cap_window,
-                            n_ref_haps,
-                        );
-                        adaptive_top_m_calls = adaptive_top_m_calls.saturating_add(1);
-                        adaptive_top_m_sum = adaptive_top_m_sum.saturating_add(top_m);
-                        adaptive_top_m_min = adaptive_top_m_min.min(top_m);
-                        adaptive_top_m_max = adaptive_top_m_max.max(top_m);
-                        if top_m > base_top_m {
-                            adaptive_top_m_boosted = adaptive_top_m_boosted.saturating_add(1);
-                        } else if top_m < base_top_m {
-                            adaptive_top_m_reduced = adaptive_top_m_reduced.saturating_add(1);
-                        }
-                        distribute_scores_to_planning_bins(
-                            &top,
-                            io_s,
-                            io_e,
-                            plan_start,
-                            plan_end,
-                            &planning_handoff,
-                            &mut scores_by_window[i],
-                        );
+                }
+                for (i, p, scores) in sparse_acc {
+                    if p < scores_by_window[i].len() {
+                        scores_by_window[i][p].extend(scores);
                     }
+                }
 
-                    window_idx += 1;
-                    if let Some(bb) = telemetry {
-                        bb.set_current_window(window_idx as u64);
-                        bb.add_markers(1);
+                // Update stats variables
+                exact_windows_total += stats_acc.exact_windows_total;
+                pbwt_windows_total += stats_acc.pbwt_windows_total;
+                pbwt_sampled_sum += stats_acc.pbwt_sampled_sum;
+                pbwt_markers_sum += stats_acc.pbwt_markers_sum;
+                pbwt_sampled_min = pbwt_sampled_min.min(stats_acc.pbwt_sampled_min);
+                pbwt_sampled_max = pbwt_sampled_max.max(stats_acc.pbwt_sampled_max);
+                pbwt_flat_windows += stats_acc.pbwt_flat_windows;
+                pbwt_low_sample_windows += stats_acc.pbwt_low_sample_windows;
+                pbwt_non_finite_windows += stats_acc.pbwt_non_finite_windows;
+                adaptive_top_m_calls += stats_acc.adaptive_top_m_calls;
+                adaptive_top_m_sum += stats_acc.adaptive_top_m_sum;
+                adaptive_top_m_min = adaptive_top_m_min.min(stats_acc.adaptive_top_m_min);
+                adaptive_top_m_max = adaptive_top_m_max.max(stats_acc.adaptive_top_m_max);
+                adaptive_top_m_boosted += stats_acc.adaptive_top_m_boosted;
+                adaptive_top_m_reduced += stats_acc.adaptive_top_m_reduced;
+
+                if let Some((cm, bp)) = span_acc {
+                    if window_span_cm.is_none() {
+                        window_span_cm = Some(cm);
+                        window_span_bp = Some(bp);
                     }
+                }
+                window_idx = windows.len(); // Set final window index for consistency checks
+
+                if let Some(bb) = telemetry {
+                    bb.set_current_window(window_idx as u64);
+                    bb.add_markers(processed_acc as u64);
                 }
             }
             ReferenceData::OnDisk { .. } => {
