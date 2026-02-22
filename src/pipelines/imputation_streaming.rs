@@ -686,13 +686,13 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 }
 
 #[inline]
-fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
-    let p = freq.clamp(min_freq, 1.0 - min_freq);
-    // Use log-odds to strongly favor rare allele matches, but clamp to a small
-    // positive epsilon to ensure common-allele matches provide a non-zero tie-breaker
-    // signal (preventing "abyss" filtering where all candidates have score 0).
-    let w = ((1.0 - p) / p).ln();
-    w.max(1e-4)
+fn prescan_match_weight(freq: f32) -> f32 {
+    // Use linear weighting (1 - p) to favor rare alleles without the extreme
+    // exponential scaling of IDF/log-odds. This prevents single rare-allele
+    // matches (which may be errors or chance IBS) from overpowering strong
+    // backbone signals on common variants.
+    // We add a small epsilon to ensure even p=1.0 matches contribute for tie-breaking.
+    (1.0 - freq).max(1e-4)
 }
 
 #[inline]
@@ -1641,7 +1641,6 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
     }
     let resolutions =
         build_ref_typed_marker_resolutions(target_gt.markers(), ref_markers, alignment);
-    let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
     let mut query_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); batch_haps.len()];
     let mut ref_alleles = vec![crate::data::storage::AlleleCode::MISSING.raw(); n_ref_haps];
@@ -1727,7 +1726,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
             if freq <= 0.0 {
                 continue;
             }
-            let weight = prescan_match_weight(freq, min_freq);
+            let weight = prescan_match_weight(freq);
             if weight <= 0.0 {
                 continue;
             }
@@ -1869,8 +1868,6 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     let mut donors_buf: Vec<u32> = Vec::new();
     let mut allele_counts: Vec<u32> = Vec::new();
 
-    let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
-
     for m in 0..n_markers {
         let resolution = resolutions.get(m).copied().flatten();
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
@@ -1943,7 +1940,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let weight = prescan_match_weight(freq);
                 if weight <= 0.0 {
                     continue;
                 }
@@ -2045,7 +2042,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let weight = prescan_match_weight(freq);
                 if weight <= 0.0 {
                     continue;
                 }
@@ -10009,7 +10006,6 @@ mod tests {
         }
         let resolutions =
             build_ref_typed_marker_resolutions(target_gt.markers(), ref_markers, alignment);
-        let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
         let mut query_alleles =
             vec![crate::data::storage::AlleleCode::MISSING.raw(); batch_haps.len()];
@@ -10069,7 +10065,7 @@ mod tests {
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let weight = prescan_match_weight(freq);
                 if weight <= 0.0 {
                     continue;
                 }
@@ -10583,19 +10579,24 @@ mod tests {
 
     #[test]
     fn test_prescan_match_weight_positive() {
-        let min_freq = 0.005;
-        let w_common = prescan_match_weight(0.99, min_freq);
+        let w_common = prescan_match_weight(0.99);
         assert!(w_common > 0.0, "Weight for p=0.99 should be positive, got {}", w_common);
 
-        let w_mid = prescan_match_weight(0.5, min_freq);
+        let w_mid = prescan_match_weight(0.5);
         assert!(w_mid > 0.0, "Weight for p=0.5 should be positive, got {}", w_mid);
 
-        let w_rare = prescan_match_weight(0.01, min_freq);
+        let w_rare = prescan_match_weight(0.01);
+        // Linear weighting:
+        // p=0.01 -> 0.99
+        // p=0.5 -> 0.5
+        // p=0.99 -> 0.01
         assert!(
-            w_rare > w_mid * 100.0,
-            "Rare weight {} should be much larger than mid weight {}",
+            w_rare > w_mid,
+            "Rare weight {} should be larger than mid weight {}",
             w_rare,
             w_mid
         );
+        // Ratio should be around 2x, not 100x.
+        assert!(w_rare < w_mid * 3.0);
     }
 }
