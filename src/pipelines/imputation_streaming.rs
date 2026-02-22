@@ -688,7 +688,11 @@ fn adaptive_sm_donor_k(beam: &RankBeam, n_ref_haps: usize, query: PbwtQueryAllel
 #[inline]
 fn prescan_match_weight(freq: f32, min_freq: f32) -> f32 {
     let p = freq.clamp(min_freq, 1.0 - min_freq);
-    (-p.ln()).max(0.0)
+    // Use log-odds to strongly favor rare allele matches, but clamp to a small
+    // positive epsilon to ensure common-allele matches provide a non-zero tie-breaker
+    // signal (preventing "abyss" filtering where all candidates have score 0).
+    let w = ((1.0 - p) / p).ln();
+    w.max(1e-4)
 }
 
 #[inline]
@@ -1724,7 +1728,6 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
                 continue;
             }
             let weight = prescan_match_weight(freq, min_freq);
-            if m < 5 && targ_idx == 0 { eprintln!("DEBUG: m={} freq={:.4} min={:.4} weight={:.4} targ={}", m, freq, min_freq, weight, targ_idx); }
             if weight <= 0.0 {
                 continue;
             }
@@ -10581,10 +10584,18 @@ mod tests {
     #[test]
     fn test_prescan_match_weight_positive() {
         let min_freq = 0.005;
-        let w1 = prescan_match_weight(1.0, min_freq);
-        assert!(w1 > 0.0, "Weight for p=1.0 should be positive, got {}", w1);
+        let w_common = prescan_match_weight(0.99, min_freq);
+        assert!(w_common > 0.0, "Weight for p=0.99 should be positive, got {}", w_common);
 
         let w_mid = prescan_match_weight(0.5, min_freq);
         assert!(w_mid > 0.0, "Weight for p=0.5 should be positive, got {}", w_mid);
+
+        let w_rare = prescan_match_weight(0.01, min_freq);
+        assert!(
+            w_rare > w_mid * 100.0,
+            "Rare weight {} should be much larger than mid weight {}",
+            w_rare,
+            w_mid
+        );
     }
 }
