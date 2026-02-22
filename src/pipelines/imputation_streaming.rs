@@ -253,9 +253,9 @@ const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
-const SM_MATCH_DONORS: usize = 64;
+const SM_MATCH_DONORS: usize = 32;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
-const SM_MATCH_MIN_DONORS: usize = 16;
+const SM_MATCH_MIN_DONORS: usize = 8;
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
@@ -595,7 +595,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // imputed sites in high LD with the error site.
     // Java Beagle uses ~1e-4. Maintaining a reasonable floor prevents
     // single-marker mismatches from wiping out the correct haplotype.
-    let min_error = (base * 0.5).max(1e-4).min(base);
+    let min_error = (base * 0.25).max(1e-5).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -671,8 +671,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    let floor = 0.001 + 0.04 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.0001, 0.06)
 }
 
 #[inline]
