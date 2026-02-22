@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_emission_prob_is_neutral() {
+    fn test_missing_emission_prob_scales_with_concentration() {
         let match_prob = 0.99f32;
         let mismatch_prob = 0.01f32;
 
@@ -438,13 +438,17 @@ mod tests {
         let c = missing_emission_prob(concentrated, match_prob, mismatch_prob);
         let d = missing_emission_prob(diffuse, match_prob, mismatch_prob);
 
-        // Missing emission should be neutral (0.5 for biallelic) regardless of
-        // target concentration. It must be less than match_prob (to prefer
-        // actual matches) but greater than mismatch_prob.
-        assert!((c - 0.5).abs() < 1e-6);
-        assert!((d - 0.5).abs() < 1e-6);
-        assert!(c < match_prob);
-        assert!(c > mismatch_prob);
+        // Concentrated target: sum(p^2) = 1.0. Emission = match_prob.
+        assert!((c - match_prob).abs() < 1e-6);
+
+        // Diffuse target: sum(p^2) = 0.25+0.25 = 0.5.
+        // Emission = mismatch + (match-mismatch)*0.5 ~ 0.5.
+        let expected_d = mismatch_prob + (match_prob - mismatch_prob) * 0.5;
+        assert!((d - expected_d).abs() < 1e-6);
+
+        // Concentrated should yield higher missing probability (more permissive
+        // of missing ref when we are sure what we have).
+        assert!(c > d);
     }
 
     #[test]
@@ -1381,15 +1385,25 @@ fn missing_emission_prob(
     if n == 0 {
         return 1.0;
     }
-    // Neutral emission for missing reference: assume uniform prior on the
-    // underlying reference allele. This ensures that a definite match (p=match_prob)
-    // is preferred over a missing reference (p=1/n), while a missing reference
-    // is preferred over a definite mismatch (p=mismatch_prob).
+    // Missing reference emission probability:
+    // P(obs | miss) = sum_a P(obs | a) P(a | miss)
     //
-    // Previous behavior used target concentration, which allowed missing reference
-    // to score as high as a perfect match when the target was confident. This
-    // caused the HMM to lose information by selecting non-informative haplotypes.
-    let concentration = 1.0 / n as f32;
+    // Assuming P(a | miss) matches the target's current belief state (concentration),
+    // we get a probability that scales with target confidence.
+    //
+    // If the target is confident (e.g. 1.0 on allele A), concentration is 1.0,
+    // and missing_prob approaches match_prob.
+    // If the target is diffuse (e.g. uniform), concentration is small (1/K),
+    // and missing_prob is lower.
+    //
+    // This heuristic prefers keeping "confident" haplotypes in the beam even if they
+    // hit a missing reference marker, rather than penalizing them.
+    let mut concentration = 0.0f32;
+    for &p in target_probs.as_slice() {
+        if p > 0.0 {
+            concentration += p * p;
+        }
+    }
     mismatch_prob + (match_prob - mismatch_prob) * concentration
 }
 
