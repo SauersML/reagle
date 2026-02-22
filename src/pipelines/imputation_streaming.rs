@@ -586,9 +586,9 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow sharpening below base when typed evidence is strong, but limit
-    // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    // Enforce base error floor to prevent sparse-array collapse on rare variants.
+    // (Previously allowed sharpening below base, but this caused collapse in Perfect LD scenarios)
+    let min_error = base.max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -624,7 +624,8 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    // Fixed: enforce base error floor to prevent sparse-array collapse on rare variants
+    blended.clamp(base.max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -10106,10 +10107,10 @@ mod tests {
             limit,
             out
         );
-        // With sharp observations, it should be below base.
+        // With sharp observations, it should be clamped to base (no sharpening below base).
         assert!(
-            out < base,
-            "expected calibrated error to sharpen below base {}, got {}",
+            (out - base).abs() < 1e-6,
+            "expected calibrated error clamped to base {}, got {}",
             base,
             out
         );
