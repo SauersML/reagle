@@ -586,11 +586,12 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow moderate sharpening (down to 50% of base) but enforce a floor to
-    // prevent sparse-array collapse on rare variants in Perfect LD scenarios.
-    // (Aggressive sharpening to 0.1*base caused collapse; blocking sharpening
-    // entirely degraded R2).
-    let min_error = (base * 0.5).max(1e-6).min(base);
+    // Allow stronger sharpening (down to 10% of base) to capture rare variants
+    // in Perfect LD scenarios (AF collapse), while maintaining a safety floor
+    // to prevent sparse-array numeric collapse.
+    // (Floor of 0.5*base was insufficient to rescue rare variants; 0.1*base
+    // aligns with the natural posterior for clean data).
+    let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -626,8 +627,8 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    // Enforce moderate floor (0.5 * base) to prevent collapse while allowing sharpening.
-    blended.clamp((base * 0.5).max(1e-6), 0.5)
+    // Allow stronger sharpening (0.1 * base) to prevent AF collapse.
+    blended.clamp((base * 0.1).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -10101,15 +10102,15 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening is allowed down to 50% of base.
-        let limit = base * 0.5;
+        // Sharpening is allowed down to 10% of base.
+        let limit = base * 0.1;
         assert!(
             out >= limit,
             "expected calibrated error clamped to limit {}, got {}",
             limit,
             out
         );
-        // With sharp observations, it should be sharpened below base (but above limit).
+        // With sharp observations, it should be sharpened below base.
         // (alpha=0.16, beta=15.84, w=3, r=0) -> 0.16 / 19 = 0.0084
         assert!(
             out < base,
