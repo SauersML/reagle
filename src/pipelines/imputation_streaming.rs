@@ -253,9 +253,9 @@ const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
-const SM_MATCH_DONORS: usize = 16;
+const SM_MATCH_DONORS: usize = 64;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
-const SM_MATCH_MIN_DONORS: usize = 2;
+const SM_MATCH_MIN_DONORS: usize = 16;
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
@@ -588,7 +588,14 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Relaxed sharpening limit from 0.1*base to 0.5*base.
+    // Over-sharpening (e.g. down to 1e-5) makes the HMM brittle to isolated
+    // genotyping errors in otherwise clean windows, causing dosage flips at
+    // imputed sites in high LD with the error site.
+    // Java Beagle uses ~1e-4. Maintaining a reasonable floor prevents
+    // single-marker mismatches from wiping out the correct haplotype.
+    let min_error = (base * 0.5).max(1e-4).min(base);
     posterior.clamp(min_error, 0.5)
 }
 

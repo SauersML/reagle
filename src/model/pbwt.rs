@@ -618,6 +618,16 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
         let n_bins = 3usize;
         self.ensure_capacity(n_bins);
+
+        // Recompute per-word counts from provided bits, as self.word_count1 may be stale/empty
+        // when called from ReferencePbwtImpl which manages its own bit buffers.
+        for w in 0..n_words {
+            let bits = permuted_bits[w];
+            let miss = permuted_missing_bits[w];
+            self.word_count1[w] = bits.count_ones() as u8;
+            self.word_count_miss[w] = miss.count_ones() as u8;
+        }
+
         self.counts[0] = binary_counts[0] as usize;
         self.counts[1] = binary_counts[1] as usize;
         self.counts[2] = binary_counts[2] as usize;
