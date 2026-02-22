@@ -586,12 +586,12 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow stronger sharpening (down to 10% of base) to capture rare variants
+    // Allow stronger sharpening (down to 1% of base) to capture rare variants
     // in Perfect LD scenarios (AF collapse), while maintaining a safety floor
     // to prevent sparse-array numeric collapse.
     // (Floor of 0.5*base was insufficient to rescue rare variants; 0.1*base
     // aligns with the natural posterior for clean data).
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = (base * 0.01).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -624,11 +624,15 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         1.0
     };
     let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let scaled = base * (1.6 - 1.2 * confidence);
+    // Sharpen significantly for high-confidence markers (target 0.05*base)
+    // to ensure rare variants in perfect LD are preserved (prevent AF collapse).
+    // Previous formula (1.6 - 1.2*conf) yielded 0.4*base, which was too loose.
+    // Updated: Use 1.0 - 0.95*conf to target 0.05*base for perfect markers.
+    let scaled = base * (1.0 - 0.95 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    // Allow stronger sharpening (0.1 * base) to prevent AF collapse.
-    blended.clamp((base * 0.1).max(1e-6), 0.5)
+    // Allow stronger sharpening (0.01 * base) to prevent AF collapse.
+    blended.clamp((base * 0.01).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -10102,8 +10106,8 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening is allowed down to 10% of base.
-        let limit = base * 0.1;
+        // Sharpening is allowed down to 1% of base.
+        let limit = base * 0.01;
         assert!(
             out >= limit,
             "expected calibrated error clamped to limit {}, got {}",
