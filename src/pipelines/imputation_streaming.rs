@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -621,10 +621,10 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         1.0
     };
     let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let scaled = base * (1.6 - 1.2 * confidence);
+    let scaled = base * (1.5 - 0.7 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    blended.clamp((base * 0.5).max(1e-6), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -10098,8 +10098,8 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening is allowed down to 10% of base or 1e-6.
-        let limit = base * 0.1;
+        // Sharpening is allowed down to 50% of base or 1e-6.
+        let limit = base * 0.5;
         assert!(
             out >= limit,
             "expected calibrated error clamped to limit {}, got {}",
