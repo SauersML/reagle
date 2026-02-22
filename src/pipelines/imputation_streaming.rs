@@ -588,7 +588,14 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // UPDATE: Relaxed sharpening limit from 0.1*base to 0.5*base.
+    // Over-sharpening (e.g. down to 1e-5) makes the HMM brittle to isolated
+    // genotyping errors in otherwise clean windows, causing dosage flips at
+    // imputed sites in high LD with the error site (the "Perfect LD trap").
+    // Java Beagle uses ~1e-4. Maintaining a reasonable floor prevents
+    // single-marker mismatches from wiping out the correct haplotype.
+    let min_error = (base * 0.5).max(1e-5).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
