@@ -2386,13 +2386,11 @@ struct PrescanTargetEntry {
 }
 
 fn trim_alignment_for_prescan_cache(
-    mut alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
+    alignment: MarkerAlignment<AnyMarkerSpace, RefWindowSpace>,
 ) -> MarkerAlignment<AnyMarkerSpace, RefWindowSpace> {
-    // Prescan scoring only uses target_to_ref + reverse_map_allele (allele_mappings).
-    // Dropping ref_to_target avoids storing a second large mapping that is unused
-    // during prescan and materially increases cache memory.
-    alignment.ref_to_target.clear();
-    alignment.ref_to_target.shrink_to_fit();
+    // Keep ref_to_target because score_window_batch_* functions rely on it
+    // via build_ref_typed_marker_resolutions to avoid expensive/fragile positional
+    // fallback logic. The memory cost is acceptable (one Option<MarkerIdx> per ref marker).
     alignment
 }
 
@@ -3082,6 +3080,17 @@ fn build_imputation_plan(
                 packed_columns,
                 ..
             } => {
+                // Use a single reader for sequential processing to avoid overhead/errors
+                let mut fallback_reader = if cache_ready {
+                    None
+                } else {
+                    Some(StreamingVcfReader::open(
+                        target_path,
+                        gen_maps.clone(),
+                        streaming_config.clone(),
+                    )?)
+                };
+
                 let init_accum = || {
                     (
                         vec![vec![0.0f32; n_ref_haps]; batch_len], // global_scores
@@ -3096,11 +3105,11 @@ fn build_imputation_plan(
 
                 let (global_acc, best_acc, hits_acc, sparse_acc, stats_acc, span_acc, processed_acc) =
                     windows
-                        .par_iter()
-                        .zip(packed_columns.par_iter())
+                        .iter()
+                        .zip(packed_columns.iter())
                         .enumerate()
                         .fold(
-                            init_accum,
+                            init_accum(),
                             |mut acc, (idx, (ref_window, ref_columns))| {
                                 let (
                                     global,
@@ -3148,7 +3157,6 @@ fn build_imputation_plan(
                                             Cow::Borrowed(&entry.phased_target),
                                         )
                                     } else {
-                                        // Cache miss/failure in read-only path: need reader.
                                         let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                                         let ref_chrom = ref_window
                                             .markers
@@ -3160,17 +3168,13 @@ fn build_imputation_plan(
                                             .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
                                             .pos;
                                         let chrom_candidates = chrom_variants(ref_chrom);
-                                        // On-demand reader open
-                                        let mut reader = StreamingVcfReader::open(
-                                            target_path,
-                                            gen_maps.clone(),
-                                            streaming_config.clone(),
-                                        ).ok(); // Parallel fallback: ignore errors or return partial?
-                                        let target_window = reader.as_mut().and_then(|r| r.load_window_for_region(
-                                            &chrom_candidates,
-                                            start_pos,
-                                            end_pos,
-                                        ).ok().flatten());
+
+                                        let target_window = fallback_reader.as_mut()
+                                            .and_then(|r| r.load_window_for_region(
+                                                &chrom_candidates,
+                                                start_pos,
+                                                end_pos,
+                                            ).ok().flatten());
 
                                         if let Some(target_window) = target_window {
                                             let alignment = MarkerAlignment::new_with_ref_markers(
@@ -3184,8 +3188,6 @@ fn build_imputation_plan(
                                         }
                                     }
                                 } else {
-                                    // No cache: open fresh reader per window (costly but correct for parallel fallback)
-                                    // Ideally we rely on cache.
                                     let ref_chrom_idx = ref_window.markers.marker(MarkerIdx::new(0)).chrom;
                                     let ref_chrom = ref_window
                                         .markers
@@ -3197,16 +3199,13 @@ fn build_imputation_plan(
                                         .marker(MarkerIdx::new((n_ref_markers - 1) as u32))
                                         .pos;
                                     let chrom_candidates = chrom_variants(ref_chrom);
-                                    let mut reader = StreamingVcfReader::open(
-                                        target_path,
-                                        gen_maps.clone(),
-                                        streaming_config.clone(),
-                                    ).expect("Parallel target reader open failed");
-                                    let target_window = reader.load_window_for_region(
-                                        &chrom_candidates,
-                                        start_pos,
-                                        end_pos,
-                                    ).expect("Parallel target window load failed");
+
+                                    let target_window = fallback_reader.as_mut()
+                                        .and_then(|r| r.load_window_for_region(
+                                            &chrom_candidates,
+                                            start_pos,
+                                            end_pos,
+                                        ).ok().flatten());
 
                                     if let Some(target_window) = target_window {
                                         let alignment = MarkerAlignment::new_with_ref_markers(
@@ -3353,36 +3352,6 @@ fn build_imputation_plan(
 
                                 *processed += 1;
                                 acc
-                            },
-                        )
-                        .reduce(
-                            init_accum,
-                            |mut a, mut b| {
-                                // Merge b into a
-                                for (ga, gb) in a.0.iter_mut().zip(b.0.iter()) {
-                                    for (va, vb) in ga.iter_mut().zip(gb.iter()) {
-                                        *va += vb;
-                                    }
-                                }
-                                for (ba, bb) in a.1.iter_mut().zip(b.1.iter()) {
-                                    for (va, vb) in ba.iter_mut().zip(bb.iter()) {
-                                        if *vb > *va {
-                                            *va = *vb;
-                                        }
-                                    }
-                                }
-                                for (ha, hb) in a.2.iter_mut().zip(b.2.iter()) {
-                                    for (va, vb) in ha.iter_mut().zip(hb.iter()) {
-                                        *va += vb;
-                                    }
-                                }
-                                a.3.append(&mut b.3);
-                                a.4 = a.4 + b.4;
-                                if a.5.is_none() {
-                                    a.5 = b.5;
-                                }
-                                a.6 += b.6;
-                                a
                             },
                         );
 
@@ -3698,6 +3667,11 @@ fn build_imputation_plan(
                 window_handoff.len()
             )));
         }
+
+        // Aggregate sparse scores from parallel chunks (merging duplicates).
+        scores_by_window
+            .par_iter_mut()
+            .for_each(|m| aggregate_window_sparse_scores(m));
 
         let num_windows = planning_handoff.len();
         let per_window_caps_used = planning_window_caps.as_slice();
