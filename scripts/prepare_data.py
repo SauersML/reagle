@@ -145,9 +145,15 @@ def _compress_panel_if_needed(output_dir):
     if not os.path.exists(panel_vcf):
         return
     print(f"Compressing large panel artifact: {panel_vcf} -> {panel_vcfgz}")
-    subprocess.check_call(["bcftools", "view", panel_vcf, "-Oz", "-o", panel_vcfgz])
-    subprocess.check_call(["bcftools", "index", "-f", panel_vcfgz])
-    os.remove(panel_vcf)
+    try:
+        subprocess.check_call(["bcftools", "view", panel_vcf, "-Oz", "-o", panel_vcfgz])
+        subprocess.check_call(["bcftools", "index", "-f", panel_vcfgz])
+        os.remove(panel_vcf)
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: Failed to compress/index panel artifact {panel_vcf}: {e}")
+        # Ensure we don't leave a half-baked compressed file
+        if os.path.exists(panel_vcfgz):
+            os.remove(panel_vcfgz)
 
 
 def _clear_convert_genome_cache():
@@ -517,7 +523,6 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         source_vcf,
-        ref_hg38_fasta,
         truth_raw_vcf,
         "--assembly", "GRCh38",
         "--format", "vcf",
@@ -634,20 +639,58 @@ def run_conversion(input_path, output_vcf, panel_path):
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
 
+    # Use absolute paths to avoid any directory confusion in the external tool
+    raw_file_abs = os.path.abspath(raw_file)
+    panel_path_abs = os.path.abspath(panel_path)
+    temp_genotypes = os.path.join(temp_output_dir, "genotypes.vcf")
+    temp_genotypes_abs = os.path.abspath(temp_genotypes)
+
     cmd = [
         "convert_genome",
-        raw_file,
-        ref_hg38_fasta,
-        "--output-dir", temp_output_dir,
+        raw_file_abs,
+        temp_genotypes_abs,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
-        "--panel", panel_path,
+        "--panel", panel_path_abs,
     ]
 
+    # convert_genome needs open file limits sometimes
     print(f"Running: {' '.join(cmd)}")
-    cmd_str = " ".join(shlex.quote(part) for part in cmd)
-    subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+    try:
+        # Run via bash to set ulimit if possible, though python subprocess usually inherits
+        # But ulimit is a shell builtin. We can try setting soft limit in python.
+        import resource
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+        except ValueError:
+            pass # Could not set limit, proceed anyway
+
+        subprocess.check_call(cmd)
+
+        # Verify output VCF integrity before proceeding
+        if os.path.exists(temp_genotypes):
+            size = os.path.getsize(temp_genotypes)
+            print(f"Generated VCF size: {size} bytes")
+            if size == 0:
+                 # Check if convert_genome wrote to stdout/stderr or failed silently
+                 raise RuntimeError(f"convert_genome produced an empty file: {temp_genotypes}")
+
+            # Check header
+            with open(temp_genotypes, 'r') as f:
+                header = f.readline()
+                print(f"VCF Header (first line): {header.strip()}")
+                if not header.startswith("##fileformat=VCF"):
+                     # Read a bit more to see error message
+                     content = header + f.read(1000)
+                     raise RuntimeError(f"convert_genome produced invalid VCF output:\n{content}")
+        else:
+             raise RuntimeError(f"convert_genome did not produce output file: {temp_genotypes}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"convert_genome failed with exit code {e.returncode}")
+        raise e
+
     # After this command succeeds, convert_genome has written its outputs under
     # convert_genome_array_out/. We deliberately do not delete panel.vcf here
     # so quality assessment scripts can inspect or reuse it.
