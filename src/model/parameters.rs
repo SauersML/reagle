@@ -162,9 +162,10 @@ impl ModelParams {
     /// Note: -expm1(x) = 1 - exp(x), which is more numerically stable
     pub fn p_recomb(&self, gen_dist_cm: f64) -> f32 {
         let c = -(self.recomb_intensity as f64);
-        // Intensity is scaled for cM (0.04 * Ne / n), not Morgans (4 * Ne / n).
-        // No division by 100 needed.
-        let p = (-f64::exp_m1(c * gen_dist_cm)) as f32;
+        // P(recomb) = 1 - e^(-4 * Ne * r * d / 100)
+        // We use the approximation 4 * Ne * r / 100 as the intensity.
+        // The factor 100 is empirical to scale cM to probability space correctly for this HMM.
+        let p = (-f64::exp_m1(c * gen_dist_cm / 100.0)) as f32;
         p.max(Self::MIN_RECOMB_PROB)
     }
 
@@ -267,8 +268,10 @@ impl ParamEstimates {
         if self.sum_gen_dist <= 1e-9 {
             return None;
         }
-        // Return intensity per cM (no *100.0 scaling needed, matches p_recomb input)
-        Some((self.sum_expected_switches / self.sum_gen_dist) as f32)
+        // Scale by 100.0 because p_recomb divides by 100.0.
+        // If actual rate is switches/dist, we need input param X such that X/100 = rate.
+        // So X = 100 * rate.
+        Some((self.sum_expected_switches / self.sum_gen_dist) as f32 * 100.0)
     }
 
     /// Estimate mismatch probability
@@ -434,12 +437,13 @@ mod tests {
         let mut e = ParamEstimates::new();
         // 1 switch over 1.0 cM genetic distance
         // Intensity should be 1 switch / 1.0 cM = 1.0
+        // Scaled intensity for ModelParams (which divides by 100) should be 100.0
         e.add_switch(1.0, 1.0);
 
         let intensity = e.recomb_intensity().unwrap();
         assert!(
-            (intensity - 1.0).abs() < 0.001,
-            "Expected 1.0, got {}",
+            (intensity - 100.0).abs() < 0.001,
+            "Expected 100.0, got {}",
             intensity
         );
     }
