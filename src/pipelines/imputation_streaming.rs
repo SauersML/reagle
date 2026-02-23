@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = 1e-6f32;
     posterior.clamp(min_error, 0.5)
 }
 
@@ -624,7 +624,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    blended.clamp(1e-6, 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -4317,19 +4317,23 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_pool = plan.n_ref_haps.max(1);
         let n_target_haps = n_target_samples.saturating_mul(2);
+        // Use a higher effective population size (Ne) for imputation.
+        // Higher Ne increases transition probability, allowing the HMM to
+        // switch templates more freely to match rare variants or short tracts.
+        let default_ne = 1_000_000.0;
         self.params = crate::model::parameters::ModelParams::for_imputation(
             n_ref_pool,
-            self.config.ne,
+            default_ne,
             self.config.err,
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
+        let impute_recomb_intensity = (0.04 * default_ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
         eprintln!(
-            "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_transition_haps={})",
+            "Imputation recomb_intensity: {:.6} (source=fixed-ne, n_ref_haps={}, n_target_haps={}, n_transition_haps={})",
             self.params.recomb_intensity, n_ref_pool, n_target_haps, n_ref_pool,
         );
         // Do not inherit phasing mismatch estimates for imputation. Imputation
