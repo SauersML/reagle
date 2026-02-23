@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = base.max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -624,7 +624,9 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    // Enforce base error rate as floor to prevent overconfidence (sharpening)
+    // on sparse arrays, which can cause sticky-state errors.
+    blended.max(base).clamp(1e-6, 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -2711,6 +2713,16 @@ fn build_imputation_plan(
             "Reference window scanning found no haplotypes".to_string(),
         ));
     }
+    // Auto-adjust window_top_k if we have enough memory for full panel.
+    // If the configured per-window capacity allows the full panel, we should
+    // disable aggressive abyss pruning to ensure all reference haplotypes are
+    // available to the HMM (preventing premature collapse to incorrect states).
+    let effective_window_top_k = if per_window_cap >= n_ref_haps {
+        n_ref_haps
+    } else {
+        window_top_k
+    };
+
     plan.n_ref_haps = n_ref_haps;
     let window_handoff = ref_data.window_handoff();
     let per_window_caps = ref_data.per_window_caps();
@@ -3189,7 +3201,7 @@ fn build_imputation_plan(
                     }
 
                     let abyss_rank_cutoff =
-                        compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
+                        compute_abyss_rank_cutoff(n_ref_haps, effective_window_top_k.max(1));
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
@@ -3426,7 +3438,7 @@ fn build_imputation_plan(
                     }
 
                     let abyss_rank_cutoff =
-                        compute_abyss_rank_cutoff(n_ref_haps, window_top_k.max(1));
+                        compute_abyss_rank_cutoff(n_ref_haps, effective_window_top_k.max(1));
                     for (i, _) in batch_haps.iter().enumerate() {
                         for (h, score) in window_scores[i].iter().copied().enumerate() {
                             if score > best_window_scores[i][h] {
@@ -3525,7 +3537,12 @@ fn build_imputation_plan(
                 let mut abyss_count = 0usize;
                 for h in 0..n_ref_haps {
                     let score = best_window_scores[i][h];
-                    if window_rank_hits[i][h] == 0 || !score.is_finite() || score <= 0.0 {
+                    let keep = if effective_window_top_k >= n_ref_haps {
+                        true
+                    } else {
+                        window_rank_hits[i][h] > 0 && score.is_finite() && score > 0.0
+                    };
+                    if !keep {
                         abyss.set(h, true);
                         abyss_count += 1;
                     }
