@@ -264,7 +264,7 @@ const REF_PANEL_RAM_FRACTION: f64 = 0.75;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
-const ORIENTATION_ETA_MAX: f64 = 0.20;
+const ORIENTATION_ETA_MAX: f64 = 0.05;
 const ORIENTATION_ETA_MIN: f64 = 1e-8;
 const ORIENTATION_ETA_EM_ITERS: usize = 2;
 const ORIENTATION_DECISION_MARGIN: f64 = 0.02;
@@ -664,10 +664,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    // Reduced floor to allow local HMM evidence to dominate.
-    // Over-smoothing towards panel prior causes R² regression on rare variants.
-    let floor = 0.001 + 0.01 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.02)
+    let floor = 0.002 + 0.08 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
 #[inline]
