@@ -588,7 +588,12 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Do not sharpen below base (population mutation rate).
+    // Aggressive sharpening (e.g. 0.1 * base) causes "Perfect LD traps"
+    // where a single genotyped mismatch (due to error or rare recombination)
+    // decimates the correct haplotype path.
+    let min_error = base;
     posterior.clamp(min_error, 0.5)
 }
 
@@ -621,10 +626,13 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         1.0
     };
     let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let scaled = base * (1.6 - 1.2 * confidence);
+    // Don't scale down below base for high confidence.
+    // Range: [base, 1.6 * base]
+    let scaled = base * (1.6 - 0.6 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    // Clamp to base to prevent sharpening below mutation rate
+    blended.clamp(base, 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
