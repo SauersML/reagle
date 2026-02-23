@@ -241,7 +241,7 @@ fn collect_carriers_for_allele(
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_PER_WINDOW_MULT: usize = 12;
+const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
@@ -664,7 +664,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.005 + 0.04 * missing_ramp;
+    let floor = 0.0001 + 0.04 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.0001, 0.12)
 }
 
