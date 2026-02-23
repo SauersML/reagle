@@ -4317,23 +4317,19 @@ impl crate::pipelines::ImputationPipeline {
 
         let n_ref_pool = plan.n_ref_haps.max(1);
         let n_target_haps = n_target_samples.saturating_mul(2);
-        // Use a higher effective population size (Ne) for imputation.
-        // Higher Ne increases transition probability, allowing the HMM to
-        // switch templates more freely to match rare variants or short tracts.
-        let default_ne = 1_000_000.0;
         self.params = crate::model::parameters::ModelParams::for_imputation(
             n_ref_pool,
-            default_ne,
+            self.config.ne,
             self.config.err,
         );
         // Imputation transitions copy from the reference panel only; target batch
         // size must not alter Li-Stephens transition physics.
-        let impute_recomb_intensity = (0.04 * default_ne / n_ref_pool as f32)
+        let impute_recomb_intensity = (0.04 * self.config.ne / n_ref_pool as f32)
             .min(ModelParams::MAX_RECOMB_INTENSITY)
             .max(1e-6);
         self.params.recomb_intensity = impute_recomb_intensity;
         eprintln!(
-            "Imputation recomb_intensity: {:.6} (source=fixed-ne, n_ref_haps={}, n_target_haps={}, n_transition_haps={})",
+            "Imputation recomb_intensity: {:.6} (source=config-ne, n_ref_haps={}, n_target_haps={}, n_transition_haps={})",
             self.params.recomb_intensity, n_ref_pool, n_target_haps, n_ref_pool,
         );
         // Do not inherit phasing mismatch estimates for imputation. Imputation

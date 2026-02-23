@@ -1706,26 +1706,18 @@ fn apply_marker_prior_smoothing(
     } else {
         1.0
     };
-    let sparsity_boost = (1.0 - active_ratio).powi(2);
     let truncation_error = (1.0 - active_ratio).clamp(0.0, 1.0);
     // Approximation error combines structural-missingness and truncation:
     //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
     // This term captures model/subset limitations, not map distance.
     let approximation_error =
         (1.0 - (1.0 - missing_mass) * (1.0 - truncation_error)).clamp(0.0, 0.9999);
-    // Combine map and approximation uncertainty via independent-failure union:
-    //   combined_error = 1 - (1-dist_error)*(1-approx_error)
-    // so either axis can activate extra regularization.
-    //
-    // This keeps the decomposition explicit:
-    // - distance governs physical information decay
-    // - diagnostics govern approximation-risk inflation
-    let combined_error =
-        (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
+
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
-    let adaptive_panel_mix =
-        (0.10 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.0);
+    //
+    // Disabled (0.0) to prioritize local HMM accuracy over panel smoothing.
+    let adaptive_panel_mix = 0.0f32;
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
