@@ -251,13 +251,13 @@ const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
-const IMPUTE_RAM_FRACTION: f64 = 0.8;
+const SMALL_PANEL_FULL_CAP_HAPS: usize = 200;
+const AUTO_STATE_CAP: usize = 800;
+const MAX_RAM_USAGE_FRACTION: f64 = 0.85;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
-const SMALL_PANEL_FULL_CAP_HAPS: usize = 16384;
-const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
 const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
 const REF_PANEL_RAM_FRACTION: f64 = 0.75;
@@ -501,7 +501,7 @@ fn estimate_state_budget(
     if per_state_bytes == 0 {
         return 0;
     }
-    let budget = (available_bytes as f64 * IMPUTE_RAM_FRACTION) as u64;
+    let budget = (available_bytes as f64 * MAX_RAM_USAGE_FRACTION) as u64;
     let per_thread = budget / n_threads.max(1) as u64;
     let safe_bytes = (per_thread as f64 * STATE_BUDGET_SAFETY) as u64;
     (safe_bytes as usize) / per_state_bytes
@@ -2357,38 +2357,32 @@ fn compute_per_window_cap(
     n_target_markers: usize,
     available_bytes: u64,
     n_threads: usize,
-    safe_bytes_per_thread: u64,
-    force_full_panel: bool,
+    requested_states: usize,
 ) -> usize {
-    if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS {
-        return n_ref_haps.max(1);
-    }
-    let mut per_window_cap_window = if force_full_panel {
-        n_ref_haps.max(1)
+    let per_state_bytes = estimate_per_state_bytes(n_ref_markers, n_target_markers);
+    let mem_cap = if per_state_bytes == 0 {
+        0
     } else {
-        let per_state_bytes = estimate_per_state_bytes(n_ref_markers, n_target_markers);
-        let mut cap = if per_state_bytes == 0 {
-            0
-        } else {
-            let full_panel_bytes = per_state_bytes
-                .saturating_mul(n_ref_haps)
-                .saturating_mul(n_threads.max(1));
-            let can_fit_full_panel = available_bytes > 0
-                && full_panel_bytes as f64 <= (available_bytes as f64 * FULL_PANEL_RAM_FRACTION);
-            if can_fit_full_panel {
-                n_ref_haps
-            } else {
-                (safe_bytes_per_thread as usize) / per_state_bytes
-            }
-        };
-        if cap == 0 {
-            cap = 1;
-        }
-        cap
+        let budget = (available_bytes as f64 * MAX_RAM_USAGE_FRACTION) as u64;
+        let per_thread = budget / n_threads.max(1) as u64;
+        let safe_bytes = (per_thread as f64 * STATE_BUDGET_SAFETY) as u64;
+        (safe_bytes as usize) / per_state_bytes
+    }
+    .max(1);
+
+    let logic_cap = if requested_states > 0 {
+        // User requested specific state count; use it if it fits in memory.
+        requested_states
+    } else if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS {
+        // Small panels: force full panel to avoid approximation noise.
+        n_ref_haps
+    } else {
+        // Auto: use memory capacity but clamp to reasonable upper bound
+        // to preserve Abyss denoising benefits on medium panels.
+        mem_cap.min(AUTO_STATE_CAP)
     };
-    let cap = n_ref_haps.max(1);
-    per_window_cap_window = per_window_cap_window.min(cap).max(1);
-    per_window_cap_window
+
+    logic_cap.min(mem_cap).min(n_ref_haps).max(1)
 }
 
 fn count_target_markers_in_ref_window<Space>(
@@ -2417,8 +2411,7 @@ fn prepare_reference_data(
     target_positions: &TargetMarkerIndex,
     available_bytes: u64,
     n_threads: usize,
-    safe_bytes_per_thread: u64,
-    force_full_panel: bool,
+    requested_states: usize,
 ) -> Result<ReferenceData> {
     let memory_budget = if available_bytes == 0 {
         0u64
@@ -2505,8 +2498,7 @@ fn prepare_reference_data(
                 n_target_markers_window,
                 available_bytes,
                 n_threads,
-                safe_bytes_per_thread,
-                force_full_panel,
+                requested_states,
             );
             per_window_caps.push(per_window_cap_window);
 
@@ -2712,6 +2704,14 @@ fn build_imputation_plan(
         ));
     }
     plan.n_ref_haps = n_ref_haps;
+    // Heuristic: for small panels, disable Abyss approximation (set core = full)
+    // to maximize accuracy. This restores behavior for panels <= 5000 haplotypes.
+    let window_top_k = if n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS {
+        n_ref_haps
+    } else {
+        window_top_k
+    };
+
     let window_handoff = ref_data.window_handoff();
     let per_window_caps = ref_data.per_window_caps();
     let (planning_handoff, io_to_planning_ranges) =
@@ -4204,14 +4204,6 @@ impl crate::pipelines::ImputationPipeline {
             avail_bytes / (1024 * 1024)
         );
 
-        let safe_bytes_per_thread = if n_threads == 0 {
-            0u64
-        } else {
-            let budget = (avail_bytes as f64 * IMPUTE_RAM_FRACTION) as u64;
-            let per_thread = budget / n_threads as u64;
-            (per_thread as f64 * STATE_BUDGET_SAFETY) as u64
-        };
-        let prescan_force_full_panel = avail_bytes < MIN_AVAIL_BYTES_FOR_PLANNING;
         if let Some(bb) = &self.telemetry {
             bb.set_stage(crate::utils::telemetry::Stage::ImputationPrescan);
             bb.set_producer_stage(crate::utils::telemetry::Stage::ImputationPrescan);
@@ -4224,8 +4216,7 @@ impl crate::pipelines::ImputationPipeline {
             &target_positions_map,
             if force_full_panel { 0 } else { avail_bytes },
             n_threads,
-            safe_bytes_per_thread,
-            prescan_force_full_panel,
+            self.config.phase_states,
         )?;
 
         match &ref_data {
@@ -6146,7 +6137,7 @@ impl crate::pipelines::ImputationPipeline {
         let avail_bytes = crate::utils::memory::available_memory_bytes().unwrap_or(0);
         if avail_bytes >= MIN_AVAIL_BYTES_FOR_PLANNING {
             let hmm_budget_bytes =
-                (avail_bytes as f64 * IMPUTE_RAM_FRACTION * STATE_BUDGET_SAFETY) as u64;
+                (avail_bytes as f64 * MAX_RAM_USAGE_FRACTION * STATE_BUDGET_SAFETY) as u64;
             let per_job_bytes =
                 estimate_hmm_job_bytes(per_window_cap_local, n_ref_markers, target_win.n_markers());
             if per_job_bytes > 0 {
