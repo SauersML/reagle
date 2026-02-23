@@ -626,7 +626,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let blended = 0.7 * scaled + 0.3 * residual;
     // Enforce base error rate as floor to prevent overconfidence (sharpening)
     // on sparse arrays, which can cause sticky-state errors.
-    blended.clamp(1e-6, 0.5)
+    blended.max(base).clamp(1e-6, 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
