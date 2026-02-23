@@ -420,6 +420,8 @@ const INVALID_ALLELE: u8 = 254;
 const REDUCTION_SPARSE_MAX_MARKERS: usize = 1024;
 const REDUCTION_SPARSE_HET_FRAC_NUM: usize = 3;
 const REDUCTION_SPARSE_HET_FRAC_DEN: usize = 4;
+const SMALL_PANEL_FULL_CAP_HAPS: usize = 5000;
+
 struct RefAlleleProvider<'a, TargetSpace = AnyMarkerSpace, RefSpace = AnyMarkerSpace> {
     ref_gt: GenotypeView<'a, TargetSpace, RefSpace>,
     threaded_haps: &'a ThreadedHaps<CombinedHapSpace>,
@@ -656,14 +658,14 @@ fn build_sampling_points(
     sampling
 }
 
-fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+fn select_top_k(scores: &[f32], k: usize, allow_zero: bool) -> Vec<(usize, f32)> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
     let mut ranked: Vec<(usize, f32)> = scores
         .iter()
         .enumerate()
-        .filter(|&(_, &s)| s.is_finite() && s > 0.0)
+        .filter(|&(_, &s)| s.is_finite() && (s > 0.0 || allow_zero))
         .map(|(i, &s)| (i, s))
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -774,7 +776,7 @@ fn build_sparse_scores(
 
     for (w, list) in window_scores.iter().enumerate() {
         for &(hap, score) in list.iter() {
-            if score <= 0.0 || !score.is_finite() {
+            if !score.is_finite() {
                 continue;
             }
             if hap < abyss.len() && abyss[hap] {
@@ -4952,13 +4954,13 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                 if window_scores_buf.len() < batch_len {
                     let needed = batch_len - window_scores_buf.len();
                     window_scores_buf
-                        .extend((0..needed).map(|_| vec![f32::NEG_INFINITY; n_ref_haps]));
+                        .extend((0..needed).map(|_| vec![0.0; n_ref_haps]));
                 }
                 for row in window_scores_buf.iter_mut().take(batch_len) {
                     if row.len() != n_ref_haps {
-                        row.resize(n_ref_haps, f32::NEG_INFINITY);
+                        row.resize(n_ref_haps, 0.0);
                     } else {
-                        row.fill(f32::NEG_INFINITY);
+                        row.fill(0.0);
                     }
                 }
 
@@ -4984,10 +4986,14 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                     .saturating_mul(PBWT_PER_WINDOW_MULT)
                     .max(per_window_cap)
                     .min(n_ref_haps.max(1));
+                let allow_zero = n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS;
                 for (i, &hap_idx) in batch_haps_buf.iter().enumerate() {
-                    let top_m =
-                        adaptive_prescan_top_m(&window_scores_buf[i], base_top_m, n_ref_haps);
-                    let top = select_top_k(&window_scores_buf[i], top_m);
+                    let top_m = if allow_zero {
+                        base_top_m
+                    } else {
+                        adaptive_prescan_top_m(&window_scores_buf[i], base_top_m, n_ref_haps)
+                    };
+                    let top = select_top_k(&window_scores_buf[i], top_m, allow_zero);
                     scores_by_window_by_hap[hap_idx].push(top);
                 }
 
@@ -13524,7 +13530,7 @@ mod tests {
         );
 
         let hero_score = window_scores[0][hero_hap_idx];
-        let top = select_top_k(&window_scores[0], 15);
+        let top = select_top_k(&window_scores[0], 15, false);
         let in_top = top.iter().any(|(h, _)| *h == hero_hap_idx);
         println!(
             "[prescan score test] top={:?}",
@@ -13630,7 +13636,7 @@ mod tests {
                 None,
             );
             for hap_idx in 0..2 {
-                let top = select_top_k(&window_scores[hap_idx], 160.min(n_ref_haps.max(1)));
+                let top = select_top_k(&window_scores[hap_idx], 160.min(n_ref_haps.max(1)), false);
                 scores_by_window_by_hap[hap_idx].push(top);
             }
         }

@@ -251,7 +251,7 @@ const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
-const SMALL_PANEL_FULL_CAP_HAPS: usize = 200;
+const SMALL_PANEL_FULL_CAP_HAPS: usize = 5000;
 const AUTO_STATE_CAP: usize = 800;
 const MAX_RAM_USAGE_FRACTION: f64 = 0.85;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
@@ -1218,7 +1218,7 @@ fn aggregate_window_sparse_scores(window_scores: &mut [Vec<(usize, f32)>]) {
         }
         let mut acc: HashMap<usize, f32> = HashMap::with_capacity(ws.len() * 2);
         for &(hap, score) in ws.iter() {
-            if score.is_finite() && score > 0.0 {
+            if score.is_finite() {
                 acc.entry(hap).and_modify(|s| *s += score).or_insert(score);
             }
         }
@@ -1237,7 +1237,7 @@ fn build_sparse_scores(
 
     for (w, list) in window_scores.iter().enumerate() {
         for &(hap, score) in list.iter() {
-            if score <= 0.0 || !score.is_finite() {
+            if !score.is_finite() {
                 continue;
             }
             // BitSlice::get returns Option<BitRef>, deref to bool
@@ -1301,6 +1301,7 @@ fn select_top_k_adaptive_with_support(
     base_top_m: usize,
     per_window_cap_window: usize,
     n_ref_haps: usize,
+    allow_zero: bool,
 ) -> (usize, Vec<(usize, f32)>) {
     if scores.is_empty() {
         let top_m = per_window_cap_window.max(1).min(n_ref_haps.max(1));
@@ -1313,10 +1314,15 @@ fn select_top_k_adaptive_with_support(
         BinaryHeap::with_capacity(upper_k.saturating_add(1));
     let mut support = 0usize;
     for (idx, &score) in scores.iter().enumerate() {
-        if !score.is_finite() || score <= 0.0 {
+        if !score.is_finite() {
             continue;
         }
-        support = support.saturating_add(1);
+        if score > 0.0 {
+            support = support.saturating_add(1);
+        } else if !allow_zero {
+            continue;
+        }
+
         let candidate = RankedScore { idx, score };
         if heap.len() < upper_k {
             heap.push(Reverse(candidate));
@@ -3013,11 +3019,12 @@ fn build_imputation_plan(
         for i in 0..batch_len {
             if global_scores[i].len() != n_ref_haps {
                 global_scores[i] = vec![0.0f32; n_ref_haps];
-                window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
+                window_scores[i] = vec![0.0f32; n_ref_haps];
                 best_window_scores[i] = vec![f32::NEG_INFINITY; n_ref_haps];
                 window_rank_hits[i] = vec![0u32; n_ref_haps];
             } else {
                 global_scores[i].fill(0.0);
+                window_scores[i].fill(0.0);
                 best_window_scores[i].fill(f32::NEG_INFINITY);
                 window_rank_hits[i].fill(0);
             }
@@ -3129,7 +3136,8 @@ fn build_imputation_plan(
                     let phased_target = phased_target_cow.as_ref();
 
                     for w in window_scores.iter_mut() {
-                        w.fill(f32::NEG_INFINITY);
+                        w.fill(0.0);
+                        w.fill(0.0);
                     }
 
                     let k_per_hap = per_window_cap_window
@@ -3221,12 +3229,24 @@ fn build_imputation_plan(
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
                             .max(per_window_cap_window)
                             .min(n_ref_haps.max(1));
-                        let (top_m, top) = select_top_k_adaptive_with_support(
-                            &window_scores[i],
-                            base_top_m,
-                            per_window_cap_window,
-                            n_ref_haps,
-                        );
+                        let allow_zero = n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS;
+                        let (top_m, top) = if allow_zero {
+                            select_top_k_adaptive_with_support(
+                                &window_scores[i],
+                                n_ref_haps, // Force full selection if small panel
+                                n_ref_haps,
+                                n_ref_haps,
+                                true,
+                            )
+                        } else {
+                            select_top_k_adaptive_with_support(
+                                &window_scores[i],
+                                base_top_m,
+                                per_window_cap_window,
+                                n_ref_haps,
+                                false,
+                            )
+                        };
                         adaptive_top_m_calls = adaptive_top_m_calls.saturating_add(1);
                         adaptive_top_m_sum = adaptive_top_m_sum.saturating_add(top_m);
                         adaptive_top_m_min = adaptive_top_m_min.min(top_m);
@@ -3458,11 +3478,13 @@ fn build_imputation_plan(
                             .saturating_mul(PBWT_PER_WINDOW_MULT)
                             .max(per_window_cap_window)
                             .min(n_ref_haps.max(1));
+                        let allow_zero = n_ref_haps <= SMALL_PANEL_FULL_CAP_HAPS;
                         let (top_m, top) = select_top_k_adaptive_with_support(
                             &window_scores[i],
                             base_top_m,
                             per_window_cap_window,
                             n_ref_haps,
+                            allow_zero,
                         );
                         adaptive_top_m_calls = adaptive_top_m_calls.saturating_add(1);
                         adaptive_top_m_sum = adaptive_top_m_sum.saturating_add(top_m);
