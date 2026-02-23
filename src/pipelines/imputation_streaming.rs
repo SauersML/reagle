@@ -241,7 +241,7 @@ fn collect_carriers_for_allele(
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_PER_WINDOW_MULT: usize = 8;
+const PBWT_PER_WINDOW_MULT: usize = 12;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
@@ -251,16 +251,16 @@ const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
-const IMPUTE_RAM_FRACTION: f64 = 0.4;
+const IMPUTE_RAM_FRACTION: f64 = 0.35;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
-const SCAN_RAM_FRACTION: f64 = 0.10;
-const TARGET_CACHE_RAM_FRACTION: f64 = 0.10;
-const REF_PANEL_RAM_FRACTION: f64 = 0.75;
+const SCAN_RAM_FRACTION: f64 = 0.25;
+const TARGET_CACHE_RAM_FRACTION: f64 = 0.15;
+const REF_PANEL_RAM_FRACTION: f64 = 0.50;
 const EXACT_PRESCAN_MAX_OPS: u128 = 250_000_000;
 const MIN_AVAIL_BYTES_FOR_PLANNING: u64 = 64 * 1024 * 1024;
 const ORIENTATION_HANDOFF_MIN_MARGIN: f64 = 0.05;
@@ -664,8 +664,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    let floor = 0.0005 + 0.04 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.0001, 0.12)
 }
 
 #[inline]
