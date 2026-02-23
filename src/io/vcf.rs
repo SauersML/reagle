@@ -139,12 +139,6 @@ impl MarkerImputationStats {
 
         let sum = self.sum_p[allele];
         let n = self.n_haps as f32;
-        // Monomorphic sites (sum ≈ 0 or sum ≈ n) have no variance to measure.
-        // Return 1.0 because they trivially impute correctly.
-        if sum <= 1e-4 || (sum - n).abs() <= 1e-4 {
-            return 1.0;
-        }
-
         let sum_sq = self.sum_p_sq[allele];
 
         // Java: float meanTerm = sum*sum/(nInputTargHaps);
@@ -1870,6 +1864,21 @@ mod tests {
         assert_eq!(stats.sum_p_sq.len(), 3);
         assert_eq!(stats.n_haps, 0);
         assert!(!stats.is_imputed);
+    }
+
+    #[test]
+    fn test_dr2_monomorphic_matches_beagle() {
+        let mut stats = MarkerImputationStats::new(2);
+        stats.is_imputed = true;
+        // All ref (0.0)
+        for _ in 0..10 {
+            stats.add_sample_biallelic(0.0, 0.0);
+        }
+
+        let dr2 = stats.dr2(1);
+        // Beagle returns 0.0. Current Reagle returns 1.0.
+        // We assert what we expect to fix (0.0)
+        assert!(dr2 < 0.001, "DR2 should be 0.0 for monomorphic sites to match Beagle, got {}", dr2);
     }
 
     #[test]
