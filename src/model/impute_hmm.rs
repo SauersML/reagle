@@ -1699,8 +1699,6 @@ fn apply_marker_prior_smoothing(
         fallback_missing_mass
     };
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
-    let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
-    let dist_error = 1.0 - dist_retain;
     let active_ratio = if panel_haps > 0 {
         (active_states as f32 / panel_haps as f32).clamp(0.0, 1.0)
     } else {
