@@ -7704,7 +7704,7 @@ impl crate::pipelines::ImputationPipeline {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
                         }
                         let ws = ws_opt.as_mut().unwrap();
-                        let effective_error_rate = error_rate;
+                        let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
                         run_impute_hmm(
                             &state_haps,
                             ref_columns,
