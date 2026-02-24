@@ -1708,7 +1708,6 @@ fn apply_marker_prior_smoothing(
     } else {
         1.0
     };
-    let sparsity_boost = (1.0 - active_ratio).powi(2);
     let truncation_error = (1.0 - active_ratio).clamp(0.0, 1.0);
     // Approximation error combines structural-missingness and truncation:
     //   approx_error = 1 - (1-missing_mass)*(1-truncation_error)
@@ -1730,11 +1729,7 @@ fn apply_marker_prior_smoothing(
     // Reduced scaling (0.25 vs 0.35) and tighter combined_error weighting
     // prevents over-regularization on dense panels (e.g. HGDP/1KG) where
     // local evidence should be trusted even with some missingness.
-    let adaptive_panel_mix = (0.25
-        * (missing_mass + 0.1 * combined_error)
-        * combined_error
-        * (1.0 + 0.5 * sparsity_boost))
-        .clamp(0.0, 0.25);
+    let adaptive_panel_mix = 0.0f32;
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
