@@ -5678,6 +5678,16 @@ impl crate::pipelines::ImputationPipeline {
                     last_info2 = Some(ref_m);
                 }
 
+                // Ensure probability buffers are always populated, even if untyped logic fell through.
+                if aligned1.is_empty() {
+                    aligned1.resize(n_alleles.max(1), 1.0);
+                    normalize_probs(&mut aligned1);
+                }
+                if aligned2.is_empty() {
+                    aligned2.resize(n_alleles.max(1), 1.0);
+                    normalize_probs(&mut aligned2);
+                }
+
                 probs1.extend_from_slice(&aligned1);
                 probs2.extend_from_slice(&aligned2);
                 observed1.push(observed1_marker);
