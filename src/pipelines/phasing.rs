@@ -1195,9 +1195,11 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     Some(a) if a > 1 => 1.0,
                     _ => (p0 - p1).abs(),
                 };
-                if allele_certainty <= f32::EPSILON {
-                    continue;
-                }
+                let effective_certainty = if allele_certainty <= f32::EPSILON {
+                    0.5
+                } else {
+                    allele_certainty
+                };
                 let sample_idx = hap_idx / 2;
                 let sample = SampleIdx::from(sample_idx);
                 let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
@@ -1240,8 +1242,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight =
-                            anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight = anchor_norm
+                            * effective_certainty
+                            * p_match
+                            * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -1281,7 +1285,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight = effective_certainty * p_match * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -1472,9 +1476,11 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     Some(a) if a > 1 => 1.0,
                     _ => (p0 - p1).abs(),
                 };
-                if allele_certainty <= f32::EPSILON {
-                    continue;
-                }
+                let effective_certainty = if allele_certainty <= f32::EPSILON {
+                    0.5
+                } else {
+                    allele_certainty
+                };
                 let sample_idx = hap_idx / 2;
                 let sample = SampleIdx::from(sample_idx);
                 let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
@@ -1516,8 +1522,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight =
-                            anchor_norm * allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight = anchor_norm
+                            * effective_certainty
+                            * p_match
+                            * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
@@ -1557,7 +1565,7 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                         if freq <= 0.0 {
                             continue;
                         }
-                        let weight = allele_certainty * p_match * -(freq.max(min_freq)).ln();
+                        let weight = effective_certainty * p_match * -(freq.max(min_freq)).ln();
                         let w = &mut window_scores[i][idx];
                         if w.is_finite() {
                             *w += weight;
