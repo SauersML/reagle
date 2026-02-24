@@ -310,10 +310,12 @@ mod tests {
         let n_ref_haps = 6_546usize;
         let (stay, shift) = subset_transition_params(recomb_rate, active_states, n_ref_haps);
 
-        // k-scaled expectation (subset as universe)
+        // Panel-scaled expectation (subset with population denominator)
+        // This confirms the "sticky" behavior where transition probability is
+        // suppressed by K/N ratio.
         let k = active_states as f32;
-        // let n = n_ref_haps as f32; // Unused in new logic
-        let expected = (recomb_rate / k) / ((1.0 - recomb_rate) + k * (recomb_rate / k));
+        let n = n_ref_haps as f32;
+        let expected = (recomb_rate / n) / ((1.0 - recomb_rate) + k * (recomb_rate / n));
         assert!((shift - expected).abs() < 1e-8);
         assert!(stay.is_finite() && stay > 0.0);
     }
@@ -2161,15 +2163,16 @@ fn subset_transition_params(
     if active_states == 0 {
         return (0.0, 0.0);
     }
-    // Satisfy unused variable check without renaming to underscore prefix (forbidden by linter)
-    let _ = n_ref_haps;
     // Preserve historical imputation behavior: use exact active subset size
     // (no clamping of k). Recombination is still clamped in li_stephens.
     //
-    // Use active_states as effective population size to avoid recombination
-    // suppression when imputing into a small subset. This treats the subset
-    // as the relevant universe for transition probabilities.
-    let (stay, shift) = subset_linear_exact_k(recomb_rate, active_states as f32, active_states);
+    // However, we use n_ref_haps (full panel size) as the population size
+    // denominator. This intentionally suppresses recombination within the
+    // small subset relative to the full population rate, acting as a strong
+    // "stickiness" prior that favors long haplotypes in the subset.
+    // Switching to active_states here (K-scaling) drastically increases
+    // transition noise and degrades imputation accuracy (R^2).
+    let (stay, shift) = subset_linear_exact_k(recomb_rate, active_states as f32, n_ref_haps);
     // Invariant for mass-preserving affine transition on K active states:
     //   stay + K*shift == 1
     // We keep this as a hard assert so any upstream transition regression
