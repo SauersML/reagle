@@ -1694,7 +1694,9 @@ fn apply_marker_prior_smoothing(
         0.0
     };
     let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
+        // Even if we observe full coverage in the subset, truncation implies
+        // there is unseen mass. Blend in fallback estimate (scaled conservatively).
+        observed_missing_mass.max(fallback_missing_mass * 0.5)
     } else {
         fallback_missing_mass
     };
@@ -1724,8 +1726,11 @@ fn apply_marker_prior_smoothing(
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
-    let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+    let adaptive_panel_mix = (0.35
+        * (missing_mass + 0.2 * combined_error)
+        * combined_error
+        * (1.0 + 0.75 * sparsity_boost))
+        .clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1750,6 +1755,40 @@ fn apply_marker_prior_smoothing(
         let inv = 1.0 / smoothing_prior_total;
         for v in smoothing_prior_counts.iter_mut() {
             *v *= inv;
+        }
+        // Blend in panel priors if the subset is truncated (active_states < panel_haps).
+        // The local subset counts represent `active_ratio` of the panel, so we weight
+        // the observed local prior by `active_ratio` and the global panel prior by
+        // `1 - active_ratio` (which is exactly `truncation_error`). This reconstructs
+        // the expected full-panel frequency as the shrinkage target.
+        //
+        // Also blend if distance error is high: as linkage decays, local state
+        // frequencies revert to global panel frequencies.
+        let blend_weight = truncation_error.max(dist_error).clamp(0.0, 1.0);
+        if blend_weight > 0.001 {
+            if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+                let w = blend_weight;
+                let one_minus_w = 1.0 - w;
+                match panel {
+                    AllelePosteriors::Biallelic(p_alt) if smoothing_prior_counts.len() == 2 => {
+                        let p_alt = p_alt.clamp(0.0, 1.0);
+                        let p0 = 1.0 - p_alt;
+                        smoothing_prior_counts[0] =
+                            smoothing_prior_counts[0] * one_minus_w + p0 * w;
+                        smoothing_prior_counts[1] =
+                            smoothing_prior_counts[1] * one_minus_w + p_alt * w;
+                    }
+                    AllelePosteriors::Multiallelic(p)
+                        if p.len() == smoothing_prior_counts.len() =>
+                    {
+                        for (i, v) in smoothing_prior_counts.iter_mut().enumerate() {
+                            let p_val = p.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                            *v = *v * one_minus_w + p_val * w;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         AlleleProbsView::from_trusted(smoothing_prior_counts)
     } else {

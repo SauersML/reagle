@@ -151,6 +151,96 @@ fn is_represented_in_states(state_haps: &[RefHapId], col: &GenotypeColumn, allel
     false
 }
 
+fn compute_panel_priors(columns: &[GenotypeColumn]) -> Arc<Vec<AllelePosteriors>> {
+    let mut priors = Vec::with_capacity(columns.len());
+    for col in columns {
+        let n = col.n_haplotypes();
+        if n == 0 {
+            priors.push(AllelePosteriors::Biallelic(0.0));
+            continue;
+        }
+
+        // Fast path for biallelic dense/sparse columns
+        if let GenotypeColumn::Dense(d) = col {
+            if d.bits_per_allele() == 1 {
+                let mut alt_count = 0usize;
+                let mut miss_count = 0usize;
+                let bits = d.bits_raw();
+                let missing = d.missing_raw();
+                let words = (n + 63) / 64;
+                for w in 0..words {
+                    let mut m = missing.get(w).copied().unwrap_or(0);
+                    let mut b = bits.get(w).copied().unwrap_or(0);
+                    if w + 1 == words {
+                        let tail = n % 64;
+                        if tail != 0 {
+                            let mask = (1u64 << tail) - 1;
+                            m &= mask;
+                            b &= mask;
+                        }
+                    }
+                    miss_count += m.count_ones() as usize;
+                    alt_count += (b & !m).count_ones() as usize;
+                }
+                let present = n.saturating_sub(miss_count);
+                if present > 0 {
+                    priors.push(AllelePosteriors::Biallelic(
+                        alt_count as f32 / present as f32,
+                    ));
+                } else {
+                    priors.push(AllelePosteriors::Biallelic(0.0));
+                }
+                continue;
+            }
+        } else if let GenotypeColumn::Sparse(s) = col {
+            let present = n; // Sparse columns currently don't track missingness explicitly in counts
+            let carriers = s.carriers().len();
+            let alt_count = if s.is_inverted() {
+                present.saturating_sub(carriers)
+            } else {
+                carriers
+            };
+            if present > 0 {
+                priors.push(AllelePosteriors::Biallelic(
+                    alt_count as f32 / present as f32,
+                ));
+            } else {
+                priors.push(AllelePosteriors::Biallelic(0.0));
+            }
+            continue;
+        }
+
+        let mut allele_counts: HashMap<u8, usize> = HashMap::new();
+        let mut present = 0;
+        for h in 0..n {
+            let a = col.get(HapIdx::new(h as u32));
+            if a != crate::data::storage::AlleleCode::MISSING.raw() {
+                *allele_counts.entry(a).or_default() += 1;
+                present += 1;
+            }
+        }
+
+        if present == 0 {
+            priors.push(AllelePosteriors::Biallelic(0.0));
+            continue;
+        }
+
+        let max_a = allele_counts.keys().max().copied().unwrap_or(0);
+        if max_a <= 1 {
+            let alt_count = allele_counts.get(&1).copied().unwrap_or(0);
+            let p = alt_count as f32 / present as f32;
+            priors.push(AllelePosteriors::Biallelic(p));
+        } else {
+            let mut probs = vec![0.0f32; max_a as usize + 1];
+            for (a, c) in allele_counts {
+                probs[a as usize] = c as f32 / present as f32;
+            }
+            priors.push(AllelePosteriors::Multiallelic(Arc::from(probs)));
+        }
+    }
+    Arc::new(priors)
+}
+
 fn collect_carriers_for_allele(
     col: &GenotypeColumn,
     allele: u8,
@@ -3059,7 +3149,6 @@ fn build_imputation_plan(
                         .get(window_idx)
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
-
                     let (alignment_cow, phased_target_cow) = if let Some(cache) =
                         target_cache.as_ref()
                     {
@@ -3292,7 +3381,6 @@ fn build_imputation_plan(
                         .get(window_idx)
                         .copied()
                         .unwrap_or(per_window_cap.max(1));
-
                     let (alignment_cow, phased_target_cow) = if let Some(cache) =
                         target_cache.as_ref()
                     {
@@ -4503,12 +4591,14 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     }
 
+                    let panel_priors_arc = Some(compute_panel_priors(&ref_window.ref_columns));
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
                         phased_target_pl.as_ref(),
                         target_missing,
                         &ref_window.markers,
                         &ref_window.ref_columns,
+                        panel_priors_arc,
                         &alignment,
                         &gen_maps,
                         imp_overlap.as_ref(),
@@ -4756,12 +4846,14 @@ impl crate::pipelines::ImputationPipeline {
                         window_quality.set_imputed(ref_m, !is_present);
                     }
 
+                    let panel_priors_arc = Some(compute_panel_priors(&ref_window.ref_columns));
                     let window_results = self.run_imputation_window_streaming(
                         &phased_target,
                         phased_target_pl.as_ref(),
                         target_missing,
                         &ref_window.markers,
                         &ref_window.ref_columns,
+                        panel_priors_arc,
                         &alignment,
                         &gen_maps,
                         imp_overlap.as_ref(),
@@ -4918,6 +5010,7 @@ impl crate::pipelines::ImputationPipeline {
         target_missing: Option<&GenotypeMatrix<TargetMissingState, TargetSpace>>,
         ref_markers: &crate::data::marker::Markers<RefMarkerSpace>,
         ref_columns: &[GenotypeColumn],
+        panel_priors: Option<Arc<Vec<AllelePosteriors>>>,
         alignment: &MarkerAlignment<TargetSpace, RefMarkerSpace>,
         gen_maps: &GeneticMaps,
         imp_overlap: Option<&PhasedOverlap>,
@@ -4959,6 +5052,12 @@ impl crate::pipelines::ImputationPipeline {
         if output_start >= output_end || n_ref_markers == 0 {
             return Ok(None);
         }
+
+        let panel_slice = panel_priors.as_ref().map(|p| {
+            let start = output_start.min(p.len());
+            let end = output_end.min(p.len());
+            Arc::new(p[start..end].to_vec())
+        });
         if let Some(bb) = &self.telemetry {
             bb.set_stage(crate::utils::telemetry::Stage::Imputation);
             bb.set_consumer_stage(crate::utils::telemetry::Stage::Imputation);
@@ -5728,11 +5827,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                panel_slice.clone(),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                panel_slice.clone(),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
