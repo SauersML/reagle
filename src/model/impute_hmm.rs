@@ -1694,7 +1694,9 @@ fn apply_marker_prior_smoothing(
         0.0
     };
     let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
+        // Even if we observe full coverage in the subset, truncation implies
+        // there is unseen mass. Blend in fallback estimate (scaled conservatively).
+        observed_missing_mass.max(fallback_missing_mass * 0.5)
     } else {
         fallback_missing_mass
     };
