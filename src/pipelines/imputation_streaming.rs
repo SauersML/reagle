@@ -246,7 +246,7 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
-const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
+const PBWT_TYPED_ANCHORS_PER_BIN: usize = 10;
 const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = (base * 0.5).max(1e-5).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -7704,7 +7704,7 @@ impl crate::pipelines::ImputationPipeline {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
                         }
                         let ws = ws_opt.as_mut().unwrap();
-                        let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
+                        let effective_error_rate = error_rate;
                         run_impute_hmm(
                             &state_haps,
                             ref_columns,
