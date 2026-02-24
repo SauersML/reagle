@@ -534,7 +534,12 @@ impl SegmentExtent {
     ) -> impl Iterator<Item = AllelePosteriors> + 'a {
         let take_start = self.core_start.max(output_start);
         let take_end = self.core_end.min(output_end);
-        (take_start..take_end).map(move |gm| seg_posteriors[gm - self.core_start].clone())
+        (take_start..take_end).map(move |gm| {
+            seg_posteriors
+                .get(gm - self.core_start)
+                .cloned()
+                .unwrap_or(AllelePosteriors::Biallelic(0.0))
+        })
     }
 }
 

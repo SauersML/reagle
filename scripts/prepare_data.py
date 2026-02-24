@@ -633,12 +633,13 @@ def run_conversion(input_path, output_vcf, panel_path):
     ref_hg38_fasta = _ensure_chr22_reference_fasta()
     temp_output_dir = "convert_genome_array_out"
     _clean_output_dir(temp_output_dir)
+    temp_hg38_vcf = os.path.join(temp_output_dir, "genotypes.vcf")
 
     cmd = [
         "convert_genome",
         raw_file,
         ref_hg38_fasta,
-        "--output-dir", temp_output_dir,
+        temp_hg38_vcf,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
