@@ -1725,7 +1725,8 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
+        (0.35 * approximation_error * combined_error * (1.0 + 0.75 * sparsity_boost))
+            .clamp(0.0, 0.35);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
