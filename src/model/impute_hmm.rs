@@ -2089,6 +2089,9 @@ fn normalize_allele_posterior_structural_missing(
     missing_ood_mass: f32,
     prior_scratch: &mut Vec<f32>,
     target_probs: AlleleProbsView<'_>,
+    panel_priors: Option<&[AllelePosteriors]>,
+    marker_idx: usize,
+    is_uniform: bool,
 ) {
     // Structural posterior decomposition at one marker:
     //   p_i = (q_i + M_ref * rho_ref_i + M_ood * rho_ood_i) / (Q + M_ref + M_ood)
@@ -2112,8 +2115,36 @@ fn normalize_allele_posterior_structural_missing(
     let missing_ref = missing_ref_mass.max(0.0);
     let missing_ood = missing_ood_mass.max(0.0);
     let total = subset + missing_ref + missing_ood;
+
+    let resolve_prior = |scratch: &mut Vec<f32>| -> AlleleProbsView<'_> {
+        if is_uniform {
+            if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
+                if scratch.len() < allele_probs.len() {
+                    scratch.resize(allele_probs.len(), 0.0);
+                }
+                match panel {
+                    AllelePosteriors::Biallelic(p_alt) if allele_probs.len() == 2 => {
+                        let p = p_alt.clamp(0.0, 1.0);
+                        scratch[0] = 1.0 - p;
+                        scratch[1] = p;
+                    }
+                    AllelePosteriors::Multiallelic(p) if p.len() == allele_probs.len() => {
+                        scratch.copy_from_slice(p);
+                    }
+                    _ => {
+                        // Dimension mismatch or unhandled case: fallback to uniform
+                        let u = 1.0 / allele_probs.len().max(1) as f32;
+                        scratch.fill(u);
+                    }
+                }
+                return AlleleProbsView::from_trusted(scratch);
+            }
+        }
+        normalized_allele_prior(scratch, target_probs)
+    };
+
     if total <= 0.0 {
-        let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let prior = resolve_prior(prior_scratch);
         allele_probs.copy_from_slice(prior.as_slice());
         return;
     }
@@ -2121,7 +2152,7 @@ fn normalize_allele_posterior_structural_missing(
     if subset <= 0.0 {
         // No represented-state evidence: unknown mass cannot inherit local shape.
         // Fall back to the target prior to avoid undefined q/Q terms.
-        let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let prior = resolve_prior(prior_scratch);
         allele_probs.copy_from_slice(prior.as_slice());
         return;
     }
@@ -2131,7 +2162,7 @@ fn normalize_allele_posterior_structural_missing(
         // Structural Dirichlet concentration alpha is derived from prior
         // concentration (effective allele count), not hand-tuned thresholds.
         // rho_ood = (q + alpha*pi)/(Q + alpha).
-        let prior = normalized_allele_prior(prior_scratch, target_probs);
+        let prior = resolve_prior(prior_scratch);
         let ood_dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
         let inv_subset = 1.0 / subset;
         let inv_rho = 1.0 / (subset + ood_dirichlet_alpha);
@@ -5079,6 +5110,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             missing_ood_mass_f32,
                                             &mut ws.allele_prior_scratch,
                                             probs,
+                                            panel_priors,
+                                            m,
+                                            target_probs.is_uniform_marker(m),
                                         );
                                     } else {
                                         // No subset support reached the represented allele space
@@ -5350,6 +5384,9 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         missing_ood_mass_f32,
                                         &mut ws.allele_prior_scratch,
                                         probs,
+                                        panel_priors,
+                                        m_rev,
+                                        target_probs.is_uniform_marker(m_rev),
                                     );
                                 } else {
                                     if !warned_af_fallback {
