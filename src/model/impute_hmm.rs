@@ -2167,7 +2167,11 @@ fn subset_transition_params(
     }
     // Preserve historical imputation behavior: use exact active subset size
     // (no clamping of k). Recombination is still clamped in li_stephens.
-    let (stay, shift) = subset_linear_exact_k(recomb_rate, active_states as f32, n_ref_haps);
+    //
+    // Use active_states as effective population size to avoid recombination
+    // suppression when imputing into a small subset. This treats the subset
+    // as the relevant universe for transition probabilities.
+    let (stay, shift) = subset_linear_exact_k(recomb_rate, active_states as f32, active_states);
     // Invariant for mass-preserving affine transition on K active states:
     //   stay + K*shift == 1
     // We keep this as a hard assert so any upstream transition regression
