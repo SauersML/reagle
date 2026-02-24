@@ -1726,11 +1726,15 @@ fn apply_marker_prior_smoothing(
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
-    let adaptive_panel_mix = (0.35
-        * (missing_mass + 0.2 * combined_error)
+    //
+    // Reduced scaling (0.25 vs 0.35) and tighter combined_error weighting
+    // prevents over-regularization on dense panels (e.g. HGDP/1KG) where
+    // local evidence should be trusted even with some missingness.
+    let adaptive_panel_mix = (0.25
+        * (missing_mass + 0.1 * combined_error)
         * combined_error
-        * (1.0 + 0.75 * sparsity_boost))
-        .clamp(0.0, 0.35);
+        * (1.0 + 0.5 * sparsity_boost))
+        .clamp(0.0, 0.25);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
@@ -1764,7 +1768,10 @@ fn apply_marker_prior_smoothing(
         //
         // Also blend if distance error is high: as linkage decays, local state
         // frequencies revert to global panel frequencies.
-        let blend_weight = truncation_error.max(dist_error).clamp(0.0, 1.0);
+        //
+        // Only trigger this if we have significant combined error (distance AND approximation).
+        // Pure truncation error on high-LD sites should not force a panel revert.
+        let blend_weight = combined_error.max(dist_error * 0.5).clamp(0.0, 1.0);
         if blend_weight > 0.001 {
             if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
                 let w = blend_weight;

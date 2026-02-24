@@ -448,12 +448,24 @@ impl SegmentExtent {
     /// Slice `ref_columns` for HMM input (core + halo).
     #[inline]
     fn slice_ref_columns<'a>(&self, cols: &'a [GenotypeColumn]) -> &'a [GenotypeColumn] {
+        if self.extended_end > cols.len() {
+            if self.core_start >= cols.len() {
+                return &[];
+            }
+            return &cols[self.core_start..];
+        }
         &cols[self.core_start..self.extended_end]
     }
 
     /// Slice `nearest_obs_retain` for HMM input (core + halo).
     #[inline]
     fn slice_retain<'a>(&self, retain: &'a [f32]) -> &'a [f32] {
+        if self.extended_end > retain.len() {
+            if self.core_start >= retain.len() {
+                return &[];
+            }
+            return &retain[self.core_start..];
+        }
         &retain[self.core_start..self.extended_end]
     }
 
@@ -461,7 +473,15 @@ impl SegmentExtent {
     /// when the segment received boundary-mapped priors.
     #[inline]
     fn build_p_recomb(&self, full_p_recomb: &[f32], boundary_mapped: bool) -> Vec<f32> {
-        let mut out = full_p_recomb[self.core_start..self.extended_end].to_vec();
+        let mut out = if self.extended_end > full_p_recomb.len() {
+            if self.core_start >= full_p_recomb.len() {
+                Vec::new()
+            } else {
+                full_p_recomb[self.core_start..].to_vec()
+            }
+        } else {
+            full_p_recomb[self.core_start..self.extended_end].to_vec()
+        };
         if boundary_mapped && !out.is_empty() {
             out[0] = 0.0;
         }
@@ -477,15 +497,28 @@ impl SegmentExtent {
         let mut marker_errors = Vec::with_capacity(hmm_len);
         offsets.push(0);
         for m in self.core_start..self.extended_end {
-            probs.extend_from_slice(input_probs.probs_for_marker(m));
-            offsets.push(probs.len());
-            observed.push(input_probs.is_observed_marker(m));
-            marker_errors.push(input_probs.marker_error_rate(m).unwrap_or(0.0));
+            if m < input_probs.n_markers() {
+                probs.extend_from_slice(input_probs.probs_for_marker(m));
+                offsets.push(probs.len());
+                observed.push(input_probs.is_observed_marker(m));
+                marker_errors.push(input_probs.marker_error_rate(m).unwrap_or(0.0));
+            } else {
+                // Out-of-bounds marker (extended halo beyond input): pad with dummy values.
+                // Offsets must advance to keep structure consistent (though probs added is 0).
+                offsets.push(probs.len());
+                observed.push(false);
+                marker_errors.push(0.0);
+            }
         }
         let panel_priors = input_probs.panel_priors().map(|panel| {
             let mut local = Vec::with_capacity(hmm_len);
             for m in self.core_start..self.extended_end {
-                local.push(panel[m].clone());
+                local.push(
+                    panel
+                        .get(m)
+                        .cloned()
+                        .unwrap_or(AllelePosteriors::Biallelic(0.0)),
+                );
             }
             std::sync::Arc::new(local)
         });
@@ -759,7 +792,9 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
+    // Reduced base floor from 0.08 to 0.015 to prevent excessive noise injection
+    // in ultra-dense or high-accuracy scenarios. The HMM should be trusted more.
+    let floor = 0.002 + 0.015 * missing_ramp;
     (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
 }
 
