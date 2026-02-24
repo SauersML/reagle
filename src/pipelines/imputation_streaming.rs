@@ -246,7 +246,7 @@ const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
-const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
+const PBWT_TYPED_ANCHORS_PER_BIN: usize = 10;
 const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
@@ -1313,7 +1313,7 @@ fn select_top_k_adaptive_with_support(
         BinaryHeap::with_capacity(upper_k.saturating_add(1));
     let mut support = 0usize;
     for (idx, &score) in scores.iter().enumerate() {
-        if !score.is_finite() || score <= 0.0 {
+        if !score.is_finite() || score < 0.0 {
             continue;
         }
         support = support.saturating_add(1);
@@ -1348,7 +1348,7 @@ fn select_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     if k == 0 || scores.is_empty() {
         return Vec::new();
     }
-    select_top_k_heap(scores, k, true)
+    select_top_k_heap(scores, k, false)
 }
 
 fn select_top_k_allow_zero(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
