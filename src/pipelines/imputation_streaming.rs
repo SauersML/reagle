@@ -1418,14 +1418,15 @@ fn should_use_exact_prescan(n_ref_haps: usize, batch_len: usize, n_markers: usiz
     ops <= EXACT_PRESCAN_MAX_OPS
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TypedMarkerMapKind {
     Alignment,
     PositionalBiallelicMatch,
     PositionalBiallelicSwap,
+    PositionalMapping(std::sync::Arc<crate::data::marker::AlleleMapping>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TypedMarkerResolution {
     target_idx: usize,
     map_kind: TypedMarkerMapKind,
@@ -1433,7 +1434,7 @@ struct TypedMarkerResolution {
 
 impl TypedMarkerResolution {
     #[inline]
-    fn is_positional_fallback(self) -> bool {
+    fn is_positional_fallback(&self) -> bool {
         !matches!(self.map_kind, TypedMarkerMapKind::Alignment)
     }
 }
