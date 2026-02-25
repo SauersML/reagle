@@ -11727,7 +11727,8 @@ fn sample_swap_bits_mosaic<RefSpace>(
         };
         swap_lr.push(lr);
         swap_probs.push(p_swap.clamp(0.0, 1.0));
-        swap_probs_conf.push(p_swap.clamp(0.0, 1.0));
+        let conf_val = if chosen_swap { p_swap } else { 1.0 - p_swap };
+        swap_probs_conf.push(conf_val.clamp(0.0, 1.0));
     }
 
     // Removed redundant and unstable overwrite loop (using single sample "new_paths").
@@ -11737,8 +11738,12 @@ fn sample_swap_bits_mosaic<RefSpace>(
         let transition_logs = compute_label_switch_transition_logs(p_recomb, het_positions);
         let (decoded_bits, posterior_probs, _) =
             decode_orientation_hmm(&swap_probs, &transition_logs);
+        swap_probs_conf = posterior_probs
+            .iter()
+            .zip(decoded_bits.iter())
+            .map(|(&p, &b)| if b == 1 { p } else { 1.0 - p })
+            .collect();
         swap_bits = decoded_bits;
-        swap_probs_conf = posterior_probs;
     }
 
     workspace.fwd = buffers.fwd.into_avec();
