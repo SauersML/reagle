@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.5).max(1e-6).min(base);
+    let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -621,7 +621,10 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         1.0
     };
     let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let scaled = base * (2.0 - 0.6 * confidence);
+    // Use moderate sharpening: (1.7 - 0.9 * confidence) -> 0.8 * base at 1.0 confidence.
+    // This is safer than the aggressive 0.4x of the old logic (which caused
+    // LD traps) and the 1.4x of the recent attempt (which hurt accuracy).
+    let scaled = base * (1.7 - 0.9 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
     blended.clamp((base * 0.15).max(1e-6), 0.5)
@@ -10584,12 +10587,13 @@ mod tests {
     fn test_marker_emission_error_logic() {
         let base = 1e-4;
 
-        // Hard call: should be close to base (approx 0.98 * base)
+        // Hard call: should be moderately sharpened (approx 0.56 * base)
+        // (1.7 - 0.9 * 1.0) * 0.7 = 0.56
         let probs_hard = vec![1.0, 0.0];
         let err_hard = marker_emission_error_from_probs(&probs_hard, true, base);
         println!("Hard call error: {:.2e}", err_hard);
-        assert!(err_hard >= 0.9 * base, "Hard call error too low: {} < 0.9 * {}", err_hard, base);
-        assert!(err_hard <= 1.1 * base, "Hard call error too high: {} > 1.1 * {}", err_hard, base);
+        assert!(err_hard >= 0.5 * base, "Hard call error too low: {} < 0.5 * {}", err_hard, base);
+        assert!(err_hard <= 0.7 * base, "Hard call error too high: {} > 0.7 * {}", err_hard, base);
 
         // Uniform call: should be significantly higher than base
         let probs_uniform = vec![0.5, 0.5];
