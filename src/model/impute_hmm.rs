@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_emission_prob_is_neutral() {
+    fn test_missing_emission_prob_tracks_target_concentration() {
         let match_prob = 0.99f32;
         let mismatch_prob = 0.01f32;
 
@@ -438,21 +438,9 @@ mod tests {
         let c = missing_emission_prob(concentrated, match_prob, mismatch_prob);
         let d = missing_emission_prob(diffuse, match_prob, mismatch_prob);
 
-        // Missing emission should be neutral regardless of target concentration.
-        // For biallelic, it should be (match + mismatch) / 2 = 0.5.
-        let expected = (match_prob + mismatch_prob) / 2.0;
-        assert!(
-            (c - expected).abs() < 1e-6,
-            "Concentrated target should yield neutral missing emission"
-        );
-        assert!(
-            (d - expected).abs() < 1e-6,
-            "Diffuse target should yield neutral missing emission"
-        );
-        assert_eq!(
-            c, d,
-            "Missing emission should not depend on target concentration"
-        );
+        assert!((c - match_prob).abs() < 1e-6);
+        assert!(d < c);
+        assert!(d > mismatch_prob);
     }
 
     #[test]
@@ -505,15 +493,6 @@ mod tests {
                     }
                 }
                 assert!(miss <= best_called + 1e-6);
-
-                // Stricter check:
-                let max_p = probs.iter().cloned().fold(0.0, f32::max);
-                if max_p > 1.0 / n_alleles as f32 + 1e-6 {
-                    assert!(
-                        miss < best_called - 1e-6,
-                        "Missing emission should be strictly penalized vs best match"
-                    );
-                }
             }
         }
     }
@@ -1398,14 +1377,19 @@ fn missing_emission_prob(
     if n == 0 {
         return 1.0;
     }
-    // Uniform marginalization over missing reference alleles.
-    // P(Obs | Miss) = sum_a P(Obs | Ref=a) P(Ref=a)
-    // Assume P(Ref=a) = 1/n (uniform prior).
-    //
-    // P(Obs | Miss) = (1/n) * sum_a P(Obs | Ref=a)
-    //               = (1/n) * (match_prob + (n-1)*mismatch_prob)
-    let inv_n = 1.0 / n as f32;
-    inv_n * (match_prob + (n as f32 - 1.0) * mismatch_prob)
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    for i in 0..n {
+        let p = target_probs.get(i).unwrap_or(0.0).max(0.0);
+        sum += p;
+        sum_sq += p * p;
+    }
+    let concentration = if sum > 0.0 {
+        (sum_sq / (sum * sum)).clamp(0.0, 1.0)
+    } else {
+        1.0 / n as f32
+    };
+    mismatch_prob + (match_prob - mismatch_prob) * concentration
 }
 
 #[inline]
