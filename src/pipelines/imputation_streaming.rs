@@ -594,7 +594,11 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // genotyped marker is 0/0 and the imputed marker is in perfect LD.
     // The mismatch penalty (1e5) kills the valid haplotype path.
     // Keeping it at base (1e4) allows survival.
-    let min_error = base;
+    //
+    // We allow limited sharpening (0.5 * base) to improve calibration on common
+    // variants, but clamp at 1.5e-5 to stay safely above the ~1e-5 danger zone
+    // that triggers the perfect LD trap.
+    let min_error = (base * 0.5).max(1.5e-5);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -10104,11 +10108,12 @@ mod tests {
 
         let base = 0.01;
         let out = calibrated_emission_error(&input, base);
-        // Sharpening below base is disabled to prevent perfect-LD collapse.
-        // It should be exactly base.
+        // Sharpening below base is limited (0.5 * base) but allowed to improve calibration.
+        // Expected unclamped posterior ~ 0.0084 (0.16 / 19).
+        // New floor is 0.005. So we get 0.0084.
         assert!(
-            (out - base).abs() < 1e-6,
-            "expected calibrated error clamped to base {}, got {}",
+            out < base && out >= base * 0.5,
+            "expected calibrated error sharpened but bounded (base={}, got {})",
             base,
             out
         );
