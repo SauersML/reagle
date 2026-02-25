@@ -392,8 +392,8 @@ const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
-const PBWT_MIN_PER_HAP: usize = 128;
-const PBWT_MAX_PER_HAP: usize = 2048;
+const PBWT_MIN_PER_HAP: usize = 64;
+const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_ADAPTIVE_K_MIN_DIVISOR: usize = 3;
 const PBWT_ADAPTIVE_K_FLOOR: usize = 16;
 const PBWT_ADAPTIVE_K_MAX_MULT: usize = 2;
@@ -1188,16 +1188,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_fwd[i], query_alleles[i]);
                 pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
                 let allele_probs = query_allele_probs[i];
-                let p0 = allele_probs.prob_for_allele(0).clamp(0.0, 1.0);
-                let p1 = allele_probs.prob_for_allele(1).clamp(0.0, 1.0);
                 let query_allele = query_alleles[i].as_allele();
-                let allele_certainty = match query_allele {
-                    Some(a) if a > 1 => 1.0,
-                    _ => (p0 - p1).abs(),
-                };
-                if allele_certainty <= f32::EPSILON {
-                    continue;
-                }
+                // Use the match probability directly as the weight, without penalizing phase uncertainty.
+                // This ensures unphased hets (p=0.5) still contribute to state selection scores.
+                let allele_certainty = 1.0f32;
                 let sample_idx = hap_idx / 2;
                 let sample = SampleIdx::from(sample_idx);
                 let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
@@ -1465,16 +1459,10 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                     adaptive_pbwt_donor_k(k_per_hap, n_ref_haps, &beams_bwd[i], query_alleles[i]);
                 pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
                 let allele_probs = query_allele_probs[i];
-                let p0 = allele_probs.prob_for_allele(0).clamp(0.0, 1.0);
-                let p1 = allele_probs.prob_for_allele(1).clamp(0.0, 1.0);
                 let query_allele = query_alleles[i].as_allele();
-                let allele_certainty = match query_allele {
-                    Some(a) if a > 1 => 1.0,
-                    _ => (p0 - p1).abs(),
-                };
-                if allele_certainty <= f32::EPSILON {
-                    continue;
-                }
+                // Use the match probability directly as the weight, without penalizing phase uncertainty.
+                // This ensures unphased hets (p=0.5) still contribute to state selection scores.
+                let allele_certainty = 1.0f32;
                 let sample_idx = hap_idx / 2;
                 let sample = SampleIdx::from(sample_idx);
                 let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
@@ -3217,28 +3205,6 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
 
             // Beam-first, then sparse MCMC refinement on remaining unphased hets.
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
-            if packed_ref.n_ref_haps() > 0 {
-                let offset = n_target_haps as u32;
-                for s in 0..n_samples {
-                    let Ok(donors) = beam_donors[s].lock() else {
-                        continue;
-                    };
-                    if donors.is_empty() {
-                        continue;
-                    }
-                    let d1 = donors[0];
-                    let Some(d2) = donors.iter().copied().find(|&h| h != d1) else {
-                        // Do not force a degenerate single-donor seed; let Stage-1
-                        // initialize from its own LMS-supported dynamics.
-                        continue;
-                    };
-                    let hap1 = CombinedHapId::new(offset + d1 as u32);
-                    let hap2 = CombinedHapId::new(offset + d2 as u32);
-                    let path1 = vec![hap1; n_hi_freq];
-                    let path2 = vec![hap2; n_hi_freq];
-                    mcmc_paths[s] = Some(GlobalMosaicPaths { path1, path2 });
-                }
-            }
             let n_burnin = self.config.burnin;
             let n_iterations = self.config.iterations;
             let total_iterations = n_burnin + n_iterations;
