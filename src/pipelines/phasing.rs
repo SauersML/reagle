@@ -161,7 +161,7 @@ fn log_pbwt_cache_isolation_diag() {
         diag.pos_stale_hit_blocked
     );
 }
-use mini_mcmc::core::{MarkovChain, Trace};
+use crate::utils::mcmc::{MarkovChain, Trace};
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SampleCohortStats {

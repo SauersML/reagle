@@ -6,3 +6,4 @@ pub mod memory;
 pub mod state;
 pub mod telemetry;
 pub mod workspace;
+pub mod mcmc;
