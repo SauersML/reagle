@@ -161,7 +161,7 @@ fn log_pbwt_cache_isolation_diag() {
         diag.pos_stale_hit_blocked
     );
 }
-use mini_mcmc::core::{MarkovChain, Trace};
+use general_mcmc::core::{MarkovChain, Trace};
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SampleCohortStats {
@@ -392,8 +392,8 @@ const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_PER_WINDOW_MULT: usize = 8;
-const PBWT_MIN_PER_HAP: usize = 64;
-const PBWT_MAX_PER_HAP: usize = 256;
+const PBWT_MIN_PER_HAP: usize = 128;
+const PBWT_MAX_PER_HAP: usize = 2048;
 const PBWT_ADAPTIVE_K_MIN_DIVISOR: usize = 3;
 const PBWT_ADAPTIVE_K_FLOOR: usize = 16;
 const PBWT_ADAPTIVE_K_MAX_MULT: usize = 2;
