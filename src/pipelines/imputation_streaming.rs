@@ -589,7 +589,6 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
     //
-    // UPDATE: Disabling sharpening below base (min_error = base).
     // Empirical testing shows that sharpening below base (e.g. to 1e-5 when base=1e-4)
     // causes catastrophic loss of rare variants in "perfect LD traps" where the
     // genotyped marker is 0/0 and the imputed marker is in perfect LD.
