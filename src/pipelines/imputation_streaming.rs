@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = (base * 0.5).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -621,7 +621,7 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
         1.0
     };
     let confidence = ((1.0 - entropy_norm) * max_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let scaled = base * (1.6 - 1.2 * confidence);
+    let scaled = base * (2.0 - 0.6 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
     blended.clamp((base * 0.15).max(1e-6), 0.5)
@@ -10578,5 +10578,29 @@ mod tests {
         let seg = extent.build_target_probs(&input);
         assert!((seg.marker_error_rate(0).unwrap_or(0.0) - 0.01).abs() < 1e-6);
         assert!((seg.marker_error_rate(1).unwrap_or(0.0) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_marker_emission_error_logic() {
+        let base = 1e-4;
+
+        // Hard call: should be close to base (approx 0.98 * base)
+        let probs_hard = vec![1.0, 0.0];
+        let err_hard = marker_emission_error_from_probs(&probs_hard, true, base);
+        println!("Hard call error: {:.2e}", err_hard);
+        assert!(err_hard >= 0.9 * base, "Hard call error too low: {} < 0.9 * {}", err_hard, base);
+        assert!(err_hard <= 1.1 * base, "Hard call error too high: {} > 1.1 * {}", err_hard, base);
+
+        // Uniform call: should be significantly higher than base
+        let probs_uniform = vec![0.5, 0.5];
+        let err_uniform = marker_emission_error_from_probs(&probs_uniform, true, base);
+        println!("Uniform call error: {:.2e}", err_uniform);
+        assert!(err_uniform > 10.0 * base, "Uniform call error too low: {}", err_uniform);
+
+        // Slight uncertainty: should be higher than base but not huge
+        let probs_slight = vec![0.99, 0.01];
+        let err_slight = marker_emission_error_from_probs(&probs_slight, true, base);
+        println!("Slight uncertainty error: {:.2e}", err_slight);
+        assert!(err_slight > base, "Slight uncertainty error should be > base");
     }
 }
