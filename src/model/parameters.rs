@@ -79,7 +79,9 @@ impl ModelParams {
     /// * `err` - Optional allele mismatch probability (None = use Li-Stephens formula)
     pub fn for_phasing(n_haps: usize, ne: f32, err: Option<f32>) -> Self {
         // Formula from Java PhaseData constructor
-        let recomb_intensity = (4.0 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
+        // recombIntensity = 0.04 * ne / nHaps
+        // Using exactly 0.04 to match Beagle behavior for optimal calibration.
+        let recomb_intensity = (0.04 * ne / n_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
 
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_haps));
 
@@ -99,7 +101,8 @@ impl ModelParams {
     /// Uses Li-Stephens recombination intensity based on the reference
     /// haplotype count only (copying states), not target+reference.
     pub fn for_imputation(n_ref_haps: usize, ne: f32, err: Option<f32>) -> Self {
-        let recomb_intensity = (4.0 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
+        // Using exactly 0.04 to match Beagle behavior for optimal calibration.
+        let recomb_intensity = (0.04 * ne / n_ref_haps as f32).min(Self::MAX_RECOMB_INTENSITY);
         let p_mismatch = err.unwrap_or_else(|| Self::li_stephens_p_mismatch(n_ref_haps));
         Self {
             p_mismatch,
@@ -128,7 +131,9 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        // Enforce a stricter floor on error probability to prevent overconfidence
+        // in small panels, improving calibration (ECE/DR2).
+        val.max(0.0005)
     }
 
     /// Calculate LR threshold for a given iteration
@@ -370,8 +375,8 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 4.0 * 100_000 / 1000 = 400.0
-        let expected = 4.0 * 100_000.0 / 1000.0;
+        // Should be 0.04 * 100_000 / 1000 = 4.0
+        let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
 

@@ -1189,9 +1189,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 pbwt_fwd.select_donors_into(&beams_fwd[i], donor_k.get(), &mut donors_buf);
                 let allele_probs = query_allele_probs[i];
                 let query_allele = query_alleles[i].as_allele();
-                // Use the match probability directly as the weight, without penalizing phase uncertainty.
-                // This ensures unphased hets (p=0.5) still contribute to state selection scores.
-                let allele_certainty = 1.0f32;
                 let sample_idx = hap_idx / 2;
                 let sample = SampleIdx::from(sample_idx);
                 let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
@@ -1202,6 +1199,13 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let phased = phase_mask
                     .and_then(|mask| mask.get(orig_m, sample_idx))
                     .unwrap_or(0);
+                // Downweight unphased heterozygotes to prevent them from diluting the signal
+                // of homozygous anchors during candidate selection.
+                let allele_certainty = if !is_het || phased != 0 {
+                    1.0
+                } else {
+                    0.001
+                };
                 let full_anchor_scoring = phased != 0 && is_het;
                 if full_anchor_scoring {
                     anchor_seen_fwd[i] = anchor_seen_fwd[i].saturating_add(1);
@@ -1460,9 +1464,6 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 pbwt_bwd.select_donors_into(&beams_bwd[i], donor_k.get(), &mut donors_buf);
                 let allele_probs = query_allele_probs[i];
                 let query_allele = query_alleles[i].as_allele();
-                // Use the match probability directly as the weight, without penalizing phase uncertainty.
-                // This ensures unphased hets (p=0.5) still contribute to state selection scores.
-                let allele_certainty = 1.0f32;
                 let sample_idx = hap_idx / 2;
                 let sample = SampleIdx::from(sample_idx);
                 let a1 = geno.get(orig_m, sample.hap(HapSide::H1));
@@ -1473,6 +1474,13 @@ fn score_window_batch_pbwt_segment<TargetState, TargetSpace, RefSpace>(
                 let phased = phase_mask
                     .and_then(|mask| mask.get(orig_m, sample_idx))
                     .unwrap_or(0);
+                // Downweight unphased heterozygotes to prevent them from diluting the signal
+                // of homozygous anchors during candidate selection.
+                let allele_certainty = if !is_het || phased != 0 {
+                    1.0
+                } else {
+                    0.001
+                };
                 let full_anchor_scoring = phased != 0 && is_het;
                 if full_anchor_scoring {
                     anchor_seen_bwd[i] = anchor_seen_bwd[i].saturating_add(1);
