@@ -1217,11 +1217,12 @@ fn test_error_injection() {
         }
     }
 
-    // STRICT: With monomorphic reference (all 0s), DR2 should be high (near 1.0)
-    // since there's no uncertainty in the imputation
+    // STRICT: With monomorphic reference (all 0s), DR2 should be 0.0 (no variance)
+    // because correlation is undefined/zero when there is no variance.
+    // Previous logic forced it to 1.0, which was incorrect.
     assert!(
-        mean_dr2 > 0.7,
-        "Mean DR2 should be high for monomorphic reference, got {:.4}",
+        mean_dr2 < 0.01,
+        "Mean DR2 should be low (0.0) for monomorphic reference (no variance), got {:.4}",
         mean_dr2
     );
 }
