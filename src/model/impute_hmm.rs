@@ -1377,19 +1377,14 @@ fn missing_emission_prob(
     if n == 0 {
         return 1.0;
     }
-    let mut sum = 0.0f32;
-    let mut sum_sq = 0.0f32;
-    for i in 0..n {
-        let p = target_probs.get(i).unwrap_or(0.0).max(0.0);
-        sum += p;
-        sum_sq += p * p;
-    }
-    let concentration = if sum > 0.0 {
-        (sum_sq / (sum * sum)).clamp(0.0, 1.0)
-    } else {
-        1.0 / n as f32
-    };
-    mismatch_prob + (match_prob - mismatch_prob) * concentration
+    // Uniform marginalization over missing reference alleles.
+    // P(Obs | Miss) = sum_a P(Obs | Ref=a) P(Ref=a)
+    // Assume P(Ref=a) = 1/n (uniform prior).
+    //
+    // P(Obs | Miss) = (1/n) * sum_a P(Obs | Ref=a)
+    //               = (1/n) * (match_prob + (n-1)*mismatch_prob)
+    let inv_n = 1.0 / n as f32;
+    inv_n * (match_prob + (n as f32 - 1.0) * mismatch_prob)
 }
 
 #[inline]
