@@ -588,7 +588,13 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    //
+    // Update: enforce the base error rate as a stricter floor to prevent
+    // over-sharpening that exacerbates the "Perfect LD trap". When the user
+    // (or default) sets a specific error rate, we shouldn't drop 10x below it
+    // just because local markers look clean, as that kills haplotype diversity
+    // needed for robust imputation of rare variants.
+    let min_error = base.max(1e-6);
     posterior.clamp(min_error, 0.5)
 }
 
