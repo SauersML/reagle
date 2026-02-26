@@ -128,7 +128,10 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
-        val.max(1e-8)
+        // Floor at 0.001 to prevent overconfidence/rigidity with large panels.
+        // Higher error rate softens posteriors, improving calibration and reducing
+        // large dosage errors by avoiding confident-wrong calls.
+        val.max(0.001)
     }
 
     /// Calculate LR threshold for a given iteration
