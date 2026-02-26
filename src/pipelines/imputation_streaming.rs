@@ -22,7 +22,7 @@ use tracing::{info_span, instrument, warn};
 use crate::Config;
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
-use crate::data::marker::{AnyMarkerSpace, Markers, RefWindowSpace};
+use crate::data::marker::{Allele, AnyMarkerSpace, Markers, RefWindowSpace};
 use crate::data::storage::phase_state::{PhaseState, Phased};
 use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::{ChromIdx, HapIdx, HapSide, MarkerIdx, SampleIdx};
@@ -134,6 +134,52 @@ fn chrom_variants(chrom: &str) -> Vec<String> {
         push_unique(&mut candidates, format!("CHR{}", chrom));
     }
     candidates
+}
+
+fn allele_to_bytes(allele: &Allele) -> Vec<u8> {
+    allele.to_string().into_bytes()
+}
+
+fn normalize_alleles(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut a_start = 0;
+    let mut b_start = 0;
+    let mut a_end = a.len();
+    let mut b_end = b.len();
+
+    // Strip common prefix (case-insensitive)
+    while a_start < a_end && b_start < b_end && a[a_start].eq_ignore_ascii_case(&b[b_start]) {
+        a_start += 1;
+        b_start += 1;
+    }
+
+    // Strip common suffix (case-insensitive)
+    while a_end > a_start && b_end > b_start && a[a_end - 1].eq_ignore_ascii_case(&b[b_end - 1]) {
+        a_end -= 1;
+        b_end -= 1;
+    }
+
+    (a[a_start..a_end].to_vec(), b[b_start..b_end].to_vec())
+}
+
+fn alleles_match_robust(ref_a: &[u8], ref_b: &[u8], targ_a: &[u8], targ_b: &[u8]) -> bool {
+    if ref_a == targ_a && ref_b == targ_b {
+        return true;
+    }
+    if ref_a.eq_ignore_ascii_case(targ_a) && ref_b.eq_ignore_ascii_case(targ_b) {
+        return true;
+    }
+
+    let (ra, rb) = normalize_alleles(ref_a, ref_b);
+    let (ta, tb) = normalize_alleles(targ_a, targ_b);
+
+    if ra == ta && rb == tb {
+        return true;
+    }
+    if ra.eq_ignore_ascii_case(&ta) && rb.eq_ignore_ascii_case(&tb) {
+        return true;
+    }
+
+    false
 }
 
 #[inline]
@@ -624,7 +670,9 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
-    blended.clamp((base * 0.15).max(1e-6), 0.5)
+    // Disable sharpening: ensure error rate is at least the base rate.
+    // This improves robustness against genotyping errors in sparse targets.
+    blended.clamp(base.max(1e-4), 0.5)
 }
 
 // WARNING: Do NOT use aggressive scaling factors here. PR #740 tried
@@ -665,7 +713,7 @@ fn adaptive_untyped_prior_mix(
     };
 
     let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.5)
 }
 
 #[inline]
@@ -1494,9 +1542,25 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
             let Some(target_alt) = target_marker.alt_alleles.first() else {
                 continue;
             };
-            let same = ref_marker.ref_allele == target_marker.ref_allele && ref_alt == target_alt;
-            let swapped =
-                ref_marker.ref_allele == *target_alt && *ref_alt == target_marker.ref_allele;
+
+            let ref_ref_bytes = allele_to_bytes(&ref_marker.ref_allele);
+            let ref_alt_bytes = allele_to_bytes(ref_alt);
+            let targ_ref_bytes = allele_to_bytes(&target_marker.ref_allele);
+            let targ_alt_bytes = allele_to_bytes(target_alt);
+
+            let same = alleles_match_robust(
+                &ref_ref_bytes,
+                &ref_alt_bytes,
+                &targ_ref_bytes,
+                &targ_alt_bytes,
+            );
+            let swapped = alleles_match_robust(
+                &ref_ref_bytes,
+                &ref_alt_bytes,
+                &targ_alt_bytes,
+                &targ_ref_bytes,
+            );
+
             if !same && !swapped {
                 continue;
             }

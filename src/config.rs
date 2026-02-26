@@ -126,6 +126,9 @@ pub struct Config {
     /// chr21 sweeps (10 target / 1000 ref) showed a quality sweet spot around
     /// 25-30 for phase/IQS/Hellinger, while dosage R² peaked closer to ~50.
     /// Defaulting to 50 prioritizes dosage-first workflows.
+    ///
+    /// Updated to 1600 to match Java Beagle imputation defaults and prevent
+    /// state starvation in small-to-medium panels.
     pub window_top_k: usize,
 
     /// Base fraction of state budget from carried priors.
@@ -277,7 +280,7 @@ impl Default for Config {
             pbwt_batch_mb: 256,
             ap: true,
             gp: true,
-            window_top_k: 50,
+            window_top_k: 1600,
             state_mix_prior_frac: 0.20,
             state_mix_window_frac: 0.35,
             state_mix_donor_frac: 0.25,
@@ -291,7 +294,7 @@ impl Default for Config {
             state_mix_weak_window_frac: 0.10,
             state_mix_weak_donor_frac: 0.30,
             state_mix_weak_core_frac: 0.50,
-            ne: 200000.0,
+            ne: 1000000.0,
             err: None,
             em: true,
             window: 40.0,
