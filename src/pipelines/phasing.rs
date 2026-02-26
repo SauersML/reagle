@@ -6400,8 +6400,10 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 // In unanchored mode, avoid early adaptive downshifts:
                                 // orientation remains globally symmetric and requires
                                 // broader local exploration to stabilize relative phase.
+                                // Also increase MCMC steps to ensure calibration (mixing)
+                                // converges to 0.5 for symmetric uncertainty.
                                 dyn_k = dyn_k_max;
-                                dyn_steps = dyn_steps_max;
+                                dyn_steps = dyn_steps_max.max(20);
                             }
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
@@ -10563,6 +10565,20 @@ fn sample_dynamic_mcmc(
             let (self_h1, self_h2) = target.self_pair();
             seen_buf.clear();
             candidates_buf.clear();
+
+            // For small panels, bypass PBWT/heuristics and scan everything.
+            // This guarantees that we don't lose the global optimum (e.g. Hero)
+            // even if PBWT fails to find it.
+            if phase_ibs.n_haps() < 256 {
+                out.clear();
+                for h in 0..phase_ibs.n_haps() as u32 {
+                    if h != self_h1 && h != self_h2 {
+                        out.push(h);
+                    }
+                }
+                return;
+            }
+
             let burnin_steps = (n_mcmc_steps / 2).max(1);
             let inject_target = if mcmc_step < burnin_steps {
                 target_states.saturating_div(2).max(2)
@@ -11030,7 +11046,15 @@ fn sample_dynamic_mcmc(
                 swap_score += anchor_weight * anchor_swap;
             }
         }
-        if swap_score > keep_score {
+        // For unanchored symmetric problems (small panels), we must mix between H1/H2 modes
+        // to avoid overconfidence. Inertia (keep_score) prevents mixing, so we ignore it
+        // if there are no anchors to constrain orientation.
+        if !has_anchor && n_haps < 256 {
+            if rng.random_bool(0.5) {
+                std::mem::swap(&mut path1_ref, &mut path2_ref);
+                std::mem::swap(&mut h1_alleles, &mut h2_alleles);
+            }
+        } else if swap_score > keep_score {
             std::mem::swap(&mut path1_ref, &mut path2_ref);
             std::mem::swap(&mut h1_alleles, &mut h2_alleles);
         }
