@@ -588,7 +588,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
     // Allow sharpening below base when typed evidence is strong, but limit
     // maximum sharpening to avoid sparse-array collapse.
-    let min_error = (base * 0.1).max(1e-6).min(base);
+    let min_error = base.max(0.001);
     posterior.clamp(min_error, 0.5)
 }
 
@@ -664,8 +664,9 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    // Increased base mixing floor to better handle uncertainty and reduce large errors.
+    let floor = 0.05 + 0.20 * missing_ramp;
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.25)
 }
 
 #[inline]
@@ -1497,10 +1498,16 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
             let same = ref_marker.ref_allele == target_marker.ref_allele && ref_alt == target_alt;
             let swapped =
                 ref_marker.ref_allele == *target_alt && *ref_alt == target_marker.ref_allele;
-            if !same && !swapped {
+
+            let ref_compl = ref_marker.ref_allele.complement();
+            let alt_compl = ref_alt.complement();
+            let flip = ref_compl == target_marker.ref_allele && alt_compl == *target_alt;
+            let flip_swap = ref_compl == *target_alt && alt_compl == target_marker.ref_allele;
+
+            if !same && !swapped && !flip && !flip_swap {
                 continue;
             }
-            let map_kind = if swapped {
+            let map_kind = if swapped || flip_swap {
                 TypedMarkerMapKind::PositionalBiallelicSwap
             } else {
                 TypedMarkerMapKind::PositionalBiallelicMatch
