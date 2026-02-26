@@ -527,7 +527,7 @@ def prepare_truth(source, output_vcf, panel_path):
 
     print(f"Running: {' '.join(cmd)}")
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
-    subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+    subprocess.check_call(["bash", "-c", f"ulimit -n 4096; {cmd_str}"])
 
     if not os.path.exists(truth_raw_vcf):
         raise RuntimeError("convert_genome failed to produce truth_hg38_raw.vcf")
@@ -647,7 +647,7 @@ def run_conversion(input_path, output_vcf, panel_path):
 
     print(f"Running: {' '.join(cmd)}")
     cmd_str = " ".join(shlex.quote(part) for part in cmd)
-    subprocess.check_call(["bash", "-lc", f"ulimit -n 4096; {cmd_str}"])
+    subprocess.check_call(["bash", "-c", f"ulimit -n 4096; {cmd_str}"])
     # After this command succeeds, convert_genome has written its outputs under
     # convert_genome_array_out/. We deliberately do not delete panel.vcf here
     # so quality assessment scripts can inspect or reuse it.
