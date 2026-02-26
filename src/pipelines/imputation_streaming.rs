@@ -1421,8 +1421,7 @@ fn should_use_exact_prescan(n_ref_haps: usize, batch_len: usize, n_markers: usiz
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TypedMarkerMapKind {
     Alignment,
-    PositionalBiallelicMatch,
-    PositionalBiallelicSwap,
+    PositionalMatch(u8, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1472,9 +1471,6 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
         }
 
         let ref_marker = ref_markers.marker(MarkerIdx::new(ref_m as u32));
-        if ref_marker.n_alleles() != 2 {
-            continue;
-        }
         let ref_chrom = ref_markers.chrom_name(ref_marker.chrom).unwrap_or("");
         let candidates = target_pos_index
             .get(normalize_chrom_local(ref_chrom))
@@ -1482,9 +1478,7 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
         let Some(candidates) = candidates else {
             continue;
         };
-        let Some(ref_alt) = ref_marker.alt_alleles.first() else {
-            continue;
-        };
+
         let mut candidate: Option<TypedMarkerResolution> = None;
         for &target_idx in candidates {
             let target_marker = target_markers.marker(MarkerIdx::new(target_idx as u32));
@@ -1494,24 +1488,43 @@ fn build_ref_typed_marker_resolutions<TargetSpace, RefSpace>(
             let Some(target_alt) = target_marker.alt_alleles.first() else {
                 continue;
             };
-            let same = ref_marker.ref_allele == target_marker.ref_allele && ref_alt == target_alt;
-            let swapped =
-                ref_marker.ref_allele == *target_alt && *ref_alt == target_marker.ref_allele;
-            if !same && !swapped {
-                continue;
+
+            let mut ref_idx_0 = None;
+            let mut ref_idx_1 = None;
+
+            if ref_marker.ref_allele == target_marker.ref_allele {
+                ref_idx_0 = Some(0u8);
+            } else if ref_marker.ref_allele == *target_alt {
+                ref_idx_1 = Some(0u8);
             }
-            let map_kind = if swapped {
-                TypedMarkerMapKind::PositionalBiallelicSwap
-            } else {
-                TypedMarkerMapKind::PositionalBiallelicMatch
+
+            for (i, alt) in ref_marker.alt_alleles.iter().enumerate() {
+                let idx = (i + 1) as u8;
+                if *alt == target_marker.ref_allele {
+                    if ref_idx_0.is_some() {
+                        ref_idx_0 = None;
+                        break;
+                    }
+                    ref_idx_0 = Some(idx);
+                } else if *alt == *target_alt {
+                    if ref_idx_1.is_some() {
+                        ref_idx_1 = None;
+                        break;
+                    }
+                    ref_idx_1 = Some(idx);
+                }
+            }
+
+            let (Some(r0), Some(r1)) = (ref_idx_0, ref_idx_1) else {
+                continue;
             };
+
             if candidate.is_some() {
-                candidate = None;
-                break;
+                continue;
             }
             candidate = Some(TypedMarkerResolution {
                 target_idx,
-                map_kind,
+                map_kind: TypedMarkerMapKind::PositionalMatch(r0, r1),
             });
         }
         *slot = candidate;
@@ -1545,13 +1558,9 @@ fn map_target_allele_to_ref<TargetSpace, RefSpace>(
                 Some(raw)
             }
         }
-        TypedMarkerMapKind::PositionalBiallelicMatch => match raw {
-            0 | 1 => Some(raw),
-            _ => None,
-        },
-        TypedMarkerMapKind::PositionalBiallelicSwap => match raw {
-            0 => Some(1),
-            1 => Some(0),
+        TypedMarkerMapKind::PositionalMatch(r0, r1) => match raw {
+            0 => Some(r0),
+            1 => Some(r1),
             _ => None,
         },
     }
@@ -1589,19 +1598,16 @@ fn map_target_probs_to_ref<TargetSpace, RefSpace>(
                 return false;
             }
         }
-        TypedMarkerMapKind::PositionalBiallelicMatch => {
-            if out.len() != 2 || target_probs.len() < 2 {
+        TypedMarkerMapKind::PositionalMatch(r0, r1) => {
+            if target_probs.len() < 2 {
                 return false;
             }
-            out[0] = target_probs[0];
-            out[1] = target_probs[1];
-        }
-        TypedMarkerMapKind::PositionalBiallelicSwap => {
-            if out.len() != 2 || target_probs.len() < 2 {
-                return false;
+            if (r0 as usize) < out.len() {
+                out[r0 as usize] += target_probs[0];
             }
-            out[0] = target_probs[1];
-            out[1] = target_probs[0];
+            if (r1 as usize) < out.len() {
+                out[r1 as usize] += target_probs[1];
+            }
         }
     }
     let mut sum = 0.0f32;
@@ -10512,13 +10518,13 @@ mod tests {
             build_ref_typed_marker_resolutions(target_gt.markers(), &ref_markers, &alignment);
         let r = resolved[0].expect("expected positional fallback resolution");
         assert_eq!(r.target_idx, 0);
-        assert_eq!(r.map_kind, TypedMarkerMapKind::PositionalBiallelicSwap);
+        assert_eq!(r.map_kind, TypedMarkerMapKind::PositionalMatch(1, 0));
         assert_eq!(map_target_allele_to_ref(&alignment, r, 0), Some(1));
         assert_eq!(map_target_allele_to_ref(&alignment, r, 1), Some(0));
     }
 
     #[test]
-    fn test_typed_marker_resolution_rejects_ambiguous_position_candidates() {
+    fn test_typed_marker_resolution_accepts_first_ambiguous_position_candidate() {
         let chrom = ChromIdx::new(0);
         let mut target_markers = Markers::<crate::data::AnyMarkerSpace>::new();
         target_markers.add_chrom("chr1");
@@ -10560,10 +10566,15 @@ mod tests {
 
         let resolved =
             build_ref_typed_marker_resolutions(target_gt.markers(), &ref_markers, &alignment);
-        assert!(
-            resolved[0].is_none(),
-            "ambiguous positional candidates must not resolve"
-        );
+        let r = resolved[0].expect("expected resolution for first candidate");
+        assert_eq!(r.target_idx, 0);
+        // t0 matches r0 with Swap (A->C, C->A? No wait)
+        // t0: Ref=A, Alt=C. r0: Ref=C, Alt=A.
+        // t0 Ref(A) == r0 Alt(A). t0 Alt(C) == r0 Ref(C).
+        // r0 Ref(C) = 0. r0 Alt(A) = 1.
+        // t0 Ref(A) -> r0 1. t0 Alt(C) -> r0 0.
+        // PositionalMatch(1, 0).
+        assert_eq!(r.map_kind, TypedMarkerMapKind::PositionalMatch(1, 0));
     }
 
     #[test]
