@@ -6400,10 +6400,8 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 // In unanchored mode, avoid early adaptive downshifts:
                                 // orientation remains globally symmetric and requires
                                 // broader local exploration to stabilize relative phase.
-                                // Also increase MCMC steps to ensure calibration (mixing)
-                                // converges to 0.5 for symmetric uncertainty.
                                 dyn_k = dyn_k_max;
-                                dyn_steps = dyn_steps_max.max(20);
+                                dyn_steps = dyn_steps_max;
                             }
                             // SHAPEIT5-style dynamic MCMC: re-select states each step
                             let mut prior_local = prior_paths[s].as_ref().map(|gp| MosaicPaths {
@@ -10569,37 +10567,56 @@ fn sample_dynamic_mcmc(
             // For small panels, bypass PBWT/heuristics and scan everything.
             // This guarantees that we don't lose the global optimum (e.g. Hero)
             // even if PBWT fails to find it.
+            // We populate candidates_buf and fall through to scoring to ensure
+            // we keep only the best matches.
             if phase_ibs.n_haps() < 256 {
-                out.clear();
                 for h in 0..phase_ibs.n_haps() as u32 {
                     if h != self_h1 && h != self_h2 {
-                        out.push(h);
+                        candidates_buf.push(h);
                     }
                 }
-                return;
-            }
-
-            let burnin_steps = (n_mcmc_steps / 2).max(1);
-            let inject_target = if mcmc_step < burnin_steps {
-                target_states.saturating_div(2).max(2)
             } else {
-                target_states.saturating_div(8).max(1)
-            };
+                let burnin_steps = (n_mcmc_steps / 2).max(1);
+                let inject_target = if mcmc_step < burnin_steps {
+                    target_states.saturating_div(2).max(2)
+                } else {
+                    target_states.saturating_div(8).max(1)
+                };
 
-            for &m in &anchors_static {
-                let ref_hap = path_ref.get(m).copied().unwrap_or(0);
-                if (ref_hap as usize) < phase_ibs.n_haps() {
-                    let search_states = if recipient_stability < 0.95 {
-                        target_states
-                            .saturating_add((target_states / 2).max(1))
-                            .min(phase_ibs.n_haps().saturating_sub(2).max(1))
-                    } else {
-                        target_states
-                    };
-                    let mut local =
-                        phase_ibs.find_neighbors_of_state(ref_hap, m, sample_idx, search_states);
-                    local.push(ref_hap);
-                    for h in local {
+                for &m in &anchors_static {
+                    let ref_hap = path_ref.get(m).copied().unwrap_or(0);
+                    if (ref_hap as usize) < phase_ibs.n_haps() {
+                        let search_states = if recipient_stability < 0.95 {
+                            target_states
+                                .saturating_add((target_states / 2).max(1))
+                                .min(phase_ibs.n_haps().saturating_sub(2).max(1))
+                        } else {
+                            target_states
+                        };
+                        let mut local = phase_ibs.find_neighbors_of_state(
+                            ref_hap,
+                            m,
+                            sample_idx,
+                            search_states,
+                        );
+                        local.push(ref_hap);
+                        for h in local {
+                            if h == self_h1 || h == self_h2 {
+                                continue;
+                            }
+                            if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
+                                continue;
+                            }
+                            if seen_buf.insert(h) {
+                                candidates_buf.push(h);
+                            }
+                        }
+                    }
+                    // Inject target-driven neighbors so the state-space can recover
+                    // from poor latent trajectories during burn-in/mixing.
+                    let mut genotype_neighbors =
+                        phase_ibs.find_neighbors(target_hap_idx, m, ibs2, inject_target);
+                    for h in genotype_neighbors.drain(..) {
                         if h == self_h1 || h == self_h2 {
                             continue;
                         }
@@ -10609,21 +10626,6 @@ fn sample_dynamic_mcmc(
                         if seen_buf.insert(h) {
                             candidates_buf.push(h);
                         }
-                    }
-                }
-                // Inject target-driven neighbors so the state-space can recover
-                // from poor latent trajectories during burn-in/mixing.
-                let mut genotype_neighbors =
-                    phase_ibs.find_neighbors(target_hap_idx, m, ibs2, inject_target);
-                for h in genotype_neighbors.drain(..) {
-                    if h == self_h1 || h == self_h2 {
-                        continue;
-                    }
-                    if !allow_donor_at_marker(h, LocalMarkerIdx(m)) {
-                        continue;
-                    }
-                    if seen_buf.insert(h) {
-                        candidates_buf.push(h);
                     }
                 }
             }
@@ -10669,7 +10671,18 @@ fn sample_dynamic_mcmc(
                 scored_buf.push((h, donor_scores_buf[i]));
             }
 
-            let keep = target_states.min(scored_buf.len()).max(1);
+            // If the buffer contains nearly the entire panel (e.g. small panel brute force),
+            // we must prune distractors aggressively.
+            // Keeping too many mediocre matches allows the HMM to switch frequently under
+            // high recombination, destroying long-range phase consistency (SER).
+            // We keep the top 64, which is sufficient for mosaic reconstruction while
+            // excluding noise.
+            let keep_limit = if scored_buf.len() > 1 && scored_buf.len() >= phase_ibs.n_haps() - 2 {
+                64.min(scored_buf.len() - 1)
+            } else {
+                scored_buf.len()
+            };
+            let keep = target_states.min(keep_limit).max(1);
             if scored_buf.len() > keep {
                 scored_buf.select_nth_unstable_by(keep - 1, |a, b| {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -11046,15 +11059,7 @@ fn sample_dynamic_mcmc(
                 swap_score += anchor_weight * anchor_swap;
             }
         }
-        // For unanchored symmetric problems (small panels), we must mix between H1/H2 modes
-        // to avoid overconfidence. Inertia (keep_score) prevents mixing, so we ignore it
-        // if there are no anchors to constrain orientation.
-        if !has_anchor && n_haps < 256 {
-            if rng.random_bool(0.5) {
-                std::mem::swap(&mut path1_ref, &mut path2_ref);
-                std::mem::swap(&mut h1_alleles, &mut h2_alleles);
-            }
-        } else if swap_score > keep_score {
+        if swap_score > keep_score {
             std::mem::swap(&mut path1_ref, &mut path2_ref);
             std::mem::swap(&mut h1_alleles, &mut h2_alleles);
         }
