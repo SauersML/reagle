@@ -9895,6 +9895,23 @@ fn sample_dynamic_mcmc(
         sample_idx: recipient_sample,
         side: HapSide::H2,
     };
+    // If the heuristic initialization picked the sample itself as the best reference match,
+    // discard it to force the random-injection heuristic to find a better (external) match.
+    // Self-matching provides no phasing information and traps the MCMC in the current local optimum.
+    let initial_paths = if let Some(paths) = initial_paths {
+        let h1 = paths.path1.first().copied().unwrap_or(u32::MAX);
+        let h2 = paths.path2.first().copied().unwrap_or(u32::MAX);
+        let self_h1 = recipient_h1.hap_idx();
+        let self_h2 = recipient_h2.hap_idx();
+        if h1 == self_h1 || h1 == self_h2 || h2 == self_h1 || h2 == self_h2 {
+            None
+        } else {
+            Some(paths)
+        }
+    } else {
+        None
+    };
+
     let anchor_h1 = anchor_hap1.unwrap_or(&[]);
     let anchor_h2 = anchor_hap2.unwrap_or(&[]);
     let has_anchor = (0..n_markers).any(|m| {
@@ -10122,9 +10139,50 @@ fn sample_dynamic_mcmc(
     let mut neighbors = initial_neighbors;
     let n_haps = phase_ibs.n_haps() as u32;
 
+    // Inject random haplotypes to ensure global exploration (prevents getting stuck in local optima)
+    // especially when PBWT fails to find the correct phase-shifted match (e.g. Hero/AntiHero).
+    if n_haps > 0 {
+        // For small panels (<256 haplotypes), brute-force scan all haplotypes to guarantee finding the optimum.
+        // For large panels, inject 32 randoms.
+        if n_haps < 256 {
+            for h in 0..n_haps {
+                if !neighbors.contains(&h) {
+                    // Insert near the front but preserve the very best PBWT matches (top 8)
+                    let insert_pos = neighbors.len().min(8);
+                    neighbors.insert(insert_pos, h);
+                }
+            }
+        } else {
+            for _ in 0..32 {
+                let h = rng.random_range(0..n_haps);
+                if !neighbors.contains(&h) {
+                    let insert_pos = neighbors.len().min(8);
+                    neighbors.insert(insert_pos, h);
+                }
+            }
+        }
+    }
+
+    // Also explicitly inject initial_paths haplotypes into neighbors as candidates
+    // so the heuristic can verify if they are better than randoms.
+    if let Some(paths) = initial_paths {
+        if let Some(&h1) = paths.path1.first() {
+            if !neighbors.contains(&h1) && (h1 as usize) < (n_haps as usize) {
+                neighbors.insert(neighbors.len().min(8), h1);
+            }
+        }
+        if let Some(&h2) = paths.path2.first() {
+            if !neighbors.contains(&h2) && (h2 as usize) < (n_haps as usize) {
+                neighbors.insert(neighbors.len().min(8), h2);
+            }
+        }
+    }
+
     let mut seeded_from_heuristic = false;
-    if initial_paths.is_none() && !neighbors.is_empty() {
-        let limit = neighbors.len().min(16);
+    // Always run the heuristic if neighbors exist, to check if a random pair (or initial_paths)
+    // is better than the default initialization.
+    if !neighbors.is_empty() {
+        let limit = neighbors.len().min(256);
         if limit >= 2 {
             // Keep this seed-search bounded on long windows.
             const MAX_INIT_EVAL_MARKERS: usize = 2000;
@@ -10231,12 +10289,14 @@ fn sample_dynamic_mcmc(
         }
     }
 
-    if let Some(paths) = initial_paths {
+    if seeded_from_heuristic {
+        // Path and alleles already set by heuristic
+    } else if let Some(paths) = initial_paths {
         if paths.path1.len() == n_markers && paths.path2.len() == n_markers {
             path1_ref.copy_from_slice(&paths.path1);
             path2_ref.copy_from_slice(&paths.path2);
         }
-    } else if !seeded_from_heuristic {
+    } else {
         if neighbors.len() >= 2 {
             let h1_seed = neighbors[0];
             let h2_seed = neighbors[1];
