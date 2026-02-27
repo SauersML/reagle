@@ -6610,14 +6610,12 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                             Stage1OrientationUpdate::AbsoluteHap1(desired_hap1)
                         } else {
                             let mut swap_mask = vec![RelativeSwapBit(false); n_hi_freq];
-                            let lr_threshold = self.params.lr_threshold;
                             for (map_idx, &pos) in het_positions.iter().enumerate() {
-                                let lr = *swap_lr.get(map_idx).unwrap_or(&1.0);
-                                let p_swap_decoded =
-                                    *swap_probs_conf.get(map_idx).unwrap_or(&0.5);
-                                let p_swap_raw =
-                                    *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
-                                if lr >= lr_threshold && p_swap_raw > 0.5 {
+                                // Always update orientation based on the MCMC sample (swap_bits),
+                                // even if not confident enough to lock. This ensures the chain
+                                // propagates its state between iterations.
+                                let swap_bit = *swap_bits.get(map_idx).unwrap_or(&0);
+                                if swap_bit == 1 {
                                     swap_mask[pos] = RelativeSwapBit(true);
                                 }
                             }
@@ -6633,6 +6631,46 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 anchor_resets += 1;
                             }
                         }
+
+                        // Apply swap bits to reconstruct final phased haplotypes *before* computing confidence.
+                        // If swap_bit=1, this means H1 gets allele2 and H2 gets allele1 at this het site.
+                        // If swap_bit=0, H1 gets allele1 and H2 gets allele2.
+                        // This effectively reconstructs the final chosen path.
+                        //
+                        // The logic below ensures `swap_bits` (the MCMC choice) is used for allele determination,
+                        // while `swap_probs` (the confidence) is used separately.
+                        //
+                        // Furthermore, for `het_updates`, we need to package the decision correctly.
+                        // `Stage1HetUpdate` is applied later to modify the *mutable* `sp`.
+                        // The decision is: "should the alleles at marker `m` be swapped relative to current `sp`?"
+                        //
+                        // Current state in `sp` (and `seq1`/`seq2` which are copies of it):
+                        //   H1 = seq1[i], H2 = seq2[i]
+                        //
+                        // MCMC decision `swap_bit`:
+                        //   0 => Keep current orientation (H1=seq1, H2=seq2)
+                        //   1 => Swap orientation (H1=seq2, H2=seq1)
+                        //
+                        // So if `swap_bit == 1`, we want `sp` to be swapped.
+                        // The `Stage1OrientationUpdate::RelativeSwapMask` handles this exactly:
+                        // `swap_mask[pos] = true` if `swap_bit == 1`.
+                        //
+                        // However, the *confidence* calculation needs to be aligned.
+                        // `p_swap_raw` is P(swap | data).
+                        // If we chose swap (bit=1), our confidence is `p_swap_raw`.
+                        // If we chose keep (bit=0), our confidence is `1.0 - p_swap_raw` (which is P(keep)).
+                        //
+                        // Wait, `sample_swap_bits_mosaic` returns `swap_bits` which are *posterior samples*.
+                        // It also returns `swap_probs` which are the *posterior probabilities of swapping*.
+                        //
+                        // If `swap_probs[i] > 0.5`, then `swap_bits[i]` is likely 1.
+                        //
+                        // The code below constructs `het_updates` using `lr` and `confidence`.
+                        // `lr` is used to decide *locking*.
+                        // `confidence` is stored in the `GenotypeMatrix`.
+                        //
+                        // The confidence stored should always be > 0.5 (certainty of the chosen phase).
+                        // So `p_orient` logic is correct: max(p, 1-p).
 
                         // Phase confidence should reflect absolute label certainty.
                         // If there are no anchored/phased markers yet, labels are symmetric,
@@ -6650,11 +6688,22 @@ impl<RefSpace: Send + Sync> PhasingPipeline<RefSpace> {
                                 let p_swap_raw =
                                     *swap_probs.get(map_idx).unwrap_or(&p_swap_decoded);
                                 let swap_bit = *swap_bits.get(map_idx).unwrap_or(&0);
-                                let p_orient = if swap_bit == 1 {
+                                let mut p_orient = if swap_bit == 1 {
                                     p_swap_raw
                                 } else {
                                     1.0 - p_swap_raw
                                 };
+
+                                // If we don't have any phase anchors to pin the absolute orientation,
+                                // we cannot be confident about H1 vs H2 labels globally, even if
+                                // we are confident about relative phasing locally.
+                                //
+                                // Clamp confidence to 0.5 to reflect this symmetry and prevent
+                                // overconfident Brier/ECE scores, while still allowing the high LR
+                                // (based on relative consistency) to lock phases and create new anchors.
+                                if !has_phase_anchors {
+                                    p_orient = 0.5;
+                                }
                                 PhaseConfidence(p_orient.clamp(0.0, 1.0))
                             };
                             het_updates.push(Stage1HetUpdate {
