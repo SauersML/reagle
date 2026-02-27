@@ -241,7 +241,7 @@ fn collect_carriers_for_allele(
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_PER_WINDOW_MULT: usize = 8;
+const PBWT_PER_WINDOW_MULT: usize = 16;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
@@ -249,8 +249,6 @@ const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
 const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
-const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
-const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
 const SM_MATCH_DONORS: usize = 16;
@@ -1274,9 +1272,12 @@ fn adaptive_top_m_window_from_support(
     let mut out = base_top_m;
     if support_frac <= 0.08 {
         out = out.saturating_mul(PRESCAN_TOPM_WEAK_MULT_NUM) / PRESCAN_TOPM_WEAK_MULT_DEN;
-    } else if support_frac >= 0.65 {
-        out = out.saturating_mul(PRESCAN_TOPM_STRONG_MULT_NUM) / PRESCAN_TOPM_STRONG_MULT_DEN;
     }
+    // Relaxed adaptive reduction: previously we reduced top_m if support > 0.65
+    // (many candidates). However, for imputation accuracy, preserving diversity
+    // in high-density regions is beneficial to avoid collapsing rare variants.
+    // We now skip the reduction step.
+
     out.max(per_window_cap_window.max(1)).min(n_ref_haps.max(1))
 }
 
