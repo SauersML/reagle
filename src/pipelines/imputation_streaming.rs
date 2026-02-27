@@ -9699,6 +9699,14 @@ impl crate::pipelines::ImputationPipeline {
             output_markers.push(OutputMarker::Ref(ref_m));
         }
 
+        // Only flush target markers that precede the start of the next window (if any).
+        // If we are at the end of the window markers, we can flush everything.
+        let pos_limit = if output_end < ref_markers.len() {
+            Some(ref_markers.marker(MarkerIdx::new(output_end as u32)).pos)
+        } else {
+            None
+        };
+
         let mut chrom_keys: Vec<String> = target_only_linear.keys().cloned().collect();
         chrom_keys.sort_by(|a, b| {
             let ra = chrom_rank.get(a).copied().unwrap_or(usize::MAX);
@@ -9712,6 +9720,14 @@ impl crate::pipelines::ImputationPipeline {
             let cursor = target_only_cursor.get(&chrom_key).copied().unwrap_or(0);
             for &t_idx in list.iter().skip(cursor) {
                 if !emitted_target[t_idx] {
+                    // Check positional limit to prevent leaking halo markers into this window's output
+                    if let Some(limit) = pos_limit {
+                        let t_pos = target_win.marker(MarkerIdx::new(t_idx as u32)).pos;
+                        if t_pos >= limit {
+                            // Stop flushing this chromosome's target markers
+                            break;
+                        }
+                    }
                     emitted_target[t_idx] = true;
                     output_markers.push(OutputMarker::Target(t_idx));
                 }
