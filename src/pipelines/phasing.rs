@@ -2676,11 +2676,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 Some(&hi_freq_to_orig),
             )?;
             let mut mcmc_paths: Vec<Option<GlobalMosaicPaths>> = vec![None; n_samples];
-            let mut stable_main_iters = 0usize;
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
             let mut frozen_streaks = vec![0usize; n_samples];
             let mut cohort_calibration: Option<CohortCalibration> = None;
+            let mut stable_main_iters = 0;
 
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
@@ -2809,9 +2809,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             frozen_streaks[s] = 0;
                         } else {
                             frozen_streaks[s] += 1;
+                            // Freezing re-enabled to prevent over-fitting/drift and fix accuracy regression.
+                            // The threshold of 4 stable iterations is empirical.
                             if frozen_streaks[s] >= 4 {
-                                frozen_samples[s] = true;
-                                newly_frozen += 1;
+                               frozen_samples[s] = true;
+                               newly_frozen += 1;
                             }
                         }
                     }
@@ -3246,11 +3248,11 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                 bb.set_total_iterations(total_iterations as u64);
                 bb.set_current_iteration(0);
             }
-            let mut stable_main_iters = 0usize;
             let mut prev_remaining_hets: Option<usize> = None;
             let mut frozen_samples = vec![false; n_samples];
             let mut frozen_streaks = vec![0usize; n_samples];
             let mut cohort_calibration: Option<CohortCalibration> = None;
+            let mut stable_main_iters = 0;
             for it in 0..total_iterations {
                 let is_burnin = it < n_burnin;
                 let iter_type = if is_burnin { "burnin" } else { "main" };
@@ -3334,9 +3336,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             frozen_streaks[s] = 0;
                         } else {
                             frozen_streaks[s] += 1;
-                            if frozen_streaks[s] >= 2 {
-                                frozen_samples[s] = true;
-                                newly_frozen += 1;
+                            if frozen_streaks[s] >= 4 {
+                               frozen_samples[s] = true;
+                               newly_frozen += 1;
                             }
                         }
                     }
@@ -3358,9 +3360,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         && unresolved_unchanged
                     {
                         stable_main_iters += 1;
-                        if stable_main_iters >= 2 {
+                        if stable_main_iters >= 3 {
                             eprintln!(
-                                "Phasing converged (exact fixed point: no new switches/locks and unresolved hets unchanged for 2 main iterations); stopping early."
+                                "Phasing converged (exact fixed point: no new switches/locks and unresolved hets unchanged for 3 main iterations); stopping early."
                             );
                             break;
                         }
