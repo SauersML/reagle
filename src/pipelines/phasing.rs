@@ -2809,7 +2809,7 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                             frozen_streaks[s] = 0;
                         } else {
                             frozen_streaks[s] += 1;
-                            if frozen_streaks[s] >= 2 {
+                            if frozen_streaks[s] >= 4 {
                                 frozen_samples[s] = true;
                                 newly_frozen += 1;
                             }
@@ -2833,9 +2833,9 @@ impl PhasingPipeline<crate::data::AnyMarkerSpace> {
                         && unresolved_unchanged
                     {
                         stable_main_iters += 1;
-                        if stable_main_iters >= 2 {
+                        if stable_main_iters >= 3 {
                             eprintln!(
-                                "Phasing converged (exact fixed point: no new switches/locks and unresolved hets unchanged for 2 main iterations); stopping early."
+                                "Phasing converged (exact fixed point: no new switches/locks and unresolved hets unchanged for 3 main iterations); stopping early."
                             );
                             break;
                         }
