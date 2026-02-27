@@ -665,7 +665,7 @@ fn adaptive_untyped_prior_mix(
     };
 
     let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.5)
 }
 
 #[inline]

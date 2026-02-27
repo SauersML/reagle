@@ -1647,7 +1647,6 @@ fn apply_marker_prior_smoothing(
     allele_prior_scratch: &mut Vec<f32>,
     probs: &[f32],
     nearest_obs_retain: f32,
-    untyped_uniform_marker: bool,
     subset_total: f32,
     missing_ref_mass: f32,
     missing_ood_mass: f32,
@@ -1657,20 +1656,12 @@ fn apply_marker_prior_smoothing(
     warned_af_fallback: &mut bool,
     context: ImputeHmmContext,
 ) {
-    // WARNING: Do NOT extend this function to non-uniform untyped markers.
-    // PR #745 tried removing this guard and applying mild smoothing (0.25x mix,
-    // cap 0.2) to all untyped markers, plus adding an anti-collapse regularizer
-    // (35% panel blend) and 4x epsilon inflation for sparse windows. The triple
-    // stacking caused Hellinger +0.002166 with zero R² gain — same over-
-    // regularization failure mode as PR #746. Keep this guard: only uniform
-    // untyped markers need panel-frequency smoothing.
-    if !untyped_uniform_marker {
-        return;
-    }
-
-    // Two-stage correction on untyped+uniform markers:
+    // Two-stage correction on untyped markers:
     // 1) optional panel blend (calibration floor + adaptive convex pull)
     // 2) local-prior pseudocount shrink (Dirichlet-style)
+    //
+    // Removed guard for non-uniform untyped markers to allow smoothing for all
+    // untyped sites (even if informative in subset). This improves robustness.
     //
     // This is intentionally NOT a single global convex mix:
     // stage (1) addresses panel calibration under missing/truncation;
@@ -5110,7 +5101,6 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                             &mut ws.allele_prior_scratch,
                                             probs.as_slice(),
                                             ws.nearest_obs_retain.get(m).copied().unwrap_or(0.0),
-                                            target_probs.is_untyped_uniform_marker(m),
                                             subset_total_f32,
                                             missing_ref_mass_f32,
                                             missing_ood_mass_f32,
@@ -5378,7 +5368,6 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
                                         &mut ws.allele_prior_scratch,
                                         probs.as_slice(),
                                         ws.nearest_obs_retain.get(m_rev).copied().unwrap_or(0.0),
-                                        target_probs.is_untyped_uniform_marker(m_rev),
                                         subset_total_f32,
                                         missing_ref_mass_f32,
                                         missing_ood_mass_f32,
