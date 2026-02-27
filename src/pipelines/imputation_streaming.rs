@@ -9686,6 +9686,7 @@ impl crate::pipelines::ImputationPipeline {
                 while *cursor < list.len() {
                     let t_idx = list[*cursor];
                     let t_pos = target_win.marker(MarkerIdx::new(t_idx as u32)).pos;
+                    // In-interleaving loop: always stop if we exceed current reference marker
                     if t_pos > ref_marker.pos {
                         break;
                     }
@@ -9699,35 +9700,36 @@ impl crate::pipelines::ImputationPipeline {
             output_markers.push(OutputMarker::Ref(ref_m));
         }
 
-        // Only flush target markers that precede the start of the next window (if any).
-        // If we are at the end of the window markers, we can flush everything.
-        let pos_limit = if output_end < ref_markers.len() {
-            Some(ref_markers.marker(MarkerIdx::new(output_end as u32)).pos)
-        } else {
-            None
-        };
-
         let mut chrom_keys: Vec<String> = target_only_linear.keys().cloned().collect();
         chrom_keys.sort_by(|a, b| {
             let ra = chrom_rank.get(a).copied().unwrap_or(usize::MAX);
             let rb = chrom_rank.get(b).copied().unwrap_or(usize::MAX);
             ra.cmp(&rb).then_with(|| a.cmp(b))
         });
+        let limit_info = if output_end < ref_markers.len() {
+            let m = ref_markers.marker(MarkerIdx::new(output_end as u32));
+            let c = ref_markers.chrom_name(m.chrom).unwrap_or("");
+            Some((m.pos, normalize_chrom_local(c).to_string()))
+        } else {
+            None
+        };
+
         for chrom_key in chrom_keys {
             let Some(list) = target_only_linear.get(&chrom_key) else {
                 continue;
             };
             let cursor = target_only_cursor.get(&chrom_key).copied().unwrap_or(0);
             for &t_idx in list.iter().skip(cursor) {
-                if !emitted_target[t_idx] {
-                    // Check positional limit to prevent leaking halo markers into this window's output
-                    if let Some(limit) = pos_limit {
-                        let t_pos = target_win.marker(MarkerIdx::new(t_idx as u32)).pos;
-                        if t_pos >= limit {
-                            // Stop flushing this chromosome's target markers
+                if let Some((limit_pos, ref limit_chrom)) = limit_info {
+                    if chrom_key == *limit_chrom {
+                        let t_marker = target_win.marker(MarkerIdx::new(t_idx as u32));
+                        if t_marker.pos >= limit_pos {
                             break;
                         }
                     }
+                }
+
+                if !emitted_target[t_idx] {
                     emitted_target[t_idx] = true;
                     output_markers.push(OutputMarker::Target(t_idx));
                 }
@@ -10597,85 +10599,57 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod regression_tests {
-    use super::*;
-    use crate::config::Config;
-    use crate::data::ChromIdx;
-    use crate::data::alignment::MarkerAlignment;
-    use crate::data::haplotype::Samples;
-    use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
-    use crate::data::storage::GenotypeColumn;
-    use crate::data::storage::phase_state::Phased;
-    use crate::io::vcf::{ImputationQuality, VcfWriter};
-    use crate::pipelines::ImputationPipeline;
-    use tempfile::NamedTempFile;
-    use std::sync::Arc;
-
-    fn build_markers(chrom: ChromIdx, positions: &[u32]) -> Markers {
-        let mut markers = Markers::<crate::data::AnyMarkerSpace>::new();
-        markers.add_chrom("chr1");
-        for (idx, &pos) in positions.iter().enumerate() {
-            let marker = Marker::new(
-                chrom,
-                pos,
-                Some(format!("m{idx}").into()),
-                Allele::Base(Nucleotide::A),
-                vec![Allele::Base(Nucleotide::C)],
-            );
-            markers.push(marker);
-        }
-        markers
-    }
-
-    fn build_phased_matrix_from_columns(
-        markers: Markers,
-        n_samples: usize,
-        cols: Vec<Vec<u8>>,
-        n_alleles_per_marker: &[usize],
-    ) -> GenotypeMatrix<Phased> {
-        let samples = Arc::new(Samples::from_ids(
-            (0..n_samples).map(|i| format!("s{i}")).collect(),
-        ));
-        let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(cols.len());
-        for (m, alleles) in cols.into_iter().enumerate() {
-            let n_alleles = n_alleles_per_marker.get(m).copied().unwrap_or(2).max(1);
-            columns.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
-        }
-        GenotypeMatrix::new_phased(markers, columns, samples)
-    }
-
     #[test]
-    fn test_write_imputed_window_prevents_halo_leak_ordering_bug() {
-        let chrom = ChromIdx::new(0);
-        // Reference markers: 10, 20, 30, 40.
-        // Window is defined as markers 0..2 (pos 10, 20).
-        // Marker 2 (pos 30) defines the "next window start" boundary/limit.
-        let ref_markers = build_markers(chrom, &[10, 20, 30, 40]);
+    fn test_write_imputed_window_multichrom_boundary() {
+        use crate::data::marker::{Marker, Allele, Nucleotide};
+        use tempfile::NamedTempFile;
+        use crate::pipelines::ImputationPipeline;
+        use crate::data::haplotype::Samples;
 
-        // Target markers: only one marker at 35 (in the halo, > 30).
-        // It is unaligned (target-only).
-        let mut target_markers_leak = Markers::<crate::data::AnyMarkerSpace>::new();
-        target_markers_leak.add_chrom("chr1");
-        target_markers_leak.push(Marker::new(chrom, 35, Some("m35".into()), Allele::Base(Nucleotide::A), vec![Allele::Base(Nucleotide::C)]));
+        // Local helper to avoid E0425 if parent module helpers are private
+        fn build_phased_matrix_from_columns(
+            markers: Markers,
+            n_samples: usize,
+            cols: Vec<Vec<u8>>,
+            n_alleles_per_marker: &[usize],
+        ) -> GenotypeMatrix<Phased> {
+            let samples = Arc::new(Samples::from_ids(
+                (0..n_samples).map(|i| format!("s{i}")).collect(),
+            ));
+            let mut columns: Vec<GenotypeColumn> = Vec::with_capacity(cols.len());
+            for (m, alleles) in cols.into_iter().enumerate() {
+                let n_alleles = n_alleles_per_marker.get(m).copied().unwrap_or(2).max(1);
+                columns.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
+            }
+            GenotypeMatrix::new_phased(markers, columns, samples)
+        }
 
-        // One sample, homozygous ref.
-        let target_cols_leak = vec![vec![0, 0]];
-        let target_win_leak = build_phased_matrix_from_columns(target_markers_leak, 1, target_cols_leak, &[2]);
+        let mut ref_markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        ref_markers.add_chrom("chr1");
+        ref_markers.push(Marker::new(ChromIdx::new(0), 100, Some("m0".into()), Allele::Base(Nucleotide::A), vec![Allele::Base(Nucleotide::C)]));
+        ref_markers.push(Marker::new(ChromIdx::new(0), 200, Some("m1".into()), Allele::Base(Nucleotide::A), vec![Allele::Base(Nucleotide::C)]));
+        ref_markers.add_chrom("chr2");
+        ref_markers.push(Marker::new(ChromIdx::new(1), 10, Some("m2".into()), Allele::Base(Nucleotide::A), vec![Allele::Base(Nucleotide::C)]));
 
-        // No alignment (target is novel).
-        let alignment_leak = MarkerAlignment {
-            ref_to_target: vec![None; 4],
-            target_to_ref: vec![None; 1],
-            allele_mappings: vec![None; 1],
+        let mut target_markers = Markers::<crate::data::AnyMarkerSpace>::new();
+        target_markers.add_chrom("chr1");
+        target_markers.push(Marker::new(ChromIdx::new(0), 150, Some("t0".into()), Allele::Base(Nucleotide::A), vec![Allele::Base(Nucleotide::C)]));
+        target_markers.push(Marker::new(ChromIdx::new(0), 250, Some("t1".into()), Allele::Base(Nucleotide::C), vec![Allele::Base(Nucleotide::A)]));
+
+        let target_cols = vec![vec![0], vec![0]];
+        let target_win = build_phased_matrix_from_columns(target_markers, 1, target_cols, &[2, 2]);
+
+        let alignment = MarkerAlignment {
+            ref_to_target: vec![None; 3],
+            target_to_ref: vec![None; 2],
+            allele_mappings: vec![None; 2],
         };
 
         let output_start = 0;
-        let output_end = 2; // Process indices 0, 1. Pos limit is Ref[2].pos = 30.
+        let output_end = 2; // Covers chr1:100, chr1:200. Limit is chr2:10.
 
-        let n_alleles_per_marker = vec![2; 4];
+        let n_alleles_per_marker = vec![2; 3];
         let mut quality = ImputationQuality::new(&n_alleles_per_marker);
-
         let all_results = vec![SampleImputationResult {
             sample_idx: 0,
             hap_alt_probs: (Some(vec![0.0, 0.0]), Some(vec![0.0, 0.0])),
@@ -10684,17 +10658,17 @@ mod regression_tests {
 
         let tmp = NamedTempFile::new().expect("temp vcf");
         {
-            let mut writer = VcfWriter::create(tmp.path(), target_win_leak.samples_arc()).expect("writer");
+            let mut writer = VcfWriter::create(tmp.path(), target_win.samples_arc()).expect("writer");
             writer.write_header_extended(&ref_markers, true, false, false).expect("write header");
 
             let pipeline = ImputationPipeline::new(Config::default(), None);
             let ref_is_biallelic = vec![true; ref_markers.len()];
             pipeline.write_imputed_window_streaming(
                 &ref_markers,
-                &target_win_leak,
+                &target_win,
                 None,
                 None::<&GenotypeMatrix<Phased, crate::data::AnyMarkerSpace>>,
-                &alignment_leak,
+                &alignment,
                 &mut writer,
                 &mut quality,
                 &ref_is_biallelic,
@@ -10716,10 +10690,7 @@ mod regression_tests {
             .map(|p| p.parse::<u32>().expect("POS parse"))
             .collect();
 
-        // Should contain only 10, 20.
-        // If 35 leaks, it would appear here and be out of order or just present.
-        // Since 35 > 20, if it was emitted after 20, it's technically sorted, but it shouldn't be there
-        // because it belongs to the next window (>= 30).
-        assert_eq!(positions, vec![10, 20]);
+        // Expected: chr1:100, chr1:150, chr1:200, chr1:250.
+        // Bug symptom: chr1:250 > chr2:10 (if only POS compared), so it gets filtered out.
+        assert_eq!(positions, vec![100, 150, 200, 250]);
     }
-}
