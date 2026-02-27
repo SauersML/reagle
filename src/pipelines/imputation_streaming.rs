@@ -241,7 +241,7 @@ fn collect_carriers_for_allele(
 }
 
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
-const PBWT_PER_WINDOW_MULT: usize = 16;
+const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
 const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
@@ -9706,12 +9706,23 @@ impl crate::pipelines::ImputationPipeline {
             let rb = chrom_rank.get(b).copied().unwrap_or(usize::MAX);
             ra.cmp(&rb).then_with(|| a.cmp(b))
         });
+        let limit_pos = if output_end < ref_markers.len() {
+            Some(ref_markers.marker(MarkerIdx::new(output_end as u32)).pos)
+        } else {
+            None
+        };
         for chrom_key in chrom_keys {
             let Some(list) = target_only_linear.get(&chrom_key) else {
                 continue;
             };
             let cursor = target_only_cursor.get(&chrom_key).copied().unwrap_or(0);
             for &t_idx in list.iter().skip(cursor) {
+                let t_pos = target_win.marker(MarkerIdx::new(t_idx as u32)).pos;
+                if let Some(limit) = limit_pos {
+                    if t_pos >= limit {
+                        break;
+                    }
+                }
                 if !emitted_target[t_idx] {
                     emitted_target[t_idx] = true;
                     output_markers.push(OutputMarker::Target(t_idx));
