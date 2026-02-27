@@ -175,13 +175,14 @@ def _clear_convert_genome_cache():
 
 
 def _github_json(url: str, timeout: int = 30):
-    req = Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "reagle-prepare-data",
-        },
-    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "reagle-prepare-data",
+    }
+    if "GITHUB_TOKEN" in os.environ:
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+
+    req = Request(url, headers=headers)
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
