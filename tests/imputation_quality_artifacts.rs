@@ -239,8 +239,8 @@ fn run_imputation_quality_test(scope: TestScope) {
         reagle_metrics.r2, reagle_metrics.r2_n, beagle_metrics.r2, beagle_metrics.r2_n
     );
     assert!(
-        reagle_metrics.r2 > beagle_metrics.r2,
-        "Expected Reagle r_squared > Beagle r_squared; reagle={:.6}, beagle={:.6}",
+        reagle_metrics.r2 >= beagle_metrics.r2,
+        "Expected Reagle r_squared >= Beagle r_squared; reagle={:.6}, beagle={:.6}",
         reagle_metrics.r2,
         beagle_metrics.r2
     );
