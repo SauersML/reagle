@@ -522,7 +522,7 @@ def prepare_truth(source, output_vcf, panel_path):
         "--format", "vcf",
         "--standardize",
         "--panel", panel_path,
-        "--ref", ref_hg38_fasta,
+        "--reference", ref_hg38_fasta,
     ]
 
     print(f"Running: {' '.join(cmd)}")

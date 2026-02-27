@@ -132,11 +132,11 @@ impl ModelParams {
         // Scaling factor added to improve calibration on sparse/noisy data
         // Without this, p_mismatch starts too low (~1e-6) for array data (~1e-3..1e-4)
         // leading to overconfident phase locks and high ECE.
-        // Used 5.0 to balance calibration without enforcing a high minimum error rate.
-        let scale = 5.0;
+        // A scale of 10.0 and floor of 1e-4 provides better calibration for noisy inputs.
+        let scale = 10.0;
         let val = (theta / (2.0 * (theta + n))) as f32 * scale;
-        // Floor kept at 1e-6 to allow convergence on high-quality data while avoiding underflow
-        val.max(1e-6)
+        // Raised floor to 1e-4 to prevent model from becoming overconfident on noisy data.
+        val.max(1e-4)
     }
 
     /// Calculate LR threshold for a given iteration
