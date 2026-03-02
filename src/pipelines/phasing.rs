@@ -161,7 +161,7 @@ fn log_pbwt_cache_isolation_diag() {
         diag.pos_stale_hit_blocked
     );
 }
-use mini_mcmc::core::{MarkovChain, Trace};
+use mini_mcmc::core::MarkovChain;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SampleCohortStats {
@@ -1677,12 +1677,6 @@ struct MosaicTrace {
     log_likelihood: f64,
 }
 
-impl Trace for MosaicTrace {
-    fn trace(&self) -> Vec<f64> {
-        vec![self.mean_state, self.switch_rate, self.log_likelihood]
-    }
-}
-
 struct MosaicBuffers {
     n_states: StateCount,
     fwd: StateAVec32<f32>,
@@ -1823,6 +1817,7 @@ struct MosaicChain<'a, RefSpace = crate::data::AnyMarkerSpace> {
     path2: Vec<u32>,
     fwd_block: Vec<f32>,
     trace: MosaicTrace,
+    trace_vec: Vec<f64>,
     p_no_err: f32,
     p_err: f32,
     first_iteration: bool,
@@ -1901,6 +1896,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
                 switch_rate: 0.0,
                 log_likelihood: 0.0,
             },
+            trace_vec: vec![0.0; 3],
             p_no_err,
             p_err,
             first_iteration: true,
@@ -1971,6 +1967,9 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
             0.0
         };
         self.trace.log_likelihood = logp;
+        self.trace_vec[0] = self.trace.mean_state;
+        self.trace_vec[1] = self.trace.switch_rate;
+        self.trace_vec[2] = self.trace.log_likelihood;
     }
 
     #[inline]
@@ -2121,8 +2120,8 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
     }
 }
 
-impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
-    fn step(&mut self) -> &MosaicTrace {
+impl<RefSpace> MarkovChain<f64> for MosaicChain<'_, RefSpace> {
+    fn step(&mut self) -> &Vec<f64> {
         // Proper Gibbs sampling: H1 and H2 must each condition on the other.
         //
         // First iteration: use combined_checkpoints (marginal) to initialize path1.
@@ -2292,11 +2291,11 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             EmissionMode::Hap,
         );
         self.update_trace();
-        &self.trace
+        &self.trace_vec
     }
 
-    fn current_state(&self) -> &MosaicTrace {
-        &self.trace
+    fn current_state(&self) -> &Vec<f64> {
+        &self.trace_vec
     }
 }
 
