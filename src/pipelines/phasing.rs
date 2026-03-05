@@ -161,8 +161,6 @@ fn log_pbwt_cache_isolation_diag() {
         diag.pos_stale_hit_blocked
     );
 }
-use mini_mcmc::core::{MarkovChain, Trace};
-
 #[derive(Clone, Copy, Debug, Default)]
 struct SampleCohortStats {
     mismatch_mass: f64,
@@ -1677,11 +1675,6 @@ struct MosaicTrace {
     log_likelihood: f64,
 }
 
-impl Trace for MosaicTrace {
-    fn trace(&self) -> Vec<f64> {
-        vec![self.mean_state, self.switch_rate, self.log_likelihood]
-    }
-}
 
 struct MosaicBuffers {
     n_states: StateCount,
@@ -2121,7 +2114,7 @@ impl<'a, RefSpace> MosaicChain<'a, RefSpace> {
     }
 }
 
-impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
+impl<RefSpace> MosaicChain<'_, RefSpace> {
     fn step(&mut self) -> &MosaicTrace {
         // Proper Gibbs sampling: H1 and H2 must each condition on the other.
         //
@@ -2292,10 +2285,6 @@ impl<RefSpace> MarkovChain<MosaicTrace> for MosaicChain<'_, RefSpace> {
             EmissionMode::Hap,
         );
         self.update_trace();
-        &self.trace
-    }
-
-    fn current_state(&self) -> &MosaicTrace {
         &self.trace
     }
 }
