@@ -183,15 +183,21 @@ pub struct WindowAllocation {
 /// We must be consistent with the HMM parameterization. The recombination
 /// probability used by the HMM is:
 ///
-///     r_w = p_recomb(d_w)
-///     a_w = 1 - r_w
+/// ```text
+/// r_w = p_recomb(d_w)
+/// a_w = 1 - r_w
+/// ```
 ///
 /// Then, with boundary-specific donor pool size n_pool[w]:
-///     p_stay = a_w + (1-a_w)/n_pool
-///     p_switch_diff = (1-a_w) * (n_pool-1)/n_pool
+/// ```text
+/// p_stay = a_w + (1-a_w)/n_pool
+/// p_switch_diff = (1-a_w) * (n_pool-1)/n_pool
+/// ```
 ///
 /// and
-///     t11 = log(p11/p00), t10 = log(p10/p00), t01 = log(p01/p00)
+/// ```text
+/// t11 = log(p11/p00), t10 = log(p10/p00), t01 = log(p01/p00)
+/// ```
 ///
 /// These are the exact 2-state (ON/OFF) transition log-odds relative to OFF->OFF
 /// under a lumped ON=“hap h” / OFF=“not h” surrogate chain. This preserves the
