@@ -295,6 +295,9 @@ impl Default for Config {
             state_mix_weak_window_frac: 0.10,
             state_mix_weak_donor_frac: 0.30,
             state_mix_weak_core_frac: 0.50,
+            // Keep default Ne anchored here. PR #801 cut it to 50_000 and
+            // PR #793 paired a much larger Ne with window_top_k=2000; both
+            // regressions lost to Beagle on the chr21 gate.
             ne: 200000.0,
             err: None,
             em: true,

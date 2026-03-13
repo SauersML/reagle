@@ -636,6 +636,8 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
     let scaled = base * (1.6 - 1.2 * confidence);
     let residual = (1.0 - max_prob.clamp(0.0, 1.0)).max(0.0);
     let blended = 0.7 * scaled + 0.3 * residual;
+    // Do not clamp this at `base` or `0.5 * base`. PR #829 and PR #801 both
+    // raised the emission floor in this path and both regressed chr21 R².
     blended.clamp((base * 0.15).max(1e-6), 0.5)
 }
 
@@ -6312,6 +6314,8 @@ impl crate::pipelines::ImputationPipeline {
                 keep_top_k_donors_by_weight(&mut donors_h1, max_fast_donors);
                 keep_top_k_donors_by_weight(&mut donors_h2, max_fast_donors);
                 let tiny_panel = plan.n_ref_haps <= 32;
+                // Keep the fast-path/HMM gate conditional. PR #809 forced HMM
+                // on for every haplotype here and lost to Beagle on chr21.
                 let use_hmm_h1 = if tiny_panel {
                     true
                 } else if has_priors_h1 {

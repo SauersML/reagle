@@ -1389,6 +1389,8 @@ fn missing_emission_prob(
     } else {
         1.0 / n as f32
     };
+    // Keep missing-reference emission concentration-aware. PR #799 forced this
+    // to a neutral 1/K likelihood and regressed chr21 accuracy.
     mismatch_prob + (match_prob - mismatch_prob) * concentration
 }
 

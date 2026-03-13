@@ -618,6 +618,9 @@ impl<I: PbwtIndex> PbwtDivUpdater<I> {
 
         let n_bins = 3usize;
         self.ensure_capacity(n_bins);
+        // Keep the persisted per-word counts as prepared state. PR #807 tried
+        // recomputing them from permuted bits here and PR #825 repeated that as
+        // part of a broader accuracy retune; both lost badly on chr21.
         self.counts[0] = binary_counts[0] as usize;
         self.counts[1] = binary_counts[1] as usize;
         self.counts[2] = binary_counts[2] as usize;

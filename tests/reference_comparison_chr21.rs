@@ -139,29 +139,6 @@ fn write_metrics_artifact(
     println!("Saved fast metrics TSV: {}", out_path.display());
 }
 
-// Rejected chr21 experiments from open PRs that lost to Beagle on this gate.
-// Keep these notes near the failure condition so future tuning starts from the
-// actual measured regressions, not the PR titles.
-// - PR #807: recomputed PBWT word counts, lowered the untyped-prior floor, and
-//   removed adaptive stage-1 block sizing; chr21 R^2 fell to 0.894134513872.
-// - PR #825: paired PBWT bookkeeping changes with larger donor pools, weaker
-//   sharpening, and a lower untyped-prior floor; chr21 R^2 fell to 0.908758447301.
-// - PR #808: shrank the small-panel full-cap threshold, tied full-panel use to
-//   a speed limit, and raised the untyped-prior floor; chr21 R^2 fell to 0.919610661735.
-// - PR #791: raised default window_top_k/ne/err, raised MAX_RECOMB_INTENSITY,
-//   and replaced emission calibration with passthrough; chr21 R^2 fell to 0.920528755158.
-// - PR #799: forced missing-reference emission to neutral 1/K, raised the
-//   mismatch floor, and disabled sharpening below base; chr21 R^2 fell to 0.921755087394.
-// - PR #804: lowered cluster, forced ne/err upward, strengthened subset
-//   smoothing, and injected direct panel priors; chr21 R^2 fell to 0.923074407281.
-// - PR #801: dropped default ne to 50_000 and raised emission floors to
-//   0.5 * base; chr21 R^2 fell to 0.924315946024.
-// - PR #809: raised the mismatch floor and forced HMM use for every haplotype;
-//   chr21 R^2 fell to 0.924497895847.
-// - PR #793: raised window_top_k to 2000, forced ne/err upward, and disabled
-//   sharpening below base; chr21 R^2 fell to 0.924676599076.
-// - PR #829: disabled sharpening below base in both emission paths while also
-//   churning convert_genome CLI flags; chr21 R^2 fell to 0.926053805151.
 #[test]
 #[serial]
 fn test_reference_comparison_full_chr21_ref1000_target10() {

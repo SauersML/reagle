@@ -128,6 +128,8 @@ impl ModelParams {
         let n = n_haps as f64;
         let theta = 1.0 / (n.ln() + 0.5);
         let val = (theta / (2.0 * (theta + n))) as f32;
+        // Keep the Li-Stephens floor tiny here. PR #799 and PR #809 raised the
+        // effective mismatch floor for imputation and both degraded chr21 R².
         val.max(1e-8)
     }
 
