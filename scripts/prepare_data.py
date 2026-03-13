@@ -517,8 +517,8 @@ def prepare_truth(source, output_vcf, panel_path):
     cmd = [
         "convert_genome",
         source_vcf,
+        truth_raw_vcf,
         "--reference", ref_hg38_fasta,
-        "--output", truth_raw_vcf,
         "--assembly", "GRCh38",
         "--format", "vcf",
         "--standardize",
