@@ -161,7 +161,7 @@ fn log_pbwt_cache_isolation_diag() {
         diag.pos_stale_hit_blocked
     );
 }
-use mini_mcmc::core::{MarkovChain, Trace};
+use general_mcmc::core::{MarkovChain, Trace};
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SampleCohortStats {
@@ -544,6 +544,9 @@ fn stage1_block_cm(gen_positions: &[f64]) -> f64 {
     // - In stable marker-density regions (low CV), use larger blocks to cut Stage 1 transitions.
     // - On very large windows, increase block marker targets further to reduce MCMC overhead.
     // - In volatile/sparse regions (high CV), stay close to legacy behavior.
+    // PR #807 tried forcing the base marker target everywhere to "maximize accuracy".
+    // That removed density/window-size adaptation and regressed both chr21
+    // imputation and phase concordance, so keep the adaptive sizing.
     let density_stability_boost = if cv < 0.65 {
         1.0 + ((0.65 - cv) / 0.65) * 1.4
     } else {

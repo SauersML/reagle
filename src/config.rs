@@ -273,6 +273,10 @@ impl Default for Config {
             imp_segment: 6.0,
             imp_step: 0.1,
             imp_nsteps: 7,
+            // Keep the default HMM controls conservative. PR #804 and PR #791
+            // tried ne=1_000_000 plus a forced err (and PR #804 also lowered
+            // cluster), but that either wrecked calibration or regressed raw
+            // chr21 accuracy instead of improving it.
             cluster: 0.005,
             pbwt_batch_mb: 256,
             ap: true,

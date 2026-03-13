@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import concurrent.futures
 import io
 import json
 import re
@@ -12,7 +13,7 @@ import zipfile
 TARGET_WORKFLOW = "CI"
 TARGET_JOB_NAME = "reference-comparison-chr21"
 TARGET_TEST_NAME = "test_reference_comparison_full_chr21_ref1000_target10"
-TARGET_SECTION_HEADER = "=== Fast Accuracy Metrics (chr21, ref=1000, target=10) ==="
+ASSERTION_PREFIX = "Reagle worse than Beagle on "
 
 
 def get_gh_bin():
@@ -69,27 +70,40 @@ def get_repo():
     return data.get("nameWithOwner")
 
 
-def get_open_prs(limit):
-    output = run_cmd(
-        gh_cmd([
-            "pr",
-            "list",
-            "--limit",
-            str(limit),
-            "--json",
-            "number,title,headRefName",
-        ])
-    )
-    if not output:
-        return []
-    return json.loads(output)
+def get_open_prs(repo, limit=None):
+    prs = []
+    page = 1
 
+    while True:
+        output = run_cmd(
+            gh_cmd(
+                [
+                    "api",
+                    f"repos/{repo}/pulls?state=open&per_page=100&page={page}",
+                ]
+            )
+        )
+        if not output:
+            break
 
-def get_latest_run_for_branch(branch_name):
-    runs = get_recent_runs_for_branch(branch_name, 1)
-    if not runs:
-        return None
-    return runs[0]
+        page_items = json.loads(output)
+        if not page_items:
+            break
+
+        for item in page_items:
+            prs.append(
+                {
+                    "number": item["number"],
+                    "title": item["title"],
+                    "headRefName": item["head"]["ref"],
+                }
+            )
+            if limit is not None and len(prs) >= limit:
+                return prs
+
+        page += 1
+
+    return prs
 
 
 def get_recent_runs_for_branch(branch_name, limit):
@@ -160,69 +174,41 @@ def get_job_log_text(repo, job_id):
     return strip_ansi(output.decode("utf-8-sig", errors="ignore"))
 
 
-def parse_reagle_metrics_line(line):
-    pattern = re.compile(
-        r"REAGLE:\s+"
-        r"sites=(?P<sites>\d+)\s+"
-        r"genotypes=(?P<genotypes>\d+)\s+"
-        r"r2=Some\((?P<r2>[0-9.eE+-]+)\)\s+"
-        r"iqs=Some\((?P<iqs>[0-9.eE+-]+)\)\s+"
-        r"hellinger=Some\((?P<hellinger>[0-9.eE+-]+)\)\s+"
-        r"SER=Some\((?P<ser>[0-9.eE+-]+)\).*?"
-        r"phase_conc=Some\((?P<phase_conc>[0-9.eE+-]+)\)"
-    )
-    match = pattern.search(line)
-    if not match:
-        return None
-    out = match.groupdict()
-    out["raw"] = line.strip()
-    return out
+def normalize_log_line(line):
+    return re.sub(r"^\ufeff?\d{4}-\d{2}-\d{2}T[0-9:.]+Z\s*", "", line).strip()
 
 
-def extract_target_reagle_metrics(log_text):
+def extract_target_result(log_text):
     if not log_text:
         return None, "empty log"
 
-    lines = log_text.splitlines()
+    lines = [normalize_log_line(line) for line in log_text.splitlines()]
 
-    # Primary strategy: anchor on test name, then section header, then REAGLE line.
     for idx, line in enumerate(lines):
         if TARGET_TEST_NAME not in line:
             continue
 
-        header_idx = None
-        for j in range(idx, min(len(lines), idx + 250)):
-            if TARGET_SECTION_HEADER in lines[j]:
-                header_idx = j
-                break
+        window_end = min(len(lines), idx + 250)
 
-        if header_idx is None:
-            continue
+        for j in range(idx, window_end):
+            current = lines[j]
+            if current == f"test {TARGET_TEST_NAME} ... ok":
+                return "PASS", "target test passed"
 
-        for k in range(header_idx, min(len(lines), header_idx + 30)):
-            if "REAGLE:" in lines[k]:
-                parsed = parse_reagle_metrics_line(lines[k])
-                if parsed:
-                    return parsed, "matched target test + section"
+            if current.startswith(f"thread '{TARGET_TEST_NAME}'") and "panicked at" in current:
+                for k in range(j + 1, min(window_end, j + 8)):
+                    candidate = lines[k]
+                    if not candidate or candidate.startswith("note:"):
+                        continue
+                    return candidate, "panic assertion"
 
-    # Fallback: any matching section + REAGLE line (last occurrence wins).
-    last_candidate = None
-    for idx, line in enumerate(lines):
-        if TARGET_SECTION_HEADER not in line:
-            continue
-        for k in range(idx, min(len(lines), idx + 30)):
-            if "REAGLE:" in lines[k]:
-                parsed = parse_reagle_metrics_line(lines[k])
-                if parsed:
-                    last_candidate = parsed
+            if current.startswith(ASSERTION_PREFIX):
+                return current, "matched assertion line"
 
-    if last_candidate is not None:
-        return last_candidate, "matched section fallback"
-
-    return None, "target section/reagle line not found"
+    return None, "target test result not found"
 
 
-def parse_target_job_metrics_for_run(repo, run):
+def parse_target_job_result_for_run(repo, run):
     run_id = run.get("databaseId")
     if not run_id:
         return None, "run missing databaseId", "-", "-"
@@ -239,8 +225,8 @@ def parse_target_job_metrics_for_run(repo, run):
         return None, "target job missing id", job_status, job_conclusion
 
     log_text = get_job_log_text(repo, job_id)
-    metrics, reason = extract_target_reagle_metrics(log_text)
-    return metrics, reason, job_status, job_conclusion
+    result, reason = extract_target_result(log_text)
+    return result, reason, job_status, job_conclusion
 
 
 def collect_row(repo, pr):
@@ -254,7 +240,7 @@ def collect_row(repo, pr):
             "pr": number,
             "branch": branch,
             "status": "NO_RUN",
-            "metrics": None,
+            "result": None,
             "note": "no CI run found",
             "title": title,
         }
@@ -268,18 +254,18 @@ def collect_row(repo, pr):
             "pr": number,
             "branch": branch,
             "status": f"{run_status}/{run_conclusion}",
-            "metrics": None,
+            "result": None,
             "note": "run missing databaseId",
             "title": title,
         }
 
-    metrics, reason, latest_job_status, latest_job_conclusion = parse_target_job_metrics_for_run(repo, latest_run)
-    if metrics:
+    result, reason, latest_job_status, latest_job_conclusion = parse_target_job_result_for_run(repo, latest_run)
+    if result:
         return {
             "pr": number,
             "branch": branch,
             "status": f"{latest_job_status}/{latest_job_conclusion}",
-            "metrics": metrics,
+            "result": result,
             "note": reason,
             "title": title,
         }
@@ -287,15 +273,13 @@ def collect_row(repo, pr):
     for candidate_run in runs[1:]:
         if (candidate_run.get("status") or "") != "in_progress":
             continue
-        candidate_metrics, candidate_reason, candidate_job_status, candidate_job_conclusion = (
-            parse_target_job_metrics_for_run(repo, candidate_run)
-        )
-        if candidate_metrics:
+        candidate_result, candidate_reason, _, _ = parse_target_job_result_for_run(repo, candidate_run)
+        if candidate_result:
             return {
                 "pr": number,
                 "branch": branch,
                 "status": f"{latest_job_status}/{latest_job_conclusion}",
-                "metrics": candidate_metrics,
+                "result": candidate_result,
                 "note": f"sourced from in-progress run {candidate_run.get('databaseId')} ({candidate_reason})",
                 "title": title,
             }
@@ -304,7 +288,7 @@ def collect_row(repo, pr):
     for candidate_run in runs[1:]:
         if (candidate_run.get("status") or "") != "in_progress":
             continue
-        _, candidate_reason, _, _ = parse_target_job_metrics_for_run(repo, candidate_run)
+        _, candidate_reason, _, _ = parse_target_job_result_for_run(repo, candidate_run)
         note = f"{note}; in-progress run {candidate_run.get('databaseId')}: {candidate_reason}"
         break
 
@@ -312,40 +296,38 @@ def collect_row(repo, pr):
         "pr": number,
         "branch": branch,
         "status": f"{run_status}/{run_conclusion}",
-        "metrics": None,
+        "result": None,
         "note": note,
         "title": title,
     }
 
 
 def print_results(rows):
-    print(
-        f"{'PR':<6} {'Status':<20} {'r2':<14} {'iqs':<14} {'hellinger':<14} {'SER':<14} {'phase_conc':<14} {'sites':<10} {'genotypes':<12} Branch"
-    )
-    print("-" * 150)
+    print(f"{'PR':<6} {'Status':<20} {'Branch':<42} Result")
+    print("-" * 160)
 
     for row in rows:
-        metrics = row["metrics"]
-        if not metrics:
-            print(
-                f"#{row['pr']:<5} {row['status']:<20} {'-':<14} {'-':<14} {'-':<14} {'-':<14} {'-':<14} {'-':<10} {'-':<12} {row['branch']}"
-            )
+        if not row["result"]:
+            print(f"#{row['pr']:<5} {row['status']:<20} {row['branch']:<42} -")
             print(f"      note: {row['note']}")
             continue
 
-        print(
-            f"#{row['pr']:<5} {row['status']:<20} {metrics['r2']:<14} {metrics['iqs']:<14} {metrics['hellinger']:<14} {metrics['ser']:<14} {metrics['phase_conc']:<14} {metrics['sites']:<10} {metrics['genotypes']:<12} {row['branch']}"
-        )
+        print(f"#{row['pr']:<5} {row['status']:<20} {row['branch']:<42} {row['result']}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "For each open PR, inspect latest CI run and print REAGLE chr21(ref=1000,target=10) "
-            "metrics from reference-comparison-chr21 job logs."
+            "For each open PR, inspect the chr21 reference-comparison CI job and print the "
+            "target test's assertion line or PASS."
         )
     )
-    parser.add_argument("--limit", type=int, default=100, help="Max open PRs to inspect (default: 100)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max open PRs to inspect (default: all open PRs)",
+    )
     args = parser.parse_args()
 
     repo = get_repo()
@@ -353,14 +335,13 @@ def main():
         print("Failed to determine repo. Is gh authenticated?", file=sys.stderr)
         sys.exit(1)
 
-    prs = get_open_prs(args.limit)
+    prs = get_open_prs(repo, args.limit)
     if not prs:
         print("No open PRs found.")
         return
 
-    rows = []
-    for pr in prs:
-        rows.append(collect_row(repo, pr))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        rows = list(executor.map(lambda pr: collect_row(repo, pr), prs))
 
     print_results(rows)
 

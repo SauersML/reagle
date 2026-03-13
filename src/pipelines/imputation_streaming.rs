@@ -253,9 +253,15 @@ const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_STRONG_MULT_DEN: usize = 4;
 const IMPUTE_RAM_FRACTION: f64 = 0.4;
 const STATE_BUDGET_SAFETY: f64 = 0.75;
+// Keep donor-set expansion modest. PR #825 doubled the donor cap and raised the
+// minimum donor count aggressively while loosening other guards; the broader,
+// less selective state set regressed raw chr21 accuracy.
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
+// Keep the "small panel => use full panel" threshold generous. PR #808 cut this
+// to 64 for speed, which prematurely truncated affordable panels and materially
+// lowered chr21 R².
 const SMALL_PANEL_FULL_CAP_HAPS: usize = 512;
 const FULL_PANEL_RAM_FRACTION: f64 = 0.9;
 const SCAN_RAM_FRACTION: f64 = 0.10;
@@ -536,6 +542,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // We weight each marker by normalized information content:
     //   w = 1 - H(p)/log(K), K = number of alleles
     // so near-uniform markers contribute little evidence.
+    // Do not disable this calibration outright. PR #791 replaced it with a
+    // base-error passthrough while simultaneously increasing other HMM
+    // diffuseness knobs, and the combination worsened chr21 R²/SER instead of
+    // improving calibration.
     const PRIOR_STRENGTH_MARKERS: f32 = 16.0;
     let mut weighted_residual_sum = 0.0f32;
     let mut weight_sum = 0.0f32;
@@ -586,8 +596,10 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     let alpha = (base * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let beta = ((1.0 - base) * PRIOR_STRENGTH_MARKERS).max(1e-6);
     let posterior = (alpha + weighted_residual_sum) / (alpha + beta + weight_sum);
-    // Allow sharpening below base when typed evidence is strong, but limit
-    // maximum sharpening to avoid sparse-array collapse.
+    // Allow sharpening below base when typed evidence is strong, but keep it
+    // bounded to avoid sparse-array collapse. PR #791 removed sharpening
+    // entirely; PR #825 relaxed adjacent regularizers at the same time. Neither
+    // produced better chr21 accuracy.
     let min_error = (base * 0.1).max(1e-6).min(base);
     posterior.clamp(min_error, 0.5)
 }
@@ -633,6 +645,9 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
 // half the posterior with panel frequencies. Result: R² -0.000726, HOMALT
 // -0.000730. The cubic ramp + mild factors below (clamped to [0.8, 1.6])
 // are intentionally conservative: local LD should dominate when data exists.
+// PR #808 also raised this floor for calibration/speed, while PR #825 lowered
+// it during a larger donor-selection retune. Both moved the prior floor in the
+// wrong direction once the full system was measured on chr21.
 #[inline]
 fn adaptive_untyped_prior_mix(
     observed_ratio: f32,

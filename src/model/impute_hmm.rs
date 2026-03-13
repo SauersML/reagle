@@ -1723,7 +1723,11 @@ fn apply_marker_prior_smoothing(
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
     // Conservative adaptive blend: panel priors should stabilize pathological
-    // cases, not dominate local HMM evidence.
+    // cases, not dominate local HMM evidence. PR #804 and PR #835 both tried
+    // stronger global panel-prior injection here; one precomputed per-marker
+    // panel priors and shrank directly toward them, the other blended panel
+    // frequencies more aggressively into the local prior. Both over-regularized
+    // the posterior, hurting IQS/Hellinger and failing to produce a usable win.
     let adaptive_panel_mix =
         (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
