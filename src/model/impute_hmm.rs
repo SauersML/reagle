@@ -1603,28 +1603,24 @@ fn smooth_allele_posteriors_subset(
     let retain = (dist_retain * approx_retain).clamp(1e-4, 1.0);
 
     let mut post_entropy = 0.0f32;
-    let mut prior_entropy = 0.0f32;
-    for (&post, &prior) in allele_probs.iter().zip(subset_prior_probs.iter()) {
+    for &post in allele_probs.iter() {
         let p = post.clamp(0.0, 1.0);
-        let q = prior.clamp(0.0, 1.0);
         if p > 0.0 {
             post_entropy -= p * p.ln();
         }
-        if q > 0.0 {
-            prior_entropy -= q * q.ln();
-        }
     }
-    let entropy_gap = (prior_entropy - post_entropy).max(0.0);
     let max_entropy = (allele_probs.len().max(2) as f32).ln().max(1e-6);
-    let confidence_boost = (entropy_gap / max_entropy).clamp(0.0, 1.0);
+    let posterior_uncertainty = (post_entropy / max_entropy).clamp(0.0, 1.0);
 
     // Dirichlet-style pseudocount update:
     //   p'_a = (p_a + alpha * pi_a) / (1 + alpha)
     // so this step is explicit shrinkage of deviation from pi.
-    let base_mass = (1.5 * effective_alleles * (1.0 - retain) / retain).max(0.05);
-    // Keep entropy boost modest; large multipliers over-shrink rare ALT signal
-    // when subset support is sparse.
-    let prior_mass = base_mass * (1.0 + 0.5 * confidence_boost);
+    //
+    // We scale regularization by posterior uncertainty:
+    // - if HMM is confident (sharp, uncertainty~0), we trust it and apply minimal smoothing.
+    // - if HMM is uncertain (flat, uncertainty~1), we pull strongly towards the local prior.
+    let base_mass = (0.0 * effective_alleles * (1.0 - retain) / retain).max(0.0);
+    let prior_mass = base_mass * posterior_uncertainty;
     if prior_mass <= 0.0 {
         return;
     }
@@ -1723,7 +1719,7 @@ fn apply_marker_prior_smoothing(
     // Conservative adaptive blend: panel priors should stabilize pathological
     // cases, not dominate local HMM evidence.
     let adaptive_panel_mix =
-        (0.01 + 0.05 * combined_error).clamp(0.0, 0.05);
+        (0.01 + 0.05 * combined_error).clamp(0.0, 0.0);
 
     if let Some(panel) = panel_priors.and_then(|p| p.get(marker_idx)) {
         match panel {
