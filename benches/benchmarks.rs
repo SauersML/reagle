@@ -219,7 +219,7 @@ fn bench_mismatch_computation(c: &mut Criterion) {
                             1
                         };
                     }
-                    black_box(mismatches.iter().sum::<u8>())
+                    black_box(mismatches.iter().map(|&x| x as usize).sum::<usize>())
                 })
             },
         );
