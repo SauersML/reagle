@@ -247,6 +247,11 @@ const PBWT_MAX_PER_HAP: usize = 256;
 const PBWT_MIN_MARKER_STEP: usize = 50;
 const PBWT_MIN_SAMPLE_POINTS: usize = 10;
 const PBWT_TYPED_ANCHORS_PER_BIN: usize = 1;
+const PBWT_PSEUDO_ANCHOR_MIN_BRANCH_POWER: f32 = 0.08;
+const PBWT_PSEUDO_ANCHOR_MIN_SUPPORT: usize = 8;
+const PBWT_PSEUDO_ANCHOR_MIN_POSTERIOR: f32 = 0.98;
+const PBWT_PSEUDO_ANCHOR_MIN_MARGIN: f32 = 0.65;
+const PBWT_PSEUDO_ANCHOR_WEIGHT_FLOOR: f32 = 0.5;
 const PRESCAN_TOPM_WEAK_MULT_NUM: usize = 3;
 const PRESCAN_TOPM_WEAK_MULT_DEN: usize = 2;
 const PRESCAN_TOPM_STRONG_MULT_NUM: usize = 3;
@@ -1941,13 +1946,49 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         }
 
         if sampling[m] {
+            let platform_robustness = match resolution.map(|r| r.map_kind) {
+                Some(TypedMarkerMapKind::Alignment) => 1.0,
+                Some(TypedMarkerMapKind::PositionalBiallelicMatch) => 0.9,
+                Some(TypedMarkerMapKind::PositionalBiallelicSwap) => 0.85,
+                None => 0.75,
+            };
+            let mut pseudo_donors: Vec<u32> = Vec::new();
+            let mut pseudo_allele_counts: Vec<u32> = Vec::new();
             for (i, _) in batch_haps.iter().enumerate() {
-                if query_alleles[i].is_missing() {
-                    continue;
-                }
-                let targ = query_alleles[i]
-                    .as_allele()
-                    .expect("non-missing strict query allele should be concrete");
+                let mut pseudo_scale = 1.0f32;
+                let targ = if query_alleles[i].is_missing() {
+                    if let Some((pseudo_a, posterior, margin, support)) =
+                        infer_pseudo_anchor_from_beam(
+                            &mut pbwt_fwd,
+                            &beams_fwd[i],
+                            &ref_alleles,
+                            k_per_hap,
+                            &mut pseudo_donors,
+                            &mut pseudo_allele_counts,
+                        )
+                    {
+                        let branch = allele_branching_power(&allele_counts, present, pseudo_a);
+                        if branch < PBWT_PSEUDO_ANCHOR_MIN_BRANCH_POWER {
+                            continue;
+                        }
+                        // proposal-scaffold routing: pseudo-anchor contributes to donor lookup only,
+                        // never to final HMM emissions.
+                        let support_scale = (support as f32
+                            / (2.0 * PBWT_PSEUDO_ANCHOR_MIN_SUPPORT as f32))
+                            .clamp(PBWT_PSEUDO_ANCHOR_WEIGHT_FLOOR, 1.0);
+                        pseudo_scale =
+                            (posterior * margin * branch * platform_robustness * support_scale)
+                                .max(PBWT_PSEUDO_ANCHOR_WEIGHT_FLOOR)
+                                .min(1.0);
+                        pseudo_a
+                    } else {
+                        continue;
+                    }
+                } else {
+                    query_alleles[i]
+                        .as_allele()
+                        .expect("non-missing strict query allele should be concrete")
+                };
                 let freq = if present > 0 {
                     allele_counts.get(targ as usize).copied().unwrap_or(0) as f32 / present as f32
                 } else {
@@ -1956,7 +1997,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let weight = prescan_match_weight(freq, min_freq) * pseudo_scale;
                 if weight <= 0.0 {
                     continue;
                 }
@@ -2043,13 +2084,49 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
         }
 
         if sampling[m] {
+            let platform_robustness = match resolution.map(|r| r.map_kind) {
+                Some(TypedMarkerMapKind::Alignment) => 1.0,
+                Some(TypedMarkerMapKind::PositionalBiallelicMatch) => 0.9,
+                Some(TypedMarkerMapKind::PositionalBiallelicSwap) => 0.85,
+                None => 0.75,
+            };
+            let mut pseudo_donors: Vec<u32> = Vec::new();
+            let mut pseudo_allele_counts: Vec<u32> = Vec::new();
             for (i, _) in batch_haps.iter().enumerate() {
-                if query_alleles[i].is_missing() {
-                    continue;
-                }
-                let targ = query_alleles[i]
-                    .as_allele()
-                    .expect("non-missing strict query allele should be concrete");
+                let mut pseudo_scale = 1.0f32;
+                let targ = if query_alleles[i].is_missing() {
+                    if let Some((pseudo_a, posterior, margin, support)) =
+                        infer_pseudo_anchor_from_beam(
+                            &mut pbwt_bwd,
+                            &beams_bwd[i],
+                            &ref_alleles,
+                            k_per_hap,
+                            &mut pseudo_donors,
+                            &mut pseudo_allele_counts,
+                        )
+                    {
+                        let branch = allele_branching_power(&allele_counts, present, pseudo_a);
+                        if branch < PBWT_PSEUDO_ANCHOR_MIN_BRANCH_POWER {
+                            continue;
+                        }
+                        // proposal-scaffold routing: pseudo-anchor contributes to donor lookup only,
+                        // never to final HMM emissions.
+                        let support_scale = (support as f32
+                            / (2.0 * PBWT_PSEUDO_ANCHOR_MIN_SUPPORT as f32))
+                            .clamp(PBWT_PSEUDO_ANCHOR_WEIGHT_FLOOR, 1.0);
+                        pseudo_scale =
+                            (posterior * margin * branch * platform_robustness * support_scale)
+                                .max(PBWT_PSEUDO_ANCHOR_WEIGHT_FLOOR)
+                                .min(1.0);
+                        pseudo_a
+                    } else {
+                        continue;
+                    }
+                } else {
+                    query_alleles[i]
+                        .as_allele()
+                        .expect("non-missing strict query allele should be concrete")
+                };
                 let freq = if present > 0 {
                     allele_counts.get(targ as usize).copied().unwrap_or(0) as f32 / present as f32
                 } else {
@@ -2058,7 +2135,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 if freq <= 0.0 {
                     continue;
                 }
-                let weight = prescan_match_weight(freq, min_freq);
+                let weight = prescan_match_weight(freq, min_freq) * pseudo_scale;
                 if weight <= 0.0 {
                     continue;
                 }
@@ -2099,6 +2176,74 @@ fn normalize_chrom_local(name: &str) -> &str {
     } else {
         name
     }
+}
+
+#[inline]
+fn allele_branching_power(allele_counts: &[u32], present: u32, allele: u8) -> f32 {
+    if present == 0 {
+        return 0.0;
+    }
+    let p = allele_counts.get(allele as usize).copied().unwrap_or(0) as f32 / present as f32;
+    (4.0 * p * (1.0 - p)).clamp(0.0, 1.0)
+}
+
+#[inline]
+fn infer_pseudo_anchor_from_beam(
+    pbwt: &mut ReferencePbwt,
+    beam: &RankBeam,
+    ref_alleles: &[u8],
+    donor_k: usize,
+    donors_buf: &mut Vec<u32>,
+    allele_counts_buf: &mut Vec<u32>,
+) -> Option<(u8, f32, f32, usize)> {
+    let k = donor_k.max(PBWT_PSEUDO_ANCHOR_MIN_SUPPORT);
+    if k == 0 {
+        return None;
+    }
+    pbwt.select_donors_into(beam, k, donors_buf);
+    if donors_buf.is_empty() {
+        return None;
+    }
+
+    allele_counts_buf.clear();
+    let mut non_missing = 0usize;
+    for &d in donors_buf.iter() {
+        let a = ref_alleles.get(d as usize).copied().unwrap_or(u8::MAX);
+        if a == crate::data::storage::AlleleCode::MISSING.raw() {
+            continue;
+        }
+        non_missing += 1;
+        let idx = a as usize;
+        if allele_counts_buf.len() <= idx {
+            allele_counts_buf.resize(idx + 1, 0);
+        }
+        allele_counts_buf[idx] += 1;
+    }
+    if non_missing < PBWT_PSEUDO_ANCHOR_MIN_SUPPORT {
+        return None;
+    }
+
+    let mut best_allele = 0usize;
+    let mut best = 0u32;
+    let mut second = 0u32;
+    for (a, &c) in allele_counts_buf.iter().enumerate() {
+        if c > best {
+            second = best;
+            best = c;
+            best_allele = a;
+        } else if c > second {
+            second = c;
+        }
+    }
+    if best == 0 || best_allele > u8::MAX as usize {
+        return None;
+    }
+    let posterior = best as f32 / non_missing as f32;
+    let margin = (best.saturating_sub(second)) as f32 / non_missing as f32;
+    if posterior < PBWT_PSEUDO_ANCHOR_MIN_POSTERIOR || margin < PBWT_PSEUDO_ANCHOR_MIN_MARGIN {
+        return None;
+    }
+    Some((best_allele as u8, posterior, margin, non_missing))
 }
 
 #[inline]
