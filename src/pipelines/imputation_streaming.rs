@@ -11,15 +11,14 @@ use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use bitvec::prelude::*;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use tracing::{info_span, instrument, warn};
 
-use crate::Config;
 use crate::data::alignment::MarkerAlignment;
 use crate::data::genetic_map::GeneticMaps;
 use crate::data::marker::{AnyMarkerSpace, Markers, RefWindowSpace};
@@ -28,10 +27,10 @@ use crate::data::storage::{GenotypeColumn, GenotypeMatrix};
 use crate::data::{ChromIdx, HapIdx, HapSide, MarkerIdx, SampleIdx};
 use crate::error::ReagleError;
 use crate::error::Result;
-use crate::io::bref3::{RefPanelReader, RefWindow, TargetMarkerIndex, convert_ref_vcf_to_bref3};
+use crate::io::bref3::{convert_ref_vcf_to_bref3, RefPanelReader, RefWindow, TargetMarkerIndex};
 use crate::io::prescan_cache::{
-    PackedRefColumn, PrescanCacheReader, PrescanCacheWriter, create_temp_cache_path,
-    pack_ref_columns,
+    create_temp_cache_path, pack_ref_columns, PackedRefColumn, PrescanCacheReader,
+    PrescanCacheWriter,
 };
 use crate::io::streaming::{
     GlobalHapId, GlobalMarkerIdx, HaplotypePriors, PhasedOverlap, StreamingConfig,
@@ -39,8 +38,8 @@ use crate::io::streaming::{
 };
 use crate::io::vcf::{ImputationQuality, VcfWriter};
 use crate::model::impute_hmm::{
-    ImputeHmmContext, ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs,
-    compute_nearest_observed_lambda, run_impute_hmm, state_posteriors_to_priors,
+    compute_nearest_observed_lambda, run_impute_hmm, state_posteriors_to_priors, ImputeHmmContext,
+    ImputeWorkspace, RefAlleleFreqs, TargetAlleleProbs,
 };
 use crate::model::parameters::ModelParams;
 use crate::model::phase_query::{
@@ -59,6 +58,7 @@ use crate::model::transition_matrix::TransitionMatrix;
 use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
+use crate::Config;
 
 /// Retain only the `k` highest-weight donors, discarding the rest.
 ///
@@ -817,7 +817,11 @@ fn interval_support_over_range(
             total = total.saturating_add(1);
         }
     }
-    if total > 0 { Some(total) } else { None }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1866,30 +1870,48 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
         let col = &ref_columns[m];
-        col.fill_alleles(&mut ref_alleles);
+        let mut n_alleles = 2;
+        if let PackedRefColumn::Bits {
+            bits: 1,
+            n_haps,
+            words,
+            missing,
+        } = col
+        {
+            pbwt_fwd.advance_with_beams_strict_packed(
+                words,
+                missing,
+                *n_haps,
+                m,
+                &query_alleles,
+                &mut beams_fwd,
+            );
+        } else {
+            col.fill_alleles(&mut ref_alleles);
 
-        let mut max_allele = 1u8;
-        for &a in ref_alleles.iter() {
-            if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
-                max_allele = a;
-            }
-        }
-        for &q in &query_alleles {
-            if let Some(a) = q.as_allele() {
-                if a > max_allele {
+            let mut max_allele = 1u8;
+            for &a in ref_alleles.iter() {
+                if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
                     max_allele = a;
                 }
             }
-        }
-        let n_alleles = (max_allele as usize).saturating_add(1).max(2);
+            for &q in &query_alleles {
+                if let Some(a) = q.as_allele() {
+                    if a > max_allele {
+                        max_allele = a;
+                    }
+                }
+            }
+            n_alleles = (max_allele as usize).saturating_add(1).max(2);
 
-        pbwt_fwd.advance_with_beams_strict(
-            &ref_alleles,
-            n_alleles,
-            m,
-            &query_alleles,
-            &mut beams_fwd,
-        );
+            pbwt_fwd.advance_with_beams_strict(
+                &ref_alleles,
+                n_alleles,
+                m,
+                &query_alleles,
+                &mut beams_fwd,
+            );
+        }
 
         allele_counts.clear();
         allele_counts.resize(n_alleles, 0);
@@ -1968,30 +1990,48 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
         let col = &ref_columns[m];
-        col.fill_alleles(&mut ref_alleles);
+        let mut n_alleles = 2;
+        if let PackedRefColumn::Bits {
+            bits: 1,
+            n_haps,
+            words,
+            missing,
+        } = col
+        {
+            pbwt_bwd.advance_with_beams_strict_packed(
+                words,
+                missing,
+                *n_haps,
+                rev_step,
+                &query_alleles,
+                &mut beams_bwd,
+            );
+        } else {
+            col.fill_alleles(&mut ref_alleles);
 
-        let mut max_allele = 1u8;
-        for &a in ref_alleles.iter() {
-            if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
-                max_allele = a;
-            }
-        }
-        for &q in &query_alleles {
-            if let Some(a) = q.as_allele() {
-                if a > max_allele {
+            let mut max_allele = 1u8;
+            for &a in ref_alleles.iter() {
+                if a != crate::data::storage::AlleleCode::MISSING.raw() && a > max_allele {
                     max_allele = a;
                 }
             }
-        }
-        let n_alleles = (max_allele as usize).saturating_add(1).max(2);
+            for &q in &query_alleles {
+                if let Some(a) = q.as_allele() {
+                    if a > max_allele {
+                        max_allele = a;
+                    }
+                }
+            }
+            n_alleles = (max_allele as usize).saturating_add(1).max(2);
 
-        pbwt_bwd.advance_with_beams_strict(
-            &ref_alleles,
-            n_alleles,
-            rev_step,
-            &query_alleles,
-            &mut beams_bwd,
-        );
+            pbwt_bwd.advance_with_beams_strict(
+                &ref_alleles,
+                n_alleles,
+                rev_step,
+                &query_alleles,
+                &mut beams_bwd,
+            );
+        }
 
         allele_counts.clear();
         allele_counts.resize(n_alleles, 0);
@@ -3782,7 +3822,11 @@ impl SampleImputationResult {
             } else {
                 0.5
             };
-            if allele == 1 { p_alt } else { 1.0 - p_alt }
+            if allele == 1 {
+                p_alt
+            } else {
+                1.0 - p_alt
+            }
         })
     }
 
@@ -3978,7 +4022,11 @@ impl AltProbDiskStoreView {
             )
         };
         let v = values.get(idx).copied()?;
-        if v.is_nan() { None } else { Some(v) }
+        if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
     }
 }
 
@@ -8336,10 +8384,18 @@ impl crate::pipelines::ImputationPipeline {
                                     .clamp(1e-6, 1.0 - 1e-6)
                             } else {
                                 let hard = if donor_candidates.is_empty() {
-                                    if target_allele == 1 { 1.0 } else { 0.0 }
+                                    if target_allele == 1 {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
                                 } else {
                                     let allele = col.get(HapIdx::new(donor));
-                                    if allele == 1 { 1.0 } else { 0.0 }
+                                    if allele == 1 {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
                                 };
                                 (orient_weight * hard + (1.0 - orient_weight) * 0.5)
                                     .clamp(1e-6, 1.0 - 1e-6)
@@ -9442,7 +9498,11 @@ impl crate::pipelines::ImputationPipeline {
                     if gp01 >= gp00 && gp01 >= gp11 {
                         let p10 = p1_alt * (1.0 - p2_alt);
                         let p01 = (1.0 - p1_alt) * p2_alt;
-                        if p10 >= p01 { (1, 0) } else { (0, 1) }
+                        if p10 >= p01 {
+                            (1, 0)
+                        } else {
+                            (0, 1)
+                        }
                     } else if gp11 >= gp00 {
                         (1, 1)
                     } else {
@@ -10003,12 +10063,12 @@ impl crate::pipelines::ImputationPipeline {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::data::ChromIdx;
     use crate::data::alignment::MarkerAlignment;
     use crate::data::haplotype::Samples;
     use crate::data::marker::{Allele, Marker, Markers, Nucleotide};
-    use crate::data::storage::GenotypeColumn;
     use crate::data::storage::phase_state::{Phased, Unphased};
+    use crate::data::storage::GenotypeColumn;
+    use crate::data::ChromIdx;
     use crate::io::bref3::StreamingRefVcfReader;
     use crate::io::vcf::{ImputationQuality, VcfWriter};
     use crate::pipelines::ImputationPipeline;
