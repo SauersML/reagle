@@ -258,7 +258,9 @@ const STATE_BUDGET_SAFETY: f64 = 0.75;
 // less selective state set regressed raw chr21 accuracy.
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
-const SM_MATCH_MIN_DONORS: usize = 2;
+// Augment sparse donor pools with structural priors once PBWT yields too few
+// matches to keep the HMM on a brittle, near-single-path state set.
+const SM_MATCH_MIN_DONORS: usize = 16;
 // Keep the "small panel => use full panel" threshold generous. PR #808 cut this
 // to 64 for speed, which prematurely truncated affordable panels and materially
 // lowered chr21 R².
@@ -6259,28 +6261,50 @@ impl crate::pipelines::ImputationPipeline {
                         .iter()
                         .map(|(h, c)| (*h, *c))
                         .collect();
-                    if !combined.is_empty() {
-                        // Primary path: state proposal uses donor evidence W(d) learned from
-                        // informative-marker mass and Li-Stephens continuity.
-                        return combined;
-                    }
-                    // No donor evidence: fall back to structural priors only.
-                    let mut fallback: HashMap<RefHapId, f32> = HashMap::new();
-                    if let Some(core) = plan.core_states.get(hap_usize) {
-                        for &h in core {
-                            fallback.entry(h).or_insert(1.0);
-                        }
-                    }
-                    if let Some(intervals) = plan.window_intervals.get(hap_usize) {
-                        for interval in intervals {
-                            if interval_support_over_range(interval, plan_range_start, plan_range_end)
-                                .is_some()
-                            {
-                                fallback.entry(interval.hap).or_insert(1.0);
+
+                    if combined.len() < SM_MATCH_MIN_DONORS {
+                        // Few or no donors: augment with structural priors.
+                        // Structural priors provide a safety net of diverse haplotypes
+                        // derived from the global imputation plan (core states + dynamic windows).
+                        let max_weight = combined
+                            .iter()
+                            .map(|(_, w)| *w)
+                            .fold(0.0f32, |a, b| a.max(b));
+                        // If we have strong existing matches, make sure priors are
+                        // competitive but not dominant.
+                        // Lower weight (e.g. 5%) preserves the PBWT donor's lead when it
+                        // is correct, while still providing a valid path for the HMM to
+                        // switch if the donor is contradicted by data.
+                        // If max_weight is 0 (or empty), default to 1.0.
+                        let prior_weight = if max_weight > 0.0 {
+                            max_weight * 0.05
+                        } else {
+                            1.0
+                        };
+
+                        let mut fallback: HashMap<RefHapId, f32> =
+                            combined.iter().cloned().collect();
+
+                        if let Some(core) = plan.core_states.get(hap_usize) {
+                            for &h in core {
+                                fallback.entry(h).or_insert(prior_weight);
                             }
                         }
+                        if let Some(intervals) = plan.window_intervals.get(hap_usize) {
+                            for interval in intervals {
+                                if interval_support_over_range(
+                                    interval,
+                                    plan_range_start,
+                                    plan_range_end,
+                                )
+                                .is_some()
+                                {
+                                    fallback.entry(interval.hap).or_insert(prior_weight);
+                                }
+                            }
+                        }
+                        combined = fallback.into_iter().collect();
                     }
-                    combined = fallback.into_iter().collect();
                     combined
                 };
                 let mut donors_h1 = build_donor_pool(h1_idx.as_usize());
