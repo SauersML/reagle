@@ -548,7 +548,7 @@ fn calibrated_emission_error(input_probs: &TargetAlleleProbs, base_error_rate: f
     // base-error passthrough while simultaneously increasing other HMM
     // diffuseness knobs, and the combination worsened chr21 R²/SER instead of
     // improving calibration.
-    const PRIOR_STRENGTH_MARKERS: f32 = 16.0;
+    const PRIOR_STRENGTH_MARKERS: f32 = 2.0;
     let mut weighted_residual_sum = 0.0f32;
     let mut weight_sum = 0.0f32;
     for m in 0..input_probs.n_markers() {
@@ -671,9 +671,10 @@ fn adaptive_untyped_prior_mix(
     let missing_ramp = missing.powi(3);
 
     // Slightly stronger floor when cluster distance is wide (weaker local
-    // linkage signal) or the model error rate is elevated.
+    // linkage signal). Elevated model error should not raise the floor above
+    // baseline, because that suppresses rare-variant recovery in sparse windows.
     let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
-    let err_factor = (p_mismatch / 4e-4f32).clamp(0.8, 1.6);
+    let err_factor = (p_mismatch / 4e-4f32).clamp(0.5, 1.0);
 
     // Unphased-target imputation has additional uncertainty from phase
     // transfer, so apply a mild boost.
