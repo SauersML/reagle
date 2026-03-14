@@ -5086,6 +5086,56 @@ impl crate::pipelines::ImputationPipeline {
         }
         let handoff_recomb_rate = p_recomb.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
+        let panel_priors_arc = {
+            let mut priors = Vec::with_capacity(n_ref_markers);
+            let mut alleles_buf = Vec::new();
+            for m in 0..n_ref_markers {
+                let col = &ref_columns[m];
+                let n_alleles = ref_markers
+                    .marker(MarkerIdx::new(m as u32))
+                    .n_alleles()
+                    .max(1);
+                let n_haps = col.n_haplotypes();
+                if alleles_buf.len() < n_haps {
+                    alleles_buf.resize(n_haps, 0u8);
+                }
+                col.fill_all(&mut alleles_buf);
+
+                let mut counts = vec![0usize; n_alleles];
+                let mut total = 0usize;
+                for &a in &alleles_buf[..n_haps] {
+                    if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                        continue;
+                    }
+                    let idx = a as usize;
+                    if idx < n_alleles {
+                        counts[idx] += 1;
+                        total += 1;
+                    }
+                }
+
+                if total > 0 {
+                    let inv = 1.0 / total as f32;
+                    if n_alleles == 2 {
+                        priors.push(AllelePosteriors::Biallelic(
+                            counts.get(1).copied().unwrap_or(0) as f32 * inv,
+                        ));
+                    } else {
+                        let probs: Vec<f32> = counts.iter().map(|&c| c as f32 * inv).collect();
+                        priors.push(AllelePosteriors::Multiallelic(std::sync::Arc::from(probs)));
+                    }
+                } else if n_alleles == 2 {
+                    priors.push(AllelePosteriors::Biallelic(0.0));
+                } else {
+                    priors.push(AllelePosteriors::Multiallelic(std::sync::Arc::from(vec![
+                        0.0;
+                        n_alleles
+                    ])));
+                }
+            }
+            std::sync::Arc::new(priors)
+        };
+
         // Only consume overlap priors when their anchor marker is physically
         // compatible with the current window. This prevents seam drift from
         // stale/misaligned priors being projected into the wrong window.
@@ -5744,11 +5794,21 @@ impl crate::pipelines::ImputationPipeline {
                     diag_typed_hets, diag_typed_hets_phase_valid, mean_conf
                 );
             }
-            let mut input1 =
-                TargetAlleleProbs::new(offsets1, probs1, observed1, None, min_untyped_prior_mix1);
+            let mut input1 = TargetAlleleProbs::new(
+                offsets1,
+                probs1,
+                observed1,
+                Some(panel_priors_arc.clone()),
+                min_untyped_prior_mix1,
+            );
             input1.set_marker_error_rates(marker_errors1);
-            let mut input2 =
-                TargetAlleleProbs::new(offsets2, probs2, observed2, None, min_untyped_prior_mix2);
+            let mut input2 = TargetAlleleProbs::new(
+                offsets2,
+                probs2,
+                observed2,
+                Some(panel_priors_arc.clone()),
+                min_untyped_prior_mix2,
+            );
             input2.set_marker_error_rates(marker_errors2);
             (input1, input2, last_info1, last_info2)
         };
