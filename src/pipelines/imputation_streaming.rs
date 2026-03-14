@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -284,6 +284,135 @@ const PLANNING_TARGET_SWITCH_PROB: f64 = 0.01;
 // Overlap/handoff retention target: include the suffix where expected retained
 // copy signal to the window end is at least epsilon.
 const HANDOFF_RETAIN_EPS: f64 = 1e-3;
+const RARE_ATLAS_ANCHORS: usize = 8;
+const RARE_ATLAS_REPS_PER_LEAF: usize = 4;
+const RARE_ATLAS_QUERY_TOP_LEAVES: usize = 4;
+const RARE_ATLAS_INJECT_MAX: usize = 12;
+const RARE_ATLAS_MIN_LEAF_SIZE: usize = 2;
+const RARE_ATLAS_QUERY_CONFIDENCE: f32 = 0.70;
+
+#[derive(Clone, Debug)]
+struct RareAtlasLeaf {
+    signature: Vec<u8>,
+    reps: Vec<RefHapId>,
+}
+
+#[derive(Clone, Debug)]
+struct RareHaplotypeAtlas {
+    anchor_markers: Vec<usize>,
+    leaves: Vec<RareAtlasLeaf>,
+}
+
+impl RareHaplotypeAtlas {
+    fn build(ref_columns: &[GenotypeColumn], n_ref_haps: usize) -> Option<Self> {
+        if ref_columns.is_empty() || n_ref_haps == 0 {
+            return None;
+        }
+        let n_markers = ref_columns.len();
+        let mut anchors = Vec::with_capacity(RARE_ATLAS_ANCHORS);
+        let step = (n_markers / RARE_ATLAS_ANCHORS.max(1)).max(1);
+        let mut m = 0usize;
+        while m < n_markers && anchors.len() < RARE_ATLAS_ANCHORS {
+            anchors.push(m);
+            m = m.saturating_add(step);
+        }
+        if anchors.is_empty() {
+            return None;
+        }
+
+        let mut clusters: HashMap<Vec<u8>, Vec<RefHapId>> = HashMap::new();
+        let mut sig = vec![crate::data::storage::AlleleCode::MISSING.raw(); anchors.len()];
+        for h in 0..n_ref_haps {
+            let hap = RefHapId::new(h as u32);
+            for (j, &am) in anchors.iter().enumerate() {
+                sig[j] = ref_columns[am].get(HapIdx::new(h as u32));
+            }
+            clusters.entry(sig.clone()).or_default().push(hap);
+        }
+
+        let mut leaves: Vec<RareAtlasLeaf> = clusters
+            .into_iter()
+            .filter_map(|(signature, members)| {
+                if members.len() < RARE_ATLAS_MIN_LEAF_SIZE {
+                    return None;
+                }
+                Some(RareAtlasLeaf {
+                    signature,
+                    reps: members.into_iter().take(RARE_ATLAS_REPS_PER_LEAF).collect(),
+                })
+            })
+            .collect();
+        leaves.sort_unstable_by(|a, b| b.reps.len().cmp(&a.reps.len()));
+        if leaves.is_empty() {
+            None
+        } else {
+            Some(Self {
+                anchor_markers: anchors,
+                leaves,
+            })
+        }
+    }
+
+    fn query(&self, target_probs: &TargetAlleleProbs, limit: usize) -> Vec<RefHapId> {
+        if self.anchor_markers.is_empty() || self.leaves.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut query_sig =
+            vec![crate::data::storage::AlleleCode::MISSING.raw(); self.anchor_markers.len()];
+        for (j, &m) in self.anchor_markers.iter().enumerate() {
+            if m >= target_probs.n_markers() {
+                continue;
+            }
+            let probs = target_probs.probs_for_marker(m);
+            if probs.is_empty() {
+                continue;
+            }
+            let (best_idx, best_p) = probs
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap_or((0, 0.0));
+            if best_p >= RARE_ATLAS_QUERY_CONFIDENCE && best_idx <= u8::MAX as usize {
+                query_sig[j] = best_idx as u8;
+            }
+        }
+        let mut scored: Vec<(usize, usize)> = Vec::new();
+        for (leaf_idx, leaf) in self.leaves.iter().enumerate() {
+            let mut match_count = 0usize;
+            let mut compared = 0usize;
+            for (a, b) in leaf.signature.iter().zip(query_sig.iter()) {
+                if *b == crate::data::storage::AlleleCode::MISSING.raw() {
+                    continue;
+                }
+                compared += 1;
+                if a == b {
+                    match_count += 1;
+                }
+            }
+            if compared > 0 {
+                scored.push((leaf_idx, match_count * 100 / compared));
+            }
+        }
+        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for (leaf_idx, _) in scored.into_iter().take(RARE_ATLAS_QUERY_TOP_LEAVES) {
+            for &h in &self.leaves[leaf_idx].reps {
+                if out.len() >= limit {
+                    break;
+                }
+                if seen.insert(h) {
+                    out.push(h);
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+}
 
 /// Extra markers appended past each piecewise segment's core boundary so the
 /// backward pass warms up before reaching the core region.  Zero RAM cost
@@ -6410,6 +6539,9 @@ impl crate::pipelines::ImputationPipeline {
                 let mix_weak_window_frac = self.config.state_mix_weak_window_frac.clamp(0.0, 1.0);
                 let mix_weak_donor_frac = self.config.state_mix_weak_donor_frac.clamp(0.0, 1.0);
                 let mix_weak_core_frac = self.config.state_mix_weak_core_frac.clamp(0.0, 1.0);
+                let rare_atlas_h1 = RareHaplotypeAtlas::build(ref_columns, plan.n_ref_haps);
+                let rare_atlas_h2 = rare_atlas_h1.clone();
+
                 let posts_from_donors =
                     |donors: &[(RefHapId, f32)], probs_buf: &mut Vec<f32>| -> Result<Vec<AllelePosteriors>> {
                     let mut out: Vec<AllelePosteriors> =
@@ -6476,7 +6608,9 @@ impl crate::pipelines::ImputationPipeline {
                                         priors: Option<&HaplotypePriors>,
                                         donors: &[(RefHapId, f32)],
                                         informative_ratio: f32,
-                                        planning_range: Option<(usize, usize)>|
+                                        planning_range: Option<(usize, usize)>,
+                                        atlas: Option<&RareHaplotypeAtlas>,
+                                        target_probs: Option<&TargetAlleleProbs>|
                  -> Vec<RefHapId> {
                     let has_nonempty_priors = priors.map(|p| !p.is_empty()).unwrap_or(false);
                     if plan.full_panel {
@@ -6699,6 +6833,26 @@ impl crate::pipelines::ImputationPipeline {
                         fill_from(&mut out, &mut seen, core_haps, remaining, k);
                         if out.len() == before {
                             break;
+                        }
+                    }
+
+                    // Rare-atlas fallback: in hard windows where local info is weak or
+                    // donor evidence is sparse, inject representative rare backgrounds.
+                    let hard_window = informative_ratio <= mix_weak_signal_threshold
+                        || donors.len() < SM_MATCH_MIN_DONORS;
+                    if hard_window {
+                        if let (Some(atlas), Some(target_probs)) = (atlas, target_probs) {
+                            let remaining = k.saturating_sub(out.len());
+                            let query_k = remaining.max(1).min(RARE_ATLAS_INJECT_MAX);
+                            let atlas_haps = atlas.query(target_probs, query_k);
+                            for hap in atlas_haps {
+                                if out.len() >= k {
+                                    break;
+                                }
+                                if seen.insert(hap) {
+                                    out.push(hap);
+                                }
+                            }
                         }
                     }
 
@@ -7132,7 +7286,7 @@ impl crate::pipelines::ImputationPipeline {
                      donors: &[(RefHapId, f32)],
                      probs_buf: &mut Vec<f32>|
                      -> Result<(Vec<AllelePosteriors>, HaplotypePriors)> {
-                        let state_haps = build_state_haps(hap_idx, None, donors, 0.0, None);
+                        let state_haps = build_state_haps(hap_idx, None, donors, 0.0, None, None, None);
                         if state_haps.is_empty() {
                             return Err(ReagleError::vcf(format!(
                                 "State selection produced empty subset in no-info fast path: window={} sample={} hap={} donors={}",
@@ -7420,14 +7574,16 @@ impl crate::pipelines::ImputationPipeline {
                                 continue;
                             }
                             let (seg_plan_start, seg_plan_end) = extent.plan_range();
+                            let seg_input_probs = extent.build_target_probs(input_probs);
                             let mut state_haps = build_state_haps(
                                 hap_idx,
                                 chained_priors.as_ref(),
                                 donors,
                                 informative_ratio,
                                 Some((seg_plan_start, seg_plan_end)),
+                                if hap_idx.as_usize() % 2 == 0 { rare_atlas_h1.as_ref() } else { rare_atlas_h2.as_ref() },
+                                Some(&seg_input_probs),
                             );
-                            let seg_input_probs = extent.build_target_probs(input_probs);
                             let seg_ref_columns = extent.slice_ref_columns(ref_columns);
                             project_states_min_replacements(
                                 &mut state_haps,
@@ -7621,7 +7777,15 @@ impl crate::pipelines::ImputationPipeline {
                         return Ok((out_posts, next_priors, subsetted_any, informative_ratio));
                     }
                     let mut state_haps =
-                        build_state_haps(hap_idx, priors, donors, informative_ratio, None);
+                        build_state_haps(
+                            hap_idx,
+                            priors,
+                            donors,
+                            informative_ratio,
+                            None,
+                            if hap_idx.as_usize() % 2 == 0 { rare_atlas_h1.as_ref() } else { rare_atlas_h2.as_ref() },
+                            Some(input_probs),
+                        );
                     project_states_min_replacements(&mut state_haps, input_probs, ref_columns);
                     if state_haps.is_empty() {
                         return Err(ReagleError::vcf(format!(
