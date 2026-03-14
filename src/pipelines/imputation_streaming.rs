@@ -240,6 +240,118 @@ fn collect_carriers_for_allele(
     }
 }
 
+const RARE_OVERLAY_MIN_MAC: usize = 2;
+const RARE_OVERLAY_MAX_MAC: usize = 256;
+const RARE_OVERLAY_MAX_MAF: f32 = 0.01;
+const RARE_OVERLAY_FLANK_TYPED_PER_SIDE: usize = 32;
+const RARE_OVERLAY_MAX_CARRIERS_PER_MARKER: usize = 96;
+const RARE_OVERLAY_INJECT_MAX: usize = 16;
+const RARE_OVERLAY_ALT_GRAY_MIN: f32 = 0.02;
+const RARE_OVERLAY_ALT_GRAY_MAX: f32 = 0.35;
+const RARE_OVERLAY_ENTROPY_THRESHOLD: f32 = 0.55;
+const RARE_OVERLAY_CLUSTER_BIN: u32 = 64;
+const RARE_OVERLAY_BETA_IBS: f32 = 1.0;
+const RARE_OVERLAY_BETA_CLUSTER: f32 = 0.20;
+const RARE_OVERLAY_BETA_RECOMB_DIST: f32 = 0.15;
+
+fn build_target_flank_signature(
+    marker_idx: usize,
+    input_probs: &TargetAlleleProbs,
+    flank_typed_per_side: usize,
+) -> (u128, u8) {
+    let mut sig = 0u128;
+    let mut k = 0u8;
+    if input_probs.n_markers() == 0 {
+        return (sig, k);
+    }
+    let start = marker_idx.saturating_sub(flank_typed_per_side * 4);
+    let end = (marker_idx + flank_typed_per_side * 4 + 1).min(input_probs.n_markers());
+    for m in start..end {
+        if m == marker_idx || !input_probs.is_observed_marker(m) || input_probs.is_uniform_marker(m)
+        {
+            continue;
+        }
+        let probs = input_probs.probs_for_marker(m);
+        if probs.len() < 2 {
+            continue;
+        }
+        let p1 = probs[1].clamp(0.0, 1.0);
+        let code = if p1 >= 0.75 {
+            1u128
+        } else if p1 <= 0.25 {
+            0u128
+        } else {
+            2u128
+        };
+        sig |= code << (2 * k as u32);
+        k = k.saturating_add(1);
+        if k as usize >= flank_typed_per_side * 2 {
+            break;
+        }
+    }
+    (sig, k)
+}
+
+fn flank_match_score(carrier_sig: u128, carrier_len: u8, target_sig: u128, target_len: u8) -> f32 {
+    let n = carrier_len.min(target_len);
+    if n == 0 {
+        return 0.0;
+    }
+    let mut matches = 0u32;
+    let mut compared = 0u32;
+    for i in 0..n {
+        let shift = 2 * i as u32;
+        let c = ((carrier_sig >> shift) & 0b11) as u8;
+        let t = ((target_sig >> shift) & 0b11) as u8;
+        if c == 3 || t == 3 {
+            continue;
+        }
+        compared += 1;
+        if c == t {
+            matches += 1;
+        }
+    }
+    if compared == 0 {
+        0.0
+    } else {
+        matches as f32 / compared as f32
+    }
+}
+
+fn build_carrier_flank_signature(
+    carrier: RefHapId,
+    marker_idx: usize,
+    ref_columns: &[GenotypeColumn],
+    input_probs: &TargetAlleleProbs,
+    flank_typed_per_side: usize,
+) -> (u128, u8) {
+    let mut sig = 0u128;
+    let mut k = 0u8;
+    if ref_columns.is_empty() {
+        return (sig, k);
+    }
+    let start = marker_idx.saturating_sub(flank_typed_per_side * 4);
+    let end = (marker_idx + flank_typed_per_side * 4 + 1).min(ref_columns.len());
+    for (m, col) in ref_columns.iter().enumerate().take(end).skip(start) {
+        if m == marker_idx || !input_probs.is_observed_marker(m) || input_probs.is_uniform_marker(m)
+        {
+            continue;
+        }
+        let allele = col.get(HapIdx::new(carrier.as_u32()));
+        let code = match allele {
+            0 => 0u128,
+            1 => 1u128,
+            _ => 2u128,
+        };
+        sig |= code << (2 * k as u32);
+        k = k.saturating_add(1);
+        if k as usize >= flank_typed_per_side * 2 {
+            break;
+        }
+    }
+    (sig, k)
+}
+
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
@@ -7011,6 +7123,12 @@ impl crate::pipelines::ImputationPipeline {
                                 continue;
                             }
                             let col = &local_ref_columns[m];
+                            let n_haps = col.n_haplotypes().max(1);
+                            let alt_count = col.alt_count();
+                            let alt_maf = (alt_count as f32 / n_haps as f32).min(1.0 - (alt_count as f32 / n_haps as f32));
+                            let is_rare_overlay_marker = alt_count >= RARE_OVERLAY_MIN_MAC
+                                && alt_count <= RARE_OVERLAY_MAX_MAC
+                                && alt_maf <= RARE_OVERLAY_MAX_MAF;
                             let mut ranked: Vec<(usize, f32)> = probs
                                 .iter()
                                 .enumerate()
@@ -7112,7 +7230,91 @@ impl crate::pipelines::ImputationPipeline {
                             }
 
                             for (allele, weight) in needed {
-                                if is_represented_in_states(state_haps, col, allele) {
+                                let represented = is_represented_in_states(state_haps, col, allele);
+                                let mut entropy = 0.0f32;
+                                for &p in probs {
+                                    let q = p.clamp(0.0, 1.0);
+                                    if q > 0.0 {
+                                        entropy -= q * q.ln();
+                                    }
+                                }
+                                let max_entropy = (probs.len().max(2) as f32).ln().max(1e-6);
+                                let entropy_norm = (entropy / max_entropy).clamp(0.0, 1.0);
+                                let alt_prob = probs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                                let uncertain = entropy_norm >= RARE_OVERLAY_ENTROPY_THRESHOLD
+                                    || (alt_prob >= RARE_OVERLAY_ALT_GRAY_MIN
+                                        && alt_prob <= RARE_OVERLAY_ALT_GRAY_MAX);
+
+                                if is_rare_overlay_marker && allele == 1 && uncertain {
+                                    collect_carriers_for_allele(
+                                        col,
+                                        allele,
+                                        RARE_OVERLAY_MAX_CARRIERS_PER_MARKER,
+                                        &mut carriers_buf,
+                                    );
+                                    if !carriers_buf.is_empty() {
+                                        let (target_sig, target_len) = build_target_flank_signature(
+                                            m,
+                                            input_probs,
+                                            RARE_OVERLAY_FLANK_TYPED_PER_SIDE,
+                                        );
+                                        let state_cluster: u16 = if state_haps.is_empty() {
+                                            0
+                                        } else {
+                                            (state_haps[0].as_u32() / RARE_OVERLAY_CLUSTER_BIN)
+                                                as u16
+                                        };
+                                        let mut ranked_carriers: Vec<(RefHapId, f32)> = carriers_buf
+                                            .iter()
+                                            .copied()
+                                            .map(|carrier| {
+                                                let (carrier_sig, carrier_len) =
+                                                    build_carrier_flank_signature(
+                                                        carrier,
+                                                        m,
+                                                        local_ref_columns,
+                                                        input_probs,
+                                                        RARE_OVERLAY_FLANK_TYPED_PER_SIDE,
+                                                    );
+                                                let ibs = flank_match_score(
+                                                    carrier_sig,
+                                                    carrier_len,
+                                                    target_sig,
+                                                    target_len,
+                                                );
+                                                let cluster_id =
+                                                    (carrier.as_u32() / RARE_OVERLAY_CLUSTER_BIN)
+                                                        as u16;
+                                                let ancestry_match =
+                                                    if cluster_id == state_cluster { 1.0 } else { 0.0 };
+                                                let recomb_penalty = (1.0 - ibs).max(0.0);
+                                                let score = RARE_OVERLAY_BETA_IBS * ibs
+                                                    + RARE_OVERLAY_BETA_CLUSTER * ancestry_match
+                                                    - RARE_OVERLAY_BETA_RECOMB_DIST
+                                                        * recomb_penalty;
+                                                (carrier, score)
+                                            })
+                                            .collect();
+                                        ranked_carriers.sort_by(|a, b| {
+                                            b.1.partial_cmp(&a.1)
+                                                .unwrap_or(std::cmp::Ordering::Equal)
+                                        });
+                                        let selected: Vec<RefHapId> = ranked_carriers
+                                            .into_iter()
+                                            .take(RARE_OVERLAY_INJECT_MAX.min(k.max(1)))
+                                            .map(|(hap, _)| hap)
+                                            .collect();
+                                        if !selected.is_empty() && (!represented || uncertain) {
+                                            constraints.push(Constraint {
+                                                carriers: selected,
+                                                weight: weight.max(alt_prob.max(0.25)),
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                if represented {
                                     continue;
                                 }
                                 collect_carriers_for_allele(col, allele, k, &mut carriers_buf);
