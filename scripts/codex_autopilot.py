@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -42,18 +43,7 @@ DEFAULT_MONITOR_SECONDS = 15
 DEFAULT_ORCHESTRATOR_INTERVAL_SECONDS = 60 * 60
 DEFAULT_ORCHESTRATOR_TIMEOUT_SECONDS = 2 * 60 * 60
 DEFAULT_WORKER_COUNT = 2
-DEFAULT_WORKER_SANITY_CHECK_TIMEOUT_SECONDS = 30 * 60
-DEFAULT_WORKER_SANITY_CHECK_COMMAND = [
-    "cargo",
-    "test",
-    "--release",
-    "--test",
-    "fast_imputation",
-    "test_synthetic_slam_dunk",
-    "--",
-    "--exact",
-    "--nocapture",
-]
+DEFAULT_RESTART_BACKOFF_SECONDS = 5
 
 OVERALL_GOALS_CONTEXT = """
 Overall goals:
@@ -84,7 +74,7 @@ The main goal is the accuracy metrics for phasing and imputation, and do not reg
 
 Get Reagle to beat other tools on various realistic tests. DO NOT modify the test or make Reagle wrap external tools. DO NOT tweak knobs. DO active experimentation.
 
-Feel free to install deps, e.g., bcftools.
+Prefer tools already available in the environment. Do not rely on privileged or system-wide installs; if extra tooling is truly needed, prefer repo-local or user-space approaches.
 """
 
 SCIENTIFIC_METHOD_CONTEXT = """
@@ -101,6 +91,7 @@ Dead code in any form isn’t allowed, including underscore-prefixed variables, 
 You can often proceed to implement or test without asking.
 
 Never use environment variables, generally, unless forced to (e.g., some GitHub actions code requires them). Prefer being explicit. Similarly, you can include logging and prints in the production code without env vars or gates--just make sure it’s useful and non-spammy prints. If you truly need to see something that shouldn’t be in prod, just remove it after rather than gating it, or decide if you can make a version of it that can go in prod and still be useful to you.
+Do not use sudo, do not assume privileged machine control, and do not start background daemons or other detached processes.
 """
 
 ORCHESTRATOR_ROLE_CONTEXT = """
@@ -129,6 +120,7 @@ Improve imputation and phasing accuracy using your own judgment.
 Do not overfit to small tests, narrow benchmarks, or a single metric. Prefer realistic evidence and holistic improvement.
 Parallelize expensive experiments, benchmarks, and test runs so you use the machine effectively across available CPU cores.
 There is no time limit. You can work for days before finishing if needed. Do not rush to end the run.
+Remote git and GitHub access are available. You may use `git` and `gh` when useful, including pushing branches and opening PRs.
 If you decide the result is worth shipping, commit it, push the branch, and open a PR yourself.
 Do not merge any PR into `main` from this worker run.
 """
@@ -141,6 +133,7 @@ Continue the same branch and session from the current state of the worktree.
 Use your own judgment about whether this work should still ship.
 Do not overfit to small tests, narrow benchmarks, or a single metric. Re-evaluate holistically using realistic evidence.
 There is no time limit. You can keep working for days before finishing if needed.
+Remote git and GitHub access are available. You may use `git` and `gh` when useful, including pushing branches and opening PRs.
 If you still think it should ship, continue and resolve the issue.
 If you no longer think it should ship, say so plainly.
 If it should ship, make sure the branch is committed, pushed, and has an open PR.
@@ -174,6 +167,8 @@ class ActiveWorker:
     last_message_path: Path
     stdout_path: Path
     stderr_path: Path
+    stdout_thread: threading.Thread
+    stderr_thread: threading.Thread
     process: subprocess.Popen[str]
 
 
@@ -288,6 +283,7 @@ class CodexAutopilot:
         self.heartbeat_path = self.state_dir / "heartbeat.json"
         self.lock_path = self.state_dir / "lock"
         self.logs_dir = self.state_dir / "logs"
+        self.master_log_path = self.logs_dir / "master.log"
         self.attempts_dir = self.state_dir / "attempts"
         self.worktrees_dir = self.state_dir / "worktrees"
         self.orchestrator_dir = self.state_dir / "orchestrator"
@@ -302,7 +298,8 @@ class CodexAutopilot:
         self.active_workers: dict[int, ActiveWorker] = {}
         self._last_orchestrator_monotonic = 0.0
         self._lock_handle = None
-        self._stop_requested = False
+        self._master_log_lock = threading.Lock()
+        self._initial_cycle_pending = True
 
     def setup(self) -> None:
         for path in [
@@ -363,35 +360,134 @@ class CodexAutopilot:
             payload.update(extra)
         write_json(self.heartbeat_path, payload)
 
+    def append_master_log_block(self, title: str, body: str) -> None:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        normalized = body.rstrip()
+        block = f"[{utc_now_iso()}] {title}\n"
+        if normalized:
+            block += normalized + "\n"
+        block += "\n"
+        with self._master_log_lock:
+            with self.master_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(block)
+                handle.flush()
+
+    def append_master_log_line(self, stream_name: str, line: str) -> None:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        with self._master_log_lock:
+            with self.master_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"[{utc_now_iso()}] {stream_name} {line}")
+                if not line.endswith("\n"):
+                    handle.write("\n")
+                handle.flush()
+
+    def stream_process_output(self, stream: Any, destination_path: Path, stream_name: str) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with destination_path.open("w", encoding="utf-8") as destination:
+            while True:
+                line = stream.readline()
+                if line == "":
+                    break
+                destination.write(line)
+                destination.flush()
+                self.append_master_log_line(stream_name, line)
+        stream.close()
+
+    def spawn_logged_process(
+        self,
+        *,
+        cmd: list[str],
+        cwd: Path,
+        prompt_path: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        label: str,
+    ) -> tuple[subprocess.Popen[str], threading.Thread, threading.Thread]:
+        prompt_text = prompt_path.read_text(encoding="utf-8", errors="replace")
+        self.append_master_log_block(
+            f"{label} start",
+            "\n".join(
+                [
+                    f"cwd: {cwd}",
+                    f"command: {shell_join(cmd)}",
+                    "",
+                    "prompt:",
+                    prompt_text,
+                ]
+            ),
+        )
+
+        stdin_handle = prompt_path.open("r", encoding="utf-8")
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            stdin=stdin_handle,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        stdin_handle.close()
+        if process.stdout is None or process.stderr is None:
+            raise SupervisorError(f"{label} failed to allocate stdout/stderr pipes")
+
+        stdout_thread = threading.Thread(
+            target=self.stream_process_output,
+            args=(process.stdout, stdout_path, f"{label} stdout"),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=self.stream_process_output,
+            args=(process.stderr, stderr_path, f"{label} stderr"),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        return process, stdout_thread, stderr_thread
+
+    def join_process_threads(self, stdout_thread: threading.Thread, stderr_thread: threading.Thread) -> None:
+        stdout_thread.join(timeout=30)
+        stderr_thread.join(timeout=30)
+
     def handle_signal(self, signum: int, _frame: Any) -> None:
-        logging.warning("received signal %s; stopping after current step", signum)
-        self._stop_requested = True
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = str(signum)
+        message = f"received signal {signal_name}; ignoring it so the supervisor keeps running"
+        logging.warning(message)
+        self.append_master_log_block("signal ignored", message)
 
     def run(self) -> int:
         signal.signal(signal.SIGINT, self.handle_signal)
         signal.signal(signal.SIGTERM, self.handle_signal)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, self.handle_signal)
+        if hasattr(signal, "SIGQUIT"):
+            signal.signal(signal.SIGQUIT, self.handle_signal)
 
-        self.setup()
-        self.acquire_lock()
-        self.update_heartbeat("starting")
-        self.fill_worker_slots()
-        self.maybe_run_orchestrator(force=True)
+        self.append_master_log_block("supervisor process start", f"pid: {os.getpid()}")
 
         while True:
             try:
-                self.tick()
+                self.setup()
+                if self._lock_handle is None:
+                    self.acquire_lock()
+                self.update_heartbeat("starting")
+                if self._initial_cycle_pending:
+                    self.update_heartbeat("initializing")
+                    self.fill_worker_slots()
+                    self.maybe_run_orchestrator(force=True)
+                    self._initial_cycle_pending = False
+                    self.update_heartbeat("idle")
+                else:
+                    self.tick()
             except Exception:
-                logging.exception("tick failed")
-            if self._stop_requested:
-                break
+                logging.exception("supervisor cycle failed")
+                self.update_heartbeat("error")
             sleep_for = max(1.0, self.config.monitor_seconds)
             self.update_heartbeat("sleeping", {"sleep_seconds": int(sleep_for)})
             time.sleep(sleep_for)
-
-        self.stop_active_workers()
-        self.update_heartbeat("stopped")
-        self.write_state()
-        return 0
 
     def tick(self) -> None:
         self.update_heartbeat("tick")
@@ -415,6 +511,18 @@ class CodexAutopilot:
             checked_command(
                 ["git", "worktree", "add", "--detach", str(self.orchestrator_worktree), commit],
                 cwd=self.repo_root,
+            )
+            return self.orchestrator_worktree
+
+        if self.git_status_dirty(self.orchestrator_worktree):
+            self.append_master_log_block(
+                "orchestrator worktree preserved",
+                "\n".join(
+                    [
+                        f"worktree: {self.orchestrator_worktree}",
+                        "The orchestrator worktree is dirty, so the supervisor is preserving it and reusing it instead of resetting to origin/main.",
+                    ]
+                ),
             )
             return self.orchestrator_worktree
 
@@ -498,22 +606,14 @@ class CodexAutopilot:
             "-",
         ]
 
-        stdin_handle = prompt_path.open("r", encoding="utf-8")
-        stdout_handle = stdout_path.open("w", encoding="utf-8")
-        stderr_handle = stderr_path.open("w", encoding="utf-8")
-        try:
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(self.repo_root),
-                stdin=stdin_handle,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                text=True,
-            )
-        finally:
-            stdin_handle.close()
-            stdout_handle.close()
-            stderr_handle.close()
+        process, stdout_thread, stderr_thread = self.spawn_logged_process(
+            cmd=cmd,
+            cwd=self.repo_root,
+            prompt_path=prompt_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            label=f"worker slot={slot} iteration={iteration} follow_up=0",
+        )
 
         self.active_workers[slot] = ActiveWorker(
             slot=slot,
@@ -528,6 +628,8 @@ class CodexAutopilot:
             last_message_path=last_message_path,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            stdout_thread=stdout_thread,
+            stderr_thread=stderr_thread,
             process=process,
         )
         self.write_state()
@@ -562,32 +664,12 @@ class CodexAutopilot:
                 self.write_state()
         return finished_any
 
-    def stop_active_workers(self) -> None:
-        for slot in sorted(list(self.active_workers.keys())):
-            worker = self.active_workers[slot]
-            if worker.process.poll() is None:
-                logging.info("terminating worker slot %d pid %d", slot, worker.process.pid)
-                worker.process.terminate()
-                try:
-                    worker.process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    worker.process.kill()
-                    worker.process.wait(timeout=30)
-            self.active_workers.pop(slot, None)
-
     def finalize_worker(self, worker: ActiveWorker, returncode: int) -> ActiveWorker | None:
+        self.join_process_threads(worker.stdout_thread, worker.stderr_thread)
         codex_result = self.collect_worker_result(worker, returncode)
-        agent_report = self.parse_worker_report(codex_result.get("last_message") or "")
+        last_message = codex_result.get("last_message") or ""
         existing_pr = self.lookup_open_pr_for_branch(worker.branch_name, worker.worktree)
         dirty = self.git_status_dirty(worker.worktree)
-        sanity_check = None
-        if agent_report.get("status") == "completed":
-            sanity_check = self.run_worker_sanity_check(worker.worktree)
-        trusted_completion = (
-            agent_report.get("status") == "completed"
-            and agent_report.get("tests") != "failed"
-            and (sanity_check is None or bool(sanity_check.get("passed")))
-        )
         record = {
             "kind": "attempt",
             "slot": worker.slot,
@@ -597,9 +679,6 @@ class CodexAutopilot:
             "started_at": worker.started_at,
             "finished_at": utc_now_iso(),
             "codex": codex_result,
-            "agent_report": agent_report,
-            "sanity_check": sanity_check,
-            "trusted_completion": trusted_completion,
             "session_id": codex_result.get("session_id"),
             "follow_up_index": worker.follow_up_index,
             "returncode": returncode,
@@ -611,9 +690,9 @@ class CodexAutopilot:
         next_worker = None
         follow_up_prompt = self.build_worker_follow_up_prompt(
             branch_name=worker.branch_name,
-            agent_report=agent_report,
+            last_message=last_message,
             existing_pr=existing_pr,
-            sanity_check=sanity_check,
+            returncode=returncode,
         )
         session_id = codex_result.get("session_id")
         if follow_up_prompt:
@@ -628,30 +707,18 @@ class CodexAutopilot:
         if existing_pr is not None:
             record["pr"] = existing_pr
             logging.info(
-                "worker slot %d iteration %d reported status=%s with PR %s",
+                "worker slot %d iteration %d finished with returncode=%d and PR %s",
                 worker.slot,
                 worker.iteration,
-                agent_report.get("status"),
+                returncode,
                 existing_pr.get("url"),
             )
-            if trusted_completion:
-                logging.info(
-                    "worker slot %d iteration %d trusted completion after single sanity check",
-                    worker.slot,
-                    worker.iteration,
-                )
-            if sanity_check is not None and not sanity_check.get("passed"):
-                logging.warning(
-                    "worker slot %d iteration %d reported completed but sanity check failed",
-                    worker.slot,
-                    worker.iteration,
-                )
         else:
             logging.info(
-                "worker slot %d iteration %d reported status=%s without opening a PR",
+                "worker slot %d iteration %d finished with returncode=%d without opening a PR",
                 worker.slot,
                 worker.iteration,
-                agent_report.get("status"),
+                returncode,
             )
         if next_worker is not None:
             logging.info(
@@ -661,6 +728,21 @@ class CodexAutopilot:
                 next_worker.session_id,
             )
 
+        self.append_master_log_block(
+            f"worker slot={worker.slot} iteration={worker.iteration} follow_up={worker.follow_up_index} complete",
+            "\n".join(
+                [
+                    f"returncode: {returncode}",
+                    f"branch: {worker.branch_name}",
+                    f"worktree: {worker.worktree}",
+                    f"session_id: {codex_result.get('session_id') or 'none'}",
+                    f"pr: {existing_pr.get('url') if existing_pr is not None else 'none'}",
+                    "",
+                    "last_message:",
+                    codex_result.get("last_message") or "",
+                ]
+            ),
+        )
         append_jsonl(self.history_path, record)
         return next_worker
 
@@ -783,15 +865,15 @@ class CodexAutopilot:
         self,
         *,
         branch_name: str,
-        agent_report: dict[str, str | None],
+        last_message: str,
         existing_pr: dict[str, Any] | None,
-        sanity_check: dict[str, Any] | None,
+        returncode: int,
     ) -> str:
         reasons: list[str] = []
-        if agent_report.get("status") == "completed" and existing_pr is None:
-            reasons.append("you indicated the work was ready to ship, but there is still no open PR for this branch")
-        if sanity_check is not None and not sanity_check.get("passed"):
-            reasons.append("the single host sanity check failed after your last turn")
+        if existing_pr is None:
+            reasons.append("there is still no open PR for this branch")
+        if returncode != 0:
+            reasons.append(f"the previous Codex turn exited with returncode {returncode}")
 
         lines = [
             "The host is sending this follow-up after the last worker turn completed.",
@@ -808,8 +890,7 @@ class CodexAutopilot:
             [
                 "",
                 f"Branch: {branch_name}",
-                f"Previous self-reported status: {agent_report.get('status') or 'unspecified'}",
-                f"Previous self-reported tests: {agent_report.get('tests') or 'unspecified'}",
+                f"Previous turn returncode: {returncode}",
             ]
         )
         if existing_pr is not None:
@@ -826,13 +907,12 @@ class CodexAutopilot:
                     "There is currently no open PR detected for this branch.",
                 ]
             )
-        if sanity_check is not None and not sanity_check.get("passed"):
+        if last_message.strip():
             lines.extend(
                 [
                     "",
-                    f"Sanity check command: {sanity_check.get('command')}",
-                    f"Sanity check stderr: {sanity_check.get('stderr_tail') or 'none'}",
-                    f"Sanity check stdout: {sanity_check.get('stdout_tail') or 'none'}",
+                    "Previous final message:",
+                    last_message,
                 ]
             )
         follow_up_state = "\n".join(lines)
@@ -891,22 +971,17 @@ class CodexAutopilot:
             ]
             cwd = self.repo_root
 
-        stdin_handle = prompt_path.open("r", encoding="utf-8")
-        stdout_handle = stdout_path.open("w", encoding="utf-8")
-        stderr_handle = stderr_path.open("w", encoding="utf-8")
-        try:
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(cwd),
-                stdin=stdin_handle,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                text=True,
-            )
-        finally:
-            stdin_handle.close()
-            stdout_handle.close()
-            stderr_handle.close()
+        process, stdout_thread, stderr_thread = self.spawn_logged_process(
+            cmd=cmd,
+            cwd=cwd,
+            prompt_path=prompt_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            label=(
+                f"worker slot={worker.slot} iteration={worker.iteration} "
+                f"follow_up={next_follow_up_index}"
+            ),
+        )
 
         logging.info(
             "continued worker slot %d iteration %d branch %s session %s follow_up_index=%d pid %d",
@@ -930,58 +1005,10 @@ class CodexAutopilot:
             last_message_path=last_message_path,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            stdout_thread=stdout_thread,
+            stderr_thread=stderr_thread,
             process=process,
         )
-
-    def parse_worker_report(self, last_message: str) -> dict[str, str | None]:
-        status_match = re.search(
-            r"(?im)^(?:status|decision|assessment|result|ship(?:ping)? decision):\s*([a-z_ -]+?)\s*$",
-            last_message,
-        )
-        tests_match = re.search(
-            r"(?im)^(?:tests|validation|checks):\s*([a-z_ -]+?)\s*$",
-            last_message,
-        )
-        status = None
-        tests = None
-        if status_match:
-            raw_status = status_match.group(1).strip().lower().replace(" ", "_").replace("-", "_")
-            if any(token in raw_status for token in ["completed", "ship", "ready"]):
-                status = "completed"
-            elif any(token in raw_status for token in ["blocked", "stuck"]):
-                status = "blocked"
-            elif any(token in raw_status for token in ["no_change", "nochange", "not_shipping", "skip"]):
-                status = "no_change"
-            else:
-                status = raw_status
-        if tests_match:
-            raw_tests = tests_match.group(1).strip().lower().replace(" ", "_").replace("-", "_")
-            if any(token in raw_tests for token in ["pass", "passed", "green", "ok"]):
-                tests = "passed"
-            elif any(token in raw_tests for token in ["fail", "failed", "red"]):
-                tests = "failed"
-            elif any(token in raw_tests for token in ["not_run", "notrun", "skipped"]):
-                tests = "not_run"
-            else:
-                tests = raw_tests
-        return {
-            "status": status,
-            "tests": tests,
-        }
-
-    def run_worker_sanity_check(self, worktree: Path) -> dict[str, Any]:
-        proc = run_command(
-            DEFAULT_WORKER_SANITY_CHECK_COMMAND,
-            cwd=worktree,
-            timeout=DEFAULT_WORKER_SANITY_CHECK_TIMEOUT_SECONDS,
-        )
-        return {
-            "command": shell_join(DEFAULT_WORKER_SANITY_CHECK_COMMAND),
-            "passed": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout_tail": redact(proc.stdout or ""),
-            "stderr_tail": redact(proc.stderr or ""),
-        }
 
     def write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,26 +1040,68 @@ class CodexAutopilot:
             "-",
         ]
 
-        proc = run_command(
-            cmd,
-            cwd=self.repo_root,
-            timeout=self.config.orchestrator_timeout_seconds,
-            input_text=prompt,
+        self.append_master_log_block(
+            "orchestrator start",
+            "\n".join(
+                [
+                    f"cwd: {self.repo_root}",
+                    f"worktree: {worktree}",
+                    f"command: {shell_join(cmd)}",
+                    "",
+                    "prompt:",
+                    prompt,
+                ]
+            ),
         )
-        self.write_text(stdout_path, proc.stdout or "")
-        self.write_text(stderr_path, proc.stderr or "")
+
+        try:
+            proc = run_command(
+                cmd,
+                cwd=self.repo_root,
+                timeout=self.config.orchestrator_timeout_seconds,
+                input_text=prompt,
+            )
+            stdout_text = proc.stdout or ""
+            stderr_text = proc.stderr or ""
+            returncode: int | None = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_text = exc.stdout or ""
+            stderr_text = exc.stderr or ""
+            returncode = None
+
+        self.write_text(stdout_path, stdout_text)
+        self.write_text(stderr_path, stderr_text)
 
         result: dict[str, Any] = {
             "command": shell_join(cmd),
-            "returncode": proc.returncode,
+            "returncode": returncode,
             "stdout_log": str(stdout_path),
             "stderr_log": str(stderr_path),
             "prompt_path": str(prompt_path),
         }
-        if proc.returncode != 0:
-            result["stderr_tail"] = redact(proc.stderr or proc.stdout)
-        elif proc.stdout:
-            result["stdout_tail"] = redact(proc.stdout)
+        if returncode is None:
+            result["timed_out"] = True
+            result["stderr_tail"] = redact(stderr_text or stdout_text)
+        elif returncode != 0:
+            result["stderr_tail"] = redact(stderr_text or stdout_text)
+        elif stdout_text:
+            result["stdout_tail"] = redact(stdout_text)
+
+        self.append_master_log_block(
+            "orchestrator complete",
+            "\n".join(
+                [
+                    f"returncode: {returncode if returncode is not None else 'timeout'}",
+                    f"worktree: {worktree}",
+                    "",
+                    "stdout:",
+                    stdout_text,
+                    "",
+                    "stderr:",
+                    stderr_text,
+                ]
+            ),
+        )
         return result
 
     def format_open_pr_signal(self, rows: list[dict[str, Any]]) -> str:
@@ -1148,7 +1217,7 @@ def build_default_config() -> Config:
 def configure_logging(state_dir: Path) -> None:
     logs_dir = state_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / "autopilot.log"
+    log_path = logs_dir / "master.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1156,14 +1225,24 @@ def configure_logging(state_dir: Path) -> None:
             logging.FileHandler(log_path, encoding="utf-8"),
             logging.StreamHandler(sys.stderr),
         ],
+        force=True,
     )
 
 
 def main() -> int:
-    config = build_default_config()
-    configure_logging(config.state_dir)
-    supervisor = CodexAutopilot(config)
-    return supervisor.run()
+    while True:
+        try:
+            config = build_default_config()
+            configure_logging(config.state_dir)
+            supervisor = CodexAutopilot(config)
+            result = supervisor.run()
+            logging.error("supervisor.run returned unexpectedly with result=%r; restarting", result)
+        except BaseException:
+            try:
+                logging.exception("top-level supervisor wrapper caught a fatal error; restarting")
+            except Exception:
+                print("top-level supervisor wrapper caught a fatal error; restarting", file=sys.stderr)
+        time.sleep(DEFAULT_RESTART_BACKOFF_SECONDS)
 
 
 if __name__ == "__main__":
