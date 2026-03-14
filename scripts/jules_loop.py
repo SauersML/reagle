@@ -25,6 +25,10 @@ Well, better phasing and imputation leads to downstream better, e.g., predictive
 This means we must always do what is best for real-world accuracy and performance.
 
 Do not edit tests, loosen thresholds, or edit constants.
+Jules cannot change constants, numeric thresholds, coefficients, caps, penalties, scaling factors, or model parameters.
+Jules must not "fix" a bug by changing a constant or parameter value, even if the constant looks wrong, broken, suspicious, off by a factor, or badly named.
+Do not repair formulas by swapping numeric coefficients or parameter multipliers. Do not adjust recombination intensity, Ne-derived factors, priors, penalties, cutoffs, weights, or similar knobs.
+If a failure appears to be caused by a bad constant or parameter, Jules must leave the constant/parameter unchanged and instead find an implementation or algorithmic fix elsewhere.
 
 Large changes are not bad (bigness of change is orthogonal to goodness), and should not be avoided. We don’t care about backwards compatibility.
 Model changes or algorithm changes are not bad.
@@ -42,6 +46,7 @@ RULES:
 - Correctness matters: this code affects real health outcomes via polygenic scores.
 - No hacks. Do the proper fix.
 - Avoid small, unimpactful changes such as knob tuning or tweaking.
+- Constants and parameters are off-limits. Do not tune them, do not rename-and-retune them, and do not replace one numeric coefficient with another.
 
 SCOPE:
 - DO NOT modify rust-toolchain.toml if it exists.

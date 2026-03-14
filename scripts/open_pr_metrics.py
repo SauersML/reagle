@@ -22,6 +22,7 @@ CHR21_JOB_NAME = "reference-comparison-chr21"
 CHR21_TARGET_TEST_NAME = "test_reference_comparison_full_chr21_ref1000_target10"
 CHR21_ASSERTION_PREFIX = "Reagle worse than Beagle on "
 TEST_RESULT_RE = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed;")
+BEAGLE_REF_TEST_RE = re.compile(r"^test (test_java_beagle_[A-Za-z0-9_]+) \.\.\. (ok|FAILED)$")
 SEED_RE = re.compile(r"Seed\s+(\d+):\s+Java\s+([0-9.]+)%\s*,\s*Rust\s+([0-9.]+)%")
 ASSERTION_RE = re.compile(
     r"^Reagle worse than Beagle on (?P<metric>.+?): "
@@ -424,26 +425,29 @@ def parse_test_results(log_text: str) -> dict[str, Any]:
 
 
 def parse_beagle_reference_stats(log_text: str) -> dict[str, Any] | None:
-    lines = [normalize_log_line(line) for line in log_text.splitlines()]
-    for idx, line in enumerate(lines):
-        if "deps/beagle_reference" not in line or "Running" not in line:
+    passed = 0
+    failed = 0
+
+    for raw_line in log_text.splitlines():
+        line = normalize_log_line(raw_line)
+        match = BEAGLE_REF_TEST_RE.match(line)
+        if not match:
             continue
-        for candidate in lines[idx + 1 :]:
-            if "test result:" not in candidate:
-                continue
-            match = TEST_RESULT_RE.search(candidate)
-            if not match:
-                return None
-            passed = int(match.group(1))
-            failed = int(match.group(2))
-            total = passed + failed
-            return {
-                "passed": passed,
-                "failed": failed,
-                "total": total,
-                "pass_rate": (passed / total) if total else None,
-            }
-    return None
+        if match.group(2) == "ok":
+            passed += 1
+        else:
+            failed += 1
+
+    total = passed + failed
+    if total == 0:
+        return None
+
+    return {
+        "passed": passed,
+        "failed": failed,
+        "total": total,
+        "pass_rate": (passed / total) if total else None,
+    }
 
 
 def parse_seed_metrics(log_text: str) -> dict[str, Any]:
@@ -885,76 +889,64 @@ def collect_pr_report(
     return report
 
 
-def headline_seed_delta(report: dict[str, Any]) -> str:
+def format_optional(value: float | None, fmt: str) -> str:
+    if value is None:
+        return "-"
+    return fmt.format(value)
+
+
+def headline_concord_delta(report: dict[str, Any]) -> str:
     ci = report.get("ci") or {}
     ref = ci.get("reference_comparison") or {}
     seeds = ref.get("seed_metrics") or {}
     mean = seeds.get("mean_delta_percent")
-    if mean is None:
-        return "-"
-    return f"{mean:+.2f}%"
+    return format_optional(mean, "{:+.2f}%")
 
 
 def headline_beagle_ref(report: dict[str, Any]) -> str:
     ci = report.get("ci") or {}
     ref = ci.get("reference_comparison") or {}
-    stats = ref.get("beagle_reference")
-    if not stats:
+    stats = ref.get("beagle_reference") or {}
+    passed = stats.get("passed")
+    total = stats.get("total")
+    if not isinstance(passed, int) or not isinstance(total, int) or total <= 0:
         return "-"
-    total = stats.get("total") or 0
-    if total == 0:
-        return "-"
-    return f"{stats['passed']}/{total}"
+    return f"{passed}/{total}"
 
 
-def headline_chr21(report: dict[str, Any]) -> str:
+def headline_chr21_delta(report: dict[str, Any], key: str, fmt: str) -> str:
     ci = report.get("ci") or {}
     chr21 = ci.get("reference_comparison_chr21") or {}
-    target = chr21.get("target_test") or {}
-    status = target.get("status")
-    if status == "pass":
-        return "PASS"
-    if status == "fail":
-        assertion = target.get("assertion")
-        if assertion:
-            return f"{assertion['metric']} {assertion['delta']:+.4f}"
-        return "FAIL"
-    return "-"
-
-
-def headline_status(section: dict[str, Any] | None) -> str:
-    if not section:
+    metrics = chr21.get("metrics") or {}
+    deltas = metrics.get("reagle_minus_beagle") or {}
+    timing = metrics.get("timing") or {}
+    value = deltas.get(key)
+    if value is None:
+        value = timing.get(key)
+    if not is_numeric(value):
         return "-"
-    run = section.get("run") or {}
-    status = run.get("status") or "-"
-    conclusion = run.get("conclusion")
-    if conclusion:
-        return f"{status}/{conclusion}"
-    return status
+    return format_optional(float(value), fmt)
 
 
 def print_summary(report: dict[str, Any]) -> None:
     rows = report["pull_requests"]
     print(
-        f"{'PR':<6} {'CI':<20} {'IQA':<20} {'Tests':<12} "
-        f"{'Seed Δ':<10} {'Beagle Ref':<12} {'chr21':<18} Title"
+        f"{'PR':<6} {'Concord Δ':<10} {'Beagle Ref':<11} {'ΔR²':<10} "
+        f"{'ΔIQS':<10} {'ΔHell':<10} {'ΔPhase':<10} {'ΔSER':<10} {'ΔTime(s)':<10} Title"
     )
-    print("-" * 140)
+    print("-" * 133)
 
     for row in rows:
-        ci = row.get("ci") or {}
-        tests = ci.get("aggregate_test_results") or {}
-        tests_display = "-"
-        if tests:
-            tests_display = f"{tests.get('passed', 0)}P/{tests.get('failed', 0)}F"
         print(
             f"#{row['pr']['number']:<5} "
-            f"{headline_status(row.get('ci')):<20} "
-            f"{headline_status(row.get('iqa')):<20} "
-            f"{tests_display:<12} "
-            f"{headline_seed_delta(row):<10} "
-            f"{headline_beagle_ref(row):<12} "
-            f"{headline_chr21(row):<18} "
+            f"{headline_concord_delta(row):<10} "
+            f"{headline_beagle_ref(row):<11} "
+            f"{headline_chr21_delta(row, 'r_squared', '{:+.4f}'):<10} "
+            f"{headline_chr21_delta(row, 'iqs', '{:+.4f}'):<10} "
+            f"{headline_chr21_delta(row, 'hellinger_score', '{:+.4f}'):<10} "
+            f"{headline_chr21_delta(row, 'phase_concordance', '{:+.4f}'):<10} "
+            f"{headline_chr21_delta(row, 'switch_error_rate', '{:+.4f}'):<10} "
+            f"{headline_chr21_delta(row, 'reagle_minus_beagle_runtime_sec', '{:+.2f}'):<10} "
             f"{row['pr']['title']}"
         )
 
