@@ -250,16 +250,16 @@ jobs:
           set -euo pipefail
           check_vcf () {
             local vcf="$1"
-            [ -s "$vcf" ]
-            [ -s "$vcf.csi" ] || [ -s "$vcf.tbi" ]
-            bcftools index -n "$vcf" >/dev/null
+            [ -s "$vcf" ] || return 1
+            ( [ -s "$vcf.csi" ] || [ -s "$vcf.tbi" ] ) || return 1
+            bcftools index -n "$vcf" >/dev/null || return 1
           }
 
-          check_vcf target.vcf.gz
-          check_vcf reagle_ref.vcf.gz
+          check_vcf target.vcf.gz || rm -f target.vcf.gz target.vcf.gz.csi target.vcf.gz.tbi reagle_ref.vcf.gz reagle_ref.vcf.gz.csi reagle_ref.vcf.gz.tbi
+          check_vcf reagle_ref.vcf.gz || rm -f target.vcf.gz target.vcf.gz.csi target.vcf.gz.tbi reagle_ref.vcf.gz reagle_ref.vcf.gz.csi reagle_ref.vcf.gz.tbi
 
-          reagle_sites=$(bcftools index -n reagle_ref.vcf.gz)
-          ref_sites=$(bcftools index -n ref.vcf.gz)
+          reagle_sites=$(bcftools index -n reagle_ref.vcf.gz 2>/dev/null || echo "0")
+          ref_sites=$(bcftools index -n ref.vcf.gz 2>/dev/null || echo "0")
           min_expected=$(( ref_sites / 2 ))
           echo "Cached reagle_ref sites=${reagle_sites}, ref sites=${ref_sites}, min expected=${min_expected}"
           if [ "$ref_sites" -gt 0 ] && [ "$reagle_sites" -lt "$min_expected" ]; then
@@ -274,16 +274,16 @@ jobs:
           set -euo pipefail
           check_vcf () {
             local vcf="$1"
-            [ -s "$vcf" ]
-            [ -s "$vcf.csi" ] || [ -s "$vcf.tbi" ]
-            bcftools index -n "$vcf" >/dev/null
+            [ -s "$vcf" ] || return 1
+            ( [ -s "$vcf.csi" ] || [ -s "$vcf.tbi" ] ) || return 1
+            bcftools index -n "$vcf" >/dev/null || return 1
           }
 
-          check_vcf truth.vcf.gz
-          check_vcf ref_beagle.vcf.gz
+          check_vcf truth.vcf.gz || rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi ref_beagle.vcf.gz ref_beagle.vcf.gz.csi ref_beagle.vcf.gz.tbi
+          check_vcf ref_beagle.vcf.gz || rm -f truth.vcf.gz truth.vcf.gz.csi truth.vcf.gz.tbi ref_beagle.vcf.gz ref_beagle.vcf.gz.csi ref_beagle.vcf.gz.tbi
 
-          truth_sites=$(bcftools index -n truth.vcf.gz)
-          beagle_ref_sites=$(bcftools index -n ref_beagle.vcf.gz)
+          truth_sites=$(bcftools index -n truth.vcf.gz 2>/dev/null || echo "0")
+          beagle_ref_sites=$(bcftools index -n ref_beagle.vcf.gz 2>/dev/null || echo "0")
           echo "Cached truth sites=${truth_sites}, cached beagle-ref sites=${beagle_ref_sites}"
           if [ "$truth_sites" -le 0 ] || [ "$beagle_ref_sites" -le 0 ]; then
             echo "Cached truth/ref_beagle look inconsistent; purging for regeneration."

@@ -371,7 +371,7 @@ mod tests {
     fn test_recomb_intensity_formula() {
         let params = ModelParams::for_phasing(1000, 100_000.0, None);
 
-        // Should be 0.04 * 100_000 / 1000 = 4.0
+        // Should be 0.04 * 100_000 / 1000 = 400.0
         let expected = 0.04 * 100_000.0 / 1000.0;
         assert!((params.recomb_intensity - expected as f32).abs() < 0.01);
     }
