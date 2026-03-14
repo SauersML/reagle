@@ -167,6 +167,24 @@ pub struct Config {
     /// Weak-signal core fraction when priors are empty.
     pub state_mix_weak_core_frac: f32,
 
+    /// Enable reverse rare-haplotype atlas donor injection in hard windows.
+    pub rare_atlas_enabled: bool,
+
+    /// Maximum anchor markers used to build per-window rare atlas signatures.
+    pub rare_atlas_max_anchor_markers: usize,
+
+    /// Maximum per-allele panel frequency considered "rare" in atlas enrichment.
+    pub rare_atlas_rare_freq_max: f32,
+
+    /// Minimum haplotypes per rare-atlas leaf.
+    pub rare_atlas_min_leaf_size: usize,
+
+    /// Maximum representatives injected per selected rare-atlas leaf.
+    pub rare_atlas_max_representatives_per_leaf: usize,
+
+    /// Maximum rare-atlas representatives injected per haplotype window rerun.
+    pub rare_atlas_max_inject_per_hap: usize,
+
     // ============ General Parameters ============
     /// Effective population size
     pub ne: f32,
@@ -239,6 +257,12 @@ struct TomlConfig {
     pub state_mix_weak_window_frac: Option<f32>,
     pub state_mix_weak_donor_frac: Option<f32>,
     pub state_mix_weak_core_frac: Option<f32>,
+    pub rare_atlas_enabled: Option<bool>,
+    pub rare_atlas_max_anchor_markers: Option<usize>,
+    pub rare_atlas_rare_freq_max: Option<f32>,
+    pub rare_atlas_min_leaf_size: Option<usize>,
+    pub rare_atlas_max_representatives_per_leaf: Option<usize>,
+    pub rare_atlas_max_inject_per_hap: Option<usize>,
 
     // General parameters
     pub ne: Option<f32>,
@@ -295,6 +319,12 @@ impl Default for Config {
             state_mix_weak_window_frac: 0.10,
             state_mix_weak_donor_frac: 0.30,
             state_mix_weak_core_frac: 0.50,
+            rare_atlas_enabled: true,
+            rare_atlas_max_anchor_markers: 12,
+            rare_atlas_rare_freq_max: 0.01,
+            rare_atlas_min_leaf_size: 2,
+            rare_atlas_max_representatives_per_leaf: 4,
+            rare_atlas_max_inject_per_hap: 12,
             // Keep default Ne anchored here. PR #801 cut it to 50_000 and
             // PR #793 paired a much larger Ne with window_top_k=2000; both
             // regressions lost to Beagle on the chr21 gate.
@@ -414,6 +444,24 @@ impl Config {
         }
         if let Some(value) = cfg.state_mix_weak_core_frac {
             self.state_mix_weak_core_frac = value;
+        }
+        if let Some(value) = cfg.rare_atlas_enabled {
+            self.rare_atlas_enabled = value;
+        }
+        if let Some(value) = cfg.rare_atlas_max_anchor_markers {
+            self.rare_atlas_max_anchor_markers = value;
+        }
+        if let Some(value) = cfg.rare_atlas_rare_freq_max {
+            self.rare_atlas_rare_freq_max = value;
+        }
+        if let Some(value) = cfg.rare_atlas_min_leaf_size {
+            self.rare_atlas_min_leaf_size = value;
+        }
+        if let Some(value) = cfg.rare_atlas_max_representatives_per_leaf {
+            self.rare_atlas_max_representatives_per_leaf = value;
+        }
+        if let Some(value) = cfg.rare_atlas_max_inject_per_hap {
+            self.rare_atlas_max_inject_per_hap = value;
         }
 
         if let Some(value) = cfg.ne {
@@ -586,6 +634,27 @@ impl Config {
         }
         if self.window_top_k == 0 {
             return Err(ReagleError::config("window_top_k must be positive"));
+        }
+
+        if self.rare_atlas_max_anchor_markers == 0 {
+            return Err(ReagleError::config(
+                "rare_atlas_max_anchor_markers must be positive",
+            ));
+        }
+        if self.rare_atlas_min_leaf_size == 0 {
+            return Err(ReagleError::config(
+                "rare_atlas_min_leaf_size must be positive",
+            ));
+        }
+        if self.rare_atlas_max_representatives_per_leaf == 0 {
+            return Err(ReagleError::config(
+                "rare_atlas_max_representatives_per_leaf must be positive",
+            ));
+        }
+        if self.rare_atlas_max_inject_per_hap == 0 {
+            return Err(ReagleError::config(
+                "rare_atlas_max_inject_per_hap must be positive",
+            ));
         }
 
         let frac_fields = [

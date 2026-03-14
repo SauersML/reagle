@@ -52,6 +52,7 @@ pub mod phase_hmm;
 pub mod phase_ibs;
 pub mod phase_query;
 pub mod pl_emission;
+pub mod rare_haplotype_atlas;
 pub mod reference_pbwt;
 pub mod state_allocator;
 pub mod states;

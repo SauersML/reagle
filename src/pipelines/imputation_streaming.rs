@@ -52,6 +52,9 @@ use crate::model::pl_emission::{
     allele_probs_cond_from_pl, allele_probs_uncond_from_pl, genotype_probs_from_pl,
     infer_n_alleles_from_pl_len,
 };
+use crate::model::rare_haplotype_atlas::{
+    RareHaplotypeAtlas, RareHaplotypeAtlasConfig, should_query_rare_atlas,
+};
 use crate::model::reference_pbwt::{
     DonorPick, PbwtQueryAllele, PbwtStrictAllele, RankBeam, ReferencePbwt,
 };
@@ -7030,6 +7033,17 @@ impl crate::pipelines::ImputationPipeline {
                         }
                     };
 
+                let rare_atlas_cfg = RareHaplotypeAtlasConfig {
+                    max_anchor_markers: self.config.rare_atlas_max_anchor_markers,
+                    rare_freq_max: self.config.rare_atlas_rare_freq_max,
+                    min_leaf_size: self.config.rare_atlas_min_leaf_size,
+                    max_representatives_per_leaf: self
+                        .config
+                        .rare_atlas_max_representatives_per_leaf,
+                    max_enriched_alleles_per_leaf: 8,
+                    min_enrichment: 2.0,
+                };
+
                 let mut mapped_priors_buf: Vec<f32> = Vec::new();
                 let mut mapped_entry_pi_buf: Vec<f32> = Vec::new();
                 let mut prev_states_buf: Vec<RefHapId> = Vec::new();
@@ -7339,7 +7353,8 @@ impl crate::pipelines::ImputationPipeline {
                                                  input_probs: &mut TargetAlleleProbs,
                                                  error_rate: f32,
                                                  prior_marker_idx: Option<usize>,
-                                                 donors: &[(RefHapId, f32)]|
+                                                 donors: &[(RefHapId, f32)],
+                                                 atlas_candidates: Option<&[RefHapId]>|
                  -> Result<(
                     Vec<AllelePosteriors>,
                     HaplotypePriors,
@@ -7355,6 +7370,31 @@ impl crate::pipelines::ImputationPipeline {
                     } else {
                         informative_n as f32 / n_markers as f32
                     };
+                    let mut atlas_inject: Vec<RefHapId> = Vec::new();
+                    if self.config.rare_atlas_enabled
+                        && should_query_rare_atlas(input_probs, donors)
+                        && !ref_columns.is_empty()
+                    {
+                        let atlas = RareHaplotypeAtlas::build(
+                            ref_columns,
+                            input_probs,
+                            plan.n_ref_haps,
+                            rare_atlas_cfg,
+                        );
+                        atlas_inject = atlas.suggest_representatives(
+                            input_probs,
+                            donors,
+                            self.config.rare_atlas_max_inject_per_hap,
+                        );
+                    }
+                    if let Some(extra) = atlas_candidates {
+                        for &h in extra {
+                            if !atlas_inject.contains(&h) {
+                                atlas_inject.push(h);
+                            }
+                        }
+                    }
+
                     let use_piecewise_segments = n_markers > 0
                         && plan_range_end > plan_range_start + 1
                         && plan_range_end <= plan.planning_handoff.len();
@@ -7427,6 +7467,18 @@ impl crate::pipelines::ImputationPipeline {
                                 informative_ratio,
                                 Some((seg_plan_start, seg_plan_end)),
                             );
+                            if !atlas_inject.is_empty() {
+                                for &h in &atlas_inject {
+                                    if !state_haps.contains(&h) {
+                                        state_haps.push(h);
+                                    }
+                                }
+                                state_haps.sort_unstable_by_key(|h| h.as_u32());
+                                state_haps.dedup();
+                                if state_haps.len() > per_window_cap_local {
+                                    state_haps.truncate(per_window_cap_local);
+                                }
+                            }
                             let seg_input_probs = extent.build_target_probs(input_probs);
                             let seg_ref_columns = extent.slice_ref_columns(ref_columns);
                             project_states_min_replacements(
@@ -7622,6 +7674,18 @@ impl crate::pipelines::ImputationPipeline {
                     }
                     let mut state_haps =
                         build_state_haps(hap_idx, priors, donors, informative_ratio, None);
+                    if !atlas_inject.is_empty() {
+                        for &h in &atlas_inject {
+                            if !state_haps.contains(&h) {
+                                state_haps.push(h);
+                            }
+                        }
+                        state_haps.sort_unstable_by_key(|h| h.as_u32());
+                        state_haps.dedup();
+                        if state_haps.len() > per_window_cap_local {
+                            state_haps.truncate(per_window_cap_local);
+                        }
+                    }
                     project_states_min_replacements(&mut state_haps, input_probs, ref_columns);
                     if state_haps.is_empty() {
                         return Err(ReagleError::vcf(format!(
@@ -7809,6 +7873,7 @@ impl crate::pipelines::ImputationPipeline {
                         prior_error_rate.clamp(1e-6, 0.5),
                         handoff_capture_idx_h1,
                         &donors_h1,
+                        None,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
                     hap1_posts = Some(posts);
@@ -7873,6 +7938,7 @@ impl crate::pipelines::ImputationPipeline {
                         prior_error_rate.clamp(1e-6, 0.5),
                         handoff_capture_idx_h2,
                         &donors_h2,
+                        None,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
                     hap2_posts = Some(posts);
