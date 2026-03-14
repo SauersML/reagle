@@ -15,6 +15,239 @@ use crate::model::weighted_kernel::{EmissionProbs, PatternCounts, WeightedHmmUpd
 use crate::pipelines::imputation::AllelePosteriors;
 use std::sync::Arc;
 
+const BUNDLE_MIN_COUNT: usize = 4;
+const BUNDLE_MAX_COUNT: usize = 8;
+const BUNDLE_DEFAULT_WIDTH: usize = 4;
+const BUNDLE_MAX_WIDTH: usize = 8;
+const BUNDLE_ENTROPY_SPLIT_BITS: f32 = 0.5;
+
+#[derive(Clone, Debug)]
+struct DonorBundle {
+    members: Vec<RefHapId>,
+    weights: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct CompositeBundles {
+    bundles: Vec<DonorBundle>,
+}
+
+impl CompositeBundles {
+    #[inline]
+    fn len(&self) -> usize {
+        self.bundles.len()
+    }
+}
+
+#[inline]
+fn normalize_weights(weights: &mut [f32]) {
+    let mut sum = 0.0f32;
+    for &w in weights.iter() {
+        if w.is_finite() && w > 0.0 {
+            sum += w;
+        }
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for w in weights.iter_mut() {
+            *w = if w.is_finite() && *w > 0.0 {
+                *w * inv
+            } else {
+                0.0
+            };
+        }
+    } else if !weights.is_empty() {
+        let uniform = 1.0 / weights.len() as f32;
+        for w in weights.iter_mut() {
+            *w = uniform;
+        }
+    }
+}
+
+#[inline]
+fn divergence_over_block(
+    ref_columns: &[GenotypeColumn],
+    hap_a: RefHapId,
+    hap_b: RefHapId,
+    start: usize,
+    end: usize,
+) -> f32 {
+    let mut diffs = 0u32;
+    let mut compared = 0u32;
+    let a = HapIdx::new(hap_a.as_u32());
+    let b = HapIdx::new(hap_b.as_u32());
+    for m in start..end {
+        let aa = ref_columns[m].get(a);
+        let bb = ref_columns[m].get(b);
+        if GenotypeColumn::is_missing_allele(aa) || GenotypeColumn::is_missing_allele(bb) {
+            continue;
+        }
+        compared += 1;
+        if aa != bb {
+            diffs += 1;
+        }
+    }
+    if compared == 0 {
+        1.0
+    } else {
+        diffs as f32 / compared as f32
+    }
+}
+
+fn build_composite_bundles(
+    state_haps: &[RefHapId],
+    ref_columns: &[GenotypeColumn],
+) -> CompositeBundles {
+    if state_haps.is_empty() {
+        return CompositeBundles {
+            bundles: Vec::new(),
+        };
+    }
+    let block_end = ref_columns.len().clamp(8, 64);
+    let target_bundles = state_haps
+        .len()
+        .div_ceil(BUNDLE_DEFAULT_WIDTH)
+        .clamp(BUNDLE_MIN_COUNT, BUNDLE_MAX_COUNT)
+        .min(state_haps.len());
+
+    let mut seeds: Vec<RefHapId> = Vec::with_capacity(target_bundles);
+    seeds.push(state_haps[0]);
+    while seeds.len() < target_bundles {
+        let mut best_hap = None;
+        let mut best_score = f32::NEG_INFINITY;
+        for &cand in state_haps {
+            if seeds.contains(&cand) {
+                continue;
+            }
+            let mut nearest = f32::INFINITY;
+            for &seed in &seeds {
+                nearest = nearest.min(divergence_over_block(ref_columns, cand, seed, 0, block_end));
+            }
+            if nearest > best_score {
+                best_score = nearest;
+                best_hap = Some(cand);
+            }
+        }
+        if let Some(h) = best_hap {
+            seeds.push(h);
+        } else {
+            break;
+        }
+    }
+
+    let mut memberships: Vec<Vec<RefHapId>> = vec![Vec::new(); seeds.len()];
+    for &hap in state_haps {
+        let mut best_idx = 0usize;
+        let mut best_div = f32::INFINITY;
+        for (i, &seed) in seeds.iter().enumerate() {
+            let d = divergence_over_block(ref_columns, hap, seed, 0, block_end);
+            if d < best_div {
+                best_div = d;
+                best_idx = i;
+            }
+        }
+        memberships[best_idx].push(hap);
+    }
+
+    let bundles = memberships
+        .into_iter()
+        .filter(|m| !m.is_empty())
+        .map(|members| {
+            let mut weights = vec![1.0; members.len()];
+            normalize_weights(&mut weights);
+            DonorBundle { members, weights }
+        })
+        .collect();
+    CompositeBundles { bundles }
+}
+
+fn select_bundle_state_haps(
+    bundles: &CompositeBundles,
+    ref_columns: &[GenotypeColumn],
+    state_priors: Option<&[f32]>,
+    state_haps: &[RefHapId],
+) -> (Vec<RefHapId>, Vec<f32>) {
+    let mut prior_by_hap: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    if let Some(priors) = state_priors {
+        for (&hap, &p) in state_haps.iter().zip(priors.iter()) {
+            if p.is_finite() && p > 0.0 {
+                prior_by_hap.insert(hap.as_u32(), p);
+            }
+        }
+    }
+
+    let mut selected_haps = Vec::new();
+    let mut selected_priors = Vec::new();
+    let marker_cap = ref_columns.len().min(64);
+
+    for bundle in &bundles.bundles {
+        let mut member_scores: Vec<(RefHapId, f32)> = bundle
+            .members
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, h)| {
+                let prior = *prior_by_hap.get(&h.as_u32()).unwrap_or(&1.0);
+                let q = bundle.weights.get(idx).copied().unwrap_or(0.0);
+                (h, (prior * q.max(1e-6)).max(0.0))
+            })
+            .collect();
+        member_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let mut keep = BUNDLE_DEFAULT_WIDTH.min(member_scores.len());
+        let mut split_flag = false;
+        if marker_cap > 0 && member_scores.len() > keep {
+            for m in 0..marker_cap {
+                let mut alt_mass = 0.0f32;
+                let mut total_mass = 0.0f32;
+                for (hap, s) in &member_scores {
+                    let a = ref_columns[m].get(HapIdx::new(hap.as_u32()));
+                    if GenotypeColumn::is_missing_allele(a) {
+                        continue;
+                    }
+                    let w = s.max(0.0);
+                    total_mass += w;
+                    if a != 0 {
+                        alt_mass += w;
+                    }
+                }
+                if total_mass > 0.0 {
+                    let p = (alt_mass / total_mass).clamp(1e-6, 1.0 - 1e-6);
+                    let entropy_bits =
+                        (-(p * p.ln() + (1.0 - p) * (1.0 - p).ln())) / std::f32::consts::LN_2;
+                    if entropy_bits > BUNDLE_ENTROPY_SPLIT_BITS {
+                        split_flag = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if split_flag {
+            keep = BUNDLE_MAX_WIDTH.min(member_scores.len()).max(keep);
+        }
+        for (hap, score) in member_scores.into_iter().take(keep) {
+            selected_haps.push(hap);
+            selected_priors.push(score.max(0.0));
+        }
+    }
+
+    if selected_haps.is_empty() {
+        return (state_haps.to_vec(), vec![1.0; state_haps.len()]);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut dedup_haps = Vec::with_capacity(selected_haps.len());
+    let mut dedup_priors = Vec::with_capacity(selected_priors.len());
+    for (hap, p) in selected_haps.into_iter().zip(selected_priors.into_iter()) {
+        if seen.insert(hap.as_u32()) {
+            dedup_haps.push(hap);
+            dedup_priors.push(p);
+        }
+    }
+    normalize_weights(&mut dedup_priors);
+    (dedup_haps, dedup_priors)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImputeHmmContext {
     pub window_idx: usize,
@@ -256,6 +489,58 @@ mod tests {
     use super::{RefColumnLike, RefHapId};
     use crate::data::storage::AlleleCode;
     use crate::data::storage::{DenseColumn, GenotypeColumn};
+
+    #[test]
+    fn test_build_composite_bundles_respects_bounds() {
+        let state_haps: Vec<RefHapId> = (0..24u32).map(RefHapId::new).collect();
+        let mut ref_columns = Vec::new();
+        for m in 0..16 {
+            let alleles: Vec<u8> = (0..24)
+                .map(|h| if (h + m) % 5 == 0 { 1 } else { 0 })
+                .collect();
+            ref_columns.push(GenotypeColumn::Dense(DenseColumn::from_alleles(
+                alleles.into_iter(),
+                2,
+            )));
+        }
+        let bundles = super::build_composite_bundles(&state_haps, &ref_columns);
+        assert!(!bundles.bundles.is_empty());
+        assert!(bundles.bundles.len() <= super::BUNDLE_MAX_COUNT);
+        for b in &bundles.bundles {
+            assert!(!b.members.is_empty());
+            assert_eq!(b.members.len(), b.weights.len());
+            let s: f32 = b.weights.iter().sum();
+            assert!((s - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_select_bundle_state_haps_entropy_split_increases_width() {
+        let state_haps: Vec<RefHapId> = (0..8u32).map(RefHapId::new).collect();
+        let mut ref_columns = Vec::new();
+        for m in 0..12 {
+            let alleles: Vec<u8> = (0..8)
+                .map(|h| if (h + m) % 2 == 0 { 1 } else { 0 })
+                .collect();
+            ref_columns.push(GenotypeColumn::Dense(DenseColumn::from_alleles(
+                alleles.into_iter(),
+                2,
+            )));
+        }
+        let bundles = super::CompositeBundles {
+            bundles: vec![super::DonorBundle {
+                members: state_haps.clone(),
+                weights: vec![1.0 / 8.0; 8],
+            }],
+        };
+        let (sel, priors) =
+            super::select_bundle_state_haps(&bundles, &ref_columns, None, &state_haps);
+        assert!(sel.len() >= super::BUNDLE_DEFAULT_WIDTH);
+        assert!(sel.len() <= super::BUNDLE_MAX_WIDTH);
+        assert_eq!(sel.len(), priors.len());
+        let sum: f32 = priors.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
 
     #[test]
     fn test_recomb_mass_subset_sums_to_one() {
@@ -5639,18 +5924,35 @@ pub fn run_impute_hmm(
         return Ok((Vec::new(), None));
     }
 
-    if ref_columns
+    let composite_bundles = build_composite_bundles(state_haps, ref_columns);
+    let (bundle_state_haps, bundle_state_priors) =
+        select_bundle_state_haps(&composite_bundles, ref_columns, state_priors, state_haps);
+    let effective_state_haps: &[RefHapId] = if composite_bundles.len() >= BUNDLE_MIN_COUNT
+        && bundle_state_haps.len() >= composite_bundles.len()
+        && bundle_state_haps.len() < state_haps.len()
+    {
+        &bundle_state_haps
+    } else {
+        state_haps
+    };
+    let effective_priors: Option<&[f32]> = if std::ptr::eq(effective_state_haps, state_haps) {
+        state_priors
+    } else {
+        Some(&bundle_state_priors)
+    };
+
+    let result = if ref_columns
         .iter()
         .all(|col| matches!(col, GenotypeColumn::Dense(_)))
     {
-        return run_hmm_generic(
-            state_haps,
+        run_hmm_generic(
+            effective_state_haps,
             ref_columns,
             target_probs,
             p_recomb,
             error_rate,
             prior_marker_idx,
-            state_priors,
+            effective_priors,
             ref_allele_freqs,
             transition_haps,
             transition_lambda,
@@ -5658,21 +5960,19 @@ pub fn run_impute_hmm(
             smoothing_cluster_cm,
             external_nearest_obs_retain,
             ws,
-        );
-    }
-
-    if ref_columns
+        )
+    } else if ref_columns
         .iter()
         .all(|col| matches!(col, GenotypeColumn::Sparse(_)))
     {
-        return run_hmm_generic(
-            state_haps,
+        run_hmm_generic(
+            effective_state_haps,
             ref_columns,
             target_probs,
             p_recomb,
             error_rate,
             prior_marker_idx,
-            state_priors,
+            effective_priors,
             ref_allele_freqs,
             transition_haps,
             transition_lambda,
@@ -5680,21 +5980,19 @@ pub fn run_impute_hmm(
             smoothing_cluster_cm,
             external_nearest_obs_retain,
             ws,
-        );
-    }
-
-    if ref_columns
+        )
+    } else if ref_columns
         .iter()
         .all(|col| matches!(col, GenotypeColumn::SeqCoded(_)))
     {
-        return run_hmm_seqcoded(
-            state_haps,
+        run_hmm_seqcoded(
+            effective_state_haps,
             ref_columns,
             target_probs,
             p_recomb,
             error_rate,
             prior_marker_idx,
-            state_priors,
+            effective_priors,
             ref_allele_freqs,
             transition_haps,
             transition_lambda,
@@ -5702,10 +6000,8 @@ pub fn run_impute_hmm(
             smoothing_cluster_cm,
             external_nearest_obs_retain,
             ws,
-        );
-    }
-
-    if ref_columns
+        )
+    } else if ref_columns
         .iter()
         .all(|col| matches!(col, GenotypeColumn::Dictionary(_, _)))
     {
@@ -5713,14 +6009,14 @@ pub fn run_impute_hmm(
         // sees a fully dictionary-backed window. With current streaming VCF
         // reference loading this is uncommon, because that path emits
         // Dense/Sparse columns rather than dictionary batches.
-        return run_hmm_dictionary(
-            state_haps,
+        run_hmm_dictionary(
+            effective_state_haps,
             ref_columns,
             target_probs,
             p_recomb,
             error_rate,
             prior_marker_idx,
-            state_priors,
+            effective_priors,
             ref_allele_freqs,
             transition_haps,
             transition_lambda,
@@ -5728,25 +6024,46 @@ pub fn run_impute_hmm(
             smoothing_cluster_cm,
             external_nearest_obs_retain,
             ws,
-        );
+        )
+    } else {
+        run_hmm_generic(
+            effective_state_haps,
+            ref_columns,
+            target_probs,
+            p_recomb,
+            error_rate,
+            prior_marker_idx,
+            effective_priors,
+            ref_allele_freqs,
+            transition_haps,
+            transition_lambda,
+            context,
+            smoothing_cluster_cm,
+            external_nearest_obs_retain,
+            ws,
+        )
+    }?;
+
+    if std::ptr::eq(effective_state_haps, state_haps) {
+        return Ok(result);
     }
 
-    run_hmm_generic(
-        state_haps,
-        ref_columns,
-        target_probs,
-        p_recomb,
-        error_rate,
-        prior_marker_idx,
-        state_priors,
-        ref_allele_freqs,
-        transition_haps,
-        transition_lambda,
-        context,
-        smoothing_cluster_cm,
-        external_nearest_obs_retain,
-        ws,
-    )
+    let mapped_state_post = result.1.map(|compact| {
+        let mut out = vec![0.0f32; state_haps.len()];
+        let mut original_index = std::collections::HashMap::with_capacity(state_haps.len());
+        for (idx, hap) in state_haps.iter().enumerate() {
+            original_index.insert(hap.as_u32(), idx);
+        }
+        for (&hap, &p) in effective_state_haps.iter().zip(compact.iter()) {
+            if let Some(&idx) = original_index.get(&hap.as_u32()) {
+                out[idx] = p.max(0.0);
+            }
+        }
+        normalize_weights(&mut out);
+        out
+    });
+
+    Ok((result.0, mapped_state_post))
 }
 
 /// Convert dense state posteriors into sparse global priors (sorted by RefHapId).
