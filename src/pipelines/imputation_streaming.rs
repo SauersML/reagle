@@ -240,6 +240,259 @@ fn collect_carriers_for_allele(
     }
 }
 
+#[derive(Clone, Debug)]
+struct RareCarrierRecord {
+    hap: RefHapId,
+    cluster_id: u16,
+    flank_sig: Vec<u64>,
+    recomb_pos: f32,
+}
+
+#[derive(Clone, Debug)]
+struct RareCarrierOverlayQuery {
+    marker_idx: usize,
+    alt_allele: u8,
+    carriers: Vec<RareCarrierRecord>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RareOverlayWeights {
+    ibs: f32,
+    ancestry: f32,
+    recomb: f32,
+}
+
+impl Default for RareOverlayWeights {
+    fn default() -> Self {
+        Self {
+            ibs: 1.0,
+            ancestry: 0.25,
+            recomb: 0.2,
+        }
+    }
+}
+
+#[inline]
+fn pack_ternary_code(code: u8, shift: usize, dst: &mut [u64]) {
+    let bit = shift * 2;
+    let w = bit / 64;
+    let off = bit % 64;
+    let value = (code & 0b11) as u64;
+    dst[w] |= value << off;
+    if off == 63 && w + 1 < dst.len() {
+        dst[w + 1] |= value >> 1;
+    }
+}
+
+#[inline]
+fn unpack_ternary_code(src: &[u64], shift: usize) -> u8 {
+    let bit = shift * 2;
+    let w = bit / 64;
+    let off = bit % 64;
+    let low = (src.get(w).copied().unwrap_or(0) >> off) & 0b11;
+    if off == 63 {
+        let hi = (src.get(w + 1).copied().unwrap_or(0) & 0b1) << 1;
+        (low | hi) as u8
+    } else {
+        low as u8
+    }
+}
+
+fn build_target_flank_signature(
+    input_probs: &TargetAlleleProbs,
+    marker_idx: usize,
+    flank_markers: usize,
+) -> Vec<u64> {
+    let start = marker_idx.saturating_sub(flank_markers);
+    let end = (marker_idx + flank_markers + 1).min(input_probs.n_markers());
+    let span = end.saturating_sub(start).saturating_sub(1);
+    let words = (span * 2).div_ceil(64);
+    let mut packed = vec![0u64; words.max(1)];
+    let mut k = 0usize;
+    for m in start..end {
+        if m == marker_idx {
+            continue;
+        }
+        let code = if !input_probs.is_observed_marker(m) {
+            2
+        } else {
+            let p_alt = input_probs
+                .probs_for_marker(m)
+                .get(1)
+                .copied()
+                .unwrap_or(0.0);
+            if p_alt >= 0.5 { 1 } else { 0 }
+        };
+        pack_ternary_code(code, k, &mut packed);
+        k += 1;
+    }
+    packed
+}
+
+fn build_ref_flank_signature(
+    ref_columns: &[GenotypeColumn],
+    hap: RefHapId,
+    marker_idx: usize,
+    flank_markers: usize,
+) -> Vec<u64> {
+    let start = marker_idx.saturating_sub(flank_markers);
+    let end = (marker_idx + flank_markers + 1).min(ref_columns.len());
+    let span = end.saturating_sub(start).saturating_sub(1);
+    let words = (span * 2).div_ceil(64);
+    let mut packed = vec![0u64; words.max(1)];
+    let mut k = 0usize;
+    for m in start..end {
+        if m == marker_idx {
+            continue;
+        }
+        let allele = ref_columns[m].get(HapIdx::new(hap.as_u32()));
+        let code = if allele == crate::data::storage::AlleleCode::MISSING.raw() {
+            2
+        } else if allele == 0 {
+            0
+        } else {
+            1
+        };
+        pack_ternary_code(code, k, &mut packed);
+        k += 1;
+    }
+    packed
+}
+
+fn score_flank_ibs(target_sig: &[u64], carrier_sig: &[u64], n_sites: usize) -> f32 {
+    if n_sites == 0 {
+        return 0.0;
+    }
+    let mut matches = 0usize;
+    let mut considered = 0usize;
+    for i in 0..n_sites {
+        let t = unpack_ternary_code(target_sig, i);
+        let c = unpack_ternary_code(carrier_sig, i);
+        if t == 2 || c == 2 {
+            continue;
+        }
+        considered += 1;
+        if t == c {
+            matches += 1;
+        }
+    }
+    if considered == 0 {
+        0.0
+    } else {
+        matches as f32 / considered as f32
+    }
+}
+
+fn rare_overlay_entropy(p_alt: f32) -> f32 {
+    let p = p_alt.clamp(1e-6, 1.0 - 1e-6);
+    -(p * p.ln() + (1.0 - p) * (1.0 - p).ln())
+}
+
+fn build_rare_overlay_query(
+    marker_idx: usize,
+    ref_columns: &[GenotypeColumn],
+    target_probs: &TargetAlleleProbs,
+    state_haps: &[RefHapId],
+    config: &Config,
+) -> Option<RareCarrierOverlayQuery> {
+    if marker_idx >= ref_columns.len() || marker_idx >= target_probs.n_markers() {
+        return None;
+    }
+    let col = &ref_columns[marker_idx];
+    let n_haps = col.n_haplotypes();
+    if n_haps == 0 {
+        return None;
+    }
+    let mut alt_count = 0usize;
+    for h in 0..n_haps {
+        if col.get(HapIdx::new(h as u32)) == 1 {
+            alt_count += 1;
+        }
+    }
+    if alt_count < config.rare_overlay_mac_min || alt_count > config.rare_overlay_mac_max {
+        return None;
+    }
+    let maf = (alt_count as f32 / n_haps as f32).min(1.0 - alt_count as f32 / n_haps as f32);
+    if maf > config.rare_overlay_maf_max {
+        return None;
+    }
+    if is_represented_in_states(state_haps, col, 1) {
+        return None;
+    }
+
+    let carrier_cap = (config.rare_overlay_top_r * 8).max(config.rare_overlay_top_r + 8);
+    let mut carriers = Vec::new();
+    collect_carriers_for_allele(col, 1, carrier_cap, &mut carriers);
+    if carriers.is_empty() {
+        return None;
+    }
+
+    let mut records = Vec::with_capacity(carriers.len());
+    for hap in carriers {
+        let cluster_id = ((hap.as_u32() / 64) % (u16::MAX as u32)) as u16;
+        let flank_sig = build_ref_flank_signature(
+            ref_columns,
+            hap,
+            marker_idx,
+            config.rare_overlay_flank_markers,
+        );
+        records.push(RareCarrierRecord {
+            hap,
+            cluster_id,
+            flank_sig,
+            recomb_pos: marker_idx as f32,
+        });
+    }
+
+    Some(RareCarrierOverlayQuery {
+        marker_idx,
+        alt_allele: 1,
+        carriers: records,
+    })
+}
+
+fn score_overlay_carriers(
+    query: &RareCarrierOverlayQuery,
+    target_flank_sig: &[u64],
+    target_cluster_id: u16,
+    current_marker: usize,
+    top_r: usize,
+    weights: RareOverlayWeights,
+) -> Vec<RefHapId> {
+    if top_r == 0 {
+        return Vec::new();
+    }
+    let n_sites = (target_flank_sig.len() * 64) / 2;
+    let mut scored: Vec<(RefHapId, f32)> = Vec::with_capacity(query.carriers.len());
+    for rec in &query.carriers {
+        let ibs = score_flank_ibs(target_flank_sig, &rec.flank_sig, n_sites);
+        let ancestry = if rec.cluster_id == target_cluster_id {
+            1.0
+        } else {
+            0.0
+        };
+        let recomb = (rec.recomb_pos - current_marker as f32).abs();
+        let s = weights.ibs * ibs + weights.ancestry * ancestry - weights.recomb * recomb;
+        scored.push((rec.hap, s));
+    }
+    scored.sort_unstable_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.0.as_u32().cmp(&b.0.as_u32()))
+    });
+    scored.truncate(top_r.min(scored.len()));
+    scored.into_iter().map(|(h, _)| h).collect()
+}
+
+fn should_invoke_rare_overlay(
+    p_alt: f32,
+    entropy_gate: f32,
+    dosage_min: f32,
+    dosage_max: f32,
+) -> bool {
+    let entropy = rare_overlay_entropy(p_alt);
+    entropy >= entropy_gate || (dosage_min..=dosage_max).contains(&p_alt)
+}
+
 const PBWT_SELECT_BLOCK_CM: f64 = 0.1;
 const PBWT_PER_WINDOW_MULT: usize = 8;
 const PBWT_MIN_PER_HAP: usize = 64;
@@ -7717,7 +7970,7 @@ impl crate::pipelines::ImputationPipeline {
                     // emission error for the second pass makes it worse by increasing
                     // confidence in wrong states. Tested in PR #755: R² -0.009,
                     // SEN -0.0018 — catastrophic accuracy regression.
-                    let (mut posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
+                    let (mut posteriors, mut state_post) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
@@ -7745,6 +7998,109 @@ impl crate::pipelines::ImputationPipeline {
                             ws,
                         )
                     })?;
+
+                    if self.config.rare_overlay_enabled
+                        && !state_haps.is_empty()
+                        && output_end > output_start
+                    {
+                        let weights = RareOverlayWeights::default();
+                        let target_cluster_id = ((hap_idx.as_usize() / 2) % (u16::MAX as usize)) as u16;
+                        let mut overlay_injected = false;
+                        let mut overlay_states: Vec<RefHapId> = Vec::new();
+                        for (out_idx, ref_m) in (output_start..output_end).enumerate() {
+                            if input_probs.is_observed_marker(ref_m) {
+                                continue;
+                            }
+                            let p_alt = posteriors
+                                .get(out_idx)
+                                .map(|p| p.prob(1))
+                                .unwrap_or(0.0)
+                                .clamp(0.0, 1.0);
+                            if !should_invoke_rare_overlay(
+                                p_alt,
+                                self.config.rare_overlay_entropy_min,
+                                self.config.rare_overlay_dosage_min,
+                                self.config.rare_overlay_dosage_max,
+                            ) {
+                                continue;
+                            }
+                            let Some(query) = build_rare_overlay_query(
+                                ref_m,
+                                ref_columns,
+                                input_probs,
+                                &state_haps,
+                                &self.config,
+                            ) else {
+                                continue;
+                            };
+                            if query.alt_allele != 1 || query.marker_idx != ref_m {
+                                continue;
+                            }
+                            let target_sig = build_target_flank_signature(
+                                input_probs,
+                                ref_m,
+                                self.config.rare_overlay_flank_markers,
+                            );
+                            let top_carriers = score_overlay_carriers(
+                                &query,
+                                &target_sig,
+                                target_cluster_id,
+                                ref_m,
+                                self.config.rare_overlay_top_r,
+                                weights,
+                            );
+                            if top_carriers.is_empty() {
+                                continue;
+                            }
+                            for h in top_carriers {
+                                if !state_haps.iter().any(|x| *x == h)
+                                    && !overlay_states.iter().any(|x| *x == h)
+                                {
+                                    overlay_states.push(h);
+                                }
+                            }
+                            overlay_injected = true;
+                        }
+
+                        if overlay_injected && !overlay_states.is_empty() {
+                            let mut augmented_states = state_haps.clone();
+                            augmented_states.extend_from_slice(&overlay_states);
+                            let (overlay_posteriors, overlay_state_post) = LOCAL_WORKSPACE.with(|cell| {
+                                let mut ws_opt = cell.borrow_mut();
+                                if ws_opt.is_none() {
+                                    *ws_opt = Some(ImputeWorkspace::new(
+                                        augmented_states.len(),
+                                        n_ref_markers,
+                                    ));
+                                }
+                                let ws = ws_opt.as_mut().unwrap();
+                                let effective_error_rate = calibrated_emission_error(input_probs, error_rate);
+                                run_impute_hmm(
+                                    &augmented_states,
+                                    ref_columns,
+                                    input_probs,
+                                    &p_recomb,
+                                    effective_error_rate,
+                                    prior_marker_idx,
+                                    None,
+                                    &ref_allele_freqs,
+                                    n_transition_haps,
+                                    compute_transition_lambda(&augmented_states, donors),
+                                    ImputeHmmContext {
+                                        window_idx,
+                                        sample_idx: s,
+                                        hap_idx: hap_idx.as_usize(),
+                                    },
+                                    smoothing_cluster_cm,
+                                    None,
+                                    ws,
+                                )
+                            })?;
+                            posteriors = overlay_posteriors;
+                            state_post = overlay_state_post;
+                            state_haps = augmented_states;
+                        }
+                    }
 
                     if self.config.err.is_none() {
                         // Preserve direct target evidence at observed markers. Imputation

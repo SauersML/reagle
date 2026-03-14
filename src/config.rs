@@ -167,6 +167,33 @@ pub struct Config {
     /// Weak-signal core fraction when priors are empty.
     pub state_mix_weak_core_frac: f32,
 
+    /// Enable rare-carrier overlay index during imputation.
+    pub rare_overlay_enabled: bool,
+
+    /// Maximum MAF for variants eligible for rare-carrier overlay.
+    pub rare_overlay_maf_max: f32,
+
+    /// Maximum MAC for variants eligible for rare-carrier overlay.
+    pub rare_overlay_mac_max: usize,
+
+    /// Minimum MAC for variants eligible for rare-carrier overlay.
+    pub rare_overlay_mac_min: usize,
+
+    /// Typed flank markers per side used to build compact carrier signatures.
+    pub rare_overlay_flank_markers: usize,
+
+    /// Number of top-scoring carrier states injected per queried rare variant.
+    pub rare_overlay_top_r: usize,
+
+    /// Entropy gate above which overlay is activated.
+    pub rare_overlay_entropy_min: f32,
+
+    /// Lower gray-zone bound for ALT dosage overlay gate.
+    pub rare_overlay_dosage_min: f32,
+
+    /// Upper gray-zone bound for ALT dosage overlay gate.
+    pub rare_overlay_dosage_max: f32,
+
     // ============ General Parameters ============
     /// Effective population size
     pub ne: f32,
@@ -239,6 +266,15 @@ struct TomlConfig {
     pub state_mix_weak_window_frac: Option<f32>,
     pub state_mix_weak_donor_frac: Option<f32>,
     pub state_mix_weak_core_frac: Option<f32>,
+    pub rare_overlay_enabled: Option<bool>,
+    pub rare_overlay_maf_max: Option<f32>,
+    pub rare_overlay_mac_max: Option<usize>,
+    pub rare_overlay_mac_min: Option<usize>,
+    pub rare_overlay_flank_markers: Option<usize>,
+    pub rare_overlay_top_r: Option<usize>,
+    pub rare_overlay_entropy_min: Option<f32>,
+    pub rare_overlay_dosage_min: Option<f32>,
+    pub rare_overlay_dosage_max: Option<f32>,
 
     // General parameters
     pub ne: Option<f32>,
@@ -295,6 +331,15 @@ impl Default for Config {
             state_mix_weak_window_frac: 0.10,
             state_mix_weak_donor_frac: 0.30,
             state_mix_weak_core_frac: 0.50,
+            rare_overlay_enabled: true,
+            rare_overlay_maf_max: 0.01,
+            rare_overlay_mac_max: 256,
+            rare_overlay_mac_min: 2,
+            rare_overlay_flank_markers: 32,
+            rare_overlay_top_r: 16,
+            rare_overlay_entropy_min: 0.16,
+            rare_overlay_dosage_min: 0.02,
+            rare_overlay_dosage_max: 0.35,
             // Keep default Ne anchored here. PR #801 cut it to 50_000 and
             // PR #793 paired a much larger Ne with window_top_k=2000; both
             // regressions lost to Beagle on the chr21 gate.
@@ -414,6 +459,33 @@ impl Config {
         }
         if let Some(value) = cfg.state_mix_weak_core_frac {
             self.state_mix_weak_core_frac = value;
+        }
+        if let Some(value) = cfg.rare_overlay_enabled {
+            self.rare_overlay_enabled = value;
+        }
+        if let Some(value) = cfg.rare_overlay_maf_max {
+            self.rare_overlay_maf_max = value;
+        }
+        if let Some(value) = cfg.rare_overlay_mac_max {
+            self.rare_overlay_mac_max = value;
+        }
+        if let Some(value) = cfg.rare_overlay_mac_min {
+            self.rare_overlay_mac_min = value;
+        }
+        if let Some(value) = cfg.rare_overlay_flank_markers {
+            self.rare_overlay_flank_markers = value;
+        }
+        if let Some(value) = cfg.rare_overlay_top_r {
+            self.rare_overlay_top_r = value;
+        }
+        if let Some(value) = cfg.rare_overlay_entropy_min {
+            self.rare_overlay_entropy_min = value;
+        }
+        if let Some(value) = cfg.rare_overlay_dosage_min {
+            self.rare_overlay_dosage_min = value;
+        }
+        if let Some(value) = cfg.rare_overlay_dosage_max {
+            self.rare_overlay_dosage_max = value;
         }
 
         if let Some(value) = cfg.ne {
@@ -628,6 +700,38 @@ impl Config {
                     name, value
                 )));
             }
+        }
+
+        if self.rare_overlay_mac_min == 0 {
+            return Err(ReagleError::config("rare_overlay_mac_min must be positive"));
+        }
+        if self.rare_overlay_mac_min > self.rare_overlay_mac_max {
+            return Err(ReagleError::config(
+                "rare_overlay_mac_min must be <= rare_overlay_mac_max",
+            ));
+        }
+        if self.rare_overlay_flank_markers == 0 {
+            return Err(ReagleError::config(
+                "rare_overlay_flank_markers must be positive",
+            ));
+        }
+        if self.rare_overlay_top_r == 0 {
+            return Err(ReagleError::config("rare_overlay_top_r must be positive"));
+        }
+        if !(0.0..=0.5).contains(&self.rare_overlay_maf_max) {
+            return Err(ReagleError::config(format!(
+                "rare_overlay_maf_max must be in [0, 0.5], got {}",
+                self.rare_overlay_maf_max
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.rare_overlay_dosage_min)
+            || !(0.0..=1.0).contains(&self.rare_overlay_dosage_max)
+            || self.rare_overlay_dosage_min > self.rare_overlay_dosage_max
+        {
+            return Err(ReagleError::config(format!(
+                "rare_overlay dosage bounds must satisfy 0<=min<=max<=1, got [{}, {}]",
+                self.rare_overlay_dosage_min, self.rare_overlay_dosage_max
+            )));
         }
 
         // Validate ne > 0
