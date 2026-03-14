@@ -60,6 +60,23 @@ use crate::model::types::RefHapId;
 use crate::pipelines::imputation::AllelePosteriors;
 use crate::utils::telemetry::TelemetryBlackboard;
 
+#[derive(Clone, Debug)]
+struct DonorBundle {
+    members: Vec<RefHapId>,
+    member_weights: Vec<f32>,
+    representative: RefHapId,
+}
+
+impl DonorBundle {
+    fn from_member(member: RefHapId, weight: f32) -> Self {
+        Self {
+            members: vec![member],
+            member_weights: vec![weight.max(0.0)],
+            representative: member,
+        }
+    }
+}
+
 /// Retain only the `k` highest-weight donors, discarding the rest.
 ///
 /// Uses `select_nth_unstable_by` for O(n) partitioning followed by a
@@ -258,6 +275,211 @@ const STATE_BUDGET_SAFETY: f64 = 0.75;
 // less selective state set regressed raw chr21 accuracy.
 const SM_MATCH_DONORS: usize = 16;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
+const BUNDLE_TARGET_COUNT: usize = 6;
+const BUNDLE_MAX_COUNT: usize = 8;
+const BUNDLE_DEFAULT_WIDTH: usize = 4;
+const BUNDLE_MAX_WIDTH: usize = 8;
+const BUNDLE_BLOCK_MARKERS: usize = 24;
+const BUNDLE_SPLIT_ENTROPY_BITS: f32 = 0.5;
+
+#[inline]
+fn allele_entropy_bits(counts: &[usize], total: usize) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    let inv_total = 1.0f32 / total as f32;
+    let mut entropy = 0.0f32;
+    for &c in counts {
+        if c == 0 {
+            continue;
+        }
+        let p = c as f32 * inv_total;
+        entropy -= p * p.log2();
+    }
+    entropy
+}
+
+fn bundle_divergence(
+    hap_a: RefHapId,
+    hap_b: RefHapId,
+    ref_columns: &[GenotypeColumn],
+    marker_index: &[usize],
+) -> f32 {
+    let mut compared = 0usize;
+    let mut mismatches = 0usize;
+    let missing = crate::data::storage::AlleleCode::MISSING.raw();
+    for &m in marker_index {
+        let col = &ref_columns[m];
+        let a = col.get(HapIdx::new(hap_a.as_u32()));
+        let b = col.get(HapIdx::new(hap_b.as_u32()));
+        if a == missing || b == missing {
+            continue;
+        }
+        compared += 1;
+        if a != b {
+            mismatches += 1;
+        }
+    }
+    if compared == 0 {
+        1.0
+    } else {
+        mismatches as f32 / compared as f32
+    }
+}
+
+fn split_bundle_if_heterogeneous(
+    bundles: &mut Vec<DonorBundle>,
+    ref_columns: &[GenotypeColumn],
+    marker_index: &[usize],
+) {
+    let mut idx = 0usize;
+    while idx < bundles.len() {
+        if bundles[idx].members.len() <= 2 {
+            idx += 1;
+            continue;
+        }
+        let mut best_marker: Option<(usize, f32)> = None;
+        for &m in marker_index {
+            let col = &ref_columns[m];
+            let mut counts = [0usize; 4];
+            let mut total = 0usize;
+            let missing = crate::data::storage::AlleleCode::MISSING.raw();
+            for &hap in &bundles[idx].members {
+                let allele = col.get(HapIdx::new(hap.as_u32()));
+                if allele == missing {
+                    continue;
+                }
+                total += 1;
+                let slot = (allele as usize).min(counts.len() - 1);
+                counts[slot] += 1;
+            }
+            let entropy = allele_entropy_bits(&counts, total);
+            if entropy > BUNDLE_SPLIT_ENTROPY_BITS
+                && best_marker.map(|(_, best)| entropy > best).unwrap_or(true)
+            {
+                best_marker = Some((m, entropy));
+            }
+        }
+
+        let Some((split_marker, _)) = best_marker else {
+            idx += 1;
+            continue;
+        };
+        if bundles.len() >= BUNDLE_MAX_COUNT {
+            break;
+        }
+
+        let col = &ref_columns[split_marker];
+        let mut left = DonorBundle {
+            members: Vec::new(),
+            member_weights: Vec::new(),
+            representative: bundles[idx].representative,
+        };
+        let mut right = DonorBundle {
+            members: Vec::new(),
+            member_weights: Vec::new(),
+            representative: bundles[idx].representative,
+        };
+        let pivot = col.get(HapIdx::new(bundles[idx].representative.as_u32()));
+        for (&hap, &w) in bundles[idx]
+            .members
+            .iter()
+            .zip(bundles[idx].member_weights.iter())
+        {
+            let a = col.get(HapIdx::new(hap.as_u32()));
+            if a == pivot {
+                left.members.push(hap);
+                left.member_weights.push(w);
+            } else {
+                right.members.push(hap);
+                right.member_weights.push(w);
+            }
+        }
+        if left.members.is_empty() || right.members.is_empty() {
+            idx += 1;
+            continue;
+        }
+        left.representative = left.members[0];
+        right.representative = right.members[0];
+        bundles[idx] = left;
+        bundles.push(right);
+        idx += 1;
+    }
+}
+
+fn build_donor_bundles(
+    donors: &[(RefHapId, f32)],
+    ref_columns: &[GenotypeColumn],
+    include_entropy_split: bool,
+) -> Vec<DonorBundle> {
+    if donors.is_empty() {
+        return Vec::new();
+    }
+    let marker_step = (ref_columns.len() / BUNDLE_BLOCK_MARKERS.max(1)).max(1);
+    let marker_index: Vec<usize> = (0..ref_columns.len()).step_by(marker_step).collect();
+    let max_bundles = BUNDLE_TARGET_COUNT.min(BUNDLE_MAX_COUNT).max(1);
+    let mut bundles: Vec<DonorBundle> = Vec::new();
+
+    for &(hap, weight) in donors {
+        if bundles.is_empty() {
+            bundles.push(DonorBundle::from_member(hap, weight));
+            continue;
+        }
+        let mut best_idx = 0usize;
+        let mut best_dist = f32::INFINITY;
+        for (idx, b) in bundles.iter().enumerate() {
+            let dist = bundle_divergence(hap, b.representative, ref_columns, &marker_index);
+            if dist < best_dist {
+                best_idx = idx;
+                best_dist = dist;
+            }
+        }
+        if bundles.len() < max_bundles && best_dist > 0.2 {
+            bundles.push(DonorBundle::from_member(hap, weight));
+            continue;
+        }
+        bundles[best_idx].members.push(hap);
+        bundles[best_idx].member_weights.push(weight.max(0.0));
+    }
+
+    if include_entropy_split {
+        split_bundle_if_heterogeneous(&mut bundles, ref_columns, &marker_index);
+    }
+
+    for b in &mut bundles {
+        if b.members.len() > BUNDLE_MAX_WIDTH {
+            let mut weighted: Vec<(RefHapId, f32)> = b
+                .members
+                .iter()
+                .copied()
+                .zip(b.member_weights.iter().copied())
+                .collect();
+            keep_top_k_donors_by_weight(&mut weighted, BUNDLE_MAX_WIDTH);
+            b.members = weighted.iter().map(|(h, _)| *h).collect();
+            b.member_weights = weighted.iter().map(|(_, w)| *w).collect();
+        }
+        b.representative = b.members[0];
+    }
+
+    bundles
+}
+
+fn flatten_bundles_ranked(bundles: &[DonorBundle], width_cap: usize) -> Vec<(RefHapId, f32)> {
+    let mut out: Vec<(RefHapId, f32)> = Vec::new();
+    for b in bundles {
+        let mut weighted: Vec<(RefHapId, f32)> = b
+            .members
+            .iter()
+            .copied()
+            .zip(b.member_weights.iter().copied())
+            .collect();
+        keep_top_k_donors_by_weight(&mut weighted, width_cap.max(1));
+        out.extend(weighted);
+    }
+    out.sort_unstable_by(donor_weight_cmp_desc);
+    out
+}
+
 const SM_MATCH_MIN_DONORS: usize = 2;
 // Keep the "small panel => use full panel" threshold generous. PR #808 cut this
 // to 64 for speed, which prematurely truncated affordable panels and materially
@@ -6539,6 +6761,15 @@ impl crate::pipelines::ImputationPipeline {
                         .get(hap_idx.as_usize())
                         .map(|v| v.as_slice())
                         .unwrap_or(empty_haps);
+                    let donor_bundles = build_donor_bundles(
+                        donors,
+                        ref_columns,
+                        informative_ratio <= mix_weak_signal_threshold,
+                    );
+                    let donor_bundle_haps = flatten_bundles_ranked(
+                        &donor_bundles,
+                        BUNDLE_DEFAULT_WIDTH.min(BUNDLE_MAX_WIDTH),
+                    );
 
                     let fill_from = |out: &mut Vec<RefHapId>,
                                      seen: &mut std::collections::HashSet<RefHapId>,
@@ -6625,14 +6856,14 @@ impl crate::pipelines::ImputationPipeline {
                         mix_donor_frac,
                         mix_core_frac,
                     );
-                    if donors.is_empty() {
+                    if donor_bundle_haps.is_empty() {
                         q_donor = 0;
                     }
                     if has_nonempty_priors {
                         // Keep continuity strong across windows, but do not fully disable
                         // local donors (they remain useful at rare/local mismatches).
                         q_prior = q_prior.max((k as f32 * mix_prior_boost_min_frac).floor() as usize);
-                        if !donors.is_empty() {
+                        if !donor_bundle_haps.is_empty() {
                             q_donor = q_donor.max(
                                 (k as f32 * mix_prior_boost_donor_min_frac).floor() as usize
                             );
@@ -6652,7 +6883,7 @@ impl crate::pipelines::ImputationPipeline {
                         );
                         q_prior = weak_q[0];
                         q_window = weak_q[1];
-                        q_donor = if donors.is_empty() { 0 } else { weak_q[2] };
+                        q_donor = if donor_bundle_haps.is_empty() { 0 } else { weak_q[2] };
                         q_core = weak_q[3];
                     }
                     let mut used_q = q_prior + q_window + q_donor + q_core;
@@ -6684,7 +6915,7 @@ impl crate::pipelines::ImputationPipeline {
                     fill_from(&mut out, &mut seen, &prior_haps, prior_floor, k);
                     fill_from(&mut out, &mut seen, &prior_haps, q_prior, k);
                     fill_from(&mut out, &mut seen, window_haps, q_window, k);
-                    fill_from_donors(&mut out, &mut seen, donors, q_donor, k);
+                    fill_from_donors(&mut out, &mut seen, &donor_bundle_haps, q_donor, k);
                     fill_from(&mut out, &mut seen, core_haps, q_core, k);
 
                     while out.len() < k {
@@ -6694,7 +6925,7 @@ impl crate::pipelines::ImputationPipeline {
                         let remaining = k - out.len();
                         fill_from(&mut out, &mut seen, window_haps, remaining, k);
                         let remaining = k - out.len();
-                        fill_from_donors(&mut out, &mut seen, donors, remaining, k);
+                        fill_from_donors(&mut out, &mut seen, &donor_bundle_haps, remaining, k);
                         let remaining = k - out.len();
                         fill_from(&mut out, &mut seen, core_haps, remaining, k);
                         if out.len() == before {
@@ -10009,6 +10240,49 @@ mod tests {
             columns.push(GenotypeColumn::from_alleles(&alleles, n_alleles));
         }
         GenotypeMatrix::new_phased(markers, columns, samples)
+    }
+
+    #[test]
+    fn donor_bundle_builds_multiple_clusters() {
+        let cols = vec![
+            GenotypeColumn::from_alleles(&[0, 0, 0, 1, 1, 1], 2),
+            GenotypeColumn::from_alleles(&[0, 0, 1, 1, 1, 0], 2),
+            GenotypeColumn::from_alleles(&[0, 0, 0, 1, 1, 1], 2),
+            GenotypeColumn::from_alleles(&[0, 1, 0, 1, 0, 1], 2),
+        ];
+        let donors: Vec<(RefHapId, f32)> = (0..6)
+            .map(|h| (RefHapId::new(h as u32), 1.0 - (h as f32) * 0.01))
+            .collect();
+
+        let bundles = build_donor_bundles(&donors, &cols, false);
+        assert!(!bundles.is_empty());
+        assert!(bundles.len() >= 2, "expected clustered donor bundles");
+        let flat = flatten_bundles_ranked(&bundles, BUNDLE_DEFAULT_WIDTH);
+        assert!(!flat.is_empty());
+        assert!(flat.len() <= bundles.len() * BUNDLE_DEFAULT_WIDTH);
+    }
+
+    #[test]
+    fn donor_bundle_entropy_split_separates_mixed_bundle() {
+        let cols = vec![
+            GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2),
+            GenotypeColumn::from_alleles(&[0, 1, 0, 1], 2),
+            GenotypeColumn::from_alleles(&[0, 0, 1, 1], 2),
+        ];
+        let donors: Vec<(RefHapId, f32)> = vec![
+            (RefHapId::new(0), 1.0),
+            (RefHapId::new(1), 0.9),
+            (RefHapId::new(2), 0.8),
+            (RefHapId::new(3), 0.7),
+        ];
+        let mut bundles = vec![DonorBundle {
+            members: donors.iter().map(|(h, _)| *h).collect(),
+            member_weights: donors.iter().map(|(_, w)| *w).collect(),
+            representative: donors[0].0,
+        }];
+        let marker_index = vec![0usize, 1usize, 2usize];
+        split_bundle_if_heterogeneous(&mut bundles, &cols, &marker_index);
+        assert!(bundles.len() >= 2, "expected local entropy-driven split");
     }
 
     fn score_window_batch_exact_packed_naive<TargetSpace, RefSpace>(
