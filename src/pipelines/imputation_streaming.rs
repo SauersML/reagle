@@ -257,6 +257,11 @@ const STATE_BUDGET_SAFETY: f64 = 0.75;
 // minimum donor count aggressively while loosening other guards; the broader,
 // less selective state set regressed raw chr21 accuracy.
 const SM_MATCH_DONORS: usize = 16;
+const ADAPTIVE_REFINE_WINDOW_MARKERS: usize = 16;
+const ADAPTIVE_REFINE_STEP_MARKERS: usize = 8;
+const ADAPTIVE_REFINE_U_THRESHOLD: f32 = 0.38;
+const ADAPTIVE_REFINE_MAX_DOSAGE_DELTA: f32 = 0.005;
+const ADAPTIVE_REFINE_MAX_KL: f32 = 1e-3;
 const SM_MATCH_LOW_CONF_FRAC: f32 = 0.02;
 const SM_MATCH_MIN_DONORS: usize = 2;
 // Keep the "small panel => use full panel" threshold generous. PR #808 cut this
@@ -1094,6 +1099,151 @@ fn window_boundaries_from_handoff(handoff: &[(f64, f64)]) -> Vec<f64> {
     out
 }
 
+#[inline]
+fn posterior_entropy_norm(post: &AllelePosteriors) -> f32 {
+    let mut entropy = 0.0f32;
+    let n_alleles = match post {
+        AllelePosteriors::Biallelic(p_alt) => {
+            let p1 = p_alt.clamp(1e-8, 1.0 - 1e-8);
+            let p0 = (1.0 - p1).clamp(1e-8, 1.0 - 1e-8);
+            entropy = -(p0 * p0.ln() + p1 * p1.ln());
+            2usize
+        }
+        AllelePosteriors::Multiallelic(probs) => {
+            for &p in probs.iter() {
+                if p > 1e-8 {
+                    entropy -= p * p.ln();
+                }
+            }
+            probs.len().max(2)
+        }
+    };
+    (entropy / (n_alleles as f32).ln().max(1e-8)).clamp(0.0, 1.0)
+}
+
+#[inline]
+fn top1_top2_gap(post: &AllelePosteriors) -> f32 {
+    match post {
+        AllelePosteriors::Biallelic(p_alt) => (1.0 - 2.0 * (*p_alt - 0.5).abs()).clamp(0.0, 1.0),
+        AllelePosteriors::Multiallelic(probs) => {
+            let mut top1 = 0.0f32;
+            let mut top2 = 0.0f32;
+            for &p in probs.iter() {
+                if p >= top1 {
+                    top2 = top1;
+                    top1 = p;
+                } else if p > top2 {
+                    top2 = p;
+                }
+            }
+            (1.0 - (top1 - top2).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn uncertainty_score_window(
+    posteriors: &[AllelePosteriors],
+    input_probs: &TargetAlleleProbs,
+    output_start: usize,
+    start: usize,
+    end: usize,
+) -> f32 {
+    let mut entropy_sum = 0.0f32;
+    let mut gap_sum = 0.0f32;
+    let mut discord = 0.0f32;
+    let mut n = 0usize;
+    let mut typed_n = 0usize;
+    for m in start..end.min(posteriors.len()) {
+        let ref_m = output_start + m;
+        entropy_sum += posterior_entropy_norm(&posteriors[m]);
+        gap_sum += top1_top2_gap(&posteriors[m]);
+        n += 1;
+        if input_probs.is_observed_marker(ref_m) {
+            let probs = input_probs.probs_for_marker(ref_m);
+            if !probs.is_empty() {
+                let mut best = 0usize;
+                let mut best_p = f32::MIN;
+                for (i, &p) in probs.iter().enumerate() {
+                    if p > best_p {
+                        best_p = p;
+                        best = i;
+                    }
+                }
+                let pred = match &posteriors[m] {
+                    AllelePosteriors::Biallelic(p) => {
+                        if *p >= 0.5 {
+                            1usize
+                        } else {
+                            0usize
+                        }
+                    }
+                    AllelePosteriors::Multiallelic(pmf) => pmf
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0),
+                };
+                if pred != best {
+                    discord += 1.0;
+                }
+                typed_n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let h_bar = entropy_sum / n as f32;
+    let delta_term = gap_sum / n as f32;
+    let d = if typed_n > 0 {
+        (discord / typed_n as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (0.4 * h_bar + 0.3 * delta_term + 0.3 * d).clamp(0.0, 1.0)
+}
+
+fn posterior_delta_and_kl(prev: &[AllelePosteriors], next: &[AllelePosteriors]) -> (f32, f32) {
+    let n = prev.len().min(next.len());
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mut max_delta = 0.0f32;
+    let mut kl_sum = 0.0f32;
+    for i in 0..n {
+        match (&prev[i], &next[i]) {
+            (AllelePosteriors::Biallelic(a), AllelePosteriors::Biallelic(b)) => {
+                max_delta = max_delta.max((a - b).abs());
+                let p1 = (*a).clamp(1e-8, 1.0 - 1e-8);
+                let q1 = (*b).clamp(1e-8, 1.0 - 1e-8);
+                let p0 = 1.0 - p1;
+                let q0 = 1.0 - q1;
+                kl_sum += p0 * (p0 / q0).ln() + p1 * (p1 / q1).ln();
+            }
+            _ => {
+                let pa: Vec<f32> = match &prev[i] {
+                    AllelePosteriors::Biallelic(v) => vec![1.0 - *v, *v],
+                    AllelePosteriors::Multiallelic(p) => p.to_vec(),
+                };
+                let pb: Vec<f32> = match &next[i] {
+                    AllelePosteriors::Biallelic(v) => vec![1.0 - *v, *v],
+                    AllelePosteriors::Multiallelic(p) => p.to_vec(),
+                };
+                let m = pa.len().max(pb.len());
+                for aidx in 0..m {
+                    let p = pa.get(aidx).copied().unwrap_or(0.0).clamp(1e-8, 1.0);
+                    let q = pb.get(aidx).copied().unwrap_or(0.0).clamp(1e-8, 1.0);
+                    kl_sum += p * (p / q).ln();
+                }
+                let d_a = pa.get(1).copied().unwrap_or(0.0);
+                let d_b = pb.get(1).copied().unwrap_or(0.0);
+                max_delta = max_delta.max((d_a - d_b).abs());
+            }
+        }
+    }
+    (max_delta, kl_sum / n as f32)
+}
 fn build_planning_grid_from_handoff(
     io_handoff: &[(f64, f64)],
     params: &ModelParams,
@@ -6289,6 +6439,8 @@ impl crate::pipelines::ImputationPipeline {
                 };
                 let mut donors_h1 = build_donor_pool(h1_idx.as_usize());
                 let mut donors_h2 = build_donor_pool(h2_idx.as_usize());
+                let full_donors_h1 = donors_h1.clone();
+                let full_donors_h2 = donors_h2.clone();
                 if use_abyss {
                     if let Some(mask) = plan.abyss_mask.get(h1_idx.as_usize()) {
                         let before = donors_h1.len();
@@ -7339,7 +7491,8 @@ impl crate::pipelines::ImputationPipeline {
                                                  input_probs: &mut TargetAlleleProbs,
                                                  error_rate: f32,
                                                  prior_marker_idx: Option<usize>,
-                                                 donors: &[(RefHapId, f32)]|
+                                                 donors: &[(RefHapId, f32)],
+                                                 donor_pool_full: &[(RefHapId, f32)]|
                  -> Result<(
                     Vec<AllelePosteriors>,
                     HaplotypePriors,
@@ -7717,7 +7870,7 @@ impl crate::pipelines::ImputationPipeline {
                     // emission error for the second pass makes it worse by increasing
                     // confidence in wrong states. Tested in PR #755: R² -0.009,
                     // SEN -0.0018 — catastrophic accuracy regression.
-                    let (mut posteriors, state_post) = LOCAL_WORKSPACE.with(|cell| {
+                    let (mut posteriors, mut state_post_opt) = LOCAL_WORKSPACE.with(|cell| {
                         let mut ws_opt = cell.borrow_mut();
                         if ws_opt.is_none() {
                             *ws_opt = Some(ImputeWorkspace::new(state_haps.len(), n_ref_markers));
@@ -7746,6 +7899,84 @@ impl crate::pipelines::ImputationPipeline {
                         )
                     })?;
 
+                    let donor_pool = if donor_pool_full.is_empty() {
+                        donors
+                    } else {
+                        donor_pool_full
+                    };
+                    if donor_pool.len() > donors.len() && !posteriors.is_empty() {
+                        let win = ADAPTIVE_REFINE_WINDOW_MARKERS.min(posteriors.len()).max(1);
+                        let step = ADAPTIVE_REFINE_STEP_MARKERS.min(win).max(1);
+                        let mut needs_refine = false;
+                        let mut w_start = 0usize;
+                        while w_start < posteriors.len() {
+                            let w_end = (w_start + win).min(posteriors.len());
+                            let u = uncertainty_score_window(&posteriors, input_probs, output_start, w_start, w_end);
+                            if u > ADAPTIVE_REFINE_U_THRESHOLD {
+                                needs_refine = true;
+                                break;
+                            }
+                            w_start = w_start.saturating_add(step);
+                        }
+
+                        if needs_refine {
+                            let mut l = donors.len().max(16);
+                            while l < donor_pool.len() {
+                                let next_l = (l * 2).min(128).min(donor_pool.len());
+                                if next_l <= l {
+                                    break;
+                                }
+                                let mut expanded = donor_pool.to_vec();
+                                keep_top_k_donors_by_weight(&mut expanded, next_l);
+                                let mut refined_states =
+                                    build_state_haps(hap_idx, priors, &expanded, informative_ratio, None);
+                                project_states_min_replacements(&mut refined_states, input_probs, ref_columns);
+                                if refined_states.is_empty() {
+                                    break;
+                                }
+                                let transition_lambda_refined =
+                                    compute_transition_lambda(&refined_states, &expanded);
+                                let (candidate_posts, candidate_state_post) = LOCAL_WORKSPACE.with(|cell| {
+                                    let mut ws_opt = cell.borrow_mut();
+                                    *ws_opt = Some(ImputeWorkspace::new(refined_states.len(), n_ref_markers));
+                                    let ws = ws_opt.as_mut().unwrap();
+                                    let effective_error_rate =
+                                        calibrated_emission_error(input_probs, error_rate);
+                                    run_impute_hmm(
+                                        &refined_states,
+                                        ref_columns,
+                                        input_probs,
+                                        &p_recomb,
+                                        effective_error_rate,
+                                        prior_marker_idx,
+                                        None,
+                                        &ref_allele_freqs,
+                                        n_transition_haps,
+                                        transition_lambda_refined,
+                                        ImputeHmmContext {
+                                            window_idx,
+                                            sample_idx: s,
+                                            hap_idx: hap_idx.as_usize(),
+                                        },
+                                        smoothing_cluster_cm,
+                                        None,
+                                        ws,
+                                    )
+                                })?;
+                                let (max_delta, mean_kl) = posterior_delta_and_kl(&posteriors, &candidate_posts);
+                                posteriors = candidate_posts;
+                                state_post_opt = candidate_state_post;
+                                state_haps = refined_states;
+                                l = next_l;
+                                if max_delta < ADAPTIVE_REFINE_MAX_DOSAGE_DELTA
+                                    || mean_kl < ADAPTIVE_REFINE_MAX_KL
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     if self.config.err.is_none() {
                         // Preserve direct target evidence at observed markers. Imputation
                         // should not overwrite measured genotype probabilities at typed
@@ -7769,7 +8000,7 @@ impl crate::pipelines::ImputationPipeline {
                     }
 
                     let mut next_priors = HaplotypePriors::empty();
-                    if let Some(state_post) = state_post.as_ref() {
+                    if let Some(state_post) = state_post_opt.as_ref() {
                         let pairs = state_posteriors_to_priors(&state_haps, state_post, 0.0);
                         if !pairs.is_empty() {
                             let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = pairs
@@ -7809,6 +8040,7 @@ impl crate::pipelines::ImputationPipeline {
                         prior_error_rate.clamp(1e-6, 0.5),
                         handoff_capture_idx_h1,
                         &donors_h1,
+                        &full_donors_h1,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
                     hap1_posts = Some(posts);
@@ -7873,6 +8105,7 @@ impl crate::pipelines::ImputationPipeline {
                         prior_error_rate.clamp(1e-6, 0.5),
                         handoff_capture_idx_h2,
                         &donors_h2,
+                        &full_donors_h2,
                     )?;
                     let _ = (subsetted_states, informative_ratio);
                     hap2_posts = Some(posts);
