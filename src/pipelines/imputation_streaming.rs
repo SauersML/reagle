@@ -6247,28 +6247,20 @@ impl crate::pipelines::ImputationPipeline {
                         .map(|(h, c)| (*h, *c))
                         .collect();
 
-                    if combined.len() < SM_MATCH_MIN_DONORS {
-                        // Few or no donors: augment with structural priors.
-                        // Structural priors provide a safety net of diverse haplotypes
-                        // derived from the global imputation plan (core states + dynamic windows).
-                        let max_weight = combined
-                            .iter()
-                            .map(|(_, w)| *w)
-                            .fold(0.0f32, |a, b| a.max(b));
-                        // If we have strong existing matches, make sure priors are
-                        // competitive but not dominant.
-                        // Lower weight (e.g. 1%) preserves the PBWT donor's lead when it
-                        // is correct, while still providing a valid path for the HMM to
-                        // switch if the donor is contradicted by data.
-                        // If max_weight is 0 (or empty), default to 1.0.
-                        let prior_weight = if max_weight > 0.0 {
-                            max_weight * 0.01
-                        } else {
-                            1.0
-                        };
+                    if combined.is_empty() {
+                        // No PBWT donors found: fallback to structural priors.
+                        // This prevents empty-donor crashes and provides a safety net
+                        // of diverse haplotypes derived from the global imputation plan.
+                        //
+                        // We only trigger this when the donor pool is completely empty.
+                        // If PBWT finds even a few matches (1-15), they are likely
+                        // strong local haplotype matches that should be trusted over
+                        // broad priors to maintain phasing sharpness/accuracy.
+                        // Mixing priors into small-but-good donor sets was found to
+                        // degrade SER (Switch Error Rate) by diluting the signal.
+                        let prior_weight = 1.0;
 
-                        let mut fallback: HashMap<RefHapId, f32> =
-                            combined.iter().cloned().collect();
+                        let mut fallback: HashMap<RefHapId, f32> = HashMap::new();
 
                         if let Some(core) = plan.core_states.get(hap_usize) {
                             for &h in core {

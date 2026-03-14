@@ -1937,7 +1937,7 @@ fn test_boundary_handoff_should_preserve_unique_haplotype_signal() {
     ];
     // Windowed streaming uses approximate boundary summaries, so exact GP parity
     // with single-window inference is not expected at 1e-3 precision.
-    let tol = 0.12f64;
+    let tol = 1e-1f64;
 
     for &(n_markers, anchor_idx, boundary_idx) in &scenarios {
         for &seed in &seeds {
