@@ -7901,14 +7901,19 @@ impl crate::pipelines::ImputationPipeline {
                     p1_out = priors;
                     dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let total: f32 = donors_h1
+                    let smoothing = 1.0;
+                    let total_raw: f32 = donors_h1
                         .iter()
                         .map(|(_, c)| if c.is_finite() && *c > 0.0 { *c } else { 0.0 })
                         .sum();
+                    let total = total_raw + donors_h1.len() as f32 * smoothing;
                     if total > 0.0 {
                         let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h1
                             .iter()
-                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c / total))
+                            .map(|(h, c)| {
+                                let val = if c.is_finite() && *c > 0.0 { *c } else { 0.0 };
+                                (GlobalHapId(h.as_u32()), (val + smoothing) / total)
+                            })
                             .unzip();
                         p1_out = HaplotypePriors::new(ids, probs);
                         hap1_posts = Some(posts_from_donors(&donors_h1, &mut posts_probs_buf)?);
@@ -7965,14 +7970,19 @@ impl crate::pipelines::ImputationPipeline {
                     p2_out = priors;
                     dbg_fallback_selected_priors.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let total: f32 = donors_h2
+                    let smoothing = 1.0;
+                    let total_raw: f32 = donors_h2
                         .iter()
                         .map(|(_, c)| if c.is_finite() && *c > 0.0 { *c } else { 0.0 })
                         .sum();
+                    let total = total_raw + donors_h2.len() as f32 * smoothing;
                     if total > 0.0 {
                         let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = donors_h2
                             .iter()
-                            .map(|(h, c)| (GlobalHapId(h.as_u32()), *c / total))
+                            .map(|(h, c)| {
+                                let val = if c.is_finite() && *c > 0.0 { *c } else { 0.0 };
+                                (GlobalHapId(h.as_u32()), (val + smoothing) / total)
+                            })
                             .unzip();
                         p2_out = HaplotypePriors::new(ids, probs);
                         hap2_posts = Some(posts_from_donors(&donors_h2, &mut posts_probs_buf)?);
