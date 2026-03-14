@@ -2228,7 +2228,10 @@ fn donor_and_swap_posteriors(
     }
 
     if use_dense {
-        (rank_donor_mass_dense(&mass_dense, &touched, max_out), p_swapped)
+        (
+            rank_donor_mass_dense(&mass_dense, &touched, max_out),
+            p_swapped,
+        )
     } else {
         (rank_donor_mass(mass_sparse, max_out), p_swapped)
     }
