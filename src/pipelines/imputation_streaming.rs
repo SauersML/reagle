@@ -653,7 +653,6 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
 #[inline]
 fn adaptive_untyped_prior_mix(
     observed_ratio: f32,
-    cluster_cm: f32,
     p_mismatch: f32,
     phase_confidence_unavailable: bool,
 ) -> f32 {
@@ -664,14 +663,7 @@ fn adaptive_untyped_prior_mix(
     let typed = observed_ratio.clamp(0.0, 1.0);
     let missing = 1.0 - typed;
 
-    // Cubic ramp keeps the floor almost zero until missingness becomes
-    // meaningful, then increases sharply in sparse windows.
-    let missing_ramp = missing.powi(3);
-
-    // Slightly stronger floor when cluster distance is wide (weaker local
-    // linkage signal). Elevated model error should not raise the floor above
-    // baseline, because that suppresses rare-variant recovery in sparse windows.
-    let cluster_factor = (cluster_cm / 0.04f32).clamp(0.8, 1.6);
+    let missing_ramp = missing.powi(10);
     let err_factor = (p_mismatch / 4e-4f32).clamp(0.5, 1.0);
 
     // Unphased-target imputation has additional uncertainty from phase
@@ -682,8 +674,8 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.002 + 0.08 * missing_ramp;
-    (floor * cluster_factor * err_factor * phase_factor).clamp(0.001, 0.12)
+    let floor = 0.001 + 0.50 * missing_ramp;
+    (floor * err_factor * phase_factor).clamp(0.001, 0.80)
 }
 
 #[inline]
@@ -5771,13 +5763,11 @@ impl crate::pipelines::ImputationPipeline {
             };
             let min_untyped_prior_mix1 = adaptive_untyped_prior_mix(
                 observed_ratio1,
-                smoothing_cluster_cm,
                 self.params.p_mismatch,
                 !phase_conf_valid,
             );
             let min_untyped_prior_mix2 = adaptive_untyped_prior_mix(
                 observed_ratio2,
-                smoothing_cluster_cm,
                 self.params.p_mismatch,
                 !phase_conf_valid,
             );

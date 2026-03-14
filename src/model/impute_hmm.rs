@@ -1780,10 +1780,16 @@ fn apply_adaptive_panel_blend(
         return;
     }
 
+    let mut panel_max = 0.0f32;
+    for &p in panel_probs {
+        if p > panel_max {
+            panel_max = p;
+        }
+    }
+    let rare_boost = ((panel_max - 0.5).max(0.0) * 2.0).powi(4);
+
     if floor_mix > 0.0 {
-        // Floor step: enforce a small allele floor from panel probabilities so
-        // extremely sparse subsets cannot assign hard zeros too early.
-        let scaled_floor = floor_mix.clamp(0.0, 0.15);
+        let scaled_floor = (floor_mix * (0.05 + 0.95 * rare_boost)).clamp(0.0, 0.80);
         if scaled_floor > 0.0 {
             for (i, prob) in allele_probs.iter_mut().enumerate() {
                 let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -1796,35 +1802,9 @@ fn apply_adaptive_panel_blend(
         }
     }
 
-    if adaptive_panel_mix > 0.0 {
-        // Jensen-Shannon disagreement quantifies mismatch between local subset
-        // and panel prior. Larger mismatch increases blend strength, but blend
-        // remains bounded by adaptive_panel_mix cap.
-        let mut m_entropy = 0.0f32;
-        let mut p_entropy = 0.0f32;
-        let mut q_entropy = 0.0f32;
-        for (i, &p_raw) in allele_probs.iter().enumerate() {
-            let p = p_raw.clamp(0.0, 1.0);
-            let q = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let m = 0.5 * (p + q);
-            if p > 0.0 {
-                p_entropy -= p * p.ln();
-            }
-            if q > 0.0 {
-                q_entropy -= q * q.ln();
-            }
-            if m > 0.0 {
-                m_entropy -= m * m.ln();
-            }
-        }
-        let js_div = (m_entropy - 0.5 * (p_entropy + q_entropy)).max(0.0);
-        let max_js = (2.0f32).ln();
-        let disagreement = (js_div / max_js).clamp(0.0, 1.0);
-
-        // Symmetric convex blend:
-        //   p <- (1-w) * p + w * panel
-        // applied after flooring to preserve calibration and normalization.
-        let w = (adaptive_panel_mix * (1.0 + 0.5 * disagreement)).clamp(0.0, 0.45);
+    let combined_mix = adaptive_panel_mix.max(floor_mix * 0.5);
+    if combined_mix > 0.0 {
+        let w = (combined_mix * (0.05 + 0.95 * rare_boost)).clamp(0.0, 0.95);
         let one_minus_w = 1.0 - w;
         for (i, prob) in allele_probs.iter_mut().enumerate() {
             let panel_p = panel_probs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
