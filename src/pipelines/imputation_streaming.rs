@@ -1832,6 +1832,109 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     global_scores: &mut [Vec<f32>],
     window_scores: &mut [Vec<f32>],
 ) -> PbwtPrescanWindowDiag {
+    const PSEUDO_ANCHOR_MAX_PER_WINDOW: usize = 512;
+    const PSEUDO_ANCHOR_MIN_PER_WINDOW: usize = 32;
+    const PSEUDO_ANCHOR_TOP_FRACTION: usize = 64;
+    const PSEUDO_ANCHOR_TYPED_ROBUST_SCALE: f32 = 96.0;
+    const PSEUDO_ANCHOR_FIRST_PASS_DONORS: usize = 12;
+    const PSEUDO_ANCHOR_MIN_CONF: f32 = 0.95;
+    const PSEUDO_ANCHOR_MIN_MARGIN: f32 = 0.35;
+
+    #[inline]
+    fn typed_query_allele<TargetSpace, RefSpace>(
+        target_gt: &GenotypeMatrix<Phased, TargetSpace>,
+        alignment: &MarkerAlignment<TargetSpace, RefSpace>,
+        resolution: Option<TypedMarkerResolution>,
+        hap_idx: usize,
+    ) -> u8 {
+        if let Some(resolution) = resolution {
+            let raw = target_gt.allele(
+                MarkerIdx::new(resolution.target_idx as u32),
+                HapIdx::new(hap_idx as u32),
+            );
+            map_target_allele_to_ref(alignment, resolution, raw)
+                .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
+        } else {
+            crate::data::storage::AlleleCode::MISSING.raw()
+        }
+    }
+
+    #[inline]
+    fn normalized_entropy(counts: &[u32], present: u32) -> f32 {
+        if present <= 1 {
+            return 0.0;
+        }
+        let mut entropy = 0.0f32;
+        for &c in counts {
+            if c == 0 {
+                continue;
+            }
+            let p = c as f32 / present as f32;
+            entropy -= p * p.ln();
+        }
+        let max_entropy = (counts.len().max(2) as f32).ln().max(1e-6);
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn infer_pseudo_anchor(
+        pbwt: &mut ReferencePbwt,
+        beam: &RankBeam,
+        col: &PackedRefColumn,
+        n_ref_haps: usize,
+        n_alleles: usize,
+        donors_buf: &mut Vec<u32>,
+        allele_counts: &mut Vec<u32>,
+    ) -> Option<(u8, f32)> {
+        donors_buf.clear();
+        pbwt.select_donors_into(
+            beam,
+            PSEUDO_ANCHOR_FIRST_PASS_DONORS.min(n_ref_haps.max(1)),
+            donors_buf,
+        );
+        if donors_buf.len() < 6 {
+            return None;
+        }
+        allele_counts.clear();
+        allele_counts.resize(n_alleles, 0);
+        let mut present = 0u32;
+        for &d in donors_buf.iter() {
+            let allele = col.allele(d as usize);
+            if allele == crate::data::storage::AlleleCode::MISSING.raw() {
+                continue;
+            }
+            let idx = allele as usize;
+            if idx < allele_counts.len() {
+                allele_counts[idx] += 1;
+                present += 1;
+            }
+        }
+        if present < 6 {
+            return None;
+        }
+        let mut best_idx = 0usize;
+        let mut best = 0u32;
+        let mut second = 0u32;
+        for (idx, &count) in allele_counts.iter().enumerate() {
+            if count > best {
+                second = best;
+                best = count;
+                best_idx = idx;
+            } else if count > second {
+                second = count;
+            }
+        }
+        if best_idx > u8::MAX as usize {
+            return None;
+        }
+        let conf = best as f32 / present as f32;
+        let margin = (best.saturating_sub(second)) as f32 / present as f32;
+        if conf < PSEUDO_ANCHOR_MIN_CONF || margin < PSEUDO_ANCHOR_MIN_MARGIN {
+            return None;
+        }
+        Some((best_idx as u8, conf * margin))
+    }
+
     let n_markers = ref_columns.len().min(ref_markers.len());
     if n_markers == 0 || n_ref_haps == 0 || batch_haps.is_empty() {
         return PbwtPrescanWindowDiag::default();
@@ -1848,6 +1951,72 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     }
     let mut sampling = build_sampling_points(&gen_positions, step_cm, PBWT_MIN_MARKER_STEP);
     add_typed_anchor_sampling_resolved(&mut sampling, &gen_positions, &resolutions, step_cm);
+
+    // Proposal scaffold catalog for donor routing:
+    // rank markers by local branching power (ref entropy) and platform robustness
+    // (distance to nearest observed typed marker), then keep only a tiny top slice.
+    let mut typed_idx: Vec<usize> = Vec::new();
+    for (m, r) in resolutions.iter().enumerate() {
+        if r.is_some() {
+            typed_idx.push(m);
+        }
+    }
+    let mut nearest_typed_dist = vec![usize::MAX; n_markers];
+    if !typed_idx.is_empty() {
+        let mut p = 0usize;
+        for (m, dist_slot) in nearest_typed_dist.iter_mut().enumerate().take(n_markers) {
+            while p + 1 < typed_idx.len()
+                && typed_idx[p + 1].abs_diff(m) <= typed_idx[p].abs_diff(m)
+            {
+                p += 1;
+            }
+            *dist_slot = typed_idx[p].abs_diff(m);
+        }
+    }
+    let mut catalog_scores: Vec<(usize, f32)> = Vec::new();
+    let mut catalog_ref_alleles = vec![0u8; n_ref_haps];
+    let mut catalog_counts = vec![0u32; 8];
+    for m in 0..n_markers {
+        if resolutions[m].is_some() {
+            continue;
+        }
+        ref_columns[m].fill_alleles(&mut catalog_ref_alleles);
+        catalog_counts.fill(0);
+        let mut present = 0u32;
+        for &a in catalog_ref_alleles.iter() {
+            if a == crate::data::storage::AlleleCode::MISSING.raw() {
+                continue;
+            }
+            let idx = a as usize;
+            if idx >= catalog_counts.len() {
+                catalog_counts.resize(idx + 1, 0);
+            }
+            catalog_counts[idx] += 1;
+            present += 1;
+        }
+        if present == 0 {
+            continue;
+        }
+        let branching = normalized_entropy(&catalog_counts, present);
+        let dist = nearest_typed_dist[m].min(4096) as f32;
+        let robustness = (-dist / PSEUDO_ANCHOR_TYPED_ROBUST_SCALE).exp();
+        let score = branching * robustness;
+        if score > 0.0 {
+            catalog_scores.push((m, score));
+        }
+    }
+    let mut pseudo_anchor_catalog = vec![false; n_markers];
+    let catalog_keep = ((n_markers / PSEUDO_ANCHOR_TOP_FRACTION)
+        .clamp(PSEUDO_ANCHOR_MIN_PER_WINDOW, PSEUDO_ANCHOR_MAX_PER_WINDOW))
+    .min(catalog_scores.len());
+    if catalog_keep > 0 {
+        catalog_scores.select_nth_unstable_by(catalog_keep - 1, |a, b| b.1.total_cmp(&a.1));
+        for &(idx, _) in catalog_scores.iter().take(catalog_keep) {
+            pseudo_anchor_catalog[idx] = true;
+            sampling[idx] = true;
+        }
+    }
+
     let sampled_markers = sampling.iter().filter(|&&b| b).count();
     let mut min_gen_pos = f64::INFINITY;
     let mut max_gen_pos = f64::NEG_INFINITY;
@@ -1884,19 +2053,15 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
 
     let min_freq = 1.0 / (n_ref_haps.max(1) as f32);
 
+    let mut pseudo_anchors: Vec<Vec<Option<(u8, f32)>>> =
+        vec![vec![None; n_markers]; batch_haps.len()];
+    let mut pass1_donors: Vec<u32> = Vec::new();
+    let mut pass1_counts: Vec<u32> = Vec::new();
+
     for m in 0..n_markers {
         let resolution = resolutions.get(m).copied().flatten();
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let qa = if let Some(resolution) = resolution {
-                let raw = target_gt.allele(
-                    MarkerIdx::new(resolution.target_idx as u32),
-                    HapIdx::new(hap_idx as u32),
-                );
-                map_target_allele_to_ref(alignment, resolution, raw)
-                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
-            } else {
-                crate::data::storage::AlleleCode::MISSING.raw()
-            };
+            let qa = typed_query_allele(target_gt, alignment, resolution, hap_idx);
             query_alleles[i] =
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
@@ -1925,6 +2090,26 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
             &query_alleles,
             &mut beams_fwd,
         );
+
+        if pseudo_anchor_catalog[m] {
+            let col = &ref_columns[m];
+            for i in 0..batch_haps.len() {
+                if !query_alleles[i].is_missing() {
+                    continue;
+                }
+                if let Some((allele, reliability)) = infer_pseudo_anchor(
+                    &mut pbwt_fwd,
+                    &beams_fwd[i],
+                    col,
+                    n_ref_haps,
+                    n_alleles,
+                    &mut pass1_donors,
+                    &mut pass1_counts,
+                ) {
+                    pseudo_anchors[i][m] = Some((allele, reliability));
+                }
+            }
+        }
 
         allele_counts.clear();
         allele_counts.resize(n_alleles, 0);
@@ -1989,16 +2174,14 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
     for (rev_step, m) in (0..n_markers).rev().enumerate() {
         let resolution = resolutions.get(m).copied().flatten();
         for (i, &hap_idx) in batch_haps.iter().enumerate() {
-            let qa = if let Some(resolution) = resolution {
-                let raw = target_gt.allele(
-                    MarkerIdx::new(resolution.target_idx as u32),
-                    HapIdx::new(hap_idx as u32),
-                );
-                map_target_allele_to_ref(alignment, resolution, raw)
-                    .unwrap_or(crate::data::storage::AlleleCode::MISSING.raw())
-            } else {
-                crate::data::storage::AlleleCode::MISSING.raw()
-            };
+            let mut qa = typed_query_allele(target_gt, alignment, resolution, hap_idx);
+            if qa == crate::data::storage::AlleleCode::MISSING.raw()
+                && pseudo_anchor_catalog[m]
+                && let Some((pseudo, reliability)) = pseudo_anchors[i][m]
+                && reliability >= (PSEUDO_ANCHOR_MIN_CONF * PSEUDO_ANCHOR_MIN_MARGIN)
+            {
+                qa = pseudo;
+            }
             query_alleles[i] =
                 PbwtStrictAllele::allele(qa).unwrap_or_else(PbwtStrictAllele::missing);
         }
