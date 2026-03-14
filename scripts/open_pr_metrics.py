@@ -17,8 +17,6 @@ from typing import Any
 
 CI_WORKFLOW_FILE = "CI.yml"
 IQA_WORKFLOW_FILE = "imputation_quality_report.yml"
-CI_WORKFLOW_NAME = "CI"
-IQA_WORKFLOW_NAME = "Imputation Quality Assessment"
 REFERENCE_JOB_NAME = "reference-comparison"
 CHR21_JOB_NAME = "reference-comparison-chr21"
 CHR21_TARGET_TEST_NAME = "test_reference_comparison_full_chr21_ref1000_target10"
@@ -115,14 +113,6 @@ def parse_iso(ts: str | None) -> dt.datetime | None:
     return dt.datetime.strptime(raw, fmt).replace(tzinfo=dt.timezone.utc)
 
 
-def seconds_between(start: str | None, end: str | None) -> float | None:
-    start_dt = parse_iso(start)
-    end_dt = parse_iso(end)
-    if start_dt is None or end_dt is None:
-        return None
-    return (end_dt - start_dt).total_seconds()
-
-
 def parse_run_created_at(run: dict[str, Any]) -> dt.datetime | None:
     return parse_iso(run.get("created_at") or run.get("createdAt"))
 
@@ -150,6 +140,24 @@ def flatten_numeric_values(value: Any, prefix: str = "") -> dict[str, float]:
         if math.isfinite(val):
             out[prefix] = val
     return out
+
+
+def metric_key_is_relevant(key: str) -> bool:
+    if key.startswith("ds_calibration["):
+        return False
+    if key.startswith("confusion_matrix["):
+        return False
+    if key.startswith("r2_stats."):
+        return False
+    if key.startswith("rare_r2_stats."):
+        return False
+    if ".agg_stats." in key:
+        return False
+    return True
+
+
+def filter_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    return {key: value for key, value in metrics.items() if metric_key_is_relevant(key)}
 
 
 def subtract_numeric_maps(current: dict[str, float], base: dict[str, float]) -> dict[str, float]:
@@ -202,53 +210,18 @@ def parse_optional_float(value: str) -> float | None:
     return float(match.group(1))
 
 
-def summarize_step(step: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": step.get("name"),
-        "status": step.get("status"),
-        "conclusion": step.get("conclusion"),
-        "started_at": step.get("startedAt"),
-        "completed_at": step.get("completedAt"),
-        "duration_sec": seconds_between(step.get("startedAt"), step.get("completedAt")),
-    }
-
-
-def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": job.get("databaseId") or job.get("id"),
-        "name": job.get("name"),
-        "status": job.get("status"),
-        "conclusion": job.get("conclusion"),
-        "url": job.get("url") or job.get("html_url"),
-        "started_at": job.get("startedAt") or job.get("started_at"),
-        "completed_at": job.get("completedAt") or job.get("completed_at"),
-        "duration_sec": seconds_between(
-            job.get("startedAt") or job.get("started_at"),
-            job.get("completedAt") or job.get("completed_at"),
-        ),
-        "steps": [summarize_step(step) for step in job.get("steps", [])],
-    }
-
-
 def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": run.get("id") or run.get("databaseId"),
-        "name": run.get("name") or run.get("workflow_name") or run.get("workflowName"),
-        "display_title": run.get("display_title") or run.get("displayTitle"),
         "status": run.get("status"),
         "conclusion": run.get("conclusion"),
-        "event": run.get("event"),
-        "run_number": run.get("run_number") or run.get("number"),
-        "head_branch": run.get("head_branch") or run.get("headBranch"),
-        "head_sha": run.get("head_sha") or run.get("headSha"),
-        "url": run.get("html_url") or run.get("url"),
         "created_at": run.get("created_at") or run.get("createdAt"),
-        "updated_at": run.get("updated_at") or run.get("updatedAt"),
-        "started_at": run.get("run_started_at") or run.get("startedAt"),
-        "duration_sec": seconds_between(
-            run.get("run_started_at") or run.get("startedAt") or run.get("created_at") or run.get("createdAt"),
-            run.get("updated_at") or run.get("updatedAt"),
-        ),
+    }
+
+
+def summarize_job_state(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": job.get("status"),
+        "conclusion": job.get("conclusion"),
     }
 
 
@@ -271,7 +244,6 @@ def list_open_prs(repo: str, limit: int | None) -> list[dict[str, Any]]:
             "url": item["html_url"],
             "created_at": item["created_at"],
             "head_branch": item["head"]["ref"],
-            "head_sha": item["head"]["sha"],
         }
         for item in prs
     ]
@@ -333,11 +305,41 @@ def gh_run_details(repo: str, run_id: int) -> dict[str, Any]:
     )
 
 
+def run_database_id(run: dict[str, Any]) -> int:
+    raw_id = run.get("databaseId")
+    if raw_id is None:
+        raw_id = run.get("id")
+    if raw_id is None:
+        raise KeyError("run is missing databaseId/id")
+    return int(raw_id)
+
+
 def list_run_artifacts(repo: str, run_id: int) -> list[dict[str, Any]]:
     return api_paginate_list(
         f"repos/{repo}/actions/runs/{run_id}/artifacts",
         list_key="artifacts",
     )
+
+
+def cached_metric_artifacts(run_id: int, cache_dir: Path) -> list[dict[str, Any]]:
+    run_dir = cache_dir / f"run_{run_id}"
+    if not run_dir.exists():
+        return []
+
+    artifacts: list[dict[str, Any]] = []
+    for artifact_dir in sorted(run_dir.iterdir()):
+        if not artifact_dir.is_dir() or not artifact_dir.name.startswith("metrics-"):
+            continue
+        reagle_json = list(artifact_dir.rglob("reagle_metrics.json"))
+        beagle_json = list(artifact_dir.rglob("beagle_metrics.json"))
+        if reagle_json and beagle_json:
+            artifacts.append(
+                {
+                    "name": artifact_dir.name,
+                    "expired": False,
+                }
+            )
+    return artifacts
 
 
 def load_job_log(repo: str, run_id: int, job_id: int, cache_dir: Path) -> str:
@@ -372,6 +374,16 @@ def download_metric_artifact(repo: str, run_id: int, artifact_name: str, cache_d
         return artifact_dir
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    download_dir = artifact_dir
+    if any(artifact_dir.iterdir()):
+        slot = 1
+        while True:
+            candidate = artifact_dir / f"download_{slot}"
+            if not candidate.exists():
+                download_dir = candidate
+                break
+            slot += 1
+        download_dir.mkdir(parents=True, exist_ok=True)
     run_text(
         [
             "gh",
@@ -383,14 +395,13 @@ def download_metric_artifact(repo: str, run_id: int, artifact_name: str, cache_d
             "-n",
             artifact_name,
             "-D",
-            str(artifact_dir),
+            str(download_dir),
         ]
     )
     return artifact_dir
 
 
 def parse_test_results(log_text: str) -> dict[str, Any]:
-    occurrences: list[dict[str, Any]] = []
     passed = 0
     failed = 0
 
@@ -403,20 +414,12 @@ def parse_test_results(log_text: str) -> dict[str, Any]:
         line_failed = int(match.group(2))
         passed += line_passed
         failed += line_failed
-        occurrences.append(
-            {
-                "line": line,
-                "passed": line_passed,
-                "failed": line_failed,
-            }
-        )
 
     total = passed + failed
     return {
         "passed": passed,
         "failed": failed,
         "total": total,
-        "occurrences": occurrences,
     }
 
 
@@ -439,13 +442,13 @@ def parse_beagle_reference_stats(log_text: str) -> dict[str, Any] | None:
                 "failed": failed,
                 "total": total,
                 "pass_rate": (passed / total) if total else None,
-                "line": candidate,
             }
     return None
 
 
 def parse_seed_metrics(log_text: str) -> dict[str, Any]:
-    observations: list[dict[str, Any]] = []
+    count = 0
+    total_delta = 0.0
     for raw_line in log_text.splitlines():
         line = normalize_log_line(raw_line)
         match = SEED_RE.search(line)
@@ -453,21 +456,15 @@ def parse_seed_metrics(log_text: str) -> dict[str, Any]:
             continue
         java_pct = float(match.group(2))
         rust_pct = float(match.group(3))
-        observations.append(
-            {
-                "seed": int(match.group(1)),
-                "java_percent": java_pct,
-                "rust_percent": rust_pct,
-                "delta_percent": rust_pct - java_pct,
-            }
-        )
+        total_delta += rust_pct - java_pct
+        count += 1
 
     mean_delta = None
-    if observations:
-        mean_delta = sum(item["delta_percent"] for item in observations) / len(observations)
+    if count:
+        mean_delta = total_delta / count
 
     return {
-        "observations": observations,
+        "count": count,
         "mean_delta_percent": mean_delta,
     }
 
@@ -476,7 +473,6 @@ def parse_chr21_target_result(log_text: str) -> dict[str, Any]:
     lines = [normalize_log_line(line) for line in log_text.splitlines()]
     result: dict[str, Any] = {
         "status": "missing",
-        "message": None,
         "assertion": None,
     }
 
@@ -488,7 +484,7 @@ def parse_chr21_target_result(log_text: str) -> dict[str, Any]:
         for j in range(idx, window_end):
             current = lines[j]
             if current == f"test {CHR21_TARGET_TEST_NAME} ... ok":
-                return {"status": "pass", "message": "PASS", "assertion": None}
+                return {"status": "pass", "assertion": None}
 
             if current.startswith(f"thread '{CHR21_TARGET_TEST_NAME}'") and "panicked at" in current:
                 for candidate in lines[j + 1 : min(window_end, j + 8)]:
@@ -505,7 +501,6 @@ def parse_chr21_target_result(log_text: str) -> dict[str, Any]:
                         }
                     return {
                         "status": "fail",
-                        "message": candidate,
                         "assertion": assertion,
                     }
 
@@ -521,7 +516,6 @@ def parse_chr21_target_result(log_text: str) -> dict[str, Any]:
                     }
                 return {
                     "status": "fail",
-                    "message": current,
                     "assertion": assertion,
                 }
 
@@ -636,20 +630,14 @@ def load_metrics_pair(
 
     reagle_raw = json.loads(reagle_candidates[0].read_text(encoding="utf-8"))
     beagle_raw = json.loads(beagle_candidates[0].read_text(encoding="utf-8"))
-    reagle_flat = flatten_numeric_values(reagle_raw)
-    beagle_flat = flatten_numeric_values(beagle_raw)
+    reagle_flat = filter_metrics(flatten_numeric_values(reagle_raw))
+    beagle_flat = filter_metrics(flatten_numeric_values(beagle_raw))
 
     return {
-        "id": artifact.get("id"),
         "name": artifact_name,
-        "size_in_bytes": artifact.get("size_in_bytes"),
-        "created_at": artifact.get("created_at"),
-        "expires_at": artifact.get("expires_at"),
         "reagle_flat": reagle_flat,
         "beagle_flat": beagle_flat,
         "reagle_minus_beagle_flat": subtract_numeric_maps(reagle_flat, beagle_flat),
-        "reagle_metric_count": len(reagle_flat),
-        "beagle_metric_count": len(beagle_flat),
     }
 
 
@@ -658,7 +646,7 @@ def collect_iqa_artifacts(
     run_details: dict[str, Any],
     cache_dir: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    run_id = int(run_details["databaseId"])
+    run_id = run_database_id(run_details)
     jobs = [job for job in run_details.get("jobs", []) if (job.get("name") or "").startswith("impute-and-measure")]
     job_by_artifact: dict[str, dict[str, Any]] = {}
 
@@ -672,23 +660,23 @@ def collect_iqa_artifacts(
         artifact_name = parsed.get("artifact_name")
         if artifact_name:
             job_by_artifact[artifact_name] = {
-                "job": summarize_job(job),
                 "reagle_step_seconds": parsed.get("reagle_step_seconds"),
             }
 
     artifact_reports: list[dict[str, Any]] = []
-    artifacts = [
-        artifact
-        for artifact in list_run_artifacts(repo, run_id)
-        if artifact.get("name", "").startswith("metrics-") and not artifact.get("expired", False)
-    ]
+    artifacts = cached_metric_artifacts(run_id, cache_dir)
+    if not artifacts:
+        artifacts = [
+            artifact
+            for artifact in list_run_artifacts(repo, run_id)
+            if artifact.get("name", "").startswith("metrics-") and not artifact.get("expired", False)
+        ]
     artifacts.sort(key=lambda item: item["name"])
 
     for artifact in artifacts:
         report = load_metrics_pair(repo, run_id, artifact, cache_dir)
         log_data = job_by_artifact.get(report["name"])
         if log_data is not None:
-            report["job"] = log_data["job"]
             if log_data.get("reagle_step_seconds") is not None:
                 report["reagle_step_seconds"] = log_data["reagle_step_seconds"]
                 report["reagle_flat"]["reagle_step_seconds"] = float(log_data["reagle_step_seconds"])
@@ -701,16 +689,21 @@ def run_has_metric_artifacts(
     repo: str,
     run: dict[str, Any],
     base_cache: dict[int, dict[str, Any]],
+    cache_dir: Path,
 ) -> bool:
     run_id = int(run["id"])
     cached = base_cache.get(run_id)
     if cached is not None and "has_metric_artifacts" in cached:
         return bool(cached["has_metric_artifacts"])
 
-    has_metrics = any(
-        artifact.get("name", "").startswith("metrics-") and not artifact.get("expired", False)
-        for artifact in list_run_artifacts(repo, run_id)
-    )
+    cached_artifacts = cached_metric_artifacts(run_id, cache_dir)
+    if cached_artifacts:
+        has_metrics = True
+    else:
+        has_metrics = any(
+            artifact.get("name", "").startswith("metrics-") and not artifact.get("expired", False)
+            for artifact in list_run_artifacts(repo, run_id)
+        )
     entry = cached or {}
     entry.setdefault("run", summarize_run(run))
     entry["has_metric_artifacts"] = has_metrics
@@ -723,6 +716,7 @@ def find_baseline_main_run(
     main_runs: list[dict[str, Any]],
     pr_created_at: str,
     base_cache: dict[int, dict[str, Any]],
+    cache_dir: Path,
 ) -> dict[str, Any] | None:
     pr_created = parse_iso(pr_created_at)
     if pr_created is None:
@@ -732,7 +726,7 @@ def find_baseline_main_run(
         created_at = parse_run_created_at(run)
         if created_at is None or created_at >= pr_created:
             continue
-        if run_has_metric_artifacts(repo, run, base_cache):
+        if run_has_metric_artifacts(repo, run, base_cache, cache_dir):
             return run
     return None
 
@@ -750,12 +744,11 @@ def build_baseline_report(
     base_run_id = int(base_run["id"])
     cached = base_cache.get(base_run_id)
     if cached is None or "artifacts" not in cached:
-        base_details = gh_run_details(repo, base_run_id)
-        base_artifacts, _ = collect_iqa_artifacts(repo, base_details, cache_dir)
+        base_artifacts, _ = collect_iqa_artifacts(repo, base_run, cache_dir)
         entry = cached or {}
         entry.update(
             {
-            "run": summarize_run(base_details),
+            "run": summarize_run(base_run),
             "artifacts": {artifact["name"]: artifact for artifact in base_artifacts},
             "has_metric_artifacts": bool(base_artifacts),
             }
@@ -764,7 +757,7 @@ def build_baseline_report(
 
     cached = base_cache[base_run_id]
     base_artifacts_by_name = cached["artifacts"]
-    matched_artifacts: list[dict[str, Any]] = []
+    matched_artifact_names: list[str] = []
     reagle_delta_maps: list[dict[str, float]] = []
     beagle_delta_maps: list[dict[str, float]] = []
 
@@ -778,17 +771,11 @@ def build_baseline_report(
         beagle_delta = subtract_numeric_maps(pr_artifact["beagle_flat"], base_artifact["beagle_flat"])
         reagle_delta_maps.append(reagle_delta)
         beagle_delta_maps.append(beagle_delta)
-        matched_artifacts.append(
-            {
-                "name": name,
-                "pr_reagle_minus_base_flat": reagle_delta,
-                "pr_beagle_minus_base_flat": beagle_delta,
-            }
-        )
+        matched_artifact_names.append(name)
 
     return {
         "run": cached["run"],
-        "matched_artifacts": matched_artifacts,
+        "matched_artifact_names": matched_artifact_names,
         "reagle_delta_flat_mean": mean_numeric_maps(reagle_delta_maps),
         "beagle_delta_flat_mean": mean_numeric_maps(beagle_delta_maps),
     }
@@ -802,29 +789,26 @@ def collect_ci_report(repo: str, pr: dict[str, Any], cache_dir: Path) -> dict[st
     run_id = int(latest["databaseId"])
     run_details = gh_run_details(repo, run_id)
     jobs = sorted(run_details.get("jobs", []), key=lambda item: item.get("name", ""))
-    job_summaries = {job["name"]: summarize_job(job) for job in jobs}
     jobs_by_name = {job["name"]: job for job in jobs}
 
     parsed_logs: dict[str, dict[str, Any]] = {}
     total_passed = 0
     total_failed = 0
 
-    for job_name in [REFERENCE_JOB_NAME, CHR21_JOB_NAME, "build-rust"]:
+    for job_name in [REFERENCE_JOB_NAME, CHR21_JOB_NAME]:
         job = jobs_by_name.get(job_name)
         if job is None:
             continue
         try:
             log_text = load_job_log(repo, run_id, int(job["databaseId"]), cache_dir)
         except Exception as exc:
-            parsed_logs[job_name] = {"error": str(exc)}
+            parsed_logs[job_name] = {"error": str(exc), **summarize_job_state(job)}
             continue
 
         test_results = parse_test_results(log_text)
         total_passed += test_results["passed"]
         total_failed += test_results["failed"]
-        parsed_logs[job_name] = {
-            "test_results": test_results,
-        }
+        parsed_logs[job_name] = {**summarize_job_state(job), "test_results": test_results}
 
         if job_name == REFERENCE_JOB_NAME:
             parsed_logs[job_name]["seed_metrics"] = parse_seed_metrics(log_text)
@@ -840,11 +824,8 @@ def collect_ci_report(repo: str, pr: dict[str, Any], cache_dir: Path) -> dict[st
     }
 
     return {
-        "workflow": CI_WORKFLOW_NAME,
         "run": summarize_run(run_details),
-        "jobs": job_summaries,
         "aggregate_test_results": aggregate,
-        "build_rust": parsed_logs.get("build-rust"),
         "reference_comparison": parsed_logs.get(REFERENCE_JOB_NAME),
         "reference_comparison_chr21": parsed_logs.get(CHR21_JOB_NAME),
     }
@@ -864,16 +845,11 @@ def collect_iqa_report(
     run_id = int(latest["databaseId"])
     run_details = gh_run_details(repo, run_id)
     artifact_reports, _ = collect_iqa_artifacts(repo, run_details, cache_dir)
-    baseline_run = find_baseline_main_run(repo, main_runs, pr["created_at"], base_cache)
+    baseline_run = find_baseline_main_run(repo, main_runs, pr["created_at"], base_cache, cache_dir)
     baseline = build_baseline_report(repo, artifact_reports, baseline_run, base_cache, cache_dir)
 
-    jobs = sorted(run_details.get("jobs", []), key=lambda item: item.get("name", ""))
-    job_summaries = {job["name"]: summarize_job(job) for job in jobs}
-
     return {
-        "workflow": IQA_WORKFLOW_NAME,
         "run": summarize_run(run_details),
-        "jobs": job_summaries,
         "metric_artifacts": artifact_reports,
         "baseline_main": baseline,
     }
@@ -886,22 +862,25 @@ def collect_pr_report(
     base_cache: dict[int, dict[str, Any]],
     cache_dir: Path,
 ) -> dict[str, Any]:
-    report = {
+    report: dict[str, Any] = {
         "pr": pr,
         "ci": None,
         "iqa": None,
-        "errors": [],
     }
+    errors: list[str] = []
 
     try:
         report["ci"] = collect_ci_report(repo, pr, cache_dir)
     except Exception as exc:
-        report["errors"].append(f"ci: {exc}")
+        errors.append(f"ci: {exc}")
 
     try:
         report["iqa"] = collect_iqa_report(repo, pr, main_runs, base_cache, cache_dir)
     except Exception as exc:
-        report["errors"].append(f"iqa: {exc}")
+        errors.append(f"iqa: {exc}")
+
+    if errors:
+        report["errors"] = errors
 
     return report
 
@@ -1007,10 +986,6 @@ def build_report(repo: str, prs: list[dict[str, Any]], cache_dir: Path, max_work
     return {
         "repo": repo,
         "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "workflows": {
-            "ci": CI_WORKFLOW_NAME,
-            "iqa": IQA_WORKFLOW_NAME,
-        },
         "pull_request_count": len(results),
         "pull_requests": results,
     }
@@ -1030,8 +1005,8 @@ def main() -> int:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
-        help="Maximum concurrent PR collectors.",
+        default=1,
+        help="Maximum concurrent PR collectors. Use 1 to avoid GitHub Actions API throttling.",
     )
     parser.add_argument(
         "--output",
