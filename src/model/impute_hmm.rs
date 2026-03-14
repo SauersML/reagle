@@ -1695,11 +1695,7 @@ fn apply_marker_prior_smoothing(
     } else {
         0.0
     };
-    let missing_mass = if observed_total > 0.0 {
-        observed_missing_mass
-    } else {
-        fallback_missing_mass
-    };
+    let missing_mass = observed_missing_mass.max(fallback_missing_mass);
     let floor_mix = min_prior_mix.clamp(0.0, 0.9);
     let dist_retain = nearest_obs_retain.clamp(0.0, 1.0);
     let dist_error = 1.0 - dist_retain;
@@ -1724,12 +1720,8 @@ fn apply_marker_prior_smoothing(
     // - diagnostics govern approximation-risk inflation
     let combined_error =
         (1.0 - (1.0 - dist_error) * (1.0 - approximation_error)).clamp(0.0, 0.9999);
-    // Conservative adaptive blend: panel priors should stabilize pathological
-    // cases, not dominate local HMM evidence. PR #804 and PR #835 both tried
-    // stronger global panel-prior injection here; one precomputed per-marker
-    // panel priors and shrank directly toward them, the other blended panel
-    // frequencies more aggressively into the local prior. Both over-regularized
-    // the posterior, hurting IQS/Hellinger and failing to produce a usable win.
+    // Keep panel-prior influence capped so it stabilizes truncated subsets
+    // without washing out the local linkage signal.
     let adaptive_panel_mix =
         (0.35 * missing_mass * combined_error * (1.0 + 0.75 * sparsity_boost)).clamp(0.0, 0.35);
 
@@ -2133,21 +2125,16 @@ fn normalize_allele_posterior_structural_missing(
     }
 
     let inv_total = 1.0 / total;
-    if missing_ood > 0.0 {
-        // Structural Dirichlet concentration alpha is derived from prior
-        // concentration (effective allele count), not hand-tuned thresholds.
-        // rho_ood = (q + alpha*pi)/(Q + alpha).
+    let missing_total = missing_ref + missing_ood;
+    if missing_total > 0.0 {
         let prior = normalized_allele_prior(prior_scratch, target_probs);
-        let ood_dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
-        let inv_subset = 1.0 / subset;
-        let inv_rho = 1.0 / (subset + ood_dirichlet_alpha);
-        let q_coeff = (1.0 + missing_ref * inv_subset + missing_ood * inv_rho) * inv_total;
-        let pi_coeff = (missing_ood * ood_dirichlet_alpha * inv_rho) * inv_total;
+        let dirichlet_alpha = structural_ood_dirichlet_alpha(prior.as_slice());
+        let inv_rho = 1.0 / (subset + dirichlet_alpha);
+        let q_coeff = (1.0 + missing_total * inv_rho) * inv_total;
+        let pi_coeff = (missing_total * dirichlet_alpha * inv_rho) * inv_total;
         affine_blend_with_prior_in_place(allele_probs, prior.as_slice(), q_coeff, pi_coeff);
     } else {
-        // No OOD mass: exact MAR redistribution for reference-missing states.
-        let q_coeff = (1.0 + missing_ref / subset) * inv_total;
-        scale_slice_in_place(allele_probs, q_coeff);
+        scale_slice_in_place(allele_probs, inv_total);
     }
 }
 
