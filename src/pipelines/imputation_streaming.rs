@@ -8028,6 +8028,8 @@ impl crate::pipelines::ImputationPipeline {
                                 extent.core_end,
                                 donors,
                             );
+                            let mut handoff_state_post = seg_state_post;
+                            let mut handoff_state_haps = None;
                             if seg_uncertainty > ADAPTIVE_REFINEMENT_U_THRESHOLD && !donors_full.is_empty() {
                                 let mut refined_posts = seg_posteriors.clone();
                                 for &l_refine in ADAPTIVE_REFINEMENT_LEVELS.iter() {
@@ -8088,8 +8090,9 @@ impl crate::pipelines::ImputationPipeline {
                                             )
                                         },
                                     )?;
-                                    let _ = candidate_state_post.as_ref().map(|v| v.len());
                                     let delta = max_posterior_dosage_delta(&candidate_posts, &refined_posts);
+                                    handoff_state_post = candidate_state_post;
+                                    handoff_state_haps = Some(refined_state_haps);
                                     refined_posts = candidate_posts;
                                     if delta < ADAPTIVE_REFINEMENT_MAX_DOSAGE_DELTA {
                                         break;
@@ -8109,8 +8112,9 @@ impl crate::pipelines::ImputationPipeline {
                             }
 
                             let mut next_priors_local = HaplotypePriors::empty();
-                            if let Some(state_post) = seg_state_post.as_ref() {
-                                if state_post.len() != state_haps.len() {
+                            let handoff_states = handoff_state_haps.as_ref().unwrap_or(&state_haps);
+                            if let Some(state_post) = handoff_state_post.as_ref() {
+                                if state_post.len() != handoff_states.len() {
                                     return Err(ReagleError::vcf(format!(
                                         "Piecewise state posterior/state mismatch: window={} sample={} hap={} segment=[{}..{}) post_len={} states={}",
                                         window_idx,
@@ -8119,10 +8123,10 @@ impl crate::pipelines::ImputationPipeline {
                                         extent.core_start,
                                         extent.core_end,
                                         state_post.len(),
-                                        state_haps.len()
+                                        handoff_states.len()
                                     )));
                                 }
-                                let pairs = state_posteriors_to_priors(&state_haps, state_post, 0.0);
+                                let pairs = state_posteriors_to_priors(handoff_states, state_post, 0.0);
                                 if !pairs.is_empty() {
                                     let (ids, probs): (Vec<GlobalHapId>, Vec<f32>) = pairs
                                         .into_iter()
