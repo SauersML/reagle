@@ -592,6 +592,9 @@ class CodexAutopilot:
                 force,
             )
             return
+        if self.should_drain():
+            self.log_drain_mode_once()
+            return
         logging.info(
             "running orchestrator review; open autopilot PRs: %d due=%s force=%s",
             len(open_autopilot_prs),
@@ -626,6 +629,9 @@ class CodexAutopilot:
         for slot in range(1, self.config.worker_count + 1):
             if slot in self.active_workers:
                 continue
+            if self.should_drain():
+                self.log_drain_mode_once()
+                return
             self.launch_worker(slot)
 
     def launch_worker(self, slot: int) -> None:
