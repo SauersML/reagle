@@ -18,6 +18,7 @@ branching, retries, and PR reconciliation live outside the agent.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import datetime as dt
 import fcntl
@@ -151,6 +152,7 @@ class Config:
     orchestrator_interval_seconds: int
     orchestrator_timeout_seconds: int
     worker_count: int
+    max_runtime_seconds: int | None
 
 
 @dataclasses.dataclass
@@ -300,6 +302,34 @@ class CodexAutopilot:
         self._lock_handle = None
         self._master_log_lock = threading.Lock()
         self._initial_cycle_pending = True
+        self._started_monotonic = time.monotonic()
+        self._runtime_deadline_monotonic = (
+            self._started_monotonic + config.max_runtime_seconds
+            if config.max_runtime_seconds is not None
+            else None
+        )
+        self._drain_mode_logged = False
+
+    def runtime_deadline_reached(self) -> bool:
+        return self._runtime_deadline_monotonic is not None and time.monotonic() >= self._runtime_deadline_monotonic
+
+    def should_drain(self) -> bool:
+        return self.runtime_deadline_reached()
+
+    def log_drain_mode_once(self) -> None:
+        if not self.should_drain() or self._drain_mode_logged:
+            return
+        self._drain_mode_logged = True
+        max_runtime_seconds = self.config.max_runtime_seconds
+        message = (
+            "max runtime reached; drain mode enabled. "
+            "No new workers, follow-ups, or orchestrator turns will start. "
+            "Waiting for active workers to finish."
+        )
+        if max_runtime_seconds is not None:
+            message += f" max_runtime_seconds={max_runtime_seconds}"
+        logging.info(message)
+        self.append_master_log_block("drain mode enabled", message)
 
     def setup(self) -> None:
         for path in [
@@ -344,6 +374,8 @@ class CodexAutopilot:
             "pid": os.getpid(),
             "status": status,
             "updated_at": utc_now_iso(),
+            "drain_mode": self.should_drain(),
+            "max_runtime_seconds": self.config.max_runtime_seconds,
             "active_workers": [
                 {
                     "slot": worker.slot,
@@ -476,25 +508,40 @@ class CodexAutopilot:
                 self.update_heartbeat("starting")
                 if self._initial_cycle_pending:
                     self.update_heartbeat("initializing")
-                    self.fill_worker_slots()
-                    self.maybe_run_orchestrator(force=True)
+                    if self.should_drain():
+                        self.log_drain_mode_once()
+                    else:
+                        self.fill_worker_slots()
+                        self.maybe_run_orchestrator(force=True)
                     self._initial_cycle_pending = False
                     self.update_heartbeat("idle")
                 else:
-                    self.tick()
+                    result = self.tick()
+                    if result is not None:
+                        return result
             except Exception:
                 logging.exception("supervisor cycle failed")
                 self.update_heartbeat("error")
+            if self.should_drain() and not self.active_workers:
+                self.log_drain_mode_once()
+                self.update_heartbeat("stopped", {"reason": "max_runtime_reached_and_workers_drained"})
+                return 0
             sleep_for = max(1.0, self.config.monitor_seconds)
             self.update_heartbeat("sleeping", {"sleep_seconds": int(sleep_for)})
             time.sleep(sleep_for)
 
-    def tick(self) -> None:
+    def tick(self) -> int | None:
         self.update_heartbeat("tick")
         self.reap_finished_workers()
-        self.fill_worker_slots()
-        self.maybe_run_orchestrator(force=False)
+        if self.should_drain():
+            self.log_drain_mode_once()
+            if not self.active_workers:
+                return 0
+        else:
+            self.fill_worker_slots()
+            self.maybe_run_orchestrator(force=False)
         self.update_heartbeat("idle")
+        return None
 
     def fetch_base_branch(self) -> None:
         checked_command(["git", "fetch", "origin", self.config.base_branch], cwd=self.repo_root)
@@ -531,6 +578,8 @@ class CodexAutopilot:
         return self.orchestrator_worktree
 
     def maybe_run_orchestrator(self, *, force: bool) -> None:
+        if self.should_drain():
+            return
         now = time.monotonic()
         due = (now - self._last_orchestrator_monotonic) >= self.config.orchestrator_interval_seconds
         if not force and not due:
@@ -542,6 +591,9 @@ class CodexAutopilot:
                 due,
                 force,
             )
+            return
+        if self.should_drain():
+            self.log_drain_mode_once()
             return
         logging.info(
             "running orchestrator review; open autopilot PRs: %d due=%s force=%s",
@@ -572,9 +624,14 @@ class CodexAutopilot:
         self.write_state()
 
     def fill_worker_slots(self) -> None:
+        if self.should_drain():
+            return
         for slot in range(1, self.config.worker_count + 1):
             if slot in self.active_workers:
                 continue
+            if self.should_drain():
+                self.log_drain_mode_once()
+                return
             self.launch_worker(slot)
 
     def launch_worker(self, slot: int) -> None:
@@ -695,7 +752,9 @@ class CodexAutopilot:
             returncode=returncode,
         )
         session_id = codex_result.get("session_id")
-        if follow_up_prompt:
+        if self.should_drain():
+            record["follow_up_suppressed"] = "max_runtime_reached"
+        elif follow_up_prompt:
             next_worker = self.continue_worker_with_follow_up(worker, session_id=session_id, prompt=follow_up_prompt)
             record["follow_up"] = {
                 "session_id": session_id,
@@ -1199,6 +1258,7 @@ class CodexAutopilot:
             return None
         return rows[0]
 
+
 def build_default_config() -> Config:
     repo_root = Path(__file__).resolve().parent.parent
     state_dir = repo_root / DEFAULT_STATE_DIR
@@ -1211,7 +1271,43 @@ def build_default_config() -> Config:
         orchestrator_interval_seconds=DEFAULT_ORCHESTRATOR_INTERVAL_SECONDS,
         orchestrator_timeout_seconds=DEFAULT_ORCHESTRATOR_TIMEOUT_SECONDS,
         worker_count=DEFAULT_WORKER_COUNT,
+        max_runtime_seconds=None,
     )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the Codex autopilot supervisor. "
+            "Use a max-runtime option to stop scheduling new work after a deadline and drain active workers."
+        )
+    )
+    runtime_group = parser.add_mutually_exclusive_group()
+    runtime_group.add_argument(
+        "--max-runtime-hours",
+        type=float,
+        help="Stop starting new work after this many hours, then wait for active workers to finish.",
+    )
+    runtime_group.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        help="Stop starting new work after this many seconds, then wait for active workers to finish.",
+    )
+    args = parser.parse_args(argv)
+    if args.max_runtime_hours is not None and args.max_runtime_hours < 0:
+        parser.error("--max-runtime-hours must be non-negative")
+    if args.max_runtime_seconds is not None and args.max_runtime_seconds < 0:
+        parser.error("--max-runtime-seconds must be non-negative")
+    return args
+
+
+def build_config_from_args(args: argparse.Namespace) -> Config:
+    config = build_default_config()
+    if args.max_runtime_hours is not None:
+        config.max_runtime_seconds = int(args.max_runtime_hours * 60 * 60)
+    elif args.max_runtime_seconds is not None:
+        config.max_runtime_seconds = args.max_runtime_seconds
+    return config
 
 
 def configure_logging(state_dir: Path) -> None:
@@ -1229,13 +1325,16 @@ def configure_logging(state_dir: Path) -> None:
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     while True:
         try:
-            config = build_default_config()
+            config = build_config_from_args(args)
             configure_logging(config.state_dir)
             supervisor = CodexAutopilot(config)
             result = supervisor.run()
+            if result == 0:
+                return 0
             logging.error("supervisor.run returned unexpectedly with result=%r; restarting", result)
         except BaseException:
             try:
