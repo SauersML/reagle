@@ -190,6 +190,12 @@ def shell_join(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
 
 
+def codex_command_prefix() -> list[str]:
+    # The CLI's danger-full-access sandbox still tries to start a sandbox here
+    # and fails before commands run, so worker/orchestrator sessions must bypass it.
+    return ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+
+
 def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -649,11 +655,7 @@ class CodexAutopilot:
         self.write_text(prompt_path, prompt)
 
         cmd = [
-            "codex",
-            "-a",
-            "never",
-            "-s",
-            "danger-full-access",
+            *codex_command_prefix(),
             "exec",
             "--json",
             "-C",
@@ -808,9 +810,7 @@ class CodexAutopilot:
     def collect_worker_result(self, worker: ActiveWorker, returncode: int) -> dict[str, Any]:
         if worker.follow_up_index > 0 and worker.session_id:
             cmd = [
-                "codex",
-                "-a",
-                "never",
+                *codex_command_prefix(),
                 "exec",
                 "resume",
                 "--json",
@@ -821,11 +821,7 @@ class CodexAutopilot:
             ]
         else:
             cmd = [
-                "codex",
-                "-a",
-                "never",
-                "-s",
-                "danger-full-access",
+                *codex_command_prefix(),
                 "exec",
                 "--json",
                 "-C",
@@ -1001,9 +997,7 @@ class CodexAutopilot:
         resume_session_id = session_id if isinstance(session_id, str) and session_id else None
         if resume_session_id is not None:
             cmd = [
-                "codex",
-                "-a",
-                "never",
+                *codex_command_prefix(),
                 "exec",
                 "resume",
                 "--json",
@@ -1015,11 +1009,7 @@ class CodexAutopilot:
             cwd = worker.worktree
         else:
             cmd = [
-                "codex",
-                "-a",
-                "never",
-                "-s",
-                "danger-full-access",
+                *codex_command_prefix(),
                 "exec",
                 "--json",
                 "-C",
@@ -1088,11 +1078,7 @@ class CodexAutopilot:
         self.write_text(prompt_path, prompt)
 
         cmd = [
-            "codex",
-            "-a",
-            "never",
-            "-s",
-            "danger-full-access",
+            *codex_command_prefix(),
             "exec",
             "-C",
             str(worktree),
