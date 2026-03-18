@@ -767,19 +767,14 @@ fn marker_emission_error_from_probs(probs: &[f32], observed: bool, base_error_ra
 // it during a larger donor-selection retune. Both moved the prior floor in the
 // wrong direction once the full system was measured on chr21.
 #[inline]
-fn adaptive_untyped_prior_mix(
-    observed_ratio: f32,
-    p_mismatch: f32,
-    phase_confidence_unavailable: bool,
-) -> f32 {
+fn adaptive_untyped_prior_mix(p_mismatch: f32, phase_confidence_unavailable: bool) -> f32 {
     // Global panel-frequency floor for completely untyped sites.
     //
     // This floor should be small and primarily prevent degenerate collapse.
-    // Local HMM evidence should remain dominant whenever available.
-    let typed = observed_ratio.clamp(0.0, 1.0);
-    let missing = 1.0 - typed;
-
-    let missing_ramp = missing.powi(10);
+    // Whole-window sparsity already feeds the HMM through the marker layout and
+    // retain-based smoothing. Reusing it here double-counts uncertainty on
+    // sparse arrays and flattens posteriors long after local anchor support
+    // becomes strong, so keep this as a genuinely tiny floor.
     let err_factor = (p_mismatch / 4e-4f32).clamp(0.5, 1.0);
 
     // Unphased-target imputation has additional uncertainty from phase
@@ -790,7 +785,7 @@ fn adaptive_untyped_prior_mix(
         1.0
     };
 
-    let floor = 0.001 + 0.02 * missing_ramp;
+    let floor = 0.001;
     (floor * err_factor * phase_factor).clamp(0.001, 0.80)
 }
 
@@ -6056,26 +6051,10 @@ impl crate::pipelines::ImputationPipeline {
                 offsets1.push(probs1.len());
                 offsets2.push(probs2.len());
             }
-            let observed_ratio1 = if observed1.is_empty() {
-                0.0
-            } else {
-                observed1.iter().filter(|&&v| v).count() as f32 / observed1.len() as f32
-            };
-            let observed_ratio2 = if observed2.is_empty() {
-                0.0
-            } else {
-                observed2.iter().filter(|&&v| v).count() as f32 / observed2.len() as f32
-            };
-            let min_untyped_prior_mix1 = adaptive_untyped_prior_mix(
-                observed_ratio1,
-                self.params.p_mismatch,
-                !phase_conf_valid,
-            );
-            let min_untyped_prior_mix2 = adaptive_untyped_prior_mix(
-                observed_ratio2,
-                self.params.p_mismatch,
-                !phase_conf_valid,
-            );
+            let min_untyped_prior_mix1 =
+                adaptive_untyped_prior_mix(self.params.p_mismatch, !phase_conf_valid);
+            let min_untyped_prior_mix2 =
+                adaptive_untyped_prior_mix(self.params.p_mismatch, !phase_conf_valid);
             if should_log && sample_idx == 0 {
                 let mean_conf = if diag_typed_hets_phase_valid > 0 {
                     diag_phase_conf_sum / diag_typed_hets_phase_valid as f32
