@@ -4670,7 +4670,7 @@ fn run_hmm_with_kernel<K: ImputeKernel>(
         K::LABEL
     );
     let transition_haps = n_ref_haps;
-    let use_prior_smoothing = target_probs.has_untyped_markers();
+    let use_prior_smoothing = target_probs.has_untyped_markers() && active_states < transition_haps;
     if use_prior_smoothing {
         if let Some(ext_retain) = external_nearest_obs_retain {
             // Use pre-computed retain from the full I/O window to avoid
