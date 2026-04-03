@@ -3499,7 +3499,7 @@ fn build_imputation_plan(
                             }
                         }
 
-                        let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
+                        let abyss_top = select_top_k_allow_zero(&window_scores[i], abyss_rank_cutoff);
                         for (ref_idx, _) in abyss_top {
                             if ref_idx < window_rank_hits[i].len() {
                                 window_rank_hits[i][ref_idx] =
@@ -3736,7 +3736,7 @@ fn build_imputation_plan(
                             }
                         }
 
-                        let abyss_top = select_top_k(&window_scores[i], abyss_rank_cutoff);
+                        let abyss_top = select_top_k_allow_zero(&window_scores[i], abyss_rank_cutoff);
                         for (ref_idx, _) in abyss_top {
                             if ref_idx < window_rank_hits[i].len() {
                                 window_rank_hits[i][ref_idx] =
