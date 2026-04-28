@@ -2012,7 +2012,7 @@ fn score_window_batch_exact_packed<TargetSpace, RefSpace>(
                 continue;
             }
             let weight = prescan_match_weight(freq, min_freq);
-            if weight <= 0.0 {
+            if weight < 0.0 {
                 continue;
             }
             let bins = ref_bins.get(targ_idx);
@@ -2224,7 +2224,7 @@ fn score_window_batch_pbwt_packed<TargetSpace, RefSpace>(
                     continue;
                 }
                 let weight = prescan_match_weight(freq, min_freq);
-                if weight <= 0.0 {
+                if weight < 0.0 {
                     continue;
                 }
                 pbwt_fwd.select_donors_into(&beams_fwd[i], k_per_hap, &mut donors_buf);
