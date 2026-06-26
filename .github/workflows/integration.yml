@@ -17,6 +17,33 @@ on:
         type: boolean
 
 jobs:
+  gate:
+    name: Gate scheduled runs on recent changes
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Event ${{ github.event_name }} is not a schedule; running."
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          latest=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          age_min=$(( (now - latest) / 60 ))
+          window=180
+          if [ "$age_min" -lt "$window" ]; then
+            echo "Last commit ${age_min}m ago (< ${window}m); running scheduled job."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Last commit ${age_min}m ago (>= ${window}m); nothing changed, skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # ============================================================================
   # INTEGRATION TEST DATA PREPARATION
@@ -30,6 +57,8 @@ jobs:
 
   # Job 2: Prepare test data (runs in parallel with build)
   prepare-data:
+    needs: gate
+    if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     env:
       KEEP_PHASED: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_phased == true }}
@@ -80,7 +109,8 @@ jobs:
 
   # Job 2b: Prepare 5% chr22 data
   prepare-profile-data:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
+    needs: gate
+    if: ${{ (github.event_name != 'schedule' || needs.gate.outputs.run == 'true') && !(github.event_name == 'workflow_dispatch' && inputs.phasing_only == true) }}
     runs-on: ubuntu-latest
     env:
       KEEP_PHASED: ${{ github.event_name == 'workflow_dispatch' && inputs.keep_phased == true }}

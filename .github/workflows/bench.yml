@@ -9,6 +9,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: Gate scheduled runs on recent changes
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Event ${{ github.event_name }} is not a schedule; running."
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          latest=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          age_min=$(( (now - latest) / 60 ))
+          window=180
+          if [ "$age_min" -lt "$window" ]; then
+            echo "Last commit ${age_min}m ago (< ${window}m); running scheduled job."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Last commit ${age_min}m ago (>= ${window}m); nothing changed, skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
   # ============================================================================
   # STEP 1: Data Preparation
   # Creates a 5% subset of chr22 markers for fast profiling runs.
@@ -18,6 +45,8 @@ jobs:
   # while the full dataset (~830K markers) causes state allocation to stall.
   # ============================================================================
   prepare_data:
+    needs: gate
+    if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     name: Prepare Profiling Data (5% of chr22)
     runs-on: ubuntu-latest
     defaults:
@@ -72,6 +101,8 @@ jobs:
           echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
 
   benchmark:
+    needs: gate
+    if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     name: Performance Benchmarks
     runs-on: ubuntu-latest
     defaults:
@@ -353,6 +384,8 @@ jobs:
           retention-days: 7
 
   release_tests_no_run:
+    needs: gate
+    if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     name: Cargo Test --release (no run)
     runs-on: ubuntu-latest
     steps:
